@@ -215,6 +215,9 @@ function attentionItems(d: PanelData): Alert[] {
 function describeCommand(raw: string): { text: string; isRaw: boolean } {
   let cmd = raw.trim().replace(/^\S*?(?:sh|bash|pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*/i, '').replace(/^["']|["']$/g, '')
   cmd = cmd.replace(/^(?:cd\s+\S+\s*&&\s*)+/, '').trim()
+  // Leading environment assignments (UV_CACHE_DIR=… TMPDIR=… uv run pytest) are not the command itself.
+  cmd = cmd.replace(/^(?:(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, '').trim()
+  cmd = cmd.replace(/^(?:cd\s+\S+\s*&&\s*)+/, '').trim()
   const has = (re: RegExp) => re.test(cmd)
   if (has(/\b(pytest|vitest|jest|mocha|playwright test|cargo test|go test|node --test)\b|\b(npm|pnpm|yarn|bun) (run )?test/)) {
     return { text: 'запускает тесты', isRaw: false }

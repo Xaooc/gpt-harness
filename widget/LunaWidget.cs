@@ -96,32 +96,36 @@ namespace LunaWidget
             return Path.Combine(pf, "nodejs", "node.exe");
         }
 
+        // Every path, including a missing script and a collector timeout, ends in Analyse: a failed poll must surface as
+        // a warning, never as a green "всё в порядке".
         public static Snapshot Poll()
         {
             var snap = new Snapshot();
-            try
-            {
-                var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                var script = Path.Combine(home, ".claude", "scripts", "luna-overview.mjs");
-                if (!File.Exists(script)) { snap.Error = "нет luna-overview.mjs"; return snap; }
-                var psi = new ProcessStartInfo(NodePath(), "\"" + script + "\"")
-                {
-                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
-                    RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8
-                };
-                string json;
-                using (var p = Process.Start(psi))
-                {
-                    var read = p.StandardOutput.ReadToEndAsync();
-                    if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } snap.Error = "сборщик не ответил"; return snap; }
-                    json = read.Result;
-                }
-                Parse(json, snap);
-                snap.Ok = true;
-            }
-            catch (Exception ex) { snap.Error = ex.Message.Length > 80 ? ex.Message.Substring(0, 80) : ex.Message; }
+            try { PollInto(snap); }
+            catch (Exception ex) { snap.Ok = false; snap.Error = ex.Message.Length > 80 ? ex.Message.Substring(0, 80) : ex.Message; }
             Analyse(snap);
             return snap;
+        }
+
+        static void PollInto(Snapshot snap)
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var script = Path.Combine(home, ".claude", "scripts", "luna-overview.mjs");
+            if (!File.Exists(script)) { snap.Error = "нет luna-overview.mjs"; return; }
+            var psi = new ProcessStartInfo(NodePath(), "\"" + script + "\"")
+            {
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
+                RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8
+            };
+            string json;
+            using (var p = Process.Start(psi))
+            {
+                var read = p.StandardOutput.ReadToEndAsync();
+                if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } snap.Error = "сборщик не ответил за 15 с"; return; }
+                json = read.Result;
+            }
+            Parse(json, snap);
+            snap.Ok = true;
         }
 
         static Dictionary<string, object> Obj(object o) { return o as Dictionary<string, object>; }
@@ -207,7 +211,8 @@ namespace LunaWidget
             }
             s.Running = jobs.Count(x => x.State == "running"); s.Waiting = jobs.Count - s.Running;
 
-            var ids = beats.Select(b => Str(b, "sessionId")).Concat(jobs.Select(x => x.Owner)).Where(x => x != "").Distinct().ToList();
+            // Jobs without an owner (the collector allows them) form their own group "" so they are listed and checked too.
+            var ids = beats.Select(b => Str(b, "sessionId")).Where(x => x != "").Concat(jobs.Select(x => x.Owner ?? "")).Distinct().ToList();
             foreach (var id in ids)
             {
                 var b = beats.FirstOrDefault(x => Str(x, "sessionId") == id);
@@ -225,13 +230,14 @@ namespace LunaWidget
                         var toolName = Str(tool, "name");
                         if ((toolName == "Bash" || toolName == "PowerShell") && det != "") { bool raw; var said = Describe(det, out raw); sv.ClaudeText = raw ? "выполняет: " + said : said; }
                         else sv.ClaudeText = toolName + (det != "" ? ": " + det : "");
-                        sv.ClaudeSinceS = (now - Num(tool, "since", now)) / 1000;
+                        sv.ClaudeSinceS = Since(now, Num(tool, "since", 0));
                     }
-                    else if (st == "thinking") { sv.ClaudeState = 1; sv.ClaudeText = "думает"; sv.ClaudeSinceS = (now - Num(b, "turnSince", now)) / 1000; }
-                    else { sv.ClaudeState = 3; sv.ClaudeText = "ждёт вас"; sv.ClaudeSinceS = (now - Num(b, "idleSince", now)) / 1000; }
+                    else if (st == "thinking") { sv.ClaudeState = 1; sv.ClaudeText = "думает"; sv.ClaudeSinceS = Since(now, Num(b, "turnSince", 0)); }
+                    else { sv.ClaudeState = 3; sv.ClaudeText = "ждёт вас"; sv.ClaudeSinceS = Since(now, Num(b, "idleSince", 0)); }
                     foreach (var a in Arr(b.ContainsKey("agents") ? b["agents"] : null)) sv.Agents.Add(Str(a, "description"));
                 }
                 else { sv.ClaudeText = "нет данных о Claude"; }
+                if (id == "") { sv.Name = "Задания без сессии"; sv.ClaudeText = null; }
                 if (string.IsNullOrEmpty(sv.Name)) sv.Name = ProjectOf(sv.Jobs);
                 if (string.IsNullOrEmpty(sv.Name)) sv.Name = "Сессия без проекта";
                 s.Sessions.Add(sv);
@@ -239,6 +245,9 @@ namespace LunaWidget
             // Busy sessions first: Claude working, then sessions with Codex jobs, then the rest.
             s.Sessions = s.Sessions.OrderBy(x => x.ClaudeState == 1 || x.ClaudeState == 2 ? 0 : x.Jobs.Count > 0 ? 1 : 2).ThenBy(x => x.Name).ToList();
         }
+
+        // Seconds since a ms timestamp; 0 (no time shown) for a missing or implausible one (older heartbeats send 0).
+        static double Since(double nowMs, double atMs) { return atMs <= 0 || atMs > nowMs + 60000 || nowMs - atMs > 30.0 * 86400000 ? 0 : (nowMs - atMs) / 1000; }
 
         static string ProjectOf(List<JobView> jobs)
         {
@@ -257,6 +266,9 @@ namespace LunaWidget
         {
             isRaw = false;
             var cmd = Regex.Replace(raw.Trim(), @"^\S*?(?:sh|bash|pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*", "", RegexOptions.IgnoreCase).Trim('"', '\'');
+            cmd = Regex.Replace(cmd, @"^(?:cd\s+\S+\s*&&\s*)+", "").Trim();
+            // Leading environment assignments (UV_CACHE_DIR=… TMPDIR=… uv run pytest) are not the command itself.
+            cmd = Regex.Replace(cmd, @"^(?:(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:""[^""]*""|'[^']*'|\S*)\s+)+", "").Trim();
             cmd = Regex.Replace(cmd, @"^(?:cd\s+\S+\s*&&\s*)+", "").Trim();
             if (Regex.IsMatch(cmd, @"\b(pytest|vitest|jest|mocha|playwright test|cargo test|go test|node --test)\b|\b(npm|pnpm|yarn|bun) (run )?test")) return "запускает тесты";
             if (Regex.IsMatch(cmd, @"\b(tsc|eslint|ruff|mypy|pyright|cargo (check|clippy)|biome)\b")) return "проверяет типы и стиль";
@@ -469,17 +481,27 @@ namespace LunaWidget
     }
 
     // ---- The flyout / widget window, fully custom-drawn -------------------------------------------------------------
+    // Interactions: click a session header to fold it, drag it to reorder (order kept by project name); click a job or
+    // Claude row to expand its full text; drag any edge or corner to resize (size kept); pin to keep it on screen.
     class PanelForm : Form
     {
+        enum Hit { Fold, Expand, Card }
+        class Target { public Rectangle Rect; public Hit Kind; public string Key; }
+
         readonly TrayApp app;
         Snapshot data;
         float scale = 1f;
-        int scroll, contentHeight;
+        int scroll, contentHeight, userW, userH;
+        bool layingOut;
         public bool Pinned;
         Rectangle pinBtn, closeBtn;
-        Point dragFrom; bool dragging;
+        Point moveFrom; bool moving;
         readonly HashSet<string> folded = new HashSet<string>();
-        readonly List<KeyValuePair<Rectangle, string>> foldTargets = new List<KeyValuePair<Rectangle, string>>();
+        readonly HashSet<string> expanded = new HashSet<string>();
+        readonly List<Target> targets = new List<Target>();
+        readonly List<KeyValuePair<Rectangle, string>> cardHeads = new List<KeyValuePair<Rectangle, string>>();
+        List<string> order = new List<string>();
+        string pressCard; Point pressAt; string dragCard; int dropIndex = -1;
 
         Font fTitle, fHead, fBody, fSmall, fIcon, fMono;
 
@@ -492,53 +514,90 @@ namespace LunaWidget
             fTitle = new Font("Segoe UI Semibold", 11.5f); fHead = new Font("Segoe UI Semibold", 9.5f);
             fBody = new Font("Segoe UI", 9f); fSmall = new Font("Segoe UI", 8f);
             fIcon = new Font("Segoe MDL2 Assets", 9f); fMono = new Font("Consolas", 8f);
-            Width = S(380); Height = S(200);
+            MinimumSize = new Size(S(300), S(160));
+            var st = Settings.Load(); string v; int n;
+            if (st.TryGetValue("w", out v) && int.TryParse(v, out n)) userW = n;
+            if (st.TryGetValue("h", out v) && int.TryParse(v, out n)) userH = n;
+            if (st.TryGetValue("order", out v)) order = v.Split('\u001F').Where(x => x != "").ToList();
+            Width = userW > 0 ? userW : S(380); Height = userH > 0 ? userH : S(200);
+            if (st.TryGetValue("x", out v) && st.ContainsKey("y")) { int x, y; if (int.TryParse(v, out x) && int.TryParse(st["y"], out y)) Location = new Point(x, y); }
             Deactivate += (s, e) => { if (!Pinned) Hide(); };
             KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape && !Pinned) Hide(); };
-            MouseWheel += (s, e) => { scroll = Math.Max(0, Math.Min(Math.Max(0, contentHeight - ClientSize.Height), scroll - e.Delta / 2)); Invalidate(); };
-            var st = Settings.Load(); string v;
-            if (st.TryGetValue("x", out v) && st.ContainsKey("y")) { int x, y; if (int.TryParse(v, out x) && int.TryParse(st["y"], out y)) Location = new Point(x, y); }
+            MouseWheel += (s, e) => { scroll = ClampScroll(scroll - e.Delta / 2); Invalidate(); };
+            ResizeEnd += (s, e) =>
+            {
+                userW = Width; userH = Height;
+                var cfg = Settings.Load(); cfg["w"] = Width.ToString(); cfg["h"] = Height.ToString();
+                cfg["x"] = Location.X.ToString(); cfg["y"] = Location.Y.ToString(); Settings.Save(cfg);
+            };
         }
 
         int S(float v) { return (int)Math.Round(v * scale); }
+        int ClampScroll(int v) { return Math.Max(0, Math.Min(Math.Max(0, contentHeight - Height), v)); }
 
         protected override CreateParams CreateParams
         {
             get { var cp = base.CreateParams; cp.ClassStyle |= 0x00020000; /* CS_DROPSHADOW */ cp.ExStyle |= 0x00000080; /* TOOLWINDOW */ return cp; }
         }
 
-        public void SetPinned(bool on)
+        // Borderless resize: report the edges and corners as sizing borders.
+        protected override void WndProc(ref Message m)
         {
-            Pinned = on;
-            if (!on) { PlaceAtTray(); }
+            base.WndProc(ref m);
+            if (m.Msg != 0x84 || m.Result != (IntPtr)1) return; // WM_NCHITTEST on the client area
+            var p = PointToClient(new Point((short)((long)m.LParam & 0xFFFF), (short)(((long)m.LParam >> 16) & 0xFFFF)));
+            int grip = S(6);
+            bool l = p.X <= grip, r = p.X >= Width - grip, t = p.Y <= grip, b = p.Y >= Height - grip;
+            if (t && l) m.Result = (IntPtr)13; else if (t && r) m.Result = (IntPtr)14;
+            else if (b && l) m.Result = (IntPtr)16; else if (b && r) m.Result = (IntPtr)17;
+            else if (l) m.Result = (IntPtr)10; else if (r) m.Result = (IntPtr)11;
+            else if (t) m.Result = (IntPtr)12; else if (b) m.Result = (IntPtr)15;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (layingOut || data == null) return;
+            using (var g = CreateGraphics()) contentHeight = Draw(g, true);
+            scroll = ClampScroll(scroll);
             Invalidate();
         }
+
+        public void SetPinned(bool on) { Pinned = on; if (!on) PlaceAtTray(); Invalidate(); }
 
         public void PlaceAtTray()
         {
             var wa = Screen.PrimaryScreen.WorkingArea; var b = Screen.PrimaryScreen.Bounds;
             int m = S(12);
             int x = wa.Right - Width - m, y = wa.Bottom - Height - m;
-            if (wa.Top > b.Top) y = wa.Top + m;        // taskbar on top
-            if (wa.Left > b.Left) x = wa.Left + m;     // taskbar on the left
+            if (wa.Top > b.Top) y = wa.Top + m;
+            if (wa.Left > b.Left) x = wa.Left + m;
             Location = new Point(x, y);
         }
 
-        public void SetData(Snapshot s)
+        public void SetData(Snapshot s) { data = s; Relayout(); Invalidate(); }
+
+        void Relayout()
         {
-            data = s;
-            Measure();
-            Invalidate();
+            layingOut = true;
+            try
+            {
+                var wa = Screen.PrimaryScreen.WorkingArea;
+                if (userW > 0) Width = Math.Min(userW, wa.Width);
+                using (var g = CreateGraphics()) contentHeight = Draw(g, true);
+                Height = userH > 0 ? Math.Min(userH, wa.Height) : Math.Max(S(160), Math.Min(contentHeight, (int)(wa.Height * 0.8)));
+                if (!Pinned) PlaceAtTray();
+                scroll = ClampScroll(scroll);
+            }
+            finally { layingOut = false; }
         }
 
-        void Measure()
+        // The session order the person chose (by project name); new names keep the collector's order after them.
+        List<SessionView> Ordered(List<SessionView> sessions)
         {
-            using (var g = CreateGraphics()) contentHeight = Draw(g, true);
-            var wa = Screen.PrimaryScreen.WorkingArea;
-            int h = Math.Min(contentHeight, (int)(wa.Height * 0.8));
-            Height = Math.Max(S(120), h);
-            if (!Pinned) PlaceAtTray();
-            scroll = Math.Max(0, Math.Min(scroll, Math.Max(0, contentHeight - Height)));
+            return sessions.Select((x, i) => new { x, i })
+                .OrderBy(p => { var k = order.IndexOf(p.x.Name); return k < 0 ? int.MaxValue : k; }).ThenBy(p => p.i)
+                .Select(p => p.x).ToList();
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -546,16 +605,31 @@ namespace LunaWidget
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
             Draw(e.Graphics, false);
+            if (contentHeight > Height)
+            {
+                int track = Height - S(16), thumb = Math.Max(S(24), track * Height / contentHeight);
+                int top = S(8) + (track - thumb) * scroll / Math.Max(1, contentHeight - Height);
+                FillRound(e.Graphics, new Rectangle(Width - S(6), top, S(3), thumb), S(1), Pal.Line);
+            }
             using (var p = new Pen(Pal.Line)) e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
+            using (var b = new SolidBrush(Pal.Line))
+                for (int i = 0; i < 3; i++) e.Graphics.FillEllipse(b, Width - S(6) - i * S(4), Height - S(6) - (2 - i) * S(4) + S(1), S(2), S(2));
+        }
+
+        static readonly TextFormatFlags Wrap = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding | TextFormatFlags.TextBoxControl;
+        static readonly TextFormatFlags One = TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;
+
+        int TextH(Graphics g, string text, Font f, int width)
+        {
+            return Math.Max(S(16), TextRenderer.MeasureText(g, text, f, new Size(Math.Max(10, width), int.MaxValue), Wrap).Height);
         }
 
         // Draws (or only measures) the whole panel; returns the content height.
         int Draw(Graphics g, bool measure)
         {
-            foldTargets.Clear();
+            if (!measure) { targets.Clear(); cardHeads.Clear(); }
             int pad = S(14), w = Width - 2 * pad, y = pad - (measure ? 0 : scroll);
             var s = data;
-            // Header: title, overall status, pin and close buttons.
             Color status = s == null ? Pal.Sub : s.Alerts.Any(a => a.Error) ? Pal.Err : s.Alerts.Count > 0 ? Pal.Warn : Pal.Ok;
             string statusText = s == null ? "загрузка…" : s.Alerts.Count == 0 ? "всё в порядке" : "требует внимания · " + s.Alerts.Count;
             if (!measure)
@@ -572,31 +646,32 @@ namespace LunaWidget
             y += S(30);
             if (s == null) return y + pad + (measure ? 0 : scroll);
 
-            // Attention block.
+            // Attention: wrapped, never cut.
             if (s.Alerts.Count > 0)
             {
-                int h = S(12) + s.Alerts.Count * S(20);
+                int textW = w - S(36);
+                int h = S(12) + s.Alerts.Sum(a => TextH(g, a.Text, fBody, textW) + S(4));
                 if (!measure)
                 {
                     FillRound(g, new Rectangle(pad, y, w, h), S(8), Pal.Card);
                     int ay = y + S(6);
                     foreach (var a in s.Alerts)
                     {
-                        var c = a.Error ? Pal.Err : Pal.Warn;
-                        using (var b = new SolidBrush(c)) g.FillEllipse(b, pad + S(10), ay + S(6), S(7), S(7));
-                        TextRenderer.DrawText(g, a.Text, fBody, new Rectangle(pad + S(24), ay, w - S(32), S(20)), c, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-                        ay += S(20);
+                        var c = a.Error ? Pal.Err : Pal.Warn; int th = TextH(g, a.Text, fBody, textW);
+                        using (var b = new SolidBrush(c)) g.FillEllipse(b, pad + S(10), ay + S(5), S(7), S(7));
+                        TextRenderer.DrawText(g, a.Text, fBody, new Rectangle(pad + S(24), ay, textW, th), c, Wrap);
+                        ay += th + S(4);
                     }
                 }
                 y += h + S(10);
             }
 
-            // Resources: memory, limits, daemon.
+            // Resources, each limit with its reset time.
             var rows = new List<Tuple<string, string, double, Color, string>>();
             double used = 100 - s.FreeMb / Math.Max(1, s.TotalMb) * 100;
             rows.Add(Tuple.Create("Память", Fmt.Gb(s.FreeMb) + " свободно", used, s.FreeMb < 1024 ? Pal.Err : s.FreeMb < 2048 ? Pal.Warn : Pal.Ok, (string)null));
-            foreach (var l in s.Limits) rows.Add(Tuple.Create(l.Label, Math.Round(l.Pct) + "%", l.Pct, Pal.Sev(l.Pct), l.Pct >= 70 ? l.Resets : null));
-            int resH = S(34) + rows.Sum(r => S(r.Item5 != null ? 36 : 22)) + S(26);
+            foreach (var l in s.Limits) rows.Add(Tuple.Create(l.Label, Math.Round(l.Pct) + "%", l.Pct, Pal.Sev(l.Pct), l.Resets));
+            int resH = S(34) + rows.Sum(r => S(r.Item5 != null ? 38 : 24)) + S(26);
             if (!measure)
             {
                 FillRound(g, new Rectangle(pad, y, w, resH), S(8), Pal.Card);
@@ -611,8 +686,8 @@ namespace LunaWidget
                     FillRound(g, new Rectangle(mx, ry + S(6), meterW, S(6)), S(3), Pal.Track);
                     int fw = Math.Max(S(6), (int)(meterW * Math.Min(100, Math.Max(0, r.Item3)) / 100));
                     FillRound(g, new Rectangle(mx, ry + S(6), fw, S(6)), S(3), r.Item4);
-                    if (r.Item5 != null) TextRenderer.DrawText(g, r.Item5, fSmall, new Point(pad + S(12), ry + S(17)), Pal.Sub, TextFormatFlags.NoPadding);
-                    ry += S(r.Item5 != null ? 36 : 22);
+                    if (r.Item5 != null) TextRenderer.DrawText(g, r.Item5, fSmall, new Point(pad + S(12), ry + S(18)), Pal.Sub, TextFormatFlags.NoPadding);
+                    ry += S(r.Item5 != null ? 38 : 24);
                 }
                 var dColor = !s.DaemonRunning ? Pal.Sub : !s.DaemonHealthy ? Pal.Err : s.AppServerDown ? Pal.Warn : Pal.Ok;
                 var dText = !s.DaemonRunning ? "спит, проснётся с первым заданием" : !s.DaemonHealthy ? "не отвечает" : s.AppServerDown ? "Codex перезапускается"
@@ -624,81 +699,157 @@ namespace LunaWidget
             }
             y += resH + S(10);
 
-            // Sessions.
-            if (s.Sessions.Count == 0)
+            var sessions = Ordered(s.Sessions);
+            if (sessions.Count == 0)
             {
                 if (!measure) TextRenderer.DrawText(g, "Сессии с заданиями Codex появятся здесь.", fBody, new Point(pad, y), Pal.Sub, TextFormatFlags.NoPadding);
                 y += S(24);
             }
-            foreach (var se in s.Sessions)
+            int index = 0;
+            foreach (var se in sessions)
             {
-                bool open = !folded.Contains(se.Id);
-                int h = S(34) + (open ? S(22) + se.Agents.Count * S(20) + se.Jobs.Sum(j => S(j.Activity != null || IsQuiet(j) ? 40 : 22)) + S(6) : 0);
+                bool open = !folded.Contains(se.Name);
+                int bodyH = open ? SessionBodyHeight(g, se, w) : 0;
+                int h = S(34) + bodyH;
                 if (!measure)
                 {
+                    if (dragCard != null && dropIndex == index)
+                        FillRound(g, new Rectangle(pad, y - S(6), w, S(3)), S(1), Pal.Codex);
                     var rect = new Rectangle(pad, y, w, h);
-                    FillRound(g, rect, S(8), Pal.Card);
-                    foldTargets.Add(new KeyValuePair<Rectangle, string>(new Rectangle(pad, y, w, S(30)), se.Id));
-                    TextRenderer.DrawText(g, (open ? "  " : "  "), fIcon, new Point(pad + S(10), y + S(11)), Pal.Sub, TextFormatFlags.NoPadding);
-                    TextRenderer.DrawText(g, se.Name, fHead, new Point(pad + S(28), y + S(8)), Pal.Text, TextFormatFlags.NoPadding);
+                    FillRound(g, rect, S(8), se.Name == dragCard ? Pal.CardHover : Pal.Card);
+                    var head = new Rectangle(pad, y, w, S(30));
+                    cardHeads.Add(new KeyValuePair<Rectangle, string>(head, se.Name));
+                    targets.Add(new Target { Rect = head, Kind = Hit.Card, Key = se.Name });
+                    TextRenderer.DrawText(g, open ? "" : "", fIcon, new Point(pad + S(10), y + S(11)), Pal.Sub, TextFormatFlags.NoPadding);
                     var running = se.Jobs.Count(j => j.State == "running");
-                    var summary = (se.Jobs.Count > 0 ? "Codex " + running + (se.Jobs.Count > running ? "+" + (se.Jobs.Count - running) : "") : "");
+                    var summary = se.Jobs.Count > 0 ? "Codex " + running + (se.Jobs.Count > running ? "+" + (se.Jobs.Count - running) : "") : "";
                     var ss = TextRenderer.MeasureText(g, summary, fSmall, Size.Empty, TextFormatFlags.NoPadding);
+                    TextRenderer.DrawText(g, se.Name, fHead, new Rectangle(pad + S(28), y + S(8), w - S(48) - ss.Width, S(20)), Pal.Text, One);
                     TextRenderer.DrawText(g, summary, fSmall, new Point(pad + w - S(12) - ss.Width, y + S(10)), Pal.Codex, TextFormatFlags.NoPadding);
-                    if (open)
-                    {
-                        int ry = y + S(34);
-                        var cc = se.ClaudeState == 1 ? Pal.Claude : se.ClaudeState == 2 ? Pal.Claude : Pal.Sub;
-                        using (var b = new SolidBrush(cc)) g.FillEllipse(b, pad + S(12), ry + S(5), S(7), S(7));
-                        TextRenderer.DrawText(g, "Claude", fHead, new Point(pad + S(25), ry), Pal.Text, TextFormatFlags.NoPadding);
-                        var cs = se.ClaudeSinceS > 0 ? Fmt.Duration(se.ClaudeSinceS) : "";
-                        var csz = TextRenderer.MeasureText(g, cs, fSmall, Size.Empty, TextFormatFlags.NoPadding);
-                        TextRenderer.DrawText(g, se.ClaudeText ?? "", fBody, new Rectangle(pad + S(80), ry, w - S(100) - csz.Width, S(20)), se.ClaudeState == 3 || se.ClaudeState == 0 ? Pal.Sub : Pal.Text, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-                        TextRenderer.DrawText(g, cs, fSmall, new Point(pad + w - S(12) - csz.Width, ry + S(1)), Pal.Sub, TextFormatFlags.NoPadding);
-                        ry += S(22);
-                        foreach (var a in se.Agents)
-                        {
-                            TextRenderer.DrawText(g, "◇  агент: " + a, fBody, new Rectangle(pad + S(12), ry, w - S(24), S(20)), Pal.Sub, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-                            ry += S(20);
-                        }
-                        foreach (var j in se.Jobs) ry = DrawJob(g, j, pad, w, ry);
-                    }
+                    if (open) DrawSessionBody(g, se, pad, w, y + S(34));
                 }
                 y += h + S(8);
+                index++;
             }
+            if (!measure && dragCard != null && dropIndex == index)
+                FillRound(g, new Rectangle(pad, y - S(6), w, S(3)), S(1), Pal.Codex);
 
             if (!measure)
-                TextRenderer.DrawText(g, "обновлено " + s.At.ToString("HH:mm:ss"), fSmall, new Point(pad, y), Pal.Sub, TextFormatFlags.NoPadding);
+            {
+                var foot = "обновлено " + s.At.ToString("HH:mm:ss") + (sessions.Count > 1 ? " · карточки можно перетаскивать" : "");
+                TextRenderer.DrawText(g, foot, fSmall, new Point(pad, y), Pal.Sub, TextFormatFlags.NoPadding);
+            }
             y += S(22);
             return y + (measure ? 0 : scroll);
         }
 
+        string ClaudeKey(SessionView se) { return "claude:" + se.Id; }
+        string JobKey(JobView j) { return "job:" + j.Owner + "|" + j.Name; }
         static bool IsQuiet(JobView j) { return j.State == "running" && j.IdleS >= 300; }
 
-        int DrawJob(Graphics g, JobView j, int pad, int w, int ry)
+        string JobSecond(JobView j, out Color color, out Font font)
         {
+            color = Pal.Sub; font = null;
             bool running = j.State == "running";
-            var quiet = running && j.IdleS >= 900 ? Pal.Err : running && j.IdleS >= 300 ? Pal.Warn : Color.Empty;
-            var glyphColor = quiet != Color.Empty ? quiet : running ? Pal.Ok : Pal.Warn;
+            if (running && j.IdleS >= 300)
+            {
+                color = j.IdleS >= 900 ? Pal.Err : Pal.Warn;
+                return "тишина " + Fmt.Duration(j.IdleS) + (j.IdleS >= 900 ? " — похоже, завис" : " — возможно, думает");
+            }
+            if (j.Activity != null && j.ActivityRaw) font = fMono;
+            return j.Activity;
+        }
+
+        int SessionBodyHeight(Graphics g, SessionView se, int w)
+        {
+            int h = 0;
+            if (se.ClaudeText != null)
+                h += expanded.Contains(ClaudeKey(se)) ? TextH(g, se.ClaudeText, fBody, w - S(36)) + S(26) : S(22);
+            h += se.Agents.Count * S(20);
+            foreach (var j in se.Jobs) h += JobHeight(g, j, w);
+            return h + S(6);
+        }
+
+        int JobHeight(Graphics g, JobView j, int w)
+        {
+            Color c; Font f; var second = JobSecond(j, out c, out f);
+            if (!expanded.Contains(JobKey(j))) return second != null ? S(42) : S(24);
+            int h = S(22) + TextH(g, j.Name, fBody, w - S(40)) - S(16);
+            if (second != null) h += TextH(g, second, f ?? fSmall, w - S(40)) + S(6);
+            return h + S(4);
+        }
+
+        void DrawSessionBody(Graphics g, SessionView se, int pad, int w, int ry)
+        {
+            if (se.ClaudeText != null)
+            {
+                bool exp = expanded.Contains(ClaudeKey(se));
+                var cc = se.ClaudeState == 1 || se.ClaudeState == 2 ? Pal.Claude : Pal.Sub;
+                var cs = se.ClaudeSinceS > 0 ? Fmt.Duration(se.ClaudeSinceS) : "";
+                var csz = TextRenderer.MeasureText(g, cs, fSmall, Size.Empty, TextFormatFlags.NoPadding);
+                using (var b = new SolidBrush(cc)) g.FillEllipse(b, pad + S(12), ry + S(5), S(7), S(7));
+                TextRenderer.DrawText(g, "Claude", fHead, new Point(pad + S(25), ry), Pal.Text, TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(g, cs, fSmall, new Point(pad + w - S(12) - csz.Width, ry + S(1)), Pal.Sub, TextFormatFlags.NoPadding);
+                var tc = se.ClaudeState == 3 || se.ClaudeState == 0 ? Pal.Sub : Pal.Text;
+                int rowH;
+                if (exp)
+                {
+                    int th = TextH(g, se.ClaudeText, fBody, w - S(36));
+                    TextRenderer.DrawText(g, se.ClaudeText, fBody, new Rectangle(pad + S(25), ry + S(22), w - S(36), th), tc, Wrap);
+                    rowH = th + S(26);
+                }
+                else
+                {
+                    TextRenderer.DrawText(g, se.ClaudeText, fBody, new Rectangle(pad + S(80), ry, w - S(100) - csz.Width, S(20)), tc, One);
+                    rowH = S(22);
+                }
+                targets.Add(new Target { Rect = new Rectangle(pad, ry, w, rowH), Kind = Hit.Expand, Key = ClaudeKey(se) });
+                ry += rowH;
+            }
+            foreach (var a in se.Agents)
+            {
+                TextRenderer.DrawText(g, "◇  агент: " + a, fBody, new Rectangle(pad + S(12), ry, w - S(24), S(20)), Pal.Sub, One);
+                ry += S(20);
+            }
+            foreach (var j in se.Jobs)
+            {
+                int h = JobHeight(g, j, w);
+                DrawJob(g, j, pad, w, ry);
+                targets.Add(new Target { Rect = new Rectangle(pad, ry, w, h), Kind = Hit.Expand, Key = JobKey(j) });
+                ry += h;
+            }
+        }
+
+        void DrawJob(Graphics g, JobView j, int pad, int w, int ry)
+        {
+            bool running = j.State == "running", exp = expanded.Contains(JobKey(j));
+            Color sc; Font sf; var second = JobSecond(j, out sc, out sf);
+            var glyphColor = running && j.IdleS >= 900 ? Pal.Err : running && j.IdleS >= 300 ? Pal.Warn : running ? Pal.Ok : Pal.Warn;
             TextRenderer.DrawText(g, running ? "" : "", fIcon, new Point(pad + S(10), ry + S(3)), glyphColor, TextFormatFlags.NoPadding);
             var right = running ? Fmt.Duration(j.AgeS) : (j.State == "queued" ? "в очереди" : j.State.StartsWith("waiting-") ? "ждёт" : j.State) + " · " + Fmt.Duration(j.AgeS);
             var rs = TextRenderer.MeasureText(g, right, fSmall, Size.Empty, TextFormatFlags.NoPadding);
             TextRenderer.DrawText(g, right, fSmall, new Point(pad + w - S(12) - rs.Width, ry + S(1)), Pal.Sub, TextFormatFlags.NoPadding);
             TextRenderer.DrawText(g, j.Model, fHead, new Point(pad + S(28), ry), Pal.Codex, TextFormatFlags.NoPadding);
             var ms = TextRenderer.MeasureText(g, j.Model, fHead, Size.Empty, TextFormatFlags.NoPadding);
-            TextRenderer.DrawText(g, j.Name, fBody, new Rectangle(pad + S(32) + ms.Width, ry, w - S(52) - ms.Width - rs.Width, S(20)), running ? Pal.Text : Pal.Sub, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-            ry += S(20);
-            string second = null; Color sc = Pal.Sub;
-            if (quiet != Color.Empty) { second = "тишина " + Fmt.Duration(j.IdleS) + (quiet == Pal.Err ? " — похоже, завис" : " — возможно, думает"); sc = quiet; }
-            else if (j.Activity != null) second = j.Activity;
-            if (second != null)
+            int nameW = w - S(52) - ms.Width - rs.Width;
+            var nameColor = running ? Pal.Text : Pal.Sub;
+            if (exp)
             {
-                TextRenderer.DrawText(g, second, j.ActivityRaw && quiet == Color.Empty ? fMono : fSmall,
-                    new Rectangle(pad + S(28), ry, w - S(40), S(18)), sc, TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-                ry += S(20);
+                int nh = TextH(g, j.Name, fBody, w - S(40));
+                TextRenderer.DrawText(g, j.Name, fBody, new Rectangle(pad + S(32) + ms.Width, ry, nameW, nh), nameColor, Wrap);
+                ry += Math.Max(S(20), nh + S(4));
+                if (second != null)
+                {
+                    var f = sf ?? fSmall; int th = TextH(g, second, f, w - S(40));
+                    TextRenderer.DrawText(g, second, f, new Rectangle(pad + S(28), ry, w - S(40), th), sc, Wrap);
+                }
             }
-            else ry += S(2);
-            return ry;
+            else
+            {
+                TextRenderer.DrawText(g, j.Name, fBody, new Rectangle(pad + S(32) + ms.Width, ry, nameW, S(20)), nameColor, One);
+                if (second != null)
+                    TextRenderer.DrawText(g, second, sf ?? fSmall, new Rectangle(pad + S(28), ry + S(20), w - S(40), S(18)), sc, One);
+            }
         }
 
         static void FillRound(Graphics g, Rectangle r, int radius, Color c)
@@ -714,30 +865,65 @@ namespace LunaWidget
             }
         }
 
+        Target HitAt(Point p) { return targets.LastOrDefault(t => t.Rect.Contains(p)); }
+
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
-            if (pinBtn.Contains(e.Location)) { app.SetPinned(!Pinned); return; }
-            if (closeBtn.Contains(e.Location)) { if (Pinned) app.SetPinned(false); Hide(); return; }
-            foreach (var t in foldTargets)
-                if (t.Key.Contains(e.Location)) { if (!folded.Remove(t.Value)) folded.Add(t.Value); Measure(); Invalidate(); return; }
-            if (Pinned && e.Y < S(40)) { dragging = true; dragFrom = e.Location; }
+            if (pinBtn.Contains(e.Location)) { if (app != null) app.SetPinned(!Pinned); return; }
+            if (closeBtn.Contains(e.Location)) { if (Pinned && app != null) app.SetPinned(false); Hide(); return; }
+            var t = HitAt(e.Location);
+            if (t != null && t.Kind == Hit.Card) { pressCard = t.Key; pressAt = e.Location; return; }
+            if (t != null && t.Kind == Hit.Expand) { if (!expanded.Remove(t.Key)) expanded.Add(t.Key); Relayout(); Invalidate(); return; }
+            if (Pinned && e.Y < S(40)) { moving = true; moveFrom = e.Location; }
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            if (dragging) Location = new Point(Location.X + e.X - dragFrom.X, Location.Y + e.Y - dragFrom.Y);
-            Cursor = pinBtn.Contains(e.Location) || closeBtn.Contains(e.Location) || foldTargets.Any(t => t.Key.Contains(e.Location)) ? Cursors.Hand : Cursors.Default;
+            if (moving) { Location = new Point(Location.X + e.X - moveFrom.X, Location.Y + e.Y - moveFrom.Y); return; }
+            if (pressCard != null && (dragCard != null || Math.Abs(e.Y - pressAt.Y) > S(6)))
+            {
+                dragCard = pressCard;
+                // Drop slot: before the first card whose header middle is below the pointer.
+                dropIndex = cardHeads.Count;
+                for (int i = 0; i < cardHeads.Count; i++)
+                    if (e.Y < cardHeads[i].Key.Top + cardHeads[i].Key.Height / 2) { dropIndex = i; break; }
+                Cursor = Cursors.SizeNS;
+                Invalidate();
+                return;
+            }
+            var t = HitAt(e.Location);
+            Cursor = pinBtn.Contains(e.Location) || closeBtn.Contains(e.Location) || t != null ? Cursors.Hand : Cursors.Default;
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
             base.OnMouseUp(e);
-            if (!dragging) return;
-            dragging = false;
-            var st = Settings.Load(); st["x"] = Location.X.ToString(); st["y"] = Location.Y.ToString(); Settings.Save(st);
+            if (moving)
+            {
+                moving = false;
+                var st = Settings.Load(); st["x"] = Location.X.ToString(); st["y"] = Location.Y.ToString(); Settings.Save(st);
+                return;
+            }
+            if (pressCard == null) return;
+            if (dragCard != null)
+            {
+                var names = cardHeads.Select(c => c.Value).ToList();
+                int from = names.IndexOf(dragCard);
+                if (from >= 0 && dropIndex >= 0)
+                {
+                    names.RemoveAt(from);
+                    names.Insert(Math.Min(names.Count, dropIndex > from ? dropIndex - 1 : dropIndex), dragCard);
+                    // Keep names not on screen right now after the visible ones, in their old order.
+                    order = names.Concat(order.Where(n => !names.Contains(n))).ToList();
+                    var st = Settings.Load(); st["order"] = string.Join("\u001F", order); Settings.Save(st);
+                }
+            }
+            else if (!folded.Remove(pressCard)) folded.Add(pressCard);
+            pressCard = null; dragCard = null; dropIndex = -1; Cursor = Cursors.Default;
+            Relayout(); Invalidate();
         }
     }
 }
