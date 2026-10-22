@@ -549,6 +549,16 @@ namespace LunaWidget
             CardOrder.Apply(live10b, mig, out changed);
             eq("oldest long list", Names(CardOrder.Apply(new List<SessionView> { S("r1", "rpg"), S("r2", "rpg"), S("d", "docs"), S("k", "krim") }, mig, out changed)),
                 "rpg:r1,rpg:r2,krim:k,docs:d");
+            // 10c. Oldest format, C (rpg) briefly absent during the migration and back later with the same id: A,B,C.
+            var live10c = new List<SessionView> { S("A", "rpg"), S("B", "krim") };
+            mig = CardOrder.Migrate(new List<string> { "rpg", "krim" }, new List<string> { "A", "B", "C" }, live10c);
+            CardOrder.Apply(live10c, mig, out changed);
+            eq("absent during migration", Names(CardOrder.Apply(new List<SessionView> { S("A", "rpg"), S("C", "rpg"), S("B", "krim") }, mig, out changed)),
+                "rpg:A,krim:B,rpg:C");
+            // 10d. An unnamed place of an absent session is never taken by a new session of another project.
+            eq("unnamed place kept", Names(CardOrder.Apply(new List<SessionView> { S("A", "rpg"), S("B", "krim"), S("Z", "zzz") },
+                CardOrder.Migrate(new List<string> { "rpg", "krim" }, new List<string> { "A", "Q", "B" }, new List<SessionView> { S("A", "rpg"), S("B", "krim") }), out changed)),
+                "rpg:A,krim:B,zzz:Z");
             // 11. Dragging: move N before B, keeping the dead slot of A where it was.
             slots = Slots("A:rpg", "B:krim", "N:rpg");
             CardOrder.Move(slots, "N", "B");
@@ -632,15 +642,16 @@ namespace LunaWidget
             if (aligned)
                 return ids.Select((id, i) => new CardSlot { Id = id, Name = names[i] })
                     .Concat(names.Skip(ids.Count).Select((nm, i) => new CardSlot { Id = "~free-" + i, Name = nm })).ToList();
-            // Per-project order: live cards keep their exact dragged order; each absent project gets a free place where
-            // its rank in `names` puts it among the projects on screen.
+            // Per-project order: every id keeps its exact dragged place, live or not; an absent session gets its project
+            // filled in when it comes back (Apply binds by id), and new sessions never take an unnamed place. Each project
+            // with no card at all gets a free place where its rank in `names` puts it among the named places.
             Func<string, int> rank = nm => { var k = names.IndexOf(nm); return k < 0 ? int.MaxValue : k; };
-            var slots = ids.Where(liveName.ContainsKey).Select(id => new CardSlot { Id = id, Name = liveName[id] }).ToList();
+            var slots = ids.Select(id => new CardSlot { Id = id, Name = liveName.ContainsKey(id) ? liveName[id] : "" }).ToList();
             for (int i = 0; i < names.Count; i++)
             {
                 if (slots.Any(s => s.Name == names[i])) continue;
                 var free = new CardSlot { Id = "~free-" + i, Name = names[i] };
-                int at = slots.FindIndex(s => rank(s.Name) > i);
+                int at = slots.FindIndex(s => s.Name != "" && rank(s.Name) > i);
                 if (at < 0) slots.Add(free); else slots.Insert(at, free);
             }
             return slots;
