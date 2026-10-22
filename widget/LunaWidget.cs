@@ -27,6 +27,8 @@ namespace LunaWidget
         [STAThread]
         static void Main(string[] args)
         {
+            // --self-test: checks the pure logic (card order) and exits 0/1; writes the result to stdout via a console.
+            if (args.Length == 1 && args[0] == "--self-test") { Environment.Exit(SelfTest.Run()); return; }
             // --render <png>: poll once, draw the panel into an image and exit (design checks, docs).
             if (args.Length == 2 && args[0] == "--render")
             {
@@ -481,6 +483,66 @@ namespace LunaWidget
         }
     }
 
+    static class SelfTest
+    {
+        static SessionView S(string id, string name) { return new SessionView { Id = id, Name = name }; }
+        static string Names(List<SessionView> l) { return string.Join(",", l.Select(x => x.Name + ":" + x.Id)); }
+
+        public static int Run()
+        {
+            var fails = new List<string>();
+            int n = 0;
+            Action<string, string, string> eq = (label, got, want) => { n++; if (got != want) fails.Add(label + ": got " + got + " want " + want); };
+            var none = new List<string>();
+            const string NS = "Задания без сессии";
+            // 1. After a restart (all ids new) the saved name order holds, the ownerless card included.
+            var order = new List<string> { "krim", NS, "rpg" };
+            eq("restart keeps order", Names(CardOrder.Apply(new List<SessionView> { S("~no-session", NS), S("n1", "rpg"), S("n2", "krim") }, order, new List<string> { "~no-session", "old1", "old2" })),
+                "krim:n2," + NS + ":~no-session,rpg:n1");
+            // 2. Interleaved same-name cards survive a restart.
+            order = new List<string> { "rpg", "krim", "rpg" };
+            eq("interleaved survives", Names(CardOrder.Apply(new List<SessionView> { S("a", "rpg"), S("b", "rpg"), S("c", "krim") }, order, none)),
+                "rpg:a,krim:c,rpg:b");
+            // 3. While sessions live, the dragged id order decides which rpg card is first.
+            eq("ids pick k-th", Names(CardOrder.Apply(new List<SessionView> { S("a", "rpg"), S("b", "rpg"), S("c", "krim") }, order, new List<string> { "b", "c", "a" })),
+                "rpg:b,krim:c,rpg:a");
+            // 4. Unknown projects go last in collector order; a third rpg card lands right after the last rpg slot.
+            eq("unknown last", Names(CardOrder.Apply(new List<SessionView> { S("x", "new"), S("a", "rpg"), S("c", "krim"), S("d", "rpg"), S("e", "rpg") }, order, none)),
+                "rpg:a,krim:c,rpg:d,rpg:e,new:x");
+            // 5. No saved order: collector order unchanged.
+            eq("no order", Names(CardOrder.Apply(new List<SessionView> { S("x", "b"), S("y", "a") }, none, none)), "b:x,a:y");
+            var text = fails.Count == 0 ? "PASS " + n + "/" + n : "FAIL\n" + string.Join("\n", fails);
+            try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "LunaWidget.selftest.txt"), text); } catch { }
+            return fails.Count == 0 ? 0 : 1;
+        }
+    }
+
+    // Card order: pure, so --self-test can check it.
+    static class CardOrder
+    {
+        public static List<SessionView> Apply(List<SessionView> sessions, List<string> order, List<string> idOrder)
+        {
+            // `order` lists project names, one entry per card, duplicates allowed ("rpg, kriminalist, rpg"): the k-th card of
+            // a project takes the k-th slot of that name, so an interleaved arrangement survives session restarts. Among
+            // cards of one project, the dragged order (idOrder, valid while those sessions live) decides who is k-th.
+            // Projects not in `order` go last, in the collector's order.
+            var indexed = sessions.Select((x, i) => new { x, i }).ToList();
+            var slot = new Dictionary<SessionView, double>();
+            foreach (var group in indexed.GroupBy(p => p.x.Name))
+            {
+                var cards = group.OrderBy(p => idOrder.IndexOf(p.x.Id) >= 0 ? idOrder.IndexOf(p.x.Id) : int.MaxValue)
+                    .ThenBy(p => p.i).ToList();
+                var positions = order.Select((n, k) => new { n, k }).Where(z => z.n == group.Key).Select(z => (double)z.k).ToList();
+                for (int m = 0; m < cards.Count; m++)
+                {
+                    slot[cards[m].x] = positions.Count == 0 ? 1e9 + cards[m].i
+                        : m < positions.Count ? positions[m] : positions[positions.Count - 1] + 0.001 * (m - positions.Count + 1);
+                }
+            }
+            return indexed.OrderBy(p => slot[p.x]).ThenBy(p => p.i).Select(p => p.x).ToList();
+        }
+    }
+
     // ---- The flyout / widget window, fully custom-drawn -------------------------------------------------------------
     // Interactions: click a session header to fold it, drag it to reorder (order kept by project name); click a job or
     // Claude row to expand its full text; drag any edge or corner to resize (size kept); pin to keep it on screen.
@@ -597,15 +659,7 @@ namespace LunaWidget
         }
 
         // The session order the person chose (by project name); new names keep the collector's order after them.
-        List<SessionView> Ordered(List<SessionView> sessions)
-        {
-            // Sessions the person placed keep their exact slots (by id); the others follow, by project-name order.
-            return sessions.Select((x, i) => new { x, i })
-                .OrderBy(p => idOrder.IndexOf(p.x.Id) >= 0 ? 0 : 1)
-                .ThenBy(p => idOrder.IndexOf(p.x.Id) >= 0 ? idOrder.IndexOf(p.x.Id) : 0)
-                .ThenBy(p => { var k = order.IndexOf(p.x.Name); return k < 0 ? int.MaxValue : k; }).ThenBy(p => p.i)
-                .Select(p => p.x).ToList();
-        }
+        List<SessionView> Ordered(List<SessionView> sessions) { return CardOrder.Apply(sessions, order, idOrder); }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -939,7 +993,8 @@ namespace LunaWidget
                 {
                     ids.RemoveAt(from);
                     ids.Insert(Math.Min(ids.Count, dropIndex > from ? dropIndex - 1 : dropIndex), dragCard);
-                    var names = ids.Select(id => cardNames.ContainsKey(id) ? cardNames[id] : "").Where(n => n != "").Distinct().ToList();
+                    // One entry per card (duplicates kept): the k-th "rpg" entry is the slot of the k-th rpg card.
+                    var names = ids.Select(id => cardNames.ContainsKey(id) ? cardNames[id] : "").Where(n => n != "").ToList();
                     // Keep names not on screen right now after the visible ones, in their old order.
                     order = names.Concat(order.Where(n => !names.Contains(n))).ToList();
                     idOrder = ids;

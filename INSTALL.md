@@ -130,7 +130,8 @@ cmd //c "$(cygpath -w widget/build-widget.cmd)"     # → %USERPROFILE%\.claude\
 start "" "$USERPROFILE/.claude/bin/luna-widget/LunaWidget.exe"
 ```
 "Start with Windows" writes the user's Run registry key. Leave that to the user, via the widget's right-click menu.
-`LunaWidget.exe --render out.png` draws the panel once into an image, for checks.
+`LunaWidget.exe --render out.png` draws the panel once into an image; `--self-test` checks the card-order logic
+(result in `%TEMP%unawidget.selftest.txt`, exit code 0 = pass).
 
 ## 6. Restart and smoke-test
 Hooks load at session start, so close and reopen Claude Code (or start a new session). Then:
