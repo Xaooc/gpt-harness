@@ -122,6 +122,66 @@
       "sha256": "0210da5d36d8713440c598bc913f8c304d534c04b3503ec8b12d616827bd6eda"
     },
     {
+      "src": "codex-plugin-patches/README.md",
+      "dest": "luna-harness/codex-plugin-patches/README.md",
+      "kind": "file",
+      "sha256": "ca72a3be82140d83577152d2500e9d4c6080eddea4b6f3ed3edefe22d4e4a71f"
+    },
+    {
+      "src": "codex-plugin-patches/manifest.json",
+      "dest": "luna-harness/codex-plugin-patches/manifest.json",
+      "kind": "file",
+      "sha256": "157a89e11968b49fa96455a8b53d99ab8d05ba3aec0e13c45a8b85d381cca850"
+    },
+    {
+      "src": "codex-plugin-patches/orig/scripts/app-server-broker.mjs",
+      "dest": "luna-harness/codex-plugin-patches/orig/scripts/app-server-broker.mjs",
+      "kind": "file",
+      "sha256": "21feb2d56d6c211ac86d5fd998c484ed7c104474c15bd06c16780e607b457878"
+    },
+    {
+      "src": "codex-plugin-patches/orig/scripts/lib/app-server.mjs",
+      "dest": "luna-harness/codex-plugin-patches/orig/scripts/lib/app-server.mjs",
+      "kind": "file",
+      "sha256": "d5c23fe925cfe3fec244df3d63bcba691030e716af7873fd31248aaaf763bc21"
+    },
+    {
+      "src": "codex-plugin-patches/orig/scripts/lib/broker-lifecycle.mjs",
+      "dest": "luna-harness/codex-plugin-patches/orig/scripts/lib/broker-lifecycle.mjs",
+      "kind": "file",
+      "sha256": "edda09d1c62b78293c8509b6c384ecf61c1ec8b0d382f22327e46f0c3eddf30f"
+    },
+    {
+      "src": "codex-plugin-patches/orig/scripts/lib/process.mjs",
+      "dest": "luna-harness/codex-plugin-patches/orig/scripts/lib/process.mjs",
+      "kind": "file",
+      "sha256": "708b95e1a1ca2d19021c7a9a0bcd1f9724c534d647bbe18886f8b744b7e7b63f"
+    },
+    {
+      "src": "codex-plugin-patches/patched/scripts/app-server-broker.mjs",
+      "dest": "luna-harness/codex-plugin-patches/patched/scripts/app-server-broker.mjs",
+      "kind": "file",
+      "sha256": "e4d158915c3987f1ee5ecf328b48690887453403380e77549217d0f7a57fe9f9"
+    },
+    {
+      "src": "codex-plugin-patches/patched/scripts/lib/app-server.mjs",
+      "dest": "luna-harness/codex-plugin-patches/patched/scripts/lib/app-server.mjs",
+      "kind": "file",
+      "sha256": "a2f91b0f3d72abc426488fe11c8daf68c9411b96e9701cd1d399b7bf009135b9"
+    },
+    {
+      "src": "codex-plugin-patches/patched/scripts/lib/broker-lifecycle.mjs",
+      "dest": "luna-harness/codex-plugin-patches/patched/scripts/lib/broker-lifecycle.mjs",
+      "kind": "file",
+      "sha256": "e9f236aa24f24d20b22388be3cfcdd03d2b872b9d2f6ae88feb0a3cd29a56968"
+    },
+    {
+      "src": "codex-plugin-patches/patched/scripts/lib/process.mjs",
+      "dest": "luna-harness/codex-plugin-patches/patched/scripts/lib/process.mjs",
+      "kind": "file",
+      "sha256": "7395d2e4e33bfc3b81b6e614727271925fb11fb405db3845b444f31a5360c904"
+    },
+    {
       "src": "claude/scripts/heavy-gate.mjs",
       "dest": "scripts/heavy-gate.mjs",
       "kind": "file",
@@ -242,6 +302,12 @@
       "sha256": "691e50e95fa0023806106d06c02739f95acad757bf49d10b907eb1143c8d21d3"
     },
     {
+      "src": "claude/scripts/luna-harness-plugin-patch.mjs",
+      "dest": "scripts/luna-harness-plugin-patch.mjs",
+      "kind": "file",
+      "sha256": "f0cfb5cd1c678177813925cb8e797061a8373c32bb1d1652a62f925a256b82aa"
+    },
+    {
       "src": "claude/scripts/luna-mempri.ps1",
       "dest": "scripts/luna-mempri.ps1",
       "kind": "file",
@@ -318,60 +384,6 @@
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
       "sha256": "d2165e44012217e010f9060392f53b229f852ce858bb4445aa57c9255f68bcb4"
-    },
-    {
-      "src": "claude/scripts/luna-harness-plugin-patch.mjs",
-      "dest": "scripts/luna-harness-plugin-patch.mjs",
-      "kind": "file",
-      "sha256": "f0cfb5cd1c678177813925cb8e797061a8373c32bb1d1652a62f925a256b82aa"
-    },
-    {
-      "src": "codex-plugin-patches/manifest.json",
-      "dest": "luna-harness/codex-plugin-patches/manifest.json",
-      "kind": "file",
-      "sha256": "811494ef6ac7143adf53bc8e1d704ed18db23444f651086af7beb2ba59919574"
-    },
-    {
-      "src": "codex-plugin-patches/orig/scripts/app-server-broker.mjs",
-      "dest": "luna-harness/codex-plugin-patches/orig/scripts/app-server-broker.mjs",
-      "kind": "file",
-      "sha256": "21feb2d56d6c211ac86d5fd998c484ed7c104474c15bd06c16780e607b457878"
-    },
-    {
-      "src": "codex-plugin-patches/orig/scripts/lib/app-server.mjs",
-      "dest": "luna-harness/codex-plugin-patches/orig/scripts/lib/app-server.mjs",
-      "kind": "file",
-      "sha256": "d5c23fe925cfe3fec244df3d63bcba691030e716af7873fd31248aaaf763bc21"
-    },
-    {
-      "src": "codex-plugin-patches/orig/scripts/lib/broker-lifecycle.mjs",
-      "dest": "luna-harness/codex-plugin-patches/orig/scripts/lib/broker-lifecycle.mjs",
-      "kind": "file",
-      "sha256": "edda09d1c62b78293c8509b6c384ecf61c1ec8b0d382f22327e46f0c3eddf30f"
-    },
-    {
-      "src": "codex-plugin-patches/patched/scripts/app-server-broker.mjs",
-      "dest": "luna-harness/codex-plugin-patches/patched/scripts/app-server-broker.mjs",
-      "kind": "file",
-      "sha256": "e4d158915c3987f1ee5ecf328b48690887453403380e77549217d0f7a57fe9f9"
-    },
-    {
-      "src": "codex-plugin-patches/patched/scripts/lib/app-server.mjs",
-      "dest": "luna-harness/codex-plugin-patches/patched/scripts/lib/app-server.mjs",
-      "kind": "file",
-      "sha256": "a2f91b0f3d72abc426488fe11c8daf68c9411b96e9701cd1d399b7bf009135b9"
-    },
-    {
-      "src": "codex-plugin-patches/patched/scripts/lib/broker-lifecycle.mjs",
-      "dest": "luna-harness/codex-plugin-patches/patched/scripts/lib/broker-lifecycle.mjs",
-      "kind": "file",
-      "sha256": "e9f236aa24f24d20b22388be3cfcdd03d2b872b9d2f6ae88feb0a3cd29a56968"
-    },
-    {
-      "src": "codex-plugin-patches/README.md",
-      "dest": "luna-harness/codex-plugin-patches/README.md",
-      "kind": "file",
-      "sha256": "5681860272fd3b11572cbdbc19658cac3dc0c20bf25bc9924a48b53f2f10f770"
     }
   ],
   "settings": "settings/hooks.json",

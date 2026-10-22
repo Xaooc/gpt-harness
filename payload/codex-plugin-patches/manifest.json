@@ -26,6 +26,13 @@
       "patchedSha256": "e9f236aa24f24d20b22388be3cfcdd03d2b872b9d2f6ae88feb0a3cd29a56968",
       "patched": "patched/scripts/lib/broker-lifecycle.mjs",
       "orig": "orig/scripts/lib/broker-lifecycle.mjs"
+    },
+    {
+      "rel": "scripts/lib/process.mjs",
+      "origSha256": "708b95e1a1ca2d19021c7a9a0bcd1f9724c534d647bbe18886f8b744b7e7b63f",
+      "patchedSha256": "7395d2e4e33bfc3b81b6e614727271925fb11fb405db3845b444f31a5360c904",
+      "patched": "patched/scripts/lib/process.mjs",
+      "orig": "orig/scripts/lib/process.mjs"
     }
   ]
 }

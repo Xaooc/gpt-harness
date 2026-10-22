@@ -11,3 +11,7 @@ The elevated setup helper in npm Codex 0.162.x fails with "setup refresh had err
 
 The patched files were verified byte-identical between the source cache and marketplace copies.
 The manifest records both original and patched SHA256 hashes for both installation roots.
+
+- `scripts/lib/process.mjs`: `taskkill` exits 128 when the process is already gone. The plugin only recognised the
+  English "not found" text, so on a Russian (or any non-English) Windows a dead job stayed `running` forever and the
+  stop gate kept asking to cancel it. Patched to treat exit 128 as "already gone".
