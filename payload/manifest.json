@@ -101,13 +101,13 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "064efc87b4493c2dfce1e5d7f475ee87555693cf6f239a9c3a10885c4741cca0"
+      "sha256": "8942a08d01a87fdcbc8ee8c23cb7f071f14dc453236bdef14168ea259b0a13c6"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",
       "dest": "local-plugins/luna-panel/tests/pane.test.tsx",
       "kind": "file",
-      "sha256": "ed0b87f6929d4c832076464d47d14ccd712aff5602ce822d9594aac79c5c6e60"
+      "sha256": "6770ead0cfb3709d7f905b57f4cc514e55844ea9b0964f2bd0d3c26c16868acd"
     },
     {
       "src": "claude/local-plugins/luna-panel/tsconfig.json",

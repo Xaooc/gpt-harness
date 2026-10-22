@@ -218,3 +218,27 @@ test('without CLAUDE_CODE_SESSION_ID the heartbeat uses $.session.id()', async (
   expect(beats.length).toBeGreaterThanOrEqual(1)
   expect(beats.every(b => b.sessionId === 'sess-dddddddd-4444')).toBe(true)
 })
+
+test('a session without heartbeat is named after the project of its Codex jobs', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { USERPROFILE: 'C:/Users/tester', CLAUDE_CODE_SESSION_ID: SAMPLE.sessionId })
+  const job = (out: string, dir: string, owner: string) => ({ out, state: 'running', model: 'gpt-6.1-sol', effort: 'high',
+    sandbox: 'workspace-write', engine: 'daemon', ageS: 60, dir, error: '', queuePos: null, owner, idleS: 5 })
+  const snap = { ...SAMPLE.snapshot!, sessions: [], jobs: [
+    job('C:/x/a.out.md', 'C:/rpg/.claude/worktrees/ld-g1', 'sess-old-1'),
+    job('C:/x/b.out.md', 'C:/rpg/.claude/worktrees/ld-g5', 'sess-old-1'),
+    job('C:/x/c.out.md', 'C:/rpg-wt/gq', 'sess-old-2'),
+    job('C:/x/d.out.md', 'C:/rpg-wt/tc', 'sess-old-2'),
+  ] }
+  on('process.run', async () => ({ value: { exitCode: 0, stdout: JSON.stringify(snap), stderr: '',
+    isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: [], context: { window: 200000 } } }) as never)
+  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
+  on('ui.status', async () => ({ value: undefined }) as never)
+  await $.command.run({ command: 'luna', args: '' } as never)
+  const ui = await $.ui.mount({ plugin: 'luna-panel', surface: 'desktop', ...PANE })
+  expect(await ui.find({ type: 'Text', text: /^rpg$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^rpg-wt$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Без папки$/ })).toBeUndefined()
+  await ui.unmount()
+})

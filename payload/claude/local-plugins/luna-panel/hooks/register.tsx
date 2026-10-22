@@ -174,6 +174,19 @@ function toolDetail(tool: string, input: Record<string, unknown>): string {
   return ''
 }
 
+// A session that sends no heartbeat (started before this plugin version) is still named after the project its
+// Codex jobs work in: `C:/rpg/.claude/worktrees/x` → rpg; jobs in sibling folders `C:/rpg-wt/a`, `C:/rpg-wt/b` → rpg-wt.
+function projectOfJobs(jobs: Job[]): string {
+  const dirs = jobs.map(j => (j.dir || '').replace(/\\/g, '/').replace(/\/+$/, '')).filter(Boolean)
+    .map(d => d.replace(/\/\.claude\/worktrees\/[^/]+$/, '').replace(/\/\.worktrees\/[^/]+$/, ''))
+  if (!dirs.length) return ''
+  const base = (d: string) => d.split('/').filter(Boolean).pop() ?? ''
+  const parent = (d: string) => d.split('/').slice(0, -1).join('/')
+  if (dirs.every(d => d === dirs[0])) return base(dirs[0])
+  if (dirs.every(d => parent(d) === parent(dirs[0]))) return base(parent(dirs[0]))
+  return base(dirs[0])
+}
+
 function sessionName(cwd: string): string {
   if (!cwd || /scratch-workspaces/i.test(cwd)) return ''
   return cwd.split(/[\\/]/).filter(Boolean).pop() ?? ''
@@ -543,7 +556,8 @@ export const register: Register = on => {
           const b = g.beat
           const isMe = g.id === d.sessionId
           const stale = !b || now - b.updatedAt > 60_000
-          const title = (b?.name || (isMe ? 'Эта сессия' : 'Без папки')) + (isMe && b?.name ? ' · эта' : '')
+          const name = b?.name || projectOfJobs(g.jobs)
+          const title = (name || (isMe ? 'Эта сессия' : 'Без папки')) + (isMe && name ? ' · эта' : '')
           const running = g.jobs.filter(j => j.state === 'running').length
           const codex = g.jobs.length ? ` · Codex ${running}${g.jobs.length > running ? `+${g.jobs.length - running}` : ''}` : ''
           return (
