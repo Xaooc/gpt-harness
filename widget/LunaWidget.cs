@@ -501,7 +501,8 @@ namespace LunaWidget
         readonly List<Target> targets = new List<Target>();
         readonly List<KeyValuePair<Rectangle, string>> cardHeads = new List<KeyValuePair<Rectangle, string>>(); // header rect → session id
         readonly Dictionary<string, string> cardNames = new Dictionary<string, string>();                      // session id → project name
-        List<string> order = new List<string>();
+        List<string> order = new List<string>();   // project names: the fallback order, survives session restarts
+        List<string> idOrder = new List<string>(); // session ids: the exact order the person dragged, while those sessions live
         string pressCard; Point pressAt; string dragCard; int dropIndex = -1;
 
         Font fTitle, fHead, fBody, fSmall, fIcon, fMono;
@@ -520,6 +521,7 @@ namespace LunaWidget
             if (st.TryGetValue("w", out v) && int.TryParse(v, out n)) userW = n;
             if (st.TryGetValue("h", out v) && int.TryParse(v, out n)) userH = n;
             if (st.TryGetValue("order", out v)) order = v.Split('\u001F').Where(x => x != "").ToList();
+            if (st.TryGetValue("idorder", out v)) idOrder = v.Split('\u001F').Where(x => x != "").ToList();
             Width = userW > 0 ? userW : S(380); Height = userH > 0 ? userH : S(200);
             if (st.TryGetValue("x", out v) && st.ContainsKey("y")) { int x, y; if (int.TryParse(v, out x) && int.TryParse(st["y"], out y)) Location = new Point(x, y); }
             Deactivate += (s, e) => { if (!Pinned) Hide(); };
@@ -596,8 +598,11 @@ namespace LunaWidget
         // The session order the person chose (by project name); new names keep the collector's order after them.
         List<SessionView> Ordered(List<SessionView> sessions)
         {
+            // Sessions the person placed keep their exact slots (by id); the others follow, by project-name order.
             return sessions.Select((x, i) => new { x, i })
-                .OrderBy(p => { var k = order.IndexOf(p.x.Name); return k < 0 ? int.MaxValue : k; }).ThenBy(p => p.i)
+                .OrderBy(p => idOrder.IndexOf(p.x.Id) >= 0 ? 0 : 1)
+                .ThenBy(p => idOrder.IndexOf(p.x.Id) >= 0 ? idOrder.IndexOf(p.x.Id) : 0)
+                .ThenBy(p => { var k = order.IndexOf(p.x.Name); return k < 0 ? int.MaxValue : k; }).ThenBy(p => p.i)
                 .Select(p => p.x).ToList();
         }
 
@@ -936,7 +941,9 @@ namespace LunaWidget
                     var names = ids.Select(id => cardNames.ContainsKey(id) ? cardNames[id] : "").Where(n => n != "").Distinct().ToList();
                     // Keep names not on screen right now after the visible ones, in their old order.
                     order = names.Concat(order.Where(n => !names.Contains(n))).ToList();
-                    var st = Settings.Load(); st["order"] = string.Join("\u001F", order); Settings.Save(st);
+                    idOrder = ids;
+                    var st = Settings.Load(); st["order"] = string.Join("\u001F", order); st["idorder"] = string.Join("\u001F", idOrder);
+                    Settings.Save(st);
                 }
             }
             else if (!folded.Remove(pressCard)) folded.Add(pressCard);
