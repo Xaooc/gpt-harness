@@ -1,0 +1,2 @@
+# Byte-exact files: install.mjs verifies sha256 of every payload file, and bash scripts break with CRLF.
+* -text
