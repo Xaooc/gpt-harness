@@ -39,9 +39,26 @@ powershell -NoProfile -Command "Get-PSDrive -PSProvider FileSystem | Select Name
 - **Codex CLI 0.162.1, exactly this version:** `npm i -g @openai/codex@0.162.1`. Then `codex login`; the user
   signs in with their ChatGPT account. The account must have the models `gpt-6.1-sol` and `gpt-6-luna`; check with
   `codex debug models | grep -E "gpt-6.1-sol|gpt-6-luna"`.
-- **Claude Code** with plugin support (desktop app or CLI).
+- **Claude Code 2.1.299 or newer** (desktop app or CLI). This is the tested version. It needs:
+  - function-hook plugins (the Luna pane's `register.tsx`);
+  - the built-in **Monitor** tool. The `luna` skill uses it for stall watchers. If Monitor is missing, run
+    `bash ~/.claude/scripts/luna-watch.sh -i 300 <out.md>` with Bash `run_in_background` instead, and check its
+    output whenever you get control back.
 
-Check: every command in step 0 succeeds and `codex --version` prints `codex-cli 0.162.1`.
+Check: every command in step 0 succeeds; `codex --version` prints `codex-cli 0.162.1`; `claude --version` prints
+2.1.299 or newer (or the desktop app's About shows a Claude Code version that new).
+
+## 1b. GSD (recommended)
+The owner's global rules refer to GSD workflows (phases in a project's `.planning/`, the `/gsd-*` commands).
+Sessions use GSD's task log (`.planning/quick/`) and state queries (`gsd-tools query`) to keep track of work
+between sessions. Install it **before** step 4 [ASK]:
+```bash
+npx -y @opengsd/gsd-core@latest
+```
+GSD's installer edits `settings.json`. Running ours afterwards keeps both sets of hooks. Two of our hooks exist for
+GSD projects: `codex-code-edit-block` and `codex-gsd-executor-override`. They route implementation in
+`.planning/` projects to Codex. Without GSD they simply stay idle. Skip this step only if the user explicitly says
+they don't want GSD on this machine.
 
 ## 2. Get the repo
 Clone the private repo the user gives you, e.g. into `C:\dev\luna-harness`, then `cd` there.
@@ -60,10 +77,12 @@ another version, step 4 warns and leaves the plugin unpatched; see `payload/code
 ## 4. Run the installer
 First a dry run, then the real install with checks:
 ```bash
-node install.mjs --dry-run --codex-build-root "%USERPROFILE%\codex-build"
-node install.mjs --check --codex-build-root "C:\Users\<user>\codex-build"
+ROOT="$(cygpath -w "$USERPROFILE/codex-build")"      # or e.g. ROOT='D:\codex-build' on a drive with more space
+node install.mjs --dry-run --codex-build-root "$ROOT"
+node install.mjs --check --codex-build-root "$ROOT"
 ```
-Pick a build root on a drive with ≥ 15 GB free. Use a non-system drive if C: is tight.
+These commands are for Git Bash. In PowerShell use `$env:USERPROFILE\codex-build`. Pick a build root on a drive
+with ≥ 15 GB free; use a non-system drive if C: is tight.
 
 What the installer does:
 - copies scripts, hooks, skills, the pane plugin and busybox into `~/.claude`;
@@ -141,7 +160,13 @@ starts a daemon on the new binary.
   exits after 10 idle minutes; `luna-daemon.mjs --stop` forces it.
 - **Never** edit `luna.sh`/`luna-daemon.mjs` in place while jobs run. Write `<file>.next`, test it, then swap; for
   scripts without the wrapper use `luna-swap-when-idle.sh`.
-- **The Codex plugin may update itself** and drop the patches. Re-run `node install.mjs` after plugin updates.
+- **The Codex plugin may update itself.** At every session start, `luna-harness-plugin-patch.mjs` re-applies the
+  patches to plugin version 1.0.3. A new plugin version is logged once in `~/.claude/luna-run/plugin-patch.log` and
+  left unpatched. `node ~/.claude/scripts/luna-harness-plugin-patch.mjs --check` shows the state. Port the patches
+  (see `payload/codex-plugin-patches/README.md`) or ask the owner.
+- **Uninstall:** `node install.mjs --uninstall` (`--dry-run` to preview). It removes our hooks, files, the
+  `CLAUDE.md` block and the plugin patches. Files the user edited stay, with a warning. Data in `luna-run/` and
+  `learning/` stays.
 - **Known incidents and fixes:** see the `luna` skill (`~/.claude/skills/luna/SKILL.md`): RAM gate,
   ECONNRESET/busy daemon, ghost jobs after reboot, broker leaks, unelevated sandbox, heavy gate.
 
@@ -149,4 +174,4 @@ starts a daemon on the new binary.
 - Codex login: per machine, `codex login`.
 - Learning data: events, adopted edits, candidates. The loop starts fresh.
 - Runtime state (`luna-run`).
-- Any GSD tooling.
+- GSD itself (step 1b installs it from npm).

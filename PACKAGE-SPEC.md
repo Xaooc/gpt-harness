@@ -17,6 +17,7 @@ payload/claude/...                    mirrors ~/.claude (slice S1)
 payload/settings/hooks.json           settings fragments with placeholders (slice S1)
 payload/claude-md/harness-section.md  global CLAUDE.md content (slice S1)
 payload/codex-plugin-patches/         patched + orig plugin files and their manifest (slice S1)
+payload/claude/scripts/luna-harness-plugin-patch.mjs  shared patch engine + silent session repair command
 codex-build/                          custom Codex build kit (slice S3)
 ```
 
@@ -32,6 +33,42 @@ codex-build/                          custom Codex build kit (slice S3)
 - `src` is relative to `payload/`; `dest` is relative to the Claude home (`<home>/.claude`), forward slashes.
 - `kind`: `file` (install/replace), `config-if-absent` (install only when dest is missing), `binary` (like file,
   verify sha256 after copy).
+- All files under `payload/codex-plugin-patches/` are also installed under
+  `<CLAUDE_HOME>/luna-harness/codex-plugin-patches/` so session repair works without the checkout.
+
+## Installation, upgrades, and uninstall
+
+Before writing, the installer verifies every source hash, parses settings (UTF-8 BOM accepted, comments rejected),
+validates a single ordered CLAUDE.md marker pair or no markers, substitutes the hook fragment, and validates both
+copies of every plugin patch. `--dry-run` performs validation and planning without creating files or directories.
+
+After installation, `<CLAUDE_HOME>/luna-harness.installed.json` is written atomically:
+```json
+{ "v": 1, "installedAt": "<ISO timestamp>", "repoCommit": "<git HEAD or null>",
+  "files": { "scripts/example.mjs": "<sha256 as installed>" },
+  "hooks": ["<JSON-encoded event, script path, first argument identity>"],
+  "marketplaces": ["luna-local"], "createdSentinel": true, "createdEnv": true,
+  "restoration": { "settings.json": { "before": "<base64 original bytes or null>",
+    "restoreExact": true, "installedSha256": "<hash>" }, "CLAUDE.md": {} },
+  "pluginFiles": ["<relative plugin target path>"] }
+```
+`restoration` and `pluginFiles` are additional v1 metadata for exact restoration and uninstall without the payload.
+Pre-existing `config-if-absent` files are not claimed. Previously installed config hashes are retained if the user
+edits them. Creation flags survive upgrades. A no-op reinstall leaves the record and timestamp unchanged.
+
+Upgrade pruning uses the previous record: removed manifest files are deleted only if their hashes still match;
+edited files are retained with a warning. Dropped hook identities are removed, including newly empty matcher groups.
+Before replacing a locally edited payload destination, save a timestamped `.bak-luna-harness-YYYYMMDD-HHMMSS`
+backup (numeric suffix on collisions) and warn. The first install also retains the once-only `.bak-luna-harness`.
+
+`node install.mjs --home <home> --uninstall` requires the record. It validates settings and markers first, removes
+recorded hook identities, the `luna-local` marketplace and `luna-panel@luna-local` enabled-plugin entry, and the
+CLAUDE.md marker block. Unchanged settings/CLAUDE.md can be restored byte-for-byte from restoration metadata;
+if subsequently edited, selective removal preserves user content. Pre-existing managed entries are removed rather
+than resurrected. Installed files are deleted only on a recorded hash match. Plugin targets with
+`.orig-luna-harness` backups are restored using the original bytes. Only installer-created env/sentinel files are
+deleted. The record is removed last. `--uninstall --dry-run` performs the same validation and planning without writes.
+Never remove `luna-run/`, `learning/`, or any `.bak-luna-harness*` / `.orig-luna-harness` backups.
 
 ## payload/settings/hooks.json
 ```json
@@ -39,7 +76,8 @@ codex-build/                          custom Codex build kit (slice S3)
       "hooks": [ { "type": "command",
                    "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/scripts/heavy-gate.mjs\" hook-pre",
                    "timeout": 660 } ] } ] },
-  "extraKnownMarketplaces": { "luna-local": { "source": { "source": "directory", "path": "{{CLAUDE_HOME_WIN}}\\local-plugins" } } },
+  "extraKnownMarketplaces": { "luna-local": {
+    "source": { "source": "directory", "path": "{{CLAUDE_HOME_WIN}}\\local-plugins" } } },
   "enabledPlugins": { "luna-panel@luna-local": true, "codex@openai-codex": true } }
 ```
 Placeholders (installer substitutes): `{{NODE}}` = absolute node.exe path with forward slashes;
@@ -55,6 +93,17 @@ path inside the command (e.g. `scripts/heavy-gate.mjs` + first argument `hook-pr
                "patched": "patched/scripts/app-server-broker.mjs", "orig": "orig/scripts/app-server-broker.mjs" } ] }
 ```
 `roots` are relative to the Claude home. Paths inside are forward slashes.
+
+The installer imports the matching engine from `luna-harness-plugin-patch.mjs`. It validates the manifest's raw
+payload hashes, then compares target/original/patched content with CRLF normalized to LF. Patching preserves CRLF
+when the target contains any CRLF, otherwise LF; `.orig-luna-harness` stores the exact original bytes.
+
+The installed script reads its patch set from `<CLAUDE_HOME>/luna-harness/codex-plugin-patches/`. The silent
+SessionStart clean hook launches it detached alongside `luna-clean.mjs` when present. Default mode patches known
+originals, logs actions to `luna-run/plugin-patch.log`, and remembers unknown file/hash pairs in
+`luna-run/plugin-patch-state.json` to log each only once. Errors in default mode are silent with exit 0.
+`--check` prints target status and exits 1 for patchable or unknown versions; missing targets are skipped.
+`--self-test` uses disposable fixtures. `CLAUDE_HOME` can override the default `<home>/.claude` for this script/hook.
 
 ## Machine-specific settings
 `<home>/.claude/luna-harness.env` (KEY=VALUE lines, written by the installer):
