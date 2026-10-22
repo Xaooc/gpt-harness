@@ -5,7 +5,7 @@
 // LUNA_POOL_RAMP_MS: hold the admission lock after a start (default 2000 ms).
 // LUNA_IDLE_MAX_S: no thread events before stalling (default 900 s; 0 disables).
 // LUNA_TURN_TIMEOUT_S: turn timeout (default 2400 s). Stalls use state=stalled, rc=124.
-// luna.sh instead uses LUNA_TIMEOUT_S for total attempt time (default 5400 s; 0 disables).
+// luna.sh instead uses LUNA_TIMEOUT_S for total attempt time (default 28800 s = 8 h hard cap; 0 disables).
 // Threads are ephemeral by default; LUNA_KEEP_SESSION=1 keeps Codex session history.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -104,7 +104,7 @@ function parseArgs(argv) {
       '  LUNA_ADMIT_LOCK: shared directory (default $HOME/.claude/luna-run/admit.lock)',
       '  LUNA_POOL_SERVER_MB=120, LUNA_POOL_RAMP_MS=2000, LUNA_WAIT_MAX_S=1800, LUNA_NO_GATE=1 skips admission',
       '  LUNA_IDLE_MAX_S=900 (0 disables), LUNA_TURN_TIMEOUT_S=2400; stalls: state=stalled rc=124',
-      '  luna.sh uses LUNA_TIMEOUT_S=5400 (0 disables) for its total attempt timeout'
+      '  luna.sh uses LUNA_TIMEOUT_S=28800 (8 h hard cap, 0 disables); stalls are caught by idle time'
     ].join('\n'));
   }
   return { briefsDir: positional[0], repoRoot: positional[1], max, effort, dryRun };

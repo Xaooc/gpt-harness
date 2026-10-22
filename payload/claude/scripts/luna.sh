@@ -380,7 +380,8 @@ fi
 #   LUNA_POOL_SERVER_MB  pool app-server estimate in MB (default 120; used by luna-pool.mjs)
 #   LUNA_POOL_RAMP_MS    pool start-lock hold in ms (default 2000; used by luna-pool.mjs)
 #   LUNA_IDLE_MAX_S      stall after no log size change this long (default 900; 0 disables)
-#   LUNA_TIMEOUT_S       stall after this attempt duration (default 5400; 0 disables)
+#   LUNA_TIMEOUT_S       hard cap on attempt duration (default 28800 = 8 h; 0 disables). A working job is never cut
+#                       short: stalls are caught by LUNA_IDLE_MAX_S (no log growth), this only stops runaway loops.
 #                       The pool uses LUNA_IDLE_MAX_S for events and LUNA_TURN_TIMEOUT_S (2400).
 #   LUNA_NO_GATE=1       skip admission entirely
 #   LUNA_CODEX_BIN       executable to launch directly; LUNA_DIRECT_EXE=0 disables
@@ -400,7 +401,7 @@ TOTAL_MB=$(mem_mb MemTotal 2>/dev/null); TOTAL_MB=${TOTAL_MB:-16384}
 RESERVE_MB="${LUNA_RAM_RESERVE_MB:-$(( TOTAL_MB*6/100 > 1024 ? TOTAL_MB*6/100 : 1024 ))}"
 if [ "$SANDBOX" = "workspace-write" ]; then JOB_MB="${LUNA_JOB_MB:-700}"; else JOB_MB="${LUNA_JOB_MB:-250}"; fi
 RAMP_S="${LUNA_RAMP_S:-4}"; WAIT_MAX_S="${LUNA_WAIT_MAX_S:-1800}"
-IDLE_MAX_S="${LUNA_IDLE_MAX_S:-900}"; TIMEOUT_S="${LUNA_TIMEOUT_S:-5400}"
+IDLE_MAX_S="${LUNA_IDLE_MAX_S:-900}"; TIMEOUT_S="${LUNA_TIMEOUT_S:-28800}"
 DAEMON_BUSY_MAX_S="${LUNA_DAEMON_BUSY_MAX_S-300}"
 for setting in "$IDLE_MAX_S" "$TIMEOUT_S"; do
   case "$setting" in ''|*[!0-9]*) die 2 "watchdog limits must be non-negative integer seconds" ;; esac

@@ -63,7 +63,9 @@ Critics: `high` by default, `max` only for an attacker on auth/money/secrets (se
   **On `STALL`, act immediately**: read the tail of `<out>.log` and `luna-status.sh`. If it's really stuck (no new commands,
   the model isn't thinking), kill it (`taskkill //PID <winpid> //T //F`, or Ctrl-C the wrapper task), tell the user, and
   re-brief smaller or switch model. Don't wait it out silently. The wrapper also has its own idle and total timeouts
-  (`LUNA_IDLE_MAX_S`, `LUNA_TIMEOUT_S`) that end a hung job with `state=stalled`.
+  (`LUNA_IDLE_MAX_S`, `LUNA_TIMEOUT_S`) that end a hung job with `state=stalled`. A job that keeps making progress is
+  NOT cut short (user decision, 2026-10-22: a 90-minute cap killed working jobs): stalls are caught by idle time
+  (`LUNA_IDLE_MAX_S`, 15 min without log growth); `LUNA_TIMEOUT_S` is only an 8 h runaway cap.
 - When the user asks "is it stuck?", answer from `luna-status.sh` (`state`, `elapsed_min`, `log_idle_s`, `last_note`), not from memory.
 - `state=waiting-ram` means the machine is short of memory. Say so, and don't stack more write jobs.
 - **NEVER edit the shared wrappers in place** (`luna.sh`, `luna-pool.mjs`, `luna-daemon.mjs`, `luna-panel.sh`): every Claude

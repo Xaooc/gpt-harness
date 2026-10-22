@@ -335,7 +335,7 @@
       "src": "claude/scripts/luna-pool.mjs",
       "dest": "scripts/luna-pool.mjs",
       "kind": "file",
-      "sha256": "bbdba6fd6e310a2ce036d51314aaffdaa7a7a19bd5427e9f782c5d3773647bc7"
+      "sha256": "b46ee6f31c09c0da48eb4ff6ce6e6c52d8f85cf41019450254dce7f1e792110c"
     },
     {
       "src": "claude/scripts/luna-reap-brokers.mjs",
@@ -371,7 +371,7 @@
       "src": "claude/scripts/luna.sh",
       "dest": "scripts/luna.sh",
       "kind": "file",
-      "sha256": "6652eeae6484ee237763f2413d9a309f6a789e778492228ea504bda50cd1e750"
+      "sha256": "e6265bfb0616d88210cf146e7937bf1c2264ad5ec172971da9bf102581171aa3"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
@@ -383,7 +383,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "d2165e44012217e010f9060392f53b229f852ce858bb4445aa57c9255f68bcb4"
+      "sha256": "4cfe8cf92e4801a13fa559f97a4665f015dce7e34fa717011444485c01e3985d"
     }
   ],
   "settings": "settings/hooks.json",
