@@ -122,16 +122,40 @@
       "sha256": "0210da5d36d8713440c598bc913f8c304d534c04b3503ec8b12d616827bd6eda"
     },
     {
+      "src": "codex-plugin-patches/1.0.6/orig/scripts/lib/app-server.mjs",
+      "dest": "luna-harness/codex-plugin-patches/1.0.6/orig/scripts/lib/app-server.mjs",
+      "kind": "file",
+      "sha256": "5dad5ca067fb2f54ef27f9c64b9c7e2bc2c60c475a08fd6e97ed45963d098c7d"
+    },
+    {
+      "src": "codex-plugin-patches/1.0.6/orig/scripts/lib/process.mjs",
+      "dest": "luna-harness/codex-plugin-patches/1.0.6/orig/scripts/lib/process.mjs",
+      "kind": "file",
+      "sha256": "6f36e4959109412f49e2c0768e5685c1ed68c01f5b69073855f1de6d8ece55d9"
+    },
+    {
+      "src": "codex-plugin-patches/1.0.6/patched/scripts/lib/app-server.mjs",
+      "dest": "luna-harness/codex-plugin-patches/1.0.6/patched/scripts/lib/app-server.mjs",
+      "kind": "file",
+      "sha256": "41021a6887f0c6b8ab09f999de0bfb48a62d7a762ad5b0ffbf5944f418cff343"
+    },
+    {
+      "src": "codex-plugin-patches/1.0.6/patched/scripts/lib/process.mjs",
+      "dest": "luna-harness/codex-plugin-patches/1.0.6/patched/scripts/lib/process.mjs",
+      "kind": "file",
+      "sha256": "99e9b7ca8f1439d4c1c5f3f0036fac547537f77da4fef5c55b3a950b70646439"
+    },
+    {
       "src": "codex-plugin-patches/README.md",
       "dest": "luna-harness/codex-plugin-patches/README.md",
       "kind": "file",
-      "sha256": "ca72a3be82140d83577152d2500e9d4c6080eddea4b6f3ed3edefe22d4e4a71f"
+      "sha256": "3c7ef73d13d3845e1ba5aa60946e7398288ea233bac4ab772159bd5ce90e22ef"
     },
     {
       "src": "codex-plugin-patches/manifest.json",
       "dest": "luna-harness/codex-plugin-patches/manifest.json",
       "kind": "file",
-      "sha256": "157a89e11968b49fa96455a8b53d99ab8d05ba3aec0e13c45a8b85d381cca850"
+      "sha256": "b633e3204bcc99649a34529bce3faa9525b19ae021230bd6ddf8900e5f2e2159"
     },
     {
       "src": "codex-plugin-patches/orig/scripts/app-server-broker.mjs",
@@ -305,7 +329,7 @@
       "src": "claude/scripts/luna-harness-plugin-patch.mjs",
       "dest": "scripts/luna-harness-plugin-patch.mjs",
       "kind": "file",
-      "sha256": "f0cfb5cd1c678177813925cb8e797061a8373c32bb1d1652a62f925a256b82aa"
+      "sha256": "ab68fd9803da0792763d949ee7244a0a923f1b3cf2a2e7add9334bc5b191c629"
     },
     {
       "src": "claude/scripts/luna-mempri.ps1",

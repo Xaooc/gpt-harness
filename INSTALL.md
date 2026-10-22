@@ -71,8 +71,9 @@ claude plugin install codex@openai-codex
 ```
 If the CLI form is unavailable, ask the user to run `/plugin marketplace add https://github.com/openai/codex-plugin-cc.git`
 and `/plugin install codex@openai-codex` inside Claude Code.
-Check: `ls ~/.claude/plugins/cache/openai-codex/codex/` lists a version directory. The patches target **1.0.3**. On
-another version, step 4 warns and leaves the plugin unpatched; see `payload/codex-plugin-patches/README.md`.
+Check: `ls ~/.claude/plugins/cache/openai-codex/codex/` lists a version directory. The patches cover **1.0.3 and 1.0.6**
+and later versions with known file content after CRLF normalisation. Every cache version directory and the marketplace
+copy are checked. Unknown files remain unpatched; see `payload/codex-plugin-patches/README.md`.
 
 ## 4. Run the installer
 First a dry run, then the real install with checks:
@@ -187,8 +188,10 @@ starts a daemon on the new binary.
 - **Never** edit `luna.sh`/`luna-daemon.mjs` in place while jobs run. Write `<file>.next`, test it, then swap; for
   scripts without the wrapper use `luna-swap-when-idle.sh`.
 - **The Codex plugin may update itself.** At every session start, `luna-harness-plugin-patch.mjs` re-applies the
-  patches to plugin version 1.0.3. A new plugin version is logged once in `~/.claude/luna-run/plugin-patch.log` and
-  left unpatched. `node ~/.claude/scripts/luna-harness-plugin-patch.mjs --check` shows the state. Port the patches
+  patches for 1.0.3 and 1.0.6 across all cache version directories and the marketplace. Per-file variants match known
+  original or patched content after CRLF normalisation, including later versions with identical content. Unknown
+  content is logged once per target/hash in `~/.claude/luna-run/plugin-patch.log` and left unpatched.
+  `node ~/.claude/scripts/luna-harness-plugin-patch.mjs --check` shows the state. Port the patches
   (see `payload/codex-plugin-patches/README.md`) or ask the owner.
 - **Uninstall:** `node install.mjs --uninstall` (`--dry-run` to preview). It removes our hooks, files, the
   `CLAUDE.md` block and the plugin patches. Files the user edited stay, with a warning. Data in `luna-run/` and

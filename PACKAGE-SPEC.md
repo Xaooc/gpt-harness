@@ -52,7 +52,10 @@ After installation, `<CLAUDE_HOME>/luna-harness.installed.json` is written atomi
     "restoreExact": true, "installedSha256": "<hash>" }, "CLAUDE.md": {} },
   "pluginFiles": ["<relative plugin target path>"] }
 ```
-`restoration` and `pluginFiles` are additional v1 metadata for exact restoration and uninstall without the payload.
+`restoration` and `pluginFiles` are additional v1 metadata for exact restoration. Uninstall validates plugin
+backups using the patch manifest and variant files from `<CLAUDE_HOME>/luna-harness/codex-plugin-patches/`, or the
+repository payload when that installed copy is unavailable; without either source, plugin restoration is skipped
+with a warning.
 Pre-existing `config-if-absent` files are not claimed. Previously installed config hashes are retained if the user
 edits them. Creation flags survive upgrades. A no-op reinstall leaves the record and timestamp unchanged.
 
@@ -87,12 +90,23 @@ path inside the command (e.g. `scripts/heavy-gate.mjs` + first argument `hook-pr
 
 ## payload/codex-plugin-patches/manifest.json
 ```json
-{ "plugin": "codex@openai-codex", "version": "1.0.3",
-  "roots": ["plugins/cache/openai-codex/codex/1.0.3", "plugins/marketplaces/openai-codex/plugins/codex"],
-  "files": [ { "rel": "scripts/app-server-broker.mjs", "origSha256": "...", "patchedSha256": "...",
-               "patched": "patched/scripts/app-server-broker.mjs", "orig": "orig/scripts/app-server-broker.mjs" } ] }
+{ "plugin": "codex@openai-codex", "versions": ["1.0.3", "1.0.6"],
+  "roots": ["plugins/cache/openai-codex/codex/*", "plugins/marketplaces/openai-codex/plugins/codex"],
+  "files": [ { "rel": "scripts/lib/app-server.mjs", "variants": [
+    { "versions": ["1.0.3"], "orig": "orig/scripts/lib/app-server.mjs", "origSha256": "...",
+      "patched": "patched/scripts/lib/app-server.mjs", "patchedSha256": "..." },
+    { "versions": ["1.0.6"], "orig": "1.0.6/orig/scripts/lib/app-server.mjs", "origSha256": "...",
+      "patched": "1.0.6/patched/scripts/lib/app-server.mjs", "patchedSha256": "..." } ] } ] }
 ```
-`roots` are relative to the Claude home. Paths inside are forward slashes.
+`roots` are relative to the Claude home. Paths inside are forward slashes. A trailing `/*` expands every direct
+subdirectory in sorted order; other uses of `*` and paths escaping the Claude home are invalid.
+Versions label known content; files are selected by hashes after CRLF normalisation, even on later plugin versions.
+Broker and lifecycle files share one variant with `versions: ["1.0.3", "1.0.6"]`; only app-server and process
+need separate 1.0.6 copies. Original storage preserves exact plugin bytes (CRLF); patched storage uses LF.
+Every variant's stored SHA256 is verified. Equal normalised originals with differing patches and variants whose
+patched hash equals another variant's original hash are rejected. Legacy file-level `orig`/`patched` remains supported.
+Install records store concrete `pluginFiles` paths with backups for known patched content, so uninstall restores
+each recorded version from its original bytes without expanding wildcards.
 
 The installer imports the matching engine from `luna-harness-plugin-patch.mjs`. It validates the manifest's raw
 payload hashes, then compares target/original/patched content with CRLF normalized to LF. Patching preserves CRLF

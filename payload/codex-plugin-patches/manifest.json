@@ -1,38 +1,89 @@
 {
   "plugin": "codex@openai-codex",
-  "version": "1.0.3",
+  "versions": [
+    "1.0.3",
+    "1.0.6"
+  ],
   "roots": [
-    "plugins/cache/openai-codex/codex/1.0.3",
+    "plugins/cache/openai-codex/codex/*",
     "plugins/marketplaces/openai-codex/plugins/codex"
   ],
   "files": [
     {
       "rel": "scripts/app-server-broker.mjs",
-      "origSha256": "21feb2d56d6c211ac86d5fd998c484ed7c104474c15bd06c16780e607b457878",
-      "patchedSha256": "e4d158915c3987f1ee5ecf328b48690887453403380e77549217d0f7a57fe9f9",
-      "patched": "patched/scripts/app-server-broker.mjs",
-      "orig": "orig/scripts/app-server-broker.mjs"
+      "variants": [
+        {
+          "versions": [
+            "1.0.3",
+            "1.0.6"
+          ],
+          "origSha256": "21feb2d56d6c211ac86d5fd998c484ed7c104474c15bd06c16780e607b457878",
+          "patchedSha256": "e4d158915c3987f1ee5ecf328b48690887453403380e77549217d0f7a57fe9f9",
+          "patched": "patched/scripts/app-server-broker.mjs",
+          "orig": "orig/scripts/app-server-broker.mjs"
+        }
+      ]
     },
     {
       "rel": "scripts/lib/app-server.mjs",
-      "origSha256": "d5c23fe925cfe3fec244df3d63bcba691030e716af7873fd31248aaaf763bc21",
-      "patchedSha256": "a2f91b0f3d72abc426488fe11c8daf68c9411b96e9701cd1d399b7bf009135b9",
-      "patched": "patched/scripts/lib/app-server.mjs",
-      "orig": "orig/scripts/lib/app-server.mjs"
+      "variants": [
+        {
+          "versions": [
+            "1.0.3"
+          ],
+          "origSha256": "d5c23fe925cfe3fec244df3d63bcba691030e716af7873fd31248aaaf763bc21",
+          "patchedSha256": "a2f91b0f3d72abc426488fe11c8daf68c9411b96e9701cd1d399b7bf009135b9",
+          "patched": "patched/scripts/lib/app-server.mjs",
+          "orig": "orig/scripts/lib/app-server.mjs"
+        },
+        {
+          "versions": [
+            "1.0.6"
+          ],
+          "orig": "1.0.6/orig/scripts/lib/app-server.mjs",
+          "origSha256": "5dad5ca067fb2f54ef27f9c64b9c7e2bc2c60c475a08fd6e97ed45963d098c7d",
+          "patched": "1.0.6/patched/scripts/lib/app-server.mjs",
+          "patchedSha256": "41021a6887f0c6b8ab09f999de0bfb48a62d7a762ad5b0ffbf5944f418cff343"
+        }
+      ]
     },
     {
       "rel": "scripts/lib/broker-lifecycle.mjs",
-      "origSha256": "edda09d1c62b78293c8509b6c384ecf61c1ec8b0d382f22327e46f0c3eddf30f",
-      "patchedSha256": "e9f236aa24f24d20b22388be3cfcdd03d2b872b9d2f6ae88feb0a3cd29a56968",
-      "patched": "patched/scripts/lib/broker-lifecycle.mjs",
-      "orig": "orig/scripts/lib/broker-lifecycle.mjs"
+      "variants": [
+        {
+          "versions": [
+            "1.0.3",
+            "1.0.6"
+          ],
+          "origSha256": "edda09d1c62b78293c8509b6c384ecf61c1ec8b0d382f22327e46f0c3eddf30f",
+          "patchedSha256": "e9f236aa24f24d20b22388be3cfcdd03d2b872b9d2f6ae88feb0a3cd29a56968",
+          "patched": "patched/scripts/lib/broker-lifecycle.mjs",
+          "orig": "orig/scripts/lib/broker-lifecycle.mjs"
+        }
+      ]
     },
     {
       "rel": "scripts/lib/process.mjs",
-      "origSha256": "708b95e1a1ca2d19021c7a9a0bcd1f9724c534d647bbe18886f8b744b7e7b63f",
-      "patchedSha256": "7395d2e4e33bfc3b81b6e614727271925fb11fb405db3845b444f31a5360c904",
-      "patched": "patched/scripts/lib/process.mjs",
-      "orig": "orig/scripts/lib/process.mjs"
+      "variants": [
+        {
+          "versions": [
+            "1.0.3"
+          ],
+          "origSha256": "708b95e1a1ca2d19021c7a9a0bcd1f9724c534d647bbe18886f8b744b7e7b63f",
+          "patchedSha256": "7395d2e4e33bfc3b81b6e614727271925fb11fb405db3845b444f31a5360c904",
+          "patched": "patched/scripts/lib/process.mjs",
+          "orig": "orig/scripts/lib/process.mjs"
+        },
+        {
+          "versions": [
+            "1.0.6"
+          ],
+          "orig": "1.0.6/orig/scripts/lib/process.mjs",
+          "origSha256": "6f36e4959109412f49e2c0768e5685c1ed68c01f5b69073855f1de6d8ece55d9",
+          "patched": "1.0.6/patched/scripts/lib/process.mjs",
+          "patchedSha256": "99e9b7ca8f1439d4c1c5f3f0036fac547537f77da4fef5c55b3a950b70646439"
+        }
+      ]
     }
   ]
 }

@@ -10,7 +10,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { loadPatchSet, matchPatch } from './payload/claude/scripts/luna-harness-plugin-patch.mjs';
+import {
+  expandRoots, loadPatchSet, matchPatch, planRoot, restorable,
+} from './payload/claude/scripts/luna-harness-plugin-patch.mjs';
 
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const BACKUP_SUFFIX = '.bak-luna-harness';
@@ -431,28 +433,44 @@ function patchPlugins(ctx, manifestPath) {
     return;
   }
   const manifest = ctx.prepared?.patches ?? loadPatchSet(manifestPath);
-  for (const relativeRoot of manifest.roots) {
-    const root = resolveInside(ctx.claudeHome, relativeRoot);
-    if (!fs.existsSync(root)) {
+  const roots = manifest.roots.flatMap(relative => {
+    const expanded = expandRoots(ctx.claudeHome, [relative]);
+    if (!expanded.some(root => fs.existsSync(root)) && !ctx.pluginMissingWarned) {
+      ctx.pluginMissingWarned = true;
       report(ctx, 'warn', 'codex@openai-codex not installed yet: run `/plugin install codex@openai-codex`'
         + ' in Claude Code, then re-run install.mjs');
-      continue;
     }
-    for (const file of manifest.files) {
-      const target = resolveInside(root, file.rel);
-      const bytes = readOptional(target);
-      const result = bytes === null ? null : matchPatch(bytes, file);
-      if (result?.status === 'patched') {
-        skip(ctx, `${target} already patched`);
-      } else if (result?.status === 'patchable') {
-        writeManaged(ctx, target, result.bytes, {
-          backupSuffix: '.orig-luna-harness', sha256: sha256(result.bytes),
-        });
-      } else {
+    return expanded;
+  });
+  for (const root of roots) {
+    if (!fs.existsSync(root)) continue;
+    const plan = planRoot(root, manifest.files);
+    for (const result of plan.entries) {
+      const { file, target } = result;
+      if (result.status === 'unknown') {
         report(ctx, 'warn', `${target}: plugin version differs — apply manually,`
           + ' see payload/codex-plugin-patches/README.md');
+      } else if (!plan.canPatch) {
+        continue;
+      } else if (result.status === 'patched') {
+        skip(ctx, `${target} already patched`);
+      } else if (result.status === 'patchable') {
+        const backup = `${target}.orig-luna-harness`;
+        const previous = readOptional(backup);
+        if (previous && !previous.equals(result.bytes)) {
+          if (!ctx.dryRun) atomicWrite(backup, result.bytes);
+          ctx.backups++;
+          report(ctx, 'ok', `${ctx.dryRun ? 'Would refresh backup:' : 'refreshed backup:'} ${target}`);
+        }
+        writeManaged(ctx, target, result.patchedBytes, {
+          backupSuffix: '.orig-luna-harness', sha256: sha256(result.patchedBytes),
+        });
       }
     }
+    if (plan.incomplete) {
+      report(ctx, 'warn', `${root}: left unpatched, missing plugin files: ${plan.missing.join(', ')}`);
+    }
+    if (plan.unknown) report(ctx, 'warn', `${root}: left unpatched, unknown plugin files`);
   }
 }
 
@@ -617,8 +635,8 @@ function prepareInstall(ctx, manifest) {
   if (md) markerRange(md.toString('utf8'));
   fs.readFileSync(resolveInside(ctx.payload, manifest.claudeMd));
   const patches = loadPatchSet(resolveInside(ctx.payload, manifest.pluginPatches));
-  for (const root of patches.roots) {
-    for (const file of patches.files) resolveInside(resolveInside(ctx.claudeHome, root), file.rel);
+  for (const root of expandRoots(ctx.claudeHome, patches.roots)) {
+    for (const file of patches.files) resolveInside(root, file.rel);
   }
   if (ctx.codexBuildRoot && /[\r\n]/.test(ctx.codexBuildRoot)) {
     throw new Error('Custom Codex root cannot contain a newline');
@@ -693,8 +711,15 @@ function saveRecord(ctx, manifest, restoration, created) {
   }
   const commit = runCommand('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT });
   const repoCommit = commit.status === 0 ? commit.stdout.trim() : null;
-  const pluginFiles = [...new Set([...(ctx.record?.pluginFiles ?? []), ...ctx.prepared.patches.roots.flatMap(root =>
-    ctx.prepared.patches.files.map(file => `${root}/${file.rel}`))])];
+  const patches = ctx.prepared.patches;
+  const patchedFiles = ctx.noPluginPatch ? [] : expandRoots(ctx.claudeHome, patches.roots).flatMap(root =>
+    patches.files.flatMap(file => {
+      const target = resolveInside(root, file.rel);
+      const bytes = readOptional(target);
+      if (!restorable(bytes, readOptional(`${target}.orig-luna-harness`), file)) return [];
+      return [path.relative(ctx.claudeHome, target).replaceAll('\\', '/')];
+    }));
+  const pluginFiles = [...new Set([...(ctx.record?.pluginFiles ?? []), ...patchedFiles])];
   const record = {
     v: 1, installedAt: ctx.record?.installedAt ?? new Date().toISOString(), repoCommit, files,
     hooks: ctx.prepared.hooks, marketplaces: ['luna-local'], ...created, restoration, pluginFiles,
@@ -726,6 +751,18 @@ function removeLunaKeys(settings) {
   }
 }
 
+function uninstallPatchSet(ctx) {
+  for (const root of [path.join(ctx.claudeHome, 'luna-harness'), ctx.payload]) {
+    try {
+      return loadPatchSet(path.join(root, 'codex-plugin-patches/manifest.json'));
+    } catch {
+      continue;
+    }
+  }
+  report(ctx, 'warn', 'Plugin patch manifest unavailable; plugin backups will not be restored');
+  return null;
+}
+
 function uninstall(ctx) {
   ctx.record = readRecord(ctx, true);
   const settingsPath = path.join(ctx.claudeHome, 'settings.json');
@@ -736,6 +773,7 @@ function uninstall(ctx) {
   const mdPath = path.join(ctx.claudeHome, 'CLAUDE.md');
   const md = readOptional(mdPath);
   const range = md ? markerRange(md.toString('utf8')) : null;
+  const patches = uninstallPatchSet(ctx);
   if (previous) {
     const backup = readOptional(`${settingsPath}${BACKUP_SUFFIX}`);
     if (!backup) backupOnce(ctx, settingsPath);
@@ -750,10 +788,19 @@ function uninstall(ctx) {
     writeManaged(ctx, mdPath, `${text.slice(0, range.start)}${text.slice(range.end)}`);
   }
   for (const [dest, hash] of Object.entries(ctx.record.files)) removeRecordedFile(ctx, dest, hash);
-  for (const relative of ctx.record.pluginFiles ?? []) {
+  for (const relative of patches ? ctx.record.pluginFiles ?? [] : []) {
     const target = resolveInside(ctx.claudeHome, relative);
+    const file = patches.files.find(file => relative.replaceAll('\\', '/')
+      .endsWith(`/${file.rel.replaceAll('\\', '/')}`));
+    const bytes = readOptional(target);
     const original = readOptional(`${target}.orig-luna-harness`);
-    if (original) writeManaged(ctx, target, original);
+    if (restorable(bytes, original, file)) {
+      writeManaged(ctx, target, original);
+    } else {
+      const reason = !file || !bytes || matchPatch(bytes, file).status !== 'patched'
+        ? 'changed since install' : 'backup does not match';
+      report(ctx, 'warn', `${target}: ${reason}; kept target and backup`);
+    }
   }
   if (ctx.record.createdEnv) removeFile(ctx, path.join(ctx.claudeHome, 'luna-harness.env'));
   if (ctx.record.createdSentinel) removeFile(ctx, path.join(ctx.claudeHome, 'codex-gate-runner-off'));
@@ -846,15 +893,23 @@ function fakePayload(root) {
   put(manifest.claudeMd, 'Harness instructions.\n');
   const original = 'original plugin\n';
   const patched = 'patched plugin\n';
+  const originalB = 'upstream original plugin\n';
+  const patchedB = 'upstream patched plugin\n';
   put('codex-plugin-patches/patched/plugin.mjs', patched);
   put('codex-plugin-patches/orig/plugin.mjs', original);
+  put('codex-plugin-patches/1.0.6/patched/plugin.mjs', patchedB);
+  put('codex-plugin-patches/1.0.6/orig/plugin.mjs', originalB);
   put(manifest.pluginPatches, JSON.stringify({
-    plugin: 'codex@openai-codex', version: '1.0.3', roots: ['plugins/test'],
-    files: [{ rel: 'plugin.mjs', origSha256: sha256(original), patchedSha256: sha256(patched),
-      patched: 'patched/plugin.mjs', orig: 'orig/plugin.mjs' }],
+    plugin: 'codex@openai-codex', versions: ['1.0.3', '1.0.6'], roots: ['plugins/test'],
+    files: [{ rel: 'plugin.mjs', variants: [
+      { versions: ['1.0.3'], origSha256: sha256(original), patchedSha256: sha256(patched),
+        patched: 'patched/plugin.mjs', orig: 'orig/plugin.mjs' },
+      { versions: ['1.0.6'], origSha256: sha256(originalB), patchedSha256: sha256(patchedB),
+        patched: '1.0.6/patched/plugin.mjs', orig: '1.0.6/orig/plugin.mjs' },
+    ] }],
   }));
   put('manifest.json', JSON.stringify(manifest));
-  return { payload, manifest, original, patched };
+  return { payload, manifest, original, patched, originalB, patchedB };
 }
 
 function snapshot(root) {
@@ -1079,6 +1134,191 @@ function selfTest() {
       const ctx = makeContext(options);
       return { ...fixture, ctx, options, ch: ctx.claudeHome };
     }
+    test('auto-updated target and backup survive dry-run and real uninstall with the same warning', () => {
+      const fixture = isolated('plugin-auto-update');
+      const plugin = path.join(fixture.ch, 'plugins/test/plugin.mjs');
+      atomicWrite(plugin, fixture.original);
+      install(fixture.ctx);
+      const updated = Buffer.from('auto-update unknown content\r\n');
+      atomicWrite(plugin, updated);
+      const backup = fs.readFileSync(`${plugin}.orig-luna-harness`);
+      const before = snapshot(fixture.ctx.home);
+      const dry = makeContext({ ...fixture.options, uninstall: true, dryRun: true });
+      assert.equal(install(dry), 0);
+      assert.deepEqual(snapshot(fixture.ctx.home), before);
+      const warning = `${plugin}: changed since install; kept target and backup`;
+      assert.ok(dry.warnings.includes(warning));
+      const remove = makeContext({ ...fixture.options, uninstall: true });
+      assert.equal(install(remove), 0);
+      assert.ok(remove.warnings.includes(warning));
+      assert.deepEqual(fs.readFileSync(plugin), updated);
+      assert.deepEqual(fs.readFileSync(`${plugin}.orig-luna-harness`), backup);
+    });
+    test('already patched target with an unrelated backup is not adopted or restored', () => {
+      const fixture = isolated('plugin-unrelated-backup');
+      const plugin = path.join(fixture.ch, 'plugins/test/plugin.mjs');
+      atomicWrite(plugin, fixture.patchedB);
+      atomicWrite(`${plugin}.orig-luna-harness`, 'unrelated backup');
+      assert.equal(install(fixture.ctx), 0);
+      assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, []);
+      assert.equal(install(makeContext({ ...fixture.options, uninstall: true })), 0);
+      assert.equal(fs.readFileSync(plugin, 'utf8'), fixture.patchedB);
+      assert.equal(fs.readFileSync(`${plugin}.orig-luna-harness`, 'utf8'), 'unrelated backup');
+    });
+    test('installer refreshes stale backups atomically, including EOL-only differences on reinstall', () => {
+      const fixture = isolated('plugin-stale-backup');
+      const plugin = path.join(fixture.ch, 'plugins/test/plugin.mjs');
+      const backup = `${plugin}.orig-luna-harness`;
+      const original = fixture.originalB.replaceAll('\n', '\r\n');
+      atomicWrite(plugin, original);
+      atomicWrite(backup, fixture.originalB);
+      const before = snapshot(fixture.ctx.home);
+      const dryMessages = [];
+      const dry = makeContext({ ...fixture.options, dryRun: true, log: message => dryMessages.push(message) });
+      assert.equal(install(dry), 0);
+      assert.deepEqual(snapshot(fixture.ctx.home), before);
+      assert.ok(dryMessages.some(message => message.includes(`Would refresh backup: ${plugin}`)));
+      const messages = [];
+      fixture.ctx.log = message => messages.push(message);
+      assert.equal(install(fixture.ctx), 0);
+      assert.ok(messages.some(message => message.includes(`refreshed backup: ${plugin}`)));
+      assert.equal(fs.readFileSync(backup, 'utf8'), original);
+      assert.equal(fs.readFileSync(plugin, 'utf8'), fixture.patchedB.replaceAll('\n', '\r\n'));
+      assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, ['plugins/test/plugin.mjs']);
+      const time = fs.statSync(backup).mtimeMs;
+      atomicWrite(plugin, fixture.originalB);
+      assert.equal(install(makeContext(fixture.options)), 0);
+      assert.notEqual(fs.statSync(backup).mtimeMs, time);
+      assert.equal(fs.readFileSync(backup, 'utf8'), fixture.originalB);
+    });
+    test('mixed cache root stays byte-identical while a fully known root patches and restores', () => {
+      const fixture = isolated('plugin-mixed-root');
+      const patchManifest = path.join(fixture.payload, fixture.manifest.pluginPatches);
+      const patches = readJson(patchManifest);
+      patches.roots = ['plugins/cache/openai-codex/codex/*'];
+      patches.files = ['one.mjs', 'two.mjs', 'three.mjs', 'four.mjs']
+        .map(rel => ({ ...patches.files[0], rel }));
+      atomicWrite(patchManifest, json(patches));
+      const cache = path.join(fixture.ch, 'plugins/cache/openai-codex/codex');
+      const inactive = path.join(cache, '1.0.2');
+      const active = path.join(cache, '1.0.6');
+      const original = Buffer.from(fixture.originalB.replaceAll('\n', '\r\n'));
+      patches.files.forEach((file, index) => {
+        atomicWrite(path.join(inactive, file.rel), index < 2 ? fixture.original : `unknown ${index}\r\n`);
+        atomicWrite(path.join(active, file.rel), original);
+      });
+      const inactiveBefore = snapshot(inactive);
+      const homeBefore = snapshot(fixture.ctx.home);
+      const dry = makeContext({ ...fixture.options, dryRun: true });
+      assert.equal(install(dry), 0);
+      assert.deepEqual(snapshot(fixture.ctx.home), homeBefore);
+      assert.ok(dry.warnings.includes(`${inactive}: left unpatched, unknown plugin files`));
+      assert.equal(install(fixture.ctx), 0);
+      assert.deepEqual(snapshot(inactive), inactiveBefore);
+      assert.ok(fixture.ctx.warnings.includes(`${inactive}: left unpatched, unknown plugin files`));
+      assert.equal(fixture.ctx.warnings.filter(message => message.includes('plugin version differs')).length, 2);
+      const recorded = patches.files.map(file => `plugins/cache/openai-codex/codex/1.0.6/${file.rel}`);
+      assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, recorded);
+      for (const file of patches.files) {
+        assert.equal(fs.readFileSync(path.join(active, file.rel), 'utf8'),
+          fixture.patchedB.replaceAll('\n', '\r\n'));
+      }
+      assert.equal(install(makeContext({ ...fixture.options, uninstall: true })), 0);
+      assert.deepEqual(snapshot(inactive), inactiveBefore);
+      for (const file of patches.files) assert.deepEqual(fs.readFileSync(path.join(active, file.rel)), original);
+    });
+    test('cache root with a missing target remains unpatched and reports missing plugin files', () => {
+      const fixture = isolated('plugin-incomplete-root');
+      const patchManifest = path.join(fixture.payload, fixture.manifest.pluginPatches);
+      const patches = readJson(patchManifest);
+      patches.roots = ['plugins/cache/openai-codex/codex/*'];
+      patches.files = ['one.mjs', 'two.mjs', 'three.mjs', 'four.mjs']
+        .map(rel => ({ ...patches.files[0], rel }));
+      atomicWrite(patchManifest, json(patches));
+      const root = path.join(fixture.ch, 'plugins/cache/openai-codex/codex/1.0.6');
+      const targets = patches.files.slice(0, 3).map(file => path.join(root, file.rel));
+      targets.forEach(file => atomicWrite(file, fixture.originalB));
+      const before = targets.map(file => fs.readFileSync(file));
+      assert.equal(install(fixture.ctx), 0);
+      targets.forEach((file, index) => {
+        assert.deepEqual(fs.readFileSync(file), before[index]);
+        assert.equal(fs.existsSync(`${file}.orig-luna-harness`), false);
+      });
+      assert.ok(fixture.ctx.warnings.some(message => message.includes('missing plugin files: four.mjs')));
+    });
+    test('existing records with stale backups are retained and uninstall refuses the mismatched original', () => {
+      const fixture = isolated('plugin-record-stale-backup');
+      const plugin = path.join(fixture.ch, 'plugins/test/plugin.mjs');
+      atomicWrite(plugin, fixture.originalB);
+      install(fixture.ctx);
+      atomicWrite(`${plugin}.orig-luna-harness`, fixture.original);
+      assert.equal(install(makeContext(fixture.options)), 0);
+      assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, ['plugins/test/plugin.mjs']);
+      const remove = makeContext({ ...fixture.options, uninstall: true });
+      assert.equal(install(remove), 0);
+      assert.ok(remove.warnings.some(message => message.includes(`${plugin}: backup does not match`)));
+      assert.equal(fs.readFileSync(plugin, 'utf8'), fixture.patchedB);
+      assert.equal(fs.readFileSync(`${plugin}.orig-luna-harness`, 'utf8'), fixture.original);
+    });
+    test('uninstall prefers installed patches and restores nothing if both patch sets fail to load', () => {
+      for (const available of [true, false]) {
+        const fixture = isolated(`plugin-uninstall-manifest-${available}`);
+        const plugin = path.join(fixture.ch, 'plugins/test/plugin.mjs');
+        atomicWrite(plugin, fixture.originalB);
+        install(fixture.ctx);
+        const source = path.join(fixture.payload, 'codex-plugin-patches');
+        if (available) fs.cpSync(source, path.join(fixture.ch, 'luna-harness/codex-plugin-patches'),
+          { recursive: true });
+        atomicWrite(path.join(source, 'manifest.json'), 'corrupt');
+        const remove = makeContext({ ...fixture.options, uninstall: true });
+        assert.equal(install(remove), 0);
+        assert.equal(fs.readFileSync(plugin, 'utf8'), available ? fixture.originalB : fixture.patchedB);
+        assert.equal(fs.readFileSync(`${plugin}.orig-luna-harness`, 'utf8'), fixture.originalB);
+        assert.equal(remove.warnings.filter(message => message.includes('Plugin patch manifest unavailable'))
+          .length, available ? 0 : 1);
+      }
+    });
+    test('glob cache versions install, record concrete paths, and uninstall restores exact original bytes', () => {
+      const fixture = isolated('glob-versions');
+      const patchManifest = path.join(fixture.payload, fixture.manifest.pluginPatches);
+      const patches = readJson(patchManifest);
+      patches.roots = ['plugins/cache/openai-codex/codex/*', 'plugins/marketplaces/openai-codex/plugins/codex'];
+      atomicWrite(patchManifest, json(patches));
+      const relA = 'plugins/cache/openai-codex/codex/1.0.3/plugin.mjs';
+      const relB = 'plugins/cache/openai-codex/codex/1.0.6/plugin.mjs';
+      const pluginA = path.join(fixture.ch, relA);
+      const pluginB = path.join(fixture.ch, relB);
+      const originalA = Buffer.from(fixture.original);
+      const originalB = Buffer.from(fixture.originalB.replaceAll('\n', '\r\n'));
+      atomicWrite(pluginB, originalB);
+      atomicWrite(pluginA, originalA);
+      const unknown = path.join(fixture.ch, 'plugins/cache/openai-codex/codex/1.0.2/plugin.mjs');
+      atomicWrite(unknown, 'unknown plugin');
+      atomicWrite(`${unknown}.orig-luna-harness`, 'unrelated backup');
+      const before = snapshot(fixture.ctx.home);
+      assert.equal(install(makeContext({ ...fixture.options, dryRun: true })), 0);
+      assert.deepEqual(snapshot(fixture.ctx.home), before);
+      assert.equal(install(fixture.ctx), 0);
+      assert.equal(fs.readFileSync(pluginA, 'utf8'), fixture.patched);
+      assert.equal(fs.readFileSync(pluginB, 'utf8'), fixture.patchedB.replaceAll('\n', '\r\n'));
+      assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, [relA, relB]);
+      assert.equal(install(makeContext(fixture.options)), 0);
+      assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, [relA, relB]);
+      assert.equal(install(makeContext({ ...fixture.options, uninstall: true })), 0);
+      assert.deepEqual(fs.readFileSync(pluginA), originalA);
+      assert.deepEqual(fs.readFileSync(pluginB), originalB);
+      assert.equal(fs.readFileSync(unknown, 'utf8'), 'unknown plugin');
+    });
+    test('absent cache directories and marketplace produce exactly one not-installed warning', () => {
+      const fixture = isolated('glob-missing');
+      const patchManifest = path.join(fixture.payload, fixture.manifest.pluginPatches);
+      const patches = readJson(patchManifest);
+      patches.roots = ['plugins/cache/openai-codex/codex/*', 'plugins/marketplaces/openai-codex/plugins/codex'];
+      atomicWrite(patchManifest, json(patches));
+      assert.equal(install(fixture.ctx), 0);
+      assert.equal(fixture.ctx.warnings.filter(message => message.includes('not installed yet')).length, 1);
+      assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, []);
+    });
     test('install record contains installed hashes, identities, commit, timestamp, and ownership flags', () => {
       const fixture = isolated('record');
       install(fixture.ctx);
