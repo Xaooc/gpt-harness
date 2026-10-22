@@ -104,14 +104,14 @@ async function tick($: EngineInterface): Promise<void> {
 
 async function pollOnce($: EngineInterface): Promise<void> {
   const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
-  const sessionId = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+  const sessionId = await currentSessionId($)
   const script = `${home.replace(/\\/g, '/')}/.claude/scripts/luna-overview.mjs`
   let snapshot: Snapshot | null = null
   let error = ''
   try {
     lastBeatPoll = Date.now()
     const payload = await beatPayload($)
-    beatNote = payload ? '' : `нет ID сессии (CLAUDE_CODE_SESSION_ID=${beatSessionId ? 'неподходящий' : 'пусто'})`
+    beatNote = payload ? '' : `нет ID сессии (${beatSessionId ? 'неподходящий: ' + beatSessionId.slice(0, 40) : 'пусто'})`
     const run = await $.process.run(['node', script, ...(payload ? ['--beat'] : [])],
       { timeoutMs: 12_000, ...(payload ? { stdin: payload } : {}) })
     if (run.exitCode === 0 && run.stdout.trim()) snapshot = JSON.parse(run.stdout) as Snapshot
@@ -179,8 +179,16 @@ function sessionName(cwd: string): string {
   return cwd.split(/[\\/]/).filter(Boolean).pop() ?? ''
 }
 
+// The session id names this session's jobs (luna.sh owner) and its heartbeat. CLAUDE_CODE_SESSION_ID reaches Bash
+// commands but not plugins in the desktop app; $.session.id() returns the same id (the transcript file name).
+async function currentSessionId($: EngineInterface): Promise<string> {
+  const fromEnv = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+  if (fromEnv) return fromEnv
+  try { return (await $.session.id()) ?? '' } catch { return '' }
+}
+
 async function initBeat($: EngineInterface, cwd?: string): Promise<void> {
-  if (!beatSessionId) beatSessionId = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
+  if (!beatSessionId) beatSessionId = await currentSessionId($)
   if (cwd) beat.cwd = cwd
   if (!beat.cwd) {
     try { // process.run defaults to the session's cwd: the one reliable source when the plugin loads mid-session
@@ -505,7 +513,27 @@ export const register: Register = on => {
           summary={!daemon.running ? 'спит'
             : daemon.appServer === 'down' ? 'перезапускается'
             : `${daemon.runningJobs ?? 0}${daemon.max ? `/${daemon.max}` : ''} в работе · очередь ${daemon.queuedJobs ?? 0}`}
-        />
+        >
+          {!daemon.running ? (
+            <Text size="caption" color="subtle">Запустится сам с первым заданием, засыпает после 10 минут простоя</Text>
+          ) : (
+            <Box flexDirection="column">
+              <Row label="Состояние" detail={daemon.healthy === false ? 'не отвечает'
+                : daemon.appServer === 'down' ? 'Codex перезапускается' : 'работает'} />
+              {daemon.uptimeS != null ? <Row label="Запущен" detail={`${duration(daemon.uptimeS)} назад`} /> : null}
+              {daemon.max ? <Row label="Предел" detail={`${daemon.max} заданий одновременно`} /> : null}
+              {(daemon.owners ?? []).filter(o => o.running + o.queued > 0).map(o => {
+                const beat = beats.find(b => b.sessionId === o.owner)
+                const name = o.owner === d.sessionId ? 'эта сессия'
+                  : beat?.name || `сессия ${o.owner.slice(0, 8)}`
+                return (
+                  <Row glyph="▸" label={name}
+                    detail={`${o.running} в работе${o.queued ? ` · ${o.queued} ждут` : ''}`} />
+                )
+              })}
+            </Box>
+          )}
+        </Card>
 
         {groups.length === 0 && orphans.length === 0 ? (
           <Card id="sessions-empty" title="Сессии" summary="нет данных" />

@@ -82,6 +82,9 @@ test('pane draws every section from a snapshot on desktop and terminal', async (
     expect(await ui.find({ type: 'Text', text: /выполняет: rg -n auth src\// })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /тишина 16м — похоже, завис/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /Compiling codex-cli/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^Предел$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^12 заданий одновременно$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^1 в работе · 1 ждут$/ })).toBeDefined()
     await ui.press({ key: 'toggle-limits' })
     expect(await ui.find({ type: 'Text', text: /Claude · 5 часов/ })).toBeUndefined()
     await ui.press({ key: 'toggle-limits' })
@@ -192,4 +195,26 @@ test('a prompt opens the pane when it is not on screen, once', async ($, on) => 
   expect(opens).toBe(1)
   await $.command.run({ command: 'luna', args: '' } as never)
   expect(opens).toBe(2)
+})
+
+test('without CLAUDE_CODE_SESSION_ID the heartbeat uses $.session.id()', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { USERPROFILE: 'C:/Users/tester' })
+  const beats: Record<string, unknown>[] = []
+  on('process.run', async (_$, e) => {
+    if (e.argv.includes('-e')) {
+      return { value: { exitCode: 0, stdout: 'C:/code/billing', stderr: '', isStdoutTruncated: false,
+        isStderrTruncated: false } }
+    }
+    if (e.argv.includes('--beat') && typeof e.init?.stdin === 'string') beats.push(JSON.parse(e.init.stdin))
+    return { value: { exitCode: 0, stdout: JSON.stringify(SAMPLE.snapshot), stderr: '', isStdoutTruncated: false,
+      isStderrTruncated: false } }
+  })
+  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: [], context: { window: 200000 } } }) as never)
+  on('session.id', async () => ({ value: 'sess-dddddddd-4444' }) as never)
+  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
+  on('ui.status', async () => ({ value: undefined }) as never)
+  await $.command.run({ command: 'luna', args: '' } as never)
+  expect(beats.length).toBeGreaterThanOrEqual(1)
+  expect(beats.every(b => b.sessionId === 'sess-dddddddd-4444')).toBe(true)
 })
