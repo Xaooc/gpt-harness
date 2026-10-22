@@ -154,6 +154,10 @@ jobs.** Spend them wherever they raise the quality of the final result or cut wa
   daemon on the new binary (a running daemon keeps the old one in memory).
   The root is set in `~/.claude/luna-harness.env` (default `%USERPROFILE%\codex-build`),
   see `codex-build/BUILD.md` in the luna-harness repo.
+- **Changing the Luna pane** (`~/.claude/local-plugins/luna-panel`): sessions run it from the plugin CACHE
+  (`~/.claude/plugins/cache/luna-local/luna-panel/<version>/`), so an edit reaches nobody until you bump `version`
+  in `.claude-plugin/plugin.json`, run `claude plugin marketplace update luna-local && claude plugin update
+  luna-panel@luna-local`, and sessions restart (lost a day of fixes to this on 2026-10-22). `/luna` does not reload code.
 - **Seeing everything**: the Claude Desktop pane **Luna** (`/luna`, mod `luna-panel`) shows RAM, Claude + Codex limits, the daemon
   per session, and every running job with what it's doing now and how long it's been silent. In a terminal:
   `bash ~/.claude/scripts/luna-overview.sh` (`-w` to refresh), or `node ~/.claude/scripts/luna-overview.mjs --human`.

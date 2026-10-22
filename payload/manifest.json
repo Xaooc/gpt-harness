@@ -317,7 +317,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "7dba712da09d00d639ef53c09c0c692af79ea4a48d4fd16f59243b7d237cc3d7"
+      "sha256": "d2165e44012217e010f9060392f53b229f852ce858bb4445aa57c9255f68bcb4"
     },
     {
       "src": "claude/scripts/luna-harness-plugin-patch.mjs",
