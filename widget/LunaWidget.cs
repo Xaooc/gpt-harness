@@ -534,6 +534,10 @@ namespace LunaWidget
             var mig = CardOrder.Migrate(new List<string> { "rpg", NS, "rpg" }, new List<string> { "old1", "~no-session", "old2" });
             eq("migration aligned", Names(CardOrder.Apply(new List<SessionView> { S("x1", "rpg"), S("~no-session", NS), S("x2", "rpg") }, mig, out changed)),
                 "rpg:x1," + NS + ":~no-session,rpg:x2");
+            // 9b. Migration where the previous build appended names of projects not on screen (names longer than ids).
+            mig = CardOrder.Migrate(new List<string> { "rpg", NS, "rpg", "krim" }, new List<string> { "old1", "~no-session", "old2" });
+            eq("migration with extra names", Names(CardOrder.Apply(new List<SessionView> { S("~no-session", NS), S("x1", "rpg"), S("x2", "rpg") }, mig, out changed)),
+                "rpg:x1," + NS + ":~no-session,rpg:x2");
             // 10. Migration from the oldest format (distinct names, longer id list): live ids keep their order.
             mig = CardOrder.Migrate(new List<string> { "rpg", "krim" }, new List<string> { "A", "B", "C" });
             eq("migration oldest", Names(CardOrder.Apply(new List<SessionView> { S("A", "rpg"), S("B", "krim"), S("C", "rpg") }, mig, out changed)), "rpg:A,krim:B,rpg:C");
@@ -607,11 +611,15 @@ namespace LunaWidget
             slots.Insert(at < 0 ? slots.Count : at, slot);
         }
 
-        // From the two older settings: names and ids written together by one drag (aligned by index), or the oldest
-        // distinct-name list (then the ids keep their order and the names become free places after them).
+        // From the older settings. The previous build wrote one name per on-screen card, aligned with the id list, and
+        // then appended the names of projects not on screen; so when there are at least as many names as ids, the first
+        // names belong to the ids by index and the rest become free places. Fewer names than ids means the oldest
+        // format (one name per project): the ids keep their order and the names become free places after them.
         public static List<CardSlot> Migrate(List<string> names, List<string> ids)
         {
-            if (names.Count == ids.Count) return ids.Select((id, i) => new CardSlot { Id = id, Name = names[i] }).ToList();
+            if (names.Count >= ids.Count)
+                return ids.Select((id, i) => new CardSlot { Id = id, Name = names[i] })
+                    .Concat(names.Skip(ids.Count).Select((nm, i) => new CardSlot { Id = "~free-" + i, Name = nm })).ToList();
             return ids.Select(id => new CardSlot { Id = id, Name = "" })
                 .Concat(names.Select((nm, i) => new CardSlot { Id = "~free-" + i, Name = nm })).ToList();
         }
