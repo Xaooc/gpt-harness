@@ -1,0 +1,6 @@
+busybox-w32 is licensed under the GNU General Public License version 2 (GPLv2).
+Author: Ron Yorston
+Project: https://frippery.org/busybox/
+Source: https://github.com/rmyorston/busybox-w32
+The shipped binary is busybox64u.exe renamed to sh.exe.
+SHA256 (sh.exe): 6e263d154d8548d1eb936f65d1d8312c80df31c45974e48d6335e4dcc0f4f34c

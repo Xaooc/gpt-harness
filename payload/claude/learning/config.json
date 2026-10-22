@@ -1,0 +1,28 @@
+{
+  "min_new_events": 5,
+  "min_hours_between_runs": 24,
+  "retry_after_failure_hours": 6,
+  "report_days": 7,
+  "max_edits_per_run": 3,
+  "max_edit_growth_chars": 700,
+  "candidate_expiry_days": 60,
+  "targets": {
+    "CLAUDE.md": {
+      "max_bytes": 11500
+    },
+    "skills/luna/SKILL.md": {
+      "max_bytes": 24000
+    },
+    "skills/luna-critics/SKILL.md": {
+      "max_bytes": 10500
+    }
+  },
+  "proposer": {
+    "model": "gpt-6-luna",
+    "effort": "max"
+  },
+  "critic": {
+    "model": "gpt-6.1-sol",
+    "effort": "high"
+  }
+}

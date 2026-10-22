@@ -1,0 +1,31 @@
+{
+  "plugin": "codex@openai-codex",
+  "version": "1.0.3",
+  "roots": [
+    "plugins/cache/openai-codex/codex/1.0.3",
+    "plugins/marketplaces/openai-codex/plugins/codex"
+  ],
+  "files": [
+    {
+      "rel": "scripts/app-server-broker.mjs",
+      "origSha256": "21feb2d56d6c211ac86d5fd998c484ed7c104474c15bd06c16780e607b457878",
+      "patchedSha256": "e4d158915c3987f1ee5ecf328b48690887453403380e77549217d0f7a57fe9f9",
+      "patched": "patched/scripts/app-server-broker.mjs",
+      "orig": "orig/scripts/app-server-broker.mjs"
+    },
+    {
+      "rel": "scripts/lib/app-server.mjs",
+      "origSha256": "d5c23fe925cfe3fec244df3d63bcba691030e716af7873fd31248aaaf763bc21",
+      "patchedSha256": "a2f91b0f3d72abc426488fe11c8daf68c9411b96e9701cd1d399b7bf009135b9",
+      "patched": "patched/scripts/lib/app-server.mjs",
+      "orig": "orig/scripts/lib/app-server.mjs"
+    },
+    {
+      "rel": "scripts/lib/broker-lifecycle.mjs",
+      "origSha256": "edda09d1c62b78293c8509b6c384ecf61c1ec8b0d382f22327e46f0c3eddf30f",
+      "patchedSha256": "e9f236aa24f24d20b22388be3cfcdd03d2b872b9d2f6ae88feb0a3cd29a56968",
+      "patched": "patched/scripts/lib/broker-lifecycle.mjs",
+      "orig": "orig/scripts/lib/broker-lifecycle.mjs"
+    }
+  ]
+}

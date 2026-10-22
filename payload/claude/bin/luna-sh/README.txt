@@ -1,0 +1,1 @@
+busybox64u.exe from frippery.org, sha256 6e263d154d8548d1eb936f65d1d8312c80df31c45974e48d6335e4dcc0f4f34c (matches SHA256SUM.busybox), installed 2026-10-21 as the POSIX shell for Codex commands (luna).

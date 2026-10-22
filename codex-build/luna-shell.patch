@@ -1,0 +1,1469 @@
+diff --git a/codex-rs/config.md b/codex-rs/config.md
+index cbee27c..7cd37de 100644
+--- a/codex-rs/config.md
++++ b/codex-rs/config.md
+@@ -4,3 +4,26 @@ This file has moved. Please see the latest configuration documentation here:
+ 
+ - Full config docs: [docs/config.md](https://github.com/openai/codex/blob/main/docs/config.md)
+ - MCP servers section: [docs/config.md#connecting-to-mcp-servers](https://github.com/openai/codex/blob/main/docs/config.md#connecting-to-mcp-servers)
++
++## Local shell selection patch
++
++`default_shell` optionally selects the shell used for local model commands. Accepted values are
++`powershell`, `cmd`, `sh`, `bash`, and `zsh`, case-insensitively. Omit it to retain upstream shell selection.
++When set, model-provided `shell` arguments are ignored and logged at debug level.
++
++`default_shell_path` optionally supplies an absolute path to that shell's executable. With `default_shell`
++set, a missing path, relative path, or directory causes a startup error. Without a path, Codex discovers
++the selected shell type and errors if it cannot find it. A path alone does not change upstream selection.
++
++```toml
++default_shell = "sh"
++default_shell_path = "C:/Users/PC/.claude/bin/luna-sh/sh.exe"
++```
++
++Both keys also accept CLI `-c` overrides and app-server `thread/start` `config` overrides.
++Shell argv and `allow_login_shell` retain upstream semantics; use `allow_login_shell = false` if the
++selected shell should receive `-c` instead of `-lc`.
++
++Windows POSIX shells receive POSIX tool guidance. Cmd receives cmd guidance; PowerShell guidance is
++unchanged. Windows `sh` snapshots are disabled. Sandbox selection and restricted-token spawning are unchanged.
++Remote environments retain their reported native shell; configured sessions still ignore model shell requests there.
+diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
+index 3e5cc07..ea7f5ed 100644
+--- a/codex-rs/config/src/config_toml.rs
++++ b/codex-rs/config/src/config_toml.rs
+@@ -5,6 +5,7 @@ use std::collections::HashMap;
+ use std::num::NonZeroU64;
+ use std::num::NonZeroUsize;
+ use std::path::Path;
++use std::path::PathBuf;
+ 
+ use crate::HooksToml;
+ use crate::browser_use::BrowserUseConfigToml;
+@@ -74,6 +75,36 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 5] = [
+ 
+ pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
+ 
++/// Shell used for model commands when explicitly configured.
++#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
++#[serde(rename_all = "lowercase")]
++pub enum DefaultShell {
++    PowerShell,
++    Cmd,
++    Sh,
++    Bash,
++    Zsh,
++}
++
++impl<'de> Deserialize<'de> for DefaultShell {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        let value = String::deserialize(deserializer)?;
++        match value.to_ascii_lowercase().as_str() {
++            "powershell" => Ok(Self::PowerShell),
++            "cmd" => Ok(Self::Cmd),
++            "sh" => Ok(Self::Sh),
++            "bash" => Ok(Self::Bash),
++            "zsh" => Ok(Self::Zsh),
++            _ => Err(D::Error::custom(format!(
++                "invalid default_shell `{value}`; expected powershell, cmd, sh, bash, or zsh"
++            ))),
++        }
++    }
++}
++
+ fn default_history() -> Option<History> {
+     Some(History::default())
+ }
+@@ -220,6 +251,12 @@ pub struct ConfigToml {
+     /// shell.
+     pub allow_login_shell: Option<bool>,
+ 
++    /// Shell for model commands (case-insensitive). When set, per-command shell requests are ignored.
++    pub default_shell: Option<DefaultShell>,
++
++    /// Absolute executable path for default_shell. When default_shell is set, must name an existing file.
++    pub default_shell_path: Option<PathBuf>,
++
+     /// Sandbox mode to use.
+     pub sandbox_mode: Option<SandboxMode>,
+ 
+@@ -1017,6 +1054,41 @@ mod tests {
+     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
+     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+ 
++    #[test]
++    fn default_shell_accepts_known_values_case_insensitively() {
++        for (name, expected) in [
++            ("powershell", DefaultShell::PowerShell),
++            ("cmd", DefaultShell::Cmd),
++            ("sh", DefaultShell::Sh),
++            ("bash", DefaultShell::Bash),
++            ("zsh", DefaultShell::Zsh),
++        ] {
++            for value in [name.to_string(), name.to_ascii_uppercase()] {
++                let config: ConfigToml =
++                    toml::from_str(&format!("default_shell = {value:?}")).unwrap();
++                assert_eq!(config.default_shell, Some(expected));
++            }
++        }
++        assert_eq!(ConfigToml::default().default_shell, None);
++    }
++
++    #[test]
++    fn default_shell_rejects_unknown_values() {
++        let error = toml::from_str::<ConfigToml>(r#"default_shell = "fish""#).unwrap_err();
++        assert!(error.to_string().contains("invalid default_shell `fish`"));
++    }
++
++    #[test]
++    fn default_shell_path_parses() {
++        let path = std::env::temp_dir().join("sh.exe");
++        let path_value = toml::Value::String(path.to_string_lossy().into_owned());
++        let config: ConfigToml = toml::from_str(&format!(
++            "default_shell = \"sh\"\ndefault_shell_path = {path_value}"
++        ))
++        .unwrap();
++        assert_eq!(config.default_shell_path, Some(path));
++    }
++
+     #[test]
+     fn sandbox_mode_uses_executor_platform_and_sandbox_level() {
+         use Platform::Linux;
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 5864a5d..01cbc45 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -1504,6 +1504,17 @@
+       ],
+       "type": "string"
+     },
++    "DefaultShell": {
++      "description": "Shell used for model commands when explicitly configured.",
++      "enum": [
++        "powershell",
++        "cmd",
++        "sh",
++        "bash",
++        "zsh"
++      ],
++      "type": "string"
++    },
+     "ExperimentalRequestUserInput": {
+       "additionalProperties": false,
+       "properties": {
+@@ -6882,6 +6893,18 @@
+       "description": "Default permissions profile to apply. Names starting with `:` refer to built-in profiles; other names are resolved from the `[permissions]` table.",
+       "type": "string"
+     },
++    "default_shell": {
++      "allOf": [
++        {
++          "$ref": "#/definitions/DefaultShell"
++        }
++      ],
++      "description": "Shell for model commands (case-insensitive). When set, per-command shell requests are ignored."
++    },
++    "default_shell_path": {
++      "description": "Absolute executable path for default_shell. When default_shell is set, must name an existing file.",
++      "type": "string"
++    },
+     "desktop": {
+       "additionalProperties": true,
+       "default": null,
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 806bd80..5e1a30a 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -6053,6 +6053,64 @@ async fn default_zsh_path_sets_runtime_zsh_path() -> std::io::Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn default_shell_loads_from_toml_and_cli_overrides() -> anyhow::Result<()> {
++    use codex_config::config_toml::DefaultShell;
++
++    let codex_home = TempDir::new()?;
++    let path = codex_home.path().join("sh.exe");
++    let override_path = codex_home.path().join("override-sh.exe");
++    std::fs::write(&path, "")?;
++    std::fs::write(&override_path, "")?;
++    std::fs::write(
++        codex_home.path().join(CONFIG_TOML_FILE),
++        format!(
++            "default_shell = \"cmd\"\ndefault_shell_path = {}\n",
++            toml::Value::String(path.to_string_lossy().into_owned())
++        ),
++    )?;
++    for override_shell in [None, Some("sH")] {
++        let config = ConfigBuilder::without_managed_config_for_tests()
++            .codex_home(codex_home.path().to_path_buf())
++            .fallback_cwd(Some(codex_home.path().to_path_buf()))
++            .cli_overrides(
++                override_shell
++                    .map(|value| {
++                        vec![
++                            (
++                                "default_shell".to_string(),
++                                toml::Value::String(value.to_string()),
++                            ),
++                            (
++                                "default_shell_path".to_string(),
++                                toml::Value::String(override_path.to_string_lossy().into_owned()),
++                            ),
++                        ]
++                    })
++                    .unwrap_or_default(),
++            )
++            .build()
++            .await?;
++        assert_eq!(
++            config.default_shell,
++            Some(if override_shell.is_some() {
++                DefaultShell::Sh
++            } else {
++                DefaultShell::Cmd
++            })
++        );
++        assert_eq!(
++            config.default_shell_path.as_ref(),
++            Some(if override_shell.is_some() {
++                &override_path
++            } else {
++                &path
++            })
++        );
++    }
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 1eb2cdf..e66eb09 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -1010,6 +1010,12 @@ pub struct Config {
+     /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
+     pub zsh_path: Option<PathBuf>,
+ 
++    /// Explicit shell for model commands; overrides shell discovery and per-command shell requests.
++    pub default_shell: Option<codex_config::config_toml::DefaultShell>,
++
++    /// Absolute executable path for the explicitly configured shell.
++    pub default_shell_path: Option<PathBuf>,
++
+     /// Value to use for `reasoning.effort` when making a request using the
+     /// Responses API.
+     pub model_reasoning_effort: Option<ReasoningEffort>,
+@@ -4429,6 +4435,9 @@ impl Config {
+             main_execve_wrapper_exe,
+             zsh_path,
+ 
++            default_shell: cfg.default_shell,
++            default_shell_path: cfg.default_shell_path,
++
+             hide_agent_reasoning: cfg.hide_agent_reasoning.unwrap_or(false),
+             show_raw_agent_reasoning: cfg
+                 .show_raw_agent_reasoning
+diff --git a/codex-rs/core/src/context/world_state/environment_render_tests.rs b/codex-rs/core/src/context/world_state/environment_render_tests.rs
+index 219a13d..e7d30c1 100644
+--- a/codex-rs/core/src/context/world_state/environment_render_tests.rs
++++ b/codex-rs/core/src/context/world_state/environment_render_tests.rs
+@@ -124,6 +124,25 @@ fn serialize_environment_context_with_foreign_windows_cwd() {
+     );
+ }
+ 
++#[test]
++fn serialize_windows_sh_environment_context() {
++    let context = environment_state(
++        [environment(
++            "local",
++            PathUri::parse("file:///C:/workspace").unwrap(),
++            "sh",
++        )],
++        None,
++        None,
++        None,
++        None,
++    );
++    let rendered = context.render();
++    assert!(rendered.contains("<shell>sh</shell>"));
++    assert!(!rendered.contains("powershell"));
++    assert!(!rendered.contains("shell_version"));
++}
++
+ #[test]
+ fn serialize_environment_context_with_network() {
+     let network = NetworkContext::new(
+diff --git a/codex-rs/core/src/session/review.rs b/codex-rs/core/src/session/review.rs
+index 44ec95f..c95cc78 100644
+--- a/codex-rs/core/src/session/review.rs
++++ b/codex-rs/core/src/session/review.rs
+@@ -35,7 +35,10 @@ pub(super) async fn spawn_review_thread(
+     let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
+         review_features.get(),
+         crate::tools::tool_user_shell_type(sess.services.user_shell.as_ref()),
+-        sess.services.shell_zsh_path.as_ref(),
++        sess.services
++            .shell_zsh_path
++            .as_ref()
++            .filter(|_| config.default_shell.is_none()),
+         sess.services.main_execve_wrapper_exe.as_ref(),
+     );
+ 
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index 263f08f..cf55df6 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -1238,9 +1238,17 @@ impl Session {
+                 session_source: session_configuration.session_source.clone(),
+                 cwd: session_configuration.cwd().to_path_buf(),
+                 rollout_path: rollout_path.clone(),
+-                model: session_configuration.step_settings.collaboration_mode.model().to_string(),
++                model: session_configuration
++                    .step_settings
++                    .collaboration_mode
++                    .model()
++                    .to_string(),
+                 provider_name: config.model_provider_id.clone(),
+-                approval_policy: session_configuration.step_settings.approval_policy.value().to_string(),
++                approval_policy: session_configuration
++                    .step_settings
++                    .approval_policy
++                    .value()
++                    .to_string(),
+                 sandbox_policy: format!(
+                     "{:?}",
+                     session_configuration.sandbox_policy(environment_selections)
+@@ -1280,7 +1288,9 @@ impl Session {
+             let effective_config = config.config_layer_stack.effective_config();
+             let config_path = config.codex_home.join(CONFIG_TOML_FILE);
+             if let Some(event) = unstable_features_warning_event(
+-                effective_config.get("features").and_then(TomlValue::as_table),
++                effective_config
++                    .get("features")
++                    .and_then(TomlValue::as_table),
+                 config.suppress_unstable_features_warning,
+                 &config.features,
+                 &config_path.display().to_string(),
+@@ -1295,7 +1305,11 @@ impl Session {
+             let account_email = telemetry_auth.and_then(CodexAuth::get_account_email);
+             let originator = session_configuration.originator.clone();
+             let terminal_type = user_agent();
+-            let session_model = session_configuration.step_settings.collaboration_mode.model().to_string();
++            let session_model = session_configuration
++                .step_settings
++                .collaboration_mode
++                .model()
++                .to_string();
+             let auth_env_telemetry = collect_auth_env_telemetry(
+                 session_configuration.provider.info(),
+                 auth_manager.codex_api_key_env_enabled(),
+@@ -1333,11 +1347,15 @@ impl Session {
+                 slug: Some(session_model),
+             };
+             crate::config::emit_session_start_metrics(config.as_ref(), &session_telemetry);
+-            let is_worktree = session_configuration.cwd().canonicalize().ok().and_then(|cwd| {
+-                codex_git_utils::repository_identity(&cwd).and_then(|_| {
+-                    get_git_repo_root(&cwd).map(|root| root.join(".git").is_file())
+-                })
+-            });
++            let is_worktree = session_configuration
++                .cwd()
++                .canonicalize()
++                .ok()
++                .and_then(|cwd| {
++                    codex_git_utils::repository_identity(&cwd).and_then(|_| {
++                        get_git_repo_root(&cwd).map(|root| root.join(".git").is_file())
++                    })
++                });
+             let is_worktree_tag = match is_worktree {
+                 Some(true) => "true",
+                 Some(false) => "false",
+@@ -1355,16 +1373,16 @@ impl Session {
+             );
+ 
+             let mcp_server_names =
+-                codex_mcp::effective_mcp_servers(
+-                    &mcp_projection.config,
+-                    auth.as_ref(),
+-                )
++                codex_mcp::effective_mcp_servers(&mcp_projection.config, auth.as_ref())
+                     .into_iter()
+                     .filter_map(|(name, server)| server.enabled().then_some(name))
+                     .collect::<Vec<_>>();
+             session_telemetry.conversation_starts(
+                 config.model_provider.name.as_str(),
+-                session_configuration.step_settings.collaboration_mode.reasoning_effort(),
++                session_configuration
++                    .step_settings
++                    .collaboration_mode
++                    .reasoning_effort(),
+                 config
+                     .model_reasoning_summary
+                     .unwrap_or(ReasoningSummaryConfig::Auto),
+@@ -1377,33 +1395,10 @@ impl Session {
+                 mcp_server_names.iter().map(String::as_str).collect(),
+             );
+ 
+-            let use_zsh_fork_shell = config.features.enabled(Feature::ShellZshFork);
+-            let default_shell = if let Some(user_shell_override) =
+-                session_configuration.user_shell_override.clone()
+-            {
+-                user_shell_override
+-            } else if use_zsh_fork_shell {
+-                let zsh_path = config.zsh_path.as_ref().ok_or_else(|| {
+-                    anyhow::anyhow!(
+-                        "zsh fork feature enabled, but no packaged zsh fork is available for this install"
+-                    )
+-                })?;
+-                if zsh_path.is_file() {
+-                    shell::Shell {
+-                        shell_type: shell::ShellType::Zsh,
+-                        shell_path: zsh_path.clone(),
+-                    }
+-                } else {
+-                    shell::get_shell(shell::ShellType::Zsh).ok_or_else(|| {
+-                        anyhow::anyhow!(
+-                            "zsh fork feature enabled, but packaged zsh fork `{}` is not usable",
+-                            zsh_path.display()
+-                        )
+-                    })?
+-                }
+-            } else {
+-                shell::default_user_shell()
+-            };
++            let default_shell = shell::select_session_shell(
++                &config,
++                session_configuration.user_shell_override.clone(),
++            )?;
+             let credential_broker_available = config.features.enabled(Feature::NetworkProxy)
+                 && config
+                     .config_layer_stack
+@@ -1431,7 +1426,10 @@ impl Session {
+                     codex_tools::UnifiedExecShellMode::for_session(
+                         config.features.get(),
+                         crate::tools::tool_user_shell_type(&default_shell),
+-                        config.zsh_path.as_ref(),
++                        config
++                            .zsh_path
++                            .as_ref()
++                            .filter(|_| config.default_shell.is_none()),
+                         config.main_execve_wrapper_exe.as_ref(),
+                     ),
+                     codex_tools::UnifiedExecShellMode::Direct
+@@ -1508,12 +1506,12 @@ impl Session {
+             let (agents_md_result, instruction_warnings) = instruction_refresh;
+             // TODO(anp): Present AGENTS.md discovery errors more clearly to the user.
+             agents_md_result?;
+-            post_session_configured_events.extend(
+-                instruction_warnings.into_iter().map(|message| Event {
++            post_session_configured_events.extend(instruction_warnings.into_iter().map(
++                |message| Event {
+                     id: INITIAL_SUBMIT_ID.to_owned(),
+                     msg: EventMsg::Warning(WarningEvent { message }),
+-                }),
+-            );
++                },
++            ));
+             for err in &plugin_skill_errors {
+                 error!(
+                     "failed to load skill {}: {}",
+@@ -1537,7 +1535,8 @@ impl Session {
+                 .requirements_toml()
+                 .network
+                 .is_some();
+-            let managed_network_requirements_enabled = config.managed_network_requirements_enabled();
++            let managed_network_requirements_enabled =
++                config.managed_network_requirements_enabled();
+             let network_approval = Arc::new(NetworkApprovalService::default());
+             // The managed proxy can call back into core for allowlist-miss decisions.
+             let network_policy_decider_session = if managed_network_requirements_configured {
+@@ -1563,35 +1562,34 @@ impl Session {
+                             Arc::clone(network_policy_decider_session),
+                         )
+                     });
+-            let (network_proxy, session_network_proxy) =
+-                if let Some(spec) = config
+-                    .permissions
+-                    .network
+-                    .as_ref()
+-                    .filter(|spec| spec.enabled())
+-                {
+-                    let current_exec_policy = exec_policy.current();
+-                    let (network_proxy, session_network_proxy) = Self::start_managed_network_proxy(
+-                        spec,
+-                        current_exec_policy.as_ref(),
+-                        config.permissions.permission_profile(),
+-                        config.effective_local_windows_sandbox_type(),
+-                        network_policy_decider.as_ref().map(Arc::clone),
+-                        blocked_request_observer.as_ref().map(Arc::clone),
+-                        managed_network_requirements_configured,
+-                        network_proxy_audit_metadata.clone(),
+-                    )
+-                    .instrument(info_span!(
+-                        "session_init.network_proxy",
+-                        otel.name = "session_init.network_proxy",
+-                        session_init.managed_network_requirements_enabled =
+-                            managed_network_requirements_enabled,
+-                    ))
+-                    .await?;
+-                    (Some(network_proxy), Some(session_network_proxy))
+-                } else {
+-                    (None, None)
+-                };
++            let (network_proxy, session_network_proxy) = if let Some(spec) = config
++                .permissions
++                .network
++                .as_ref()
++                .filter(|spec| spec.enabled())
++            {
++                let current_exec_policy = exec_policy.current();
++                let (network_proxy, session_network_proxy) = Self::start_managed_network_proxy(
++                    spec,
++                    current_exec_policy.as_ref(),
++                    config.permissions.permission_profile(),
++                    config.effective_local_windows_sandbox_type(),
++                    network_policy_decider.as_ref().map(Arc::clone),
++                    blocked_request_observer.as_ref().map(Arc::clone),
++                    managed_network_requirements_configured,
++                    network_proxy_audit_metadata.clone(),
++                )
++                .instrument(info_span!(
++                    "session_init.network_proxy",
++                    otel.name = "session_init.network_proxy",
++                    session_init.managed_network_requirements_enabled =
++                        managed_network_requirements_enabled,
++                ))
++                .await?;
++                (Some(network_proxy), Some(session_network_proxy))
++            } else {
++                (None, None)
++            };
+             if let Some(network_proxy) = network_proxy.as_ref()
+                 && config
+                     .permissions
+@@ -1680,32 +1678,34 @@ impl Session {
+             let mcp_resource_client = Arc::new(McpResourceClient::new(Arc::clone(&mcp_runtime)));
+             let extension_metrics =
+                 extension_metrics::from_session_telemetry(session_telemetry.clone());
+-            let workspace_routing = thread_extension_data
+-                .get_or_init(|| config.workspace_routing_context());
++            let workspace_routing =
++                thread_extension_data.get_or_init(|| config.workspace_routing_context());
+             for contributor in extensions.thread_lifecycle_contributors() {
+-                contributor.on_thread_start(codex_extension_api::ThreadStartInput {
+-                    config: config.as_ref(),
+-                    session_source: &session_configuration.session_source,
+-                    persistent_thread_state_available: state_db_ctx.is_some(),
+-                    environments: environment_selections,
+-                    mcp_resource_client: Some(Arc::clone(&mcp_resource_client)),
+-                    extension_metrics: Some(Arc::clone(&extension_metrics)),
+-                    session_store: &session_extension_data,
+-                    thread_store: &thread_extension_data,
+-                }).await;
++                contributor
++                    .on_thread_start(codex_extension_api::ThreadStartInput {
++                        config: config.as_ref(),
++                        session_source: &session_configuration.session_source,
++                        persistent_thread_state_available: state_db_ctx.is_some(),
++                        environments: environment_selections,
++                        mcp_resource_client: Some(Arc::clone(&mcp_resource_client)),
++                        extension_metrics: Some(Arc::clone(&extension_metrics)),
++                        session_store: &session_extension_data,
++                        thread_store: &thread_extension_data,
++                    })
++                    .await;
+             }
+ 
+-            let executed_tool_calls = crate::state::ExecutedToolCalls::new(
+-                &config.features,
+-                &initial_history,
+-            );
+-            let codex_responses_headers = thread_extension_data.get::<crate::CodexResponsesHeaders>();
++            let executed_tool_calls =
++                crate::state::ExecutedToolCalls::new(&config.features, &initial_history);
++            let codex_responses_headers =
++                thread_extension_data.get::<crate::CodexResponsesHeaders>();
+             // Ephemeral title requests use request-level effort even when managed settings
+             // enable overrides. The client-supplied tag selects cache behavior, not permissions.
+-            let title_request = config.ephemeral && matches!(
+-                session_configuration.thread_source.as_ref(),
+-                Some(ThreadSource::Feature(feature)) if feature == "thread_title"
+-            );
++            let title_request = config.ephemeral
++                && matches!(
++                    session_configuration.thread_source.as_ref(),
++                    Some(ThreadSource::Feature(feature)) if feature == "thread_title"
++                );
+             let reasoning_effort_override_enabled =
+                 config.features.enabled(Feature::ReasoningEffortOverride) && !title_request;
+             let services = SessionServices {
+@@ -1777,7 +1777,8 @@ impl Session {
+                     config.features.enabled(Feature::EnableRequestCompression),
+                     config.features.enabled(Feature::RuntimeMetrics),
+                     Self::build_model_client_beta_features_header(config.as_ref()),
+-                    /*concurrent_reasoning_summaries_enabled*/ config
++                    /*concurrent_reasoning_summaries_enabled*/
++                    config
+                         .features
+                         .enabled(Feature::ConcurrentReasoningSummaries),
+                     attestation_provider,
+@@ -1827,18 +1828,22 @@ impl Session {
+                 multi_agent_version,
+                 mcp_refresh: McpRefresh::new(),
+                 mcp_tool_approval_metadata: Default::default(),
+-        mcp_elicitation_reviewer_handle: OnceLock::new(),
++                mcp_elicitation_reviewer_handle: OnceLock::new(),
+                 mcp_elicitation_lifecycle_handle: OnceLock::new(),
+                 mcp_prewarm_tx,
+                 mcp_prewarm_shutdown: CancellationToken::new(),
+                 mcp_prewarm_task: std::sync::Mutex::new(None),
+                 conversation: Arc::new(RealtimeConversationManager::new()),
+-                realtime_history: (session_configuration.history_mode == ThreadHistoryMode::Paginated
++                realtime_history: (session_configuration.history_mode
++                    == ThreadHistoryMode::Paginated
+                     && services.live_thread.is_some())
+                 .then(|| Mutex::new(Default::default())),
+                 active_turn: Mutex::new(None),
+                 async_hook_results,
+-                input_queue: InputQueue::with_controller(thread_id, Arc::clone(&services.agent_control)),
++                input_queue: InputQueue::with_controller(
++                    thread_id,
++                    Arc::clone(&services.agent_control),
++                ),
+                 services,
+                 git_enrichment_policy,
+                 fork_persistence,
+@@ -1911,7 +1916,9 @@ impl Session {
+                             session_source: &session_configuration.session_source,
+                             originator: &session_configuration.originator,
+                             disabled_plugin_ids: &session_configuration.disabled_plugin_ids,
+-                            environments: McpEnvironmentScope::Selected(&resolved_environment_selections),
++                            environments: McpEnvironmentScope::Selected(
++                                &resolved_environment_selections,
++                            ),
+                         },
+                         /*ready_selected_capability_roots*/ &[],
+                         /*executor_capability_discovery*/ None,
+diff --git a/codex-rs/core/src/session/turn_context.rs b/codex-rs/core/src/session/turn_context.rs
+index f74f555..b7b0d01 100644
+--- a/codex-rs/core/src/session/turn_context.rs
++++ b/codex-rs/core/src/session/turn_context.rs
+@@ -1040,7 +1040,7 @@ impl Session {
+         let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
+             per_turn_config.features.get(),
+             crate::tools::tool_user_shell_type(user_shell),
+-            shell_zsh_path,
++            shell_zsh_path.filter(|_| per_turn_config.default_shell.is_none()),
+             main_execve_wrapper_exe,
+         );
+ 
+diff --git a/codex-rs/core/src/shell.rs b/codex-rs/core/src/shell.rs
+index da0fbbe..ca26bc5 100644
+--- a/codex-rs/core/src/shell.rs
++++ b/codex-rs/core/src/shell.rs
+@@ -1,3 +1,4 @@
++use codex_config::config_toml::DefaultShell;
+ use codex_exec_server::ShellInfo;
+ use codex_shell_command::shell_detect::DetectedShell;
+ use codex_utils_path_uri::PathConvention;
+@@ -167,6 +168,67 @@ pub fn default_user_shell() -> Shell {
+     codex_shell_command::shell_detect::default_user_shell().into()
+ }
+ 
++pub(crate) fn select_session_shell(
++    config: &crate::config::Config,
++    user_shell_override: Option<Shell>,
++) -> anyhow::Result<Shell> {
++    if let Some(shell) = user_shell_override {
++        return Ok(shell);
++    }
++    if let Some(default_shell) = config.default_shell {
++        let shell_type = match default_shell {
++            DefaultShell::PowerShell => ShellType::PowerShell,
++            DefaultShell::Cmd => ShellType::Cmd,
++            DefaultShell::Sh => ShellType::Sh,
++            DefaultShell::Bash => ShellType::Bash,
++            DefaultShell::Zsh => ShellType::Zsh,
++        };
++        if let Some(path) = config.default_shell_path.as_ref() {
++            if !path.is_absolute() || !path.is_file() {
++                anyhow::bail!(
++                    "default_shell_path `{}` must be an absolute path to an existing file",
++                    path.display()
++                );
++            }
++            return Ok(Shell {
++                shell_type,
++                shell_path: path.clone(),
++            });
++        }
++        return get_shell(shell_type).ok_or_else(|| {
++            anyhow::anyhow!(
++                "default_shell `{}` executable was not found; set default_shell_path to its absolute path",
++                shell_type.name()
++            )
++        });
++    }
++    if config
++        .features
++        .enabled(codex_features::Feature::ShellZshFork)
++    {
++        let zsh_path = config.zsh_path.as_ref().ok_or_else(|| {
++            anyhow::anyhow!(
++                "zsh fork feature enabled, but no packaged zsh fork is available for this install"
++            )
++        })?;
++        if zsh_path.is_file() {
++            Ok(Shell {
++                shell_type: ShellType::Zsh,
++                shell_path: zsh_path.clone(),
++            })
++        } else {
++            get_shell(ShellType::Zsh).ok_or_else(|| {
++                anyhow::anyhow!(
++                    "zsh fork feature enabled, but packaged zsh fork `{}` is not usable",
++                    zsh_path.display()
++                )
++            })
++        }
++    } else {
++        Ok(default_user_shell())
++    }
++}
++
+ #[cfg(all(test, target_os = "macos"))]
+ fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Shell {
+     codex_shell_command::shell_detect::default_user_shell_from_path(user_shell_path).into()
+@@ -176,3 +238,7 @@ fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Shell {
+ #[cfg(unix)]
+ #[path = "shell_tests.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "configured_shell_tests.rs"]
++mod configured_shell_tests;
+diff --git a/codex-rs/core/src/shell_snapshot.rs b/codex-rs/core/src/shell_snapshot.rs
+index 994506d..59f148f 100644
+--- a/codex-rs/core/src/shell_snapshot.rs
++++ b/codex-rs/core/src/shell_snapshot.rs
+@@ -163,6 +163,9 @@ impl ShellSnapshot {
+         }
+ 
+         let shell = shell?;
++        if cfg!(windows) && shell.shell_type == ShellType::Sh {
++            return None;
++        }
+         // TODO(anp): Migrate shell snapshot creation to accept PathUri and defer native
+         // conversion to the spawned shell process.
+         let cwd = cwd.to_abs_path().ok()?;
+@@ -545,7 +548,10 @@ async fn write_shell_snapshot(
+     sandbox: Option<&ShellSnapshotSandbox>,
+ ) -> Result<Option<SnapshotCredentials>> {
+     let shell_type = shell.shell_type;
+-    if shell_type == ShellType::PowerShell || shell_type == ShellType::Cmd {
++    if shell_type == ShellType::PowerShell
++        || shell_type == ShellType::Cmd
++        || (cfg!(windows) && shell_type == ShellType::Sh)
++    {
+         bail!("Shell snapshot not supported yet for {shell_type:?}");
+     }
+     let (snapshot, credentials) = capture_snapshot(
+diff --git a/codex-rs/core/src/shell_snapshot_tests.rs b/codex-rs/core/src/shell_snapshot_tests.rs
+index 8c81650..abcd319 100644
+--- a/codex-rs/core/src/shell_snapshot_tests.rs
++++ b/codex-rs/core/src/shell_snapshot_tests.rs
+@@ -1821,6 +1821,35 @@ async fn linux_sh_snapshot_includes_sections() -> Result<()> {
+     Ok(())
+ }
+ 
++#[cfg(windows)]
++#[tokio::test]
++async fn windows_sh_snapshot_is_unsupported_without_spawning() -> Result<()> {
++    let dir = tempdir()?;
++    let output = dir.path().join("snapshot.sh").abs();
++    let shell = Shell {
++        shell_type: ShellType::Sh,
++        shell_path: dir.path().join("must-not-spawn.exe"),
++    };
++    let error = write_shell_snapshot(
++        &shell,
++        &output,
++        &dir.path().abs(),
++        &ShellEnvironmentPolicy::default(),
++        None,
++        None,
++    )
++    .await
++    .err()
++    .expect("Windows sh snapshots must be rejected");
++    assert!(
++        error
++            .to_string()
++            .contains("Shell snapshot not supported yet for Sh")
++    );
++    assert!(!output.exists());
++    Ok(())
++}
++
+ #[cfg(target_os = "windows")]
+ #[ignore]
+ #[tokio::test]
+diff --git a/codex-rs/core/src/tools/handlers/shell_spec.rs b/codex-rs/core/src/tools/handlers/shell_spec.rs
+index ac3dcf9..81a0131 100644
+--- a/codex-rs/core/src/tools/handlers/shell_spec.rs
++++ b/codex-rs/core/src/tools/handlers/shell_spec.rs
+@@ -1,3 +1,4 @@
++use crate::shell::ShellType;
+ use codex_tools::JsonSchema;
+ use codex_tools::ResponsesApiTool;
+ use codex_tools::ToolSpec;
+@@ -18,6 +19,7 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
+         /*include_environment_id*/ false,
+         /*include_shell_parameter*/ true,
+         /*include_windows_shell_guidance*/ cfg!(windows),
++        /*configured_shell_type*/ None,
+     )
+ }
+ 
+@@ -26,6 +28,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+     include_environment_id: bool,
+     include_shell_parameter: bool,
+     include_windows_shell_guidance: bool,
++    configured_shell_type: Option<ShellType>,
+ ) -> ToolSpec {
+     let yield_time_ms_description = if cfg!(windows) {
+         "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms."
+@@ -66,7 +69,12 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+         properties.insert(
+             "shell".to_string(),
+             JsonSchema::string(Some(
+-                "Shell binary to launch. Defaults to the user's default shell.".to_string(),
++                if configured_shell_type.is_some() {
++                    "Ignored because default_shell is configured; commands use the session shell."
++                } else {
++                    "Shell binary to launch. Defaults to the user's default shell."
++                }
++                .to_string(),
+             )),
+         );
+     }
+@@ -97,7 +105,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+         description: if include_windows_shell_guidance {
+             format!(
+                 "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
+-                windows_shell_guidance()
++                shell_guidance(configured_shell_type)
+             )
+         } else {
+             "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+@@ -343,6 +351,32 @@ fn windows_shell_guidance() -> &'static str {
+ - When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."#
+ }
+ 
++fn shell_guidance(configured_shell_type: Option<ShellType>) -> &'static str {
++    match configured_shell_type {
++        Some(ShellType::Sh | ShellType::Bash | ShellType::Zsh) => concat!(
++            "Use POSIX shell syntax and utilities.\n\n",
++            "You are on Windows using a POSIX sh (busybox): paths may be written as C:/dir/file or with ",
++            "forward slashes; Windows .exe tools (git, rg, node, python, cargo) are available on PATH; ",
++            "there is no PowerShell\n\n",
++            "Windows safety rules:\n",
++            "- Use one shell end-to-end for filesystem operations. Quote paths passed to POSIX utilities.\n",
++            "- Before any recursive delete or move, verify the resolved absolute target paths stay within ",
++            "the intended workspace or explicitly named target directory.\n",
++            "- Launch background helpers without visible windows unless the user requests an interactive window."
++        ),
++        Some(ShellType::Cmd) => concat!(
++            "You are on Windows using cmd.exe. Use cmd syntax: /c, %VAR%, dir, type, copy, move, and del. ",
++            "Quote paths containing spaces; use /b with start for background helpers.\n\n",
++            "Windows safety rules:\n",
++            "- Use one shell end-to-end for filesystem operations.\n",
++            "- Before any recursive delete or move, verify the resolved absolute target paths stay within ",
++            "the intended workspace or explicitly named target directory.\n",
++            "- Launch background helpers without visible windows unless the user requests an interactive window."
++        ),
++        Some(ShellType::PowerShell) | None => windows_shell_guidance(),
++    }
++}
++
+ #[cfg(test)]
+ #[path = "shell_spec_tests.rs"]
+ mod tests;
+diff --git a/codex-rs/core/src/tools/handlers/shell_spec_tests.rs b/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
+index c3d1aff..ab26bdf 100644
+--- a/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
+@@ -6,6 +6,63 @@ fn windows_shell_guidance_description() -> String {
+     format!("\n\n{}", windows_shell_guidance())
+ }
+ 
++#[test]
++fn configured_windows_posix_shell_has_posix_guidance() {
++    for shell_type in [ShellType::Sh, ShellType::Bash, ShellType::Zsh] {
++        let ToolSpec::Function(tool) = create_exec_command_tool_with_environment_id(
++            CommandToolOptions {
++                include_login_parameter: true,
++                exec_permission_approvals_enabled: false,
++            },
++            false,
++            true,
++            /*include_windows_shell_guidance*/ true,
++            Some(shell_type),
++        ) else {
++            panic!("expected a function tool");
++        };
++        assert!(
++            tool.description
++                .contains("Use POSIX shell syntax and utilities.")
++        );
++        assert!(tool.description.contains(concat!(
++            "You are on Windows using a POSIX sh (busybox): paths may be written as C:/dir/file or with ",
++            "forward slashes; Windows .exe tools (git, rg, node, python, cargo) are available on PATH; ",
++            "there is no PowerShell"
++        )));
++        // The required note says there is no PowerShell; none of its instructions may remain.
++        assert!(!tool.description.contains("PowerShell cmdlets"));
++        assert!(!tool.description.contains("Start-Process"));
++        assert!(!tool.description.contains("Remove-Item"));
++        let shell_parameter = &tool.parameters.properties.as_ref().unwrap()["shell"];
++        assert!(
++            shell_parameter
++                .description
++                .as_ref()
++                .unwrap()
++                .contains("Ignored")
++        );
++    }
++}
++
++#[test]
++fn configured_windows_powershell_keeps_upstream_guidance() {
++    assert_eq!(
++        shell_guidance(Some(ShellType::PowerShell)),
++        windows_shell_guidance()
++    );
++    assert_eq!(shell_guidance(None), windows_shell_guidance());
++}
++
++#[test]
++fn configured_windows_cmd_has_cmd_guidance() {
++    let guidance = shell_guidance(Some(ShellType::Cmd));
++    assert!(guidance.contains("cmd.exe"));
++    assert!(guidance.contains("%VAR%"));
++    assert!(!guidance.contains("PowerShell"));
++    assert!(!guidance.contains("Start-Process"));
++}
++
+ #[test]
+ fn exec_command_tool_matches_expected_spec() {
+     let tool = create_exec_command_tool(CommandToolOptions {
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec.rs b/codex-rs/core/src/tools/handlers/unified_exec.rs
+index 763fa15..63d99ce 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec.rs
+@@ -102,6 +102,7 @@ pub(crate) fn get_command(
+     session_shell: Arc<Shell>,
+     shell_mode: &UnifiedExecShellMode,
+     allow_login_shell: bool,
++    default_shell_configured: bool,
+ ) -> Result<ResolvedCommand, String> {
+     let use_login_shell = match args.login {
+         Some(true) if !allow_login_shell => {
+@@ -113,21 +114,34 @@ pub(crate) fn get_command(
+         None => allow_login_shell,
+     };
+ 
+-    let shell = match shell_mode {
+-        UnifiedExecShellMode::Direct => args
+-            .shell
+-            .as_ref()
+-            .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
+-            .unwrap_or_else(|| session_shell.as_ref().clone()),
+-        UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
+-            if args.shell.is_some() {
+-                return Err(
+-                    "`shell` is not supported for local zsh-fork exec; omit `shell` to use zsh-fork, or target a remote environment where `shell` is supported.".to_string(),
+-                );
+-            }
+-            Shell {
+-                shell_type: ShellType::Zsh,
+-                shell_path: zsh_fork_config.shell_zsh_path.as_path().to_path_buf(),
++    let shell = if default_shell_configured {
++        if let Some(requested_shell) = &args.shell {
++            tracing::debug!(
++                requested_shell,
++                "ignoring model shell because default_shell is configured"
++            );
++        }
++        session_shell.as_ref().clone()
++    } else {
++        match shell_mode {
++            UnifiedExecShellMode::Direct => args
++                .shell
++                .as_ref()
++                .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
++                .unwrap_or_else(|| session_shell.as_ref().clone()),
++            UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
++                if args.shell.is_some() {
++                    return Err(concat!(
++                        "`shell` is not supported for local zsh-fork exec; ",
++                        "omit `shell` to use zsh-fork, or target a remote environment ",
++                        "where `shell` is supported."
++                    )
++                    .to_string());
++                }
++                Shell {
++                    shell_type: ShellType::Zsh,
++                    shell_path: zsh_fork_config.shell_zsh_path.as_path().to_path_buf(),
++                }
+             }
+         }
+     };
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs b/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
+index faf8b90..c5e295a 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
+@@ -64,6 +64,7 @@ pub(crate) struct ExecCommandHandlerOptions {
+     pub(crate) exec_permission_approvals_enabled: bool,
+     pub(crate) include_environment_id: bool,
+     pub(crate) include_windows_shell_guidance: bool,
++    pub(crate) configured_shell_type: Option<crate::shell::ShellType>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -88,6 +89,7 @@ impl Default for ExecCommandHandler {
+                 exec_permission_approvals_enabled: false,
+                 include_environment_id: false,
+                 include_windows_shell_guidance: cfg!(windows),
++                configured_shell_type: None,
+             },
+         }
+     }
+@@ -123,6 +125,7 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
+             self.options.include_environment_id,
+             self.options.include_shell_parameter,
+             self.options.include_windows_shell_guidance,
++            self.options.configured_shell_type,
+         );
+         let mut spec = match self.lifetime {
+             ExecCommandLifetime::Interactive => spec,
+@@ -268,6 +271,15 @@ impl ExecCommandHandler {
+             .unwrap_or_else(|| session.user_shell());
+         // TODO(anp): Resolve requested shells in remote environments instead of restricting
+         // commands to the reported default shell.
++        let default_shell_configured = turn.config.default_shell.is_some();
++        if default_shell_configured {
++            if let Some(requested_shell) = args.shell.take() {
++                tracing::debug!(
++                    requested_shell,
++                    "ignoring model shell because default_shell is configured"
++                );
++            }
++        }
+         if environment.is_remote()
+             && let Some(requested_shell) = args.shell.take()
+         {
+@@ -290,6 +302,7 @@ impl ExecCommandHandler {
+             shell,
+             &shell_mode,
+             turn_environment.config().allow_login_shell,
++            default_shell_configured,
+         )
+         .map_err(FunctionCallError::RespondToModel)?;
+         let command = resolved_command.command;
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+index d834c24..c244939 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+@@ -27,6 +27,43 @@ use tokio::sync::Mutex;
+ 
+ const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
+ 
++#[test]
++fn configured_shell_ignores_model_shell() -> anyhow::Result<()> {
++    let session_shell = Shell {
++        shell_type: ShellType::Sh,
++        shell_path: PathBuf::from("configured/sh.exe"),
++    };
++    let args: ExecCommandArgs =
++        parse_arguments(r#"{"cmd":"echo hello","shell":"powershell","login":false}"#)?;
++    let configured = get_command(
++        &args,
++        Arc::new(session_shell.clone()),
++        &UnifiedExecShellMode::Direct,
++        /*allow_login_shell*/ true,
++        /*default_shell_configured*/ true,
++    )
++    .map_err(anyhow::Error::msg)?;
++    assert_eq!(configured.shell.shell, session_shell);
++    assert_eq!(
++        configured.command,
++        vec!["configured/sh.exe", "-c", "echo hello"]
++    );
++
++    let unconfigured = get_command(
++        &args,
++        Arc::new(session_shell),
++        &UnifiedExecShellMode::Direct,
++        /*allow_login_shell*/ true,
++        /*default_shell_configured*/ false,
++    )
++    .map_err(anyhow::Error::msg)?;
++    assert_eq!(
++        unconfigured.shell.shell,
++        get_shell_by_model_provided_path(&PathBuf::from("powershell"))
++    );
++    Ok(())
++}
++
+ async fn invocation_for_payload(
+     tool_name: &str,
+     call_id: &str,
+@@ -60,6 +97,7 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()>
+         Arc::new(default_user_shell()),
+         &UnifiedExecShellMode::Direct,
+         /*allow_login_shell*/ true,
++        /*default_shell_configured*/ false,
+     )
+     .map_err(anyhow::Error::msg)?;
+     let command = resolved.command;
+@@ -82,6 +120,7 @@ fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
+         Arc::new(default_user_shell()),
+         &UnifiedExecShellMode::Direct,
+         /*allow_login_shell*/ true,
++        /*default_shell_configured*/ false,
+     )
+     .map_err(anyhow::Error::msg)?;
+     let command = resolved.command;
+@@ -127,6 +166,7 @@ fn test_get_command_keeps_path_prepends_after_login_startup() -> anyhow::Result<
+         Arc::clone(&shell),
+         &UnifiedExecShellMode::Direct,
+         /*allow_login_shell*/ true,
++        /*default_shell_configured*/ false,
+     )
+     .map_err(anyhow::Error::msg)?;
+     assert_eq!(
+@@ -193,6 +233,7 @@ fn test_get_command_runs_login_shell_when_path_is_readonly() -> anyhow::Result<(
+         shell,
+         &UnifiedExecShellMode::Direct,
+         /*allow_login_shell*/ true,
++        /*default_shell_configured*/ false,
+     )
+     .map_err(anyhow::Error::msg)?;
+     let command = resolved
+@@ -254,6 +295,7 @@ fn test_get_command_does_not_change_nested_login_or_powershell() -> anyhow::Resu
+             Arc::clone(&shell),
+             &UnifiedExecShellMode::Direct,
+             /*allow_login_shell*/ true,
++            /*default_shell_configured*/ false,
+         )
+         .map_err(anyhow::Error::msg)?;
+         assert_eq!(
+@@ -296,6 +338,7 @@ fn test_get_command_resolves_powershell_by_type() -> anyhow::Result<()> {
+         Arc::new(default_user_shell()),
+         &UnifiedExecShellMode::Direct,
+         /*allow_login_shell*/ true,
++        /*default_shell_configured*/ false,
+     )
+     .map_err(anyhow::Error::msg)?;
+     let expected_shell = get_shell(ShellType::PowerShell)
+@@ -321,6 +364,7 @@ fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()> {
+         Arc::new(default_user_shell()),
+         &UnifiedExecShellMode::Direct,
+         /*allow_login_shell*/ true,
++        /*default_shell_configured*/ false,
+     )
+     .map_err(anyhow::Error::msg)?;
+     let command = resolved.command;
+@@ -339,6 +383,7 @@ fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<(
+         Arc::new(default_user_shell()),
+         &UnifiedExecShellMode::Direct,
+         /*allow_login_shell*/ false,
++        /*default_shell_configured*/ false,
+     )
+     .expect_err("explicit login should be rejected");
+ 
+@@ -412,6 +457,7 @@ fn test_get_command_rejects_explicit_shell_in_zsh_fork_mode() -> anyhow::Result<
+         Arc::new(default_user_shell()),
+         &shell_mode,
+         /*allow_login_shell*/ true,
++        /*default_shell_configured*/ false,
+     )
+     .expect_err("explicit shell should be rejected");
+ 
+diff --git a/codex-rs/core/src/tools/runtimes/unified_exec.rs b/codex-rs/core/src/tools/runtimes/unified_exec.rs
+index 2642a9c..7bf899a 100644
+--- a/codex-rs/core/src/tools/runtimes/unified_exec.rs
++++ b/codex-rs/core/src/tools/runtimes/unified_exec.rs
+@@ -610,11 +610,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
+             ),
+             environment_is_remote,
+         );
+-        let command = if matches!(requested_shell.shell_type, ShellType::PowerShell) {
+-            prefix_powershell_script_with_utf8(&command)
+-        } else {
+-            command
+-        };
++        let command = prefix_utf8_for_shell(command, requested_shell.shell_type);
+         let sidecar_permissions = metrics_sidecar
+             .as_ref()
+             .map(PluginMetricsSidecar::additional_permissions);
+@@ -780,6 +776,14 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
+     }
+ }
+ 
++fn prefix_utf8_for_shell(command: Vec<String>, shell_type: ShellType) -> Vec<String> {
++    if shell_type == ShellType::PowerShell {
++        prefix_powershell_script_with_utf8(&command)
++    } else {
++        command
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -803,6 +807,30 @@ mod tests {
+     use std::time::Duration;
+     use tempfile::tempdir;
+ 
++    #[test]
++    fn utf8_prefix_is_only_applied_to_powershell() {
++        for (shell_type, shell_path) in [
++            (ShellType::Sh, "sh.exe"),
++            (ShellType::Bash, "bash.exe"),
++            (ShellType::Zsh, "zsh.exe"),
++            (ShellType::Cmd, "cmd.exe"),
++            (ShellType::PowerShell, "pwsh.exe"),
++        ] {
++            let command = crate::shell::Shell {
++                shell_type,
++                shell_path: shell_path.into(),
++            }
++            .derive_exec_args("echo hello", false);
++            let actual = prefix_utf8_for_shell(command.clone(), shell_type);
++            if shell_type == ShellType::PowerShell {
++                assert_eq!(actual, prefix_powershell_script_with_utf8(&command));
++                assert_ne!(actual, command);
++            } else {
++                assert_eq!(actual, command);
++            }
++        }
++    }
++
+     fn test_turn_environment(cwd: PathUri) -> TurnEnvironment {
+         TurnEnvironment::new(
+             TurnEnvironmentSelection {
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index 7e22134..a574592 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -1186,6 +1186,12 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
+         exec_permission_approvals_enabled,
+         include_environment_id,
+         include_windows_shell_guidance: should_include_windows_shell_guidance(context.environments),
++        configured_shell_type: turn_context.config.default_shell.and_then(|_| {
++            context
++                .environments
++                .primary()
++                .and_then(|environment| environment.shell.as_ref().map(|shell| shell.shell_type))
++        }),
+     };
+     if features.enabled(Feature::UnifiedExec) {
+         registry.add(ExecCommandHandler::new(options));
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index 395cc95..dc860ff 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -1011,6 +1011,40 @@ async fn exec_command_guidance_follows_executor_platform_and_fallbacks() {
+     }
+ }
+ 
++#[tokio::test]
++async fn configured_windows_sh_guidance_follows_environment_shell() {
++    let plan = probe(|turn| {
++        set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
++        set_feature(turn, Feature::ShellZshFork, /*enabled*/ false);
++        update_config(turn, |config| {
++            config.default_shell = Some(codex_config::config_toml::DefaultShell::Sh);
++        });
++        update_turn_settings_for_test(turn, |settings| {
++            Arc::make_mut(&mut settings.model_info).shell_type = ConfigShellToolType::UnifiedExec;
++        });
++        let TurnEnvironmentState::Ready(environment) = turn
++            .initial_environments
++            .environments
++            .first_mut()
++            .expect("primary environment")
++        else {
++            panic!("primary environment should be ready");
++        };
++        environment.executor_platform_os = Some("windows".to_string());
++        environment.shell = Some(crate::shell::Shell {
++            shell_type: crate::shell::ShellType::Sh,
++            shell_path: "C:/busybox/sh.exe".into(),
++        });
++    })
++    .await;
++    let ToolSpec::Function(tool) = plan.visible_spec("exec_command") else {
++        panic!("expected function tool");
++    };
++    assert!(tool.description.contains("POSIX shell syntax"));
++    assert!(!tool.description.contains("Remove-Item"));
++    assert!(!tool.description.contains("Start-Process"));
++}
++
+ #[tokio::test]
+ async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
+     let remote_environment = probe(|turn| {
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+index a70b8c9..fc26619 100644
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -343,6 +343,8 @@ async fn new_config(
+         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
+         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe,
+         zsh_path: None,
++        default_shell: None,
++        default_shell_path: None,
+         model_reasoning_effort: None,
+         plan_mode_reasoning_effort: None,
+         model_reasoning_summary: None,
+diff --git a/codex-rs/core/src/configured_shell_tests.rs b/codex-rs/core/src/configured_shell_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/codex-rs/core/src/configured_shell_tests.rs
+@@ -0,0 +1,126 @@
++use super::*;
++use crate::config::Config;
++use crate::config::ConfigOverrides;
++use codex_config::config_toml::ConfigToml;
++use codex_features::Feature;
++use codex_utils_absolute_path::AbsolutePathBuf;
++use pretty_assertions::assert_eq;
++
++async fn config(codex_home: &std::path::Path) -> Config {
++    let mut config = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides {
++            cwd: Some(codex_home.to_path_buf()),
++            ..Default::default()
++        },
++        AbsolutePathBuf::try_from(codex_home).unwrap(),
++    )
++    .await
++    .unwrap();
++    config.features.disable(Feature::ShellZshFork).unwrap();
++    config
++}
++
++#[tokio::test]
++async fn unset_default_shell_preserves_upstream_selection() {
++    let home = tempfile::tempdir().unwrap();
++    let mut config = config(home.path()).await;
++    assert_eq!(
++        select_session_shell(&config, None).unwrap(),
++        default_user_shell()
++    );
++    config.default_shell_path = Some(home.path().join("unused-missing-shell.exe"));
++    assert_eq!(
++        select_session_shell(&config, None).unwrap(),
++        default_user_shell()
++    );
++}
++
++#[tokio::test]
++async fn configured_shell_uses_exact_path_before_zsh_fork() {
++    let home = tempfile::tempdir().unwrap();
++    let path = home.path().join("sh.exe");
++    std::fs::write(&path, "").unwrap();
++    let mut config = config(home.path()).await;
++    config.default_shell = Some(DefaultShell::Sh);
++    config.default_shell_path = Some(path.clone());
++    config.features.enable(Feature::ShellZshFork).unwrap();
++    config.zsh_path = None;
++    assert_eq!(
++        select_session_shell(&config, None).unwrap(),
++        Shell {
++            shell_type: ShellType::Sh,
++            shell_path: path,
++        }
++    );
++}
++
++#[tokio::test]
++async fn configured_shell_rejects_missing_directory_and_relative_paths() {
++    let home = tempfile::tempdir().unwrap();
++    let mut config = config(home.path()).await;
++    config.default_shell = Some(DefaultShell::Sh);
++    for path in [
++        home.path().join("missing-sh.exe"),
++        home.path().to_path_buf(),
++        PathBuf::from("relative-sh.exe"),
++    ] {
++        config.default_shell_path = Some(path.clone());
++        let error = select_session_shell(&config, None).unwrap_err().to_string();
++        assert!(error.contains("default_shell_path"));
++        assert!(error.contains(&path.display().to_string()));
++    }
++}
++
++#[tokio::test]
++async fn user_shell_override_precedes_configured_shell() {
++    let home = tempfile::tempdir().unwrap();
++    let mut config = config(home.path()).await;
++    config.default_shell = Some(DefaultShell::Sh);
++    config.default_shell_path = Some(home.path().join("missing-sh.exe"));
++    let shell = default_user_shell();
++    assert_eq!(
++        select_session_shell(&config, Some(shell.clone())).unwrap(),
++        shell
++    );
++}
++
++#[tokio::test]
++async fn configured_shell_without_path_uses_discovery_without_fallback() {
++    let home = tempfile::tempdir().unwrap();
++    let mut config = config(home.path()).await;
++    for (configured, shell_type) in [
++        (DefaultShell::Sh, ShellType::Sh),
++        (DefaultShell::Bash, ShellType::Bash),
++        (DefaultShell::Zsh, ShellType::Zsh),
++        (DefaultShell::Cmd, ShellType::Cmd),
++        (DefaultShell::PowerShell, ShellType::PowerShell),
++    ] {
++        config.default_shell = Some(configured);
++        match get_shell(shell_type) {
++            Some(expected) => assert_eq!(select_session_shell(&config, None).unwrap(), expected),
++            None => {
++                let error = select_session_shell(&config, None).unwrap_err().to_string();
++                assert!(error.contains("default_shell"));
++                assert!(error.contains(shell_type.name()));
++                assert!(error.contains("default_shell_path"));
++            }
++        }
++    }
++}
++
++#[test]
++fn sh_argv_keeps_upstream_login_rules() {
++    let shell = Shell {
++        shell_type: ShellType::Sh,
++        shell_path: PathBuf::from("sh.exe"),
++    };
++    assert_eq!(
++        shell.derive_exec_args("echo hello", false),
++        vec!["sh.exe", "-c", "echo hello"]
++    );
++    assert_eq!(
++        shell.derive_exec_args("echo hello", true),
++        vec!["sh.exe", "-lc", "echo hello"]
++    );
++}
