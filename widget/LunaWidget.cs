@@ -499,7 +499,8 @@ namespace LunaWidget
         readonly HashSet<string> folded = new HashSet<string>();
         readonly HashSet<string> expanded = new HashSet<string>();
         readonly List<Target> targets = new List<Target>();
-        readonly List<KeyValuePair<Rectangle, string>> cardHeads = new List<KeyValuePair<Rectangle, string>>();
+        readonly List<KeyValuePair<Rectangle, string>> cardHeads = new List<KeyValuePair<Rectangle, string>>(); // header rect → session id
+        readonly Dictionary<string, string> cardNames = new Dictionary<string, string>();                      // session id → project name
         List<string> order = new List<string>();
         string pressCard; Point pressAt; string dragCard; int dropIndex = -1;
 
@@ -627,7 +628,7 @@ namespace LunaWidget
         // Draws (or only measures) the whole panel; returns the content height.
         int Draw(Graphics g, bool measure)
         {
-            if (!measure) { targets.Clear(); cardHeads.Clear(); }
+            if (!measure) { targets.Clear(); cardHeads.Clear(); cardNames.Clear(); }
             int pad = S(14), w = Width - 2 * pad, y = pad - (measure ? 0 : scroll);
             var s = data;
             Color status = s == null ? Pal.Sub : s.Alerts.Any(a => a.Error) ? Pal.Err : s.Alerts.Count > 0 ? Pal.Warn : Pal.Ok;
@@ -708,7 +709,7 @@ namespace LunaWidget
             int index = 0;
             foreach (var se in sessions)
             {
-                bool open = !folded.Contains(se.Name);
+                bool open = !folded.Contains(se.Id);
                 int bodyH = open ? SessionBodyHeight(g, se, w) : 0;
                 int h = S(34) + bodyH;
                 if (!measure)
@@ -716,10 +717,10 @@ namespace LunaWidget
                     if (dragCard != null && dropIndex == index)
                         FillRound(g, new Rectangle(pad, y - S(6), w, S(3)), S(1), Pal.Codex);
                     var rect = new Rectangle(pad, y, w, h);
-                    FillRound(g, rect, S(8), se.Name == dragCard ? Pal.CardHover : Pal.Card);
+                    FillRound(g, rect, S(8), se.Id == dragCard ? Pal.CardHover : Pal.Card);
                     var head = new Rectangle(pad, y, w, S(30));
-                    cardHeads.Add(new KeyValuePair<Rectangle, string>(head, se.Name));
-                    targets.Add(new Target { Rect = head, Kind = Hit.Card, Key = se.Name });
+                    cardHeads.Add(new KeyValuePair<Rectangle, string>(head, se.Id)); cardNames[se.Id] = se.Name;
+                    targets.Add(new Target { Rect = head, Kind = Hit.Card, Key = se.Id });
                     TextRenderer.DrawText(g, open ? "" : "", fIcon, new Point(pad + S(10), y + S(11)), Pal.Sub, TextFormatFlags.NoPadding);
                     var running = se.Jobs.Count(j => j.State == "running");
                     var summary = se.Jobs.Count > 0 ? "Codex " + running + (se.Jobs.Count > running ? "+" + (se.Jobs.Count - running) : "") : "";
@@ -774,7 +775,7 @@ namespace LunaWidget
         {
             Color c; Font f; var second = JobSecond(j, out c, out f);
             if (!expanded.Contains(JobKey(j))) return second != null ? S(42) : S(24);
-            int h = S(22) + TextH(g, j.Name, fBody, w - S(40)) - S(16);
+            int h = Math.Max(S(20), TextH(g, j.Name, fBody, NameWidth(g, j, w)) + S(4));
             if (second != null) h += TextH(g, second, f ?? fSmall, w - S(40)) + S(6);
             return h + S(4);
         }
@@ -820,22 +821,36 @@ namespace LunaWidget
             }
         }
 
+        string JobRight(JobView j)
+        {
+            return j.State == "running" ? Fmt.Duration(j.AgeS)
+                : (j.State == "queued" ? "в очереди" : j.State.StartsWith("waiting-") ? "ждёт" : j.State) + " · " + Fmt.Duration(j.AgeS);
+        }
+
+        // The width the job name gets: between the model label and the time on the right. Height and drawing both use it.
+        int NameWidth(Graphics g, JobView j, int w)
+        {
+            var ms = TextRenderer.MeasureText(g, j.Model, fHead, Size.Empty, TextFormatFlags.NoPadding);
+            var rs = TextRenderer.MeasureText(g, JobRight(j), fSmall, Size.Empty, TextFormatFlags.NoPadding);
+            return Math.Max(S(40), w - S(52) - ms.Width - rs.Width);
+        }
+
         void DrawJob(Graphics g, JobView j, int pad, int w, int ry)
         {
             bool running = j.State == "running", exp = expanded.Contains(JobKey(j));
             Color sc; Font sf; var second = JobSecond(j, out sc, out sf);
             var glyphColor = running && j.IdleS >= 900 ? Pal.Err : running && j.IdleS >= 300 ? Pal.Warn : running ? Pal.Ok : Pal.Warn;
             TextRenderer.DrawText(g, running ? "" : "", fIcon, new Point(pad + S(10), ry + S(3)), glyphColor, TextFormatFlags.NoPadding);
-            var right = running ? Fmt.Duration(j.AgeS) : (j.State == "queued" ? "в очереди" : j.State.StartsWith("waiting-") ? "ждёт" : j.State) + " · " + Fmt.Duration(j.AgeS);
+            var right = JobRight(j);
             var rs = TextRenderer.MeasureText(g, right, fSmall, Size.Empty, TextFormatFlags.NoPadding);
             TextRenderer.DrawText(g, right, fSmall, new Point(pad + w - S(12) - rs.Width, ry + S(1)), Pal.Sub, TextFormatFlags.NoPadding);
             TextRenderer.DrawText(g, j.Model, fHead, new Point(pad + S(28), ry), Pal.Codex, TextFormatFlags.NoPadding);
             var ms = TextRenderer.MeasureText(g, j.Model, fHead, Size.Empty, TextFormatFlags.NoPadding);
-            int nameW = w - S(52) - ms.Width - rs.Width;
+            int nameW = NameWidth(g, j, w);
             var nameColor = running ? Pal.Text : Pal.Sub;
             if (exp)
             {
-                int nh = TextH(g, j.Name, fBody, w - S(40));
+                int nh = TextH(g, j.Name, fBody, nameW);
                 TextRenderer.DrawText(g, j.Name, fBody, new Rectangle(pad + S(32) + ms.Width, ry, nameW, nh), nameColor, Wrap);
                 ry += Math.Max(S(20), nh + S(4));
                 if (second != null)
@@ -910,12 +925,15 @@ namespace LunaWidget
             if (pressCard == null) return;
             if (dragCard != null)
             {
-                var names = cardHeads.Select(c => c.Value).ToList();
-                int from = names.IndexOf(dragCard);
+                // Cards are moved by session id (two sessions of one project are two cards); the saved order is by
+                // project name so it survives session restarts.
+                var ids = cardHeads.Select(c => c.Value).ToList();
+                int from = ids.IndexOf(dragCard);
                 if (from >= 0 && dropIndex >= 0)
                 {
-                    names.RemoveAt(from);
-                    names.Insert(Math.Min(names.Count, dropIndex > from ? dropIndex - 1 : dropIndex), dragCard);
+                    ids.RemoveAt(from);
+                    ids.Insert(Math.Min(ids.Count, dropIndex > from ? dropIndex - 1 : dropIndex), dragCard);
+                    var names = ids.Select(id => cardNames.ContainsKey(id) ? cardNames[id] : "").Where(n => n != "").Distinct().ToList();
                     // Keep names not on screen right now after the visible ones, in their old order.
                     order = names.Concat(order.Where(n => !names.Contains(n))).ToList();
                     var st = Settings.Load(); st["order"] = string.Join("\u001F", order); Settings.Save(st);
