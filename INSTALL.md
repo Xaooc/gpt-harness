@@ -106,6 +106,10 @@ claude plugin install luna-panel@luna-local
 The installer already registered the `luna-local` marketplace (`~/.claude/local-plugins`). You can also use
 `/plugin install luna-panel@luna-local`.
 Check: in a NEW session, `/luna` opens the pane. The pane also opens on its own at the first prompt of each session.
+Claude Code runs the pane from its plugin cache (`~/.claude/plugins/cache/luna-local/luna-panel/<version>/`), not
+from `~/.claude/local-plugins/`. After a package update changes the pane, bump its version, then run:
+`claude plugin marketplace update luna-local && claude plugin update luna-panel@luna-local`, then restart sessions.
+Without the update every session keeps running the old pane.
 
 ## 6. Restart and smoke-test
 Hooks load at session start, so close and reopen Claude Code (or start a new session). Then:

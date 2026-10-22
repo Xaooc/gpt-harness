@@ -89,7 +89,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "4b1b1b59cfb0d79cae153305afc6e7665c8b95f45a2d803a7b2257eadd40d800"
+      "sha256": "370589d151d039af46a7de2c6a16d1bea3304684ae5f33d2167079a8655d265f"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
