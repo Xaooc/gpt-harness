@@ -487,89 +487,147 @@ namespace LunaWidget
     {
         static SessionView S(string id, string name) { return new SessionView { Id = id, Name = name }; }
         static string Names(List<SessionView> l) { return string.Join(",", l.Select(x => x.Name + ":" + x.Id)); }
+        static List<CardSlot> Slots(params string[] idName)
+        {
+            return idName.Select(x => { var p = x.Split(':'); return new CardSlot { Id = p[0], Name = p.Length > 1 ? p[1] : "" }; }).ToList();
+        }
 
         public static int Run()
         {
             var fails = new List<string>();
             int n = 0;
             Action<string, string, string> eq = (label, got, want) => { n++; if (got != want) fails.Add(label + ": got " + got + " want " + want); };
-            var none = new List<string>();
             const string NS = "Задания без сессии";
-            // 1. After a restart (all ids new) the saved name order holds, the ownerless card included.
-            var order = new List<string> { "krim", NS, "rpg" };
-            eq("restart keeps order", Names(CardOrder.Apply(new List<SessionView> { S("~no-session", NS), S("n1", "rpg"), S("n2", "krim") }, order, new List<string> { "~no-session", "old1", "old2" })),
+            bool changed;
+
+            // 1. Restart (all ids new) with the ownerless card: everything returns to its slot.
+            var slots = Slots("k0:krim", "~no-session:" + NS, "r0:rpg");
+            eq("restart keeps order", Names(CardOrder.Apply(new List<SessionView> { S("~no-session", NS), S("n1", "rpg"), S("n2", "krim") }, slots, out changed)),
                 "krim:n2," + NS + ":~no-session,rpg:n1");
-            // 2. Interleaved same-name cards survive a restart.
-            order = new List<string> { "rpg", "krim", "rpg" };
-            eq("interleaved survives", Names(CardOrder.Apply(new List<SessionView> { S("a", "rpg"), S("b", "rpg"), S("c", "krim") }, order, none)),
+            // 2. Interleaved same-project cards survive a restart.
+            slots = Slots("o1:rpg", "o2:krim", "o3:rpg");
+            eq("interleaved survives", Names(CardOrder.Apply(new List<SessionView> { S("a", "rpg"), S("b", "rpg"), S("c", "krim") }, slots, out changed)),
                 "rpg:a,krim:c,rpg:b");
-            // 3. While sessions live, the dragged id order decides which rpg card is first.
-            eq("ids pick k-th", Names(CardOrder.Apply(new List<SessionView> { S("a", "rpg"), S("b", "rpg"), S("c", "krim") }, order, new List<string> { "b", "c", "a" })),
+            // 3. Live placed cards keep exactly their order.
+            slots = Slots("b:rpg", "c:krim", "a:rpg");
+            eq("live order kept", Names(CardOrder.Apply(new List<SessionView> { S("a", "rpg"), S("b", "rpg"), S("c", "krim") }, slots, out changed)),
                 "rpg:b,krim:c,rpg:a");
-            // 4. Unknown projects go last in collector order; a third rpg card lands right after the last rpg slot.
-            eq("unknown last", Names(CardOrder.Apply(new List<SessionView> { S("x", "new"), S("a", "rpg"), S("c", "krim"), S("d", "rpg"), S("e", "rpg") }, order, none)),
+            // 4. No free slot: after the project's last slot; unknown projects at the end.
+            slots = Slots("o1:rpg", "o2:krim", "o3:rpg");
+            eq("overflow and unknown", Names(CardOrder.Apply(new List<SessionView> { S("x", "new"), S("a", "rpg"), S("c", "krim"), S("d", "rpg"), S("e", "rpg") }, slots, out changed)),
                 "rpg:a,krim:c,rpg:d,rpg:e,new:x");
-            // 6. Migration from the old one-name-per-project order: live ids keep their exact relative order.
-            eq("migration keeps ids", Names(CardOrder.Apply(new List<SessionView> { S("A", "rpg"), S("B", "krim"), S("C", "rpg") },
-                new List<string> { "rpg", "krim" }, new List<string> { "A", "B", "C" })), "rpg:A,krim:B,rpg:C");
-            // 7. A placed card disappears: the others keep their order instead of sliding into its slot.
-            eq("partial disappearance", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("C", "rpg") },
-                new List<string> { "rpg", "krim", "rpg" }, new List<string> { "A", "B", "C" })), "krim:B,rpg:C");
-            // 8. A new session of a known project joins its project, after the placed cards of that project.
-            eq("new fills free slot", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("N", "rpg"), S("C", "rpg") },
-                new List<string> { "rpg", "krim", "rpg" }, new List<string> { "C", "B" })), "rpg:C,krim:B,rpg:N");
-            // 10. Restart with the fixed ownerless id live: rpg, ownerless, rpg comes back as it was.
-            eq("restart with ownerless", Names(CardOrder.Apply(new List<SessionView> { S("x1", "rpg"), S("~no-session", NS), S("x2", "rpg") },
-                new List<string> { "rpg", NS, "rpg" }, new List<string> { "old1", "~no-session", "old2" })), "rpg:x1," + NS + ":~no-session,rpg:x2");
-            // 9. A new session of an unknown project goes last.
-            eq("new unknown last", Names(CardOrder.Apply(new List<SessionView> { S("Z", "zzz"), S("B", "krim"), S("C", "rpg") },
-                new List<string> { "rpg", "krim" }, new List<string> { "C", "B" })), "rpg:C,krim:B,zzz:Z");
-            // 5. No saved order: collector order unchanged.
-            eq("no order", Names(CardOrder.Apply(new List<SessionView> { S("x", "b"), S("y", "a") }, none, none)), "b:x,a:y");
+            // 5. Nothing saved: collector order.
+            slots = new List<CardSlot>();
+            eq("no order", Names(CardOrder.Apply(new List<SessionView> { S("x", "b"), S("y", "a") }, slots, out changed)), "b:x,a:y");
+            // 6. A placed card disappears: the others stay as they were.
+            slots = Slots("A:rpg", "B:krim", "C:rpg");
+            eq("partial disappearance", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("C", "rpg") }, slots, out changed)), "krim:B,rpg:C");
+            // 7. The reviewer's sequence: A,B,C → C restarts as N → A closes. N keeps C's slot for good.
+            slots = Slots("A:rpg", "B:krim", "C:rpg");
+            eq("restart C as N", Names(CardOrder.Apply(new List<SessionView> { S("A", "rpg"), S("B", "krim"), S("N", "rpg") }, slots, out changed)), "rpg:A,krim:B,rpg:N");
+            eq("binding persisted", changed ? "changed" : "same", "changed");
+            eq("then A closes", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("N", "rpg") }, slots, out changed)), "krim:B,rpg:N");
+            // 8. A new session of a known project takes that project's free slot.
+            slots = Slots("C:rpg", "B:krim", "dead:rpg");
+            eq("new fills free slot", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("N", "rpg"), S("C", "rpg") }, slots, out changed)), "rpg:C,krim:B,rpg:N");
+            // 9. Migration: old name list + id list written together by the same drag (aligned) become slots.
+            var mig = CardOrder.Migrate(new List<string> { "rpg", NS, "rpg" }, new List<string> { "old1", "~no-session", "old2" });
+            eq("migration aligned", Names(CardOrder.Apply(new List<SessionView> { S("x1", "rpg"), S("~no-session", NS), S("x2", "rpg") }, mig, out changed)),
+                "rpg:x1," + NS + ":~no-session,rpg:x2");
+            // 10. Migration from the oldest format (distinct names, longer id list): live ids keep their order.
+            mig = CardOrder.Migrate(new List<string> { "rpg", "krim" }, new List<string> { "A", "B", "C" });
+            eq("migration oldest", Names(CardOrder.Apply(new List<SessionView> { S("A", "rpg"), S("B", "krim"), S("C", "rpg") }, mig, out changed)), "rpg:A,krim:B,rpg:C");
+            // 11. Dragging: move N before B, keeping the dead slot of A where it was.
+            slots = Slots("A:rpg", "B:krim", "N:rpg");
+            CardOrder.Move(slots, "N", "B");
+            eq("drag keeps dead slots", string.Join(",", slots.Select(s => s.Id)), "A,N,B");
+            slots = Slots("A:rpg", "B:krim", "N:rpg");
+            CardOrder.Move(slots, "B", null);
+            eq("drag to end", string.Join(",", slots.Select(s => s.Id)), "A,N,B");
+
             var text = fails.Count == 0 ? "PASS " + n + "/" + n : "FAIL\n" + string.Join("\n", fails);
             try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "LunaWidget.selftest.txt"), text); } catch { }
             return fails.Count == 0 ? 0 : 1;
         }
     }
 
-    // Card order: pure, so --self-test can check it.
+    // A saved place in the panel: which session holds it and which project it belongs to.
+    class CardSlot { public string Id; public string Name; }
+
+    // Card order as a persisted list of places. A live session keeps its place by id. A new session takes the first
+    // free place of its project and keeps it from then on (so it never jumps on the next refresh). A closed session
+    // leaves its place free: nobody moves, and the next session of that project takes it. A session with no free place
+    // is added after its project's last place, or at the end. Pure apart from mutating `slots`; `changed` says save.
     static class CardOrder
     {
-        // One rule for every case: first lay all cards out by the saved per-card name slots (this restores an
-        // arrangement after session restarts, interleaving included); then the live cards the person placed (ids in
-        // idOrder) are re-dealt among the positions they occupy, in idOrder. Their relative order is exactly the
-        // dragged one, a card that disappeared moves nobody, and cards without a known id keep their name slots.
-        public static List<SessionView> Apply(List<SessionView> sessions, List<string> order, List<string> idOrder)
+        const int MaxSlots = 60;
+
+        public static List<SessionView> Apply(List<SessionView> live, List<CardSlot> slots, out bool changed)
         {
-            var arranged = ByNameSlots(sessions, order, idOrder);
-            var placed = arranged.Where(x => idOrder.Contains(x.Id)).OrderBy(x => idOrder.IndexOf(x.Id)).ToList();
-            var result = new List<SessionView>(arranged);
-            int k = 0;
-            for (int i = 0; i < result.Count; i++) if (idOrder.Contains(result[i].Id)) result[i] = placed[k++];
-            return result;
+            changed = false;
+            var liveIds = new HashSet<string>(live.Select(x => x.Id));
+            var bound = new HashSet<string>(slots.Where(s => liveIds.Contains(s.Id)).Select(s => s.Id));
+            foreach (var s in slots)
+            {
+                if (!liveIds.Contains(s.Id)) continue;
+                var name = live.First(x => x.Id == s.Id).Name;
+                if (s.Name != name) { s.Name = name; changed = true; }
+            }
+            var unplaced = new List<SessionView>();
+            foreach (var card in live)
+            {
+                if (bound.Contains(card.Id)) continue;
+                var free = slots.FirstOrDefault(s => s.Name == card.Name && !liveIds.Contains(s.Id));
+                if (free != null) { free.Id = card.Id; bound.Add(card.Id); changed = true; }
+                else unplaced.Add(card);
+            }
+            foreach (var card in unplaced)
+            {
+                int last = slots.FindLastIndex(s => s.Name == card.Name);
+                var slot = new CardSlot { Id = card.Id, Name = card.Name };
+                if (last >= 0) slots.Insert(last + 1, slot); else slots.Add(slot);
+                changed = true;
+            }
+            // Bound the list: drop the oldest free places (from the end) beyond the cap.
+            for (int i = slots.Count - 1; slots.Count > MaxSlots && i >= 0; i--)
+                if (!liveIds.Contains(slots[i].Id)) { slots.RemoveAt(i); changed = true; }
+            var byId = live.GroupBy(x => x.Id).ToDictionary(g => g.Key, g => g.First());
+            return slots.Where(s => byId.ContainsKey(s.Id)).Select(s => byId[s.Id]).ToList();
         }
 
-        // Per-card name slots: the k-th card of a project takes the k-th entry of that name in `order`.
-        static List<SessionView> ByNameSlots(List<SessionView> sessions, List<string> order, List<string> idOrder)
+        // Moves the dragged card's place before the place of `beforeId` (null = after the last live place), leaving
+        // free places of closed sessions where they are.
+        public static void Move(List<CardSlot> slots, string draggedId, string beforeId)
         {
-            // `order` lists project names, one entry per card, duplicates allowed ("rpg, kriminalist, rpg"): the k-th card of
-            // a project takes the k-th slot of that name, so an interleaved arrangement survives session restarts. Among
-            // cards of one project, the dragged order (idOrder, valid while those sessions live) decides who is k-th.
-            // Projects not in `order` go last, in the collector's order.
-            var indexed = sessions.Select((x, i) => new { x, i }).ToList();
-            var slot = new Dictionary<SessionView, double>();
-            foreach (var group in indexed.GroupBy(p => p.x.Name))
+            int from = slots.FindIndex(s => s.Id == draggedId);
+            if (from < 0) return;
+            var slot = slots[from];
+            slots.RemoveAt(from);
+            int at = beforeId == null ? slots.Count : slots.FindIndex(s => s.Id == beforeId);
+            slots.Insert(at < 0 ? slots.Count : at, slot);
+        }
+
+        // From the two older settings: names and ids written together by one drag (aligned by index), or the oldest
+        // distinct-name list (then the ids keep their order and the names become free places after them).
+        public static List<CardSlot> Migrate(List<string> names, List<string> ids)
+        {
+            if (names.Count == ids.Count) return ids.Select((id, i) => new CardSlot { Id = id, Name = names[i] }).ToList();
+            return ids.Select(id => new CardSlot { Id = id, Name = "" })
+                .Concat(names.Select((nm, i) => new CardSlot { Id = "~free-" + i, Name = nm })).ToList();
+        }
+
+        public static string Serialize(List<CardSlot> slots)
+        {
+            return string.Join("\u001F", slots.Select(s => s.Id + "\u001E" + s.Name));
+        }
+
+        public static List<CardSlot> Parse(string text)
+        {
+            return text.Split('\u001F').Where(x => x != "").Select(x =>
             {
-                var cards = group.OrderBy(p => idOrder.IndexOf(p.x.Id) >= 0 ? idOrder.IndexOf(p.x.Id) : int.MaxValue)
-                    .ThenBy(p => p.i).ToList();
-                var positions = order.Select((n, k) => new { n, k }).Where(z => z.n == group.Key).Select(z => (double)z.k).ToList();
-                for (int m = 0; m < cards.Count; m++)
-                {
-                    slot[cards[m].x] = positions.Count == 0 ? 1e9 + cards[m].i
-                        : m < positions.Count ? positions[m] : positions[positions.Count - 1] + 0.001 * (m - positions.Count + 1);
-                }
-            }
-            return indexed.OrderBy(p => slot[p.x]).ThenBy(p => p.i).Select(p => p.x).ToList();
+                var i = x.IndexOf('\u001E');
+                return i < 0 ? new CardSlot { Id = x, Name = "" } : new CardSlot { Id = x.Substring(0, i), Name = x.Substring(i + 1) };
+            }).ToList();
         }
     }
 
@@ -594,8 +652,7 @@ namespace LunaWidget
         readonly List<Target> targets = new List<Target>();
         readonly List<KeyValuePair<Rectangle, string>> cardHeads = new List<KeyValuePair<Rectangle, string>>(); // header rect → session id
         readonly Dictionary<string, string> cardNames = new Dictionary<string, string>();                      // session id → project name
-        List<string> order = new List<string>();   // project names: the fallback order, survives session restarts
-        List<string> idOrder = new List<string>(); // session ids: the exact order the person dragged, while those sessions live
+        List<CardSlot> slots = new List<CardSlot>(); // saved places of the session cards (see CardOrder)
         string pressCard; Point pressAt; string dragCard; int dropIndex = -1;
 
         Font fTitle, fHead, fBody, fSmall, fIcon, fMono;
@@ -613,8 +670,14 @@ namespace LunaWidget
             var st = Settings.Load(); string v; int n;
             if (st.TryGetValue("w", out v) && int.TryParse(v, out n)) userW = n;
             if (st.TryGetValue("h", out v) && int.TryParse(v, out n)) userH = n;
-            if (st.TryGetValue("order", out v)) order = v.Split('\u001F').Where(x => x != "").ToList();
-            if (st.TryGetValue("idorder", out v)) idOrder = v.Split('\u001F').Where(x => x != "").ToList();
+            if (st.TryGetValue("cards", out v)) slots = CardOrder.Parse(v);
+            else
+            {
+                // Settings from earlier builds: a name list and an id list.
+                var oldNames = st.TryGetValue("order", out v) ? v.Split('\u001F').Where(x => x != "").ToList() : new List<string>();
+                var oldIds = st.TryGetValue("idorder", out v) ? v.Split('\u001F').Where(x => x != "").ToList() : new List<string>();
+                slots = CardOrder.Migrate(oldNames, oldIds);
+            }
             Width = userW > 0 ? userW : S(380); Height = userH > 0 ? userH : S(200);
             if (st.TryGetValue("x", out v) && st.ContainsKey("y")) { int x, y; if (int.TryParse(v, out x) && int.TryParse(st["y"], out y)) Location = new Point(x, y); }
             Deactivate += (s, e) => { if (!Pinned) Hide(); };
@@ -689,7 +752,18 @@ namespace LunaWidget
         }
 
         // The session order the person chose (by project name); new names keep the collector's order after them.
-        List<SessionView> Ordered(List<SessionView> sessions) { return CardOrder.Apply(sessions, order, idOrder); }
+        List<SessionView> Ordered(List<SessionView> sessions)
+        {
+            bool changed;
+            var result = CardOrder.Apply(sessions, slots, out changed);
+            if (changed) SaveSlots();
+            return result;
+        }
+
+        void SaveSlots()
+        {
+            var st = Settings.Load(); st["cards"] = CardOrder.Serialize(slots); st.Remove("order"); st.Remove("idorder"); Settings.Save(st);
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -1015,21 +1089,16 @@ namespace LunaWidget
             if (pressCard == null) return;
             if (dragCard != null)
             {
-                // Cards are moved by session id (two sessions of one project are two cards); the saved order is by
-                // project name so it survives session restarts.
+                // The card's place moves before the card now at the drop slot (or after the last one); free places of
+                // closed sessions stay where they are.
                 var ids = cardHeads.Select(c => c.Value).ToList();
                 int from = ids.IndexOf(dragCard);
                 if (from >= 0 && dropIndex >= 0)
                 {
-                    ids.RemoveAt(from);
-                    ids.Insert(Math.Min(ids.Count, dropIndex > from ? dropIndex - 1 : dropIndex), dragCard);
-                    // One entry per card (duplicates kept): the k-th "rpg" entry is the slot of the k-th rpg card.
-                    var names = ids.Select(id => cardNames.ContainsKey(id) ? cardNames[id] : "").Where(n => n != "").ToList();
-                    // Keep names not on screen right now after the visible ones, in their old order.
-                    order = names.Concat(order.Where(n => !names.Contains(n))).ToList();
-                    idOrder = ids;
-                    var st = Settings.Load(); st["order"] = string.Join("\u001F", order); st["idorder"] = string.Join("\u001F", idOrder);
-                    Settings.Save(st);
+                    var others = ids.Where(id => id != dragCard).ToList();
+                    int at = Math.Min(others.Count, dropIndex > from ? dropIndex - 1 : dropIndex);
+                    CardOrder.Move(slots, dragCard, at < others.Count ? others[at] : null);
+                    SaveSlots();
                 }
             }
             else if (!folded.Remove(pressCard)) folded.Add(pressCard);
