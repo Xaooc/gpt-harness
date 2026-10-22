@@ -516,8 +516,11 @@ namespace LunaWidget
             eq("partial disappearance", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("C", "rpg") },
                 new List<string> { "rpg", "krim", "rpg" }, new List<string> { "A", "B", "C" })), "krim:B,rpg:C");
             // 8. A new session of a known project joins its project, after the placed cards of that project.
-            eq("new joins project", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("N", "rpg"), S("C", "rpg") },
-                new List<string> { "rpg", "krim", "rpg" }, new List<string> { "C", "B" })), "rpg:C,rpg:N,krim:B");
+            eq("new fills free slot", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("N", "rpg"), S("C", "rpg") },
+                new List<string> { "rpg", "krim", "rpg" }, new List<string> { "C", "B" })), "rpg:C,krim:B,rpg:N");
+            // 10. Restart with the fixed ownerless id live: rpg, ownerless, rpg comes back as it was.
+            eq("restart with ownerless", Names(CardOrder.Apply(new List<SessionView> { S("x1", "rpg"), S("~no-session", NS), S("x2", "rpg") },
+                new List<string> { "rpg", NS, "rpg" }, new List<string> { "old1", "~no-session", "old2" })), "rpg:x1," + NS + ":~no-session,rpg:x2");
             // 9. A new session of an unknown project goes last.
             eq("new unknown last", Names(CardOrder.Apply(new List<SessionView> { S("Z", "zzz"), S("B", "krim"), S("C", "rpg") },
                 new List<string> { "rpg", "krim" }, new List<string> { "C", "B" })), "rpg:C,krim:B,zzz:Z");
@@ -532,30 +535,21 @@ namespace LunaWidget
     // Card order: pure, so --self-test can check it.
     static class CardOrder
     {
-        // Live cards the person placed (ids in idOrder) keep exactly their relative order; a card that disappears moves
-        // nobody. Cards without a known id (new sessions, or everything after a restart) are slotted in by project name:
-        // after the last card of the same project, else at their project's place in `order`, else at the end.
+        // One rule for every case: first lay all cards out by the saved per-card name slots (this restores an
+        // arrangement after session restarts, interleaving included); then the live cards the person placed (ids in
+        // idOrder) are re-dealt among the positions they occupy, in idOrder. Their relative order is exactly the
+        // dragged one, a card that disappeared moves nobody, and cards without a known id keep their name slots.
         public static List<SessionView> Apply(List<SessionView> sessions, List<string> order, List<string> idOrder)
         {
-            var known = sessions.Where(x => idOrder.Contains(x.Id)).OrderBy(x => idOrder.IndexOf(x.Id)).ToList();
-            if (known.Count == 0) return ByNameSlots(sessions, order, idOrder);
-            Func<string, int> rank = n => { var k = order.IndexOf(n); return k < 0 ? int.MaxValue : k; };
-            var result = new List<SessionView>(known);
-            var unknown = sessions.Select((x, i) => new { x, i }).Where(p => !idOrder.Contains(p.x.Id))
-                .OrderBy(p => rank(p.x.Name)).ThenBy(p => p.i).Select(p => p.x).ToList();
-            foreach (var u in unknown)
-            {
-                int last = result.FindLastIndex(r => r.Name == u.Name);
-                if (last >= 0) { result.Insert(last + 1, u); continue; }
-                int p = rank(u.Name);
-                int at = p == int.MaxValue ? -1 : result.FindIndex(r => rank(r.Name) > p);
-                if (at < 0) result.Add(u); else result.Insert(at, u);
-            }
+            var arranged = ByNameSlots(sessions, order, idOrder);
+            var placed = arranged.Where(x => idOrder.Contains(x.Id)).OrderBy(x => idOrder.IndexOf(x.Id)).ToList();
+            var result = new List<SessionView>(arranged);
+            int k = 0;
+            for (int i = 0; i < result.Count; i++) if (idOrder.Contains(result[i].Id)) result[i] = placed[k++];
             return result;
         }
 
-        // No live card has a known id (e.g. right after restarting every session): per-card name slots, so an
-        // interleaved arrangement ("rpg, kriminalist, rpg") comes back as it was.
+        // Per-card name slots: the k-th card of a project takes the k-th entry of that name in `order`.
         static List<SessionView> ByNameSlots(List<SessionView> sessions, List<string> order, List<string> idOrder)
         {
             // `order` lists project names, one entry per card, duplicates allowed ("rpg, kriminalist, rpg"): the k-th card of
