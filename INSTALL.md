@@ -111,6 +111,27 @@ from `~/.claude/local-plugins/`. After a package update changes the pane, bump i
 `claude plugin marketplace update luna-local && claude plugin update luna-panel@luna-local`, then restart sessions.
 Without the update every session keeps running the old pane.
 
+## 5b. Luna tray widget
+A small native Windows app, ~25 MB RAM. It shows the same view as the pane, outside Claude Code, and does not
+depend on which session is open.
+
+**What it does.**
+- A tray icon by the clock:
+  - its colour is the overall state: green OK, amber needs a look, red stuck or out of memory;
+  - a number on it is the count of running Codex jobs.
+- Left click opens a flyout with everything that needs attention, resources (RAM, Claude and Codex limits, the
+  daemon) and every session with its Claude status and Codex jobs. Click outside it, or press Esc, to hide it.
+- The pin button turns the flyout into a widget that stays on screen and can be dragged.
+- The right-click menu has: pin, always-on-top, start with Windows, refresh, exit.
+
+**Build and start.** No SDK is needed; it compiles with the C# compiler that ships with Windows:
+```bash
+cmd //c "$(cygpath -w widget/build-widget.cmd)"     # → %USERPROFILE%\.claude\bin\luna-widget\LunaWidget.exe
+start "" "$USERPROFILE/.claude/bin/luna-widget/LunaWidget.exe"
+```
+"Start with Windows" writes the user's Run registry key. Leave that to the user, via the widget's right-click menu.
+`LunaWidget.exe --render out.png` draws the panel once into an image, for checks.
+
 ## 6. Restart and smoke-test
 Hooks load at session start, so close and reopen Claude Code (or start a new session). Then:
 ```bash

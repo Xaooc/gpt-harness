@@ -1,6 +1,6 @@
 {
   "name": "luna-panel",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Live pane: RAM, Claude and Codex limits, Luna daemon, running Codex jobs and the Codex build",
   "types": "./types/index.d.ts"
 }

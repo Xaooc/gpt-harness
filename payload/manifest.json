@@ -89,7 +89,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "7484805f743085b8dbd7db421d463d588e6709e1a330bfbf5a57767307136f80"
+      "sha256": "05b6808829cbef2c1528f7d0f3bae18c4ff9e9d6999b15043c5fc5774d937809"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
@@ -101,7 +101,7 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "11924472b10c2db3cb72c180da14ed1f9a19f462d290dd70a060d3c62c54520d"
+      "sha256": "a7bbeaa2b29f7062b86a10a60566be567bc3ebb859e88de90770550bdb174f80"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",
@@ -119,7 +119,7 @@
       "src": "claude/local-plugins/luna-panel/types/index.d.ts",
       "dest": "local-plugins/luna-panel/types/index.d.ts",
       "kind": "file",
-      "sha256": "ec1e6ec1e6273d79b4093c7c462979259127df123cead8c05926046351e5e5ad"
+      "sha256": "0210da5d36d8713440c598bc913f8c304d534c04b3503ec8b12d616827bd6eda"
     },
     {
       "src": "claude/scripts/heavy-gate.mjs",

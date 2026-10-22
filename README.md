@@ -13,7 +13,7 @@ installer.
 | Luna daemon and wrappers (`luna.sh`, `luna-daemon.mjs`, …) | Every Codex job from every session runs as a thread of one shared `codex app-server`, scheduled fairly, gated by RAM, with a stall watchdog |
 | Heavy-command gate (`heavy-gate.mjs`) | At most 2 heavy commands machine-wide, and only while RAM is free. This protects the PC from freezing |
 | Broker reaper and Codex plugin patches | Fix process leaks in the review gate and enable its sandbox |
-| Luna pane (`/luna`) | Live status: RAM, Claude/Codex limits, jobs per session |
+| Luna pane (`/luna`) and tray widget (`widget/`) | Live status: RAM, Claude/Codex limits, jobs per session — inside Claude Code and as a Windows tray widget |
 | **Self-learning** (after google-research/harness2), see [SELF-LEARNING.md](SELF-LEARNING.md) | Collects corrections and outcomes, proposes rule edits daily, filtered by code and a critic, with rollback |
 | `codex-build/` | Build of Codex 0.162.1 with the busybox patch, so commands run in a 6 MB shell instead of PowerShell |
 | Global `CLAUDE.md` | The owner's rules, as-is |

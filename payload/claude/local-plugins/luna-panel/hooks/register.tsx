@@ -125,6 +125,7 @@ async function pollOnce($: EngineInterface): Promise<void> {
   let claude: ClaudeLimit[] = []
   try {
     claude = (await $.session.usage()).rateLimits ?? []
+    if (claude.length) lastLimits = claude
   } catch {
     // no reading yet
   }
@@ -155,6 +156,8 @@ const beat: Omit<SessionBeat, 'v' | 'sessionId' | 'name' | 'cwd' | 'updatedAt'> 
   state: 'idle', tool: null, turnSince: 0, idleSince: Date.now(), agents: [], cwd: '',
 }
 let beatSessionId = ''
+// Claude rate limits as this session last read them, shared through the heartbeat (the tray widget shows them).
+let lastLimits: ClaudeLimit[] = []
 
 function oneLine(text: unknown, max = 80): string {
   const first = String(text ?? '').split(/\r?\n/)[0] ?? ''
@@ -289,6 +292,7 @@ async function beatPayload($: EngineInterface): Promise<string> {
   const out: SessionBeat = {
     v: 1, sessionId: beatSessionId, name: sessionName(beat.cwd), cwd: beat.cwd, updatedAt: Date.now(),
     state: beat.state, tool: beat.tool, turnSince: beat.turnSince, idleSince: beat.idleSince, agents: beat.agents,
+    ...(lastLimits.length ? { limits: lastLimits } : {}),
   }
   return JSON.stringify(out)
 }

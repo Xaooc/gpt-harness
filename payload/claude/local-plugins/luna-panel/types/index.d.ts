@@ -63,6 +63,8 @@ export type SessionBeat = {
   idleSince: number
   /** Claude subagents currently running in that session. */
   agents: { id: string; description: string; since: number }[]
+  /** Claude rate limits as this session last read them (same for all sessions of one account). */
+  limits?: ClaudeLimit[]
 }
 
 export type Snapshot = {
