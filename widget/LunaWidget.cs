@@ -216,7 +216,8 @@ namespace LunaWidget
             foreach (var id in ids)
             {
                 var b = beats.FirstOrDefault(x => Str(x, "sessionId") == id);
-                var sv = new SessionView { Id = id, Jobs = jobs.Where(x => x.Owner == id).ToList() };
+                // The ownerless group gets a fixed non-empty id: saved orders drop empty entries, and the card must keep its slot.
+                var sv = new SessionView { Id = id == "" ? "~no-session" : id, Jobs = jobs.Where(x => (x.Owner ?? "") == id).ToList() };
                 double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
                 if (b != null && now - Num(b, "updatedAt", 0) < 15 * 60 * 1000)
                 {
