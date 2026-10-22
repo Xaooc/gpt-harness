@@ -174,6 +174,63 @@ function toolDetail(tool: string, input: Record<string, unknown>): string {
   return ''
 }
 
+// ---- What needs the person (the pane's top block and the band above the prompt) ----------------------------
+type Alert = { level: 'error' | 'warning'; text: string }
+
+function attentionItems(d: PanelData): Alert[] {
+  const s = d.snapshot
+  const out: Alert[] = []
+  if (!s) return d.error ? [{ level: 'warning', text: 'Нет данных о Codex' }] : []
+  const free = s.ram.freeMb
+  if (free < 1024) out.push({ level: 'error', text: `Мало памяти: ${gb(free)} — новые задания ждут` })
+  else if (free < 2048) out.push({ level: 'warning', text: `Памяти немного: ${gb(free)}` })
+  for (const j of s.jobs) {
+    if (j.state === 'running' && (j.idleS ?? 0) >= 900) {
+      out.push({ level: 'error', text: `${modelLabel(j.model)} «${jobName(j.out)}» молчит ${duration(j.idleS ?? 0)} — похоже, завис` })
+    }
+  }
+  const starved = s.jobs.filter(j => j.state === 'waiting-ram').length
+  if (starved) out.push({ level: 'warning', text: `${starved} ${starved === 1 ? 'задание ждёт' : 'заданий ждут'} памяти` })
+  if (s.daemon.running && s.daemon.healthy === false) out.push({ level: 'error', text: 'Демон Codex не отвечает' })
+  else if (s.daemon.running && s.daemon.appServer === 'down') out.push({ level: 'warning', text: 'Codex перезапускается' })
+  const limit = (label: string, pct: number) => {
+    if (pct >= 90) out.push({ level: 'error', text: `Лимит ${label}: ${Math.round(pct)}%` })
+    else if (pct >= 75) out.push({ level: 'warning', text: `Лимит ${label}: ${Math.round(pct)}%` })
+  }
+  for (const l of d.claude) if (l.kind !== 'spend_limit') limit(`Claude · ${windowName(l.kind, null)}`, l.percentUsed)
+  const c = s.codexLimits
+  if (c?.reached) out.push({ level: 'error', text: 'Лимит Codex исчерпан' })
+  else {
+    if (c?.primary) limit(`Codex · ${windowName('', c.primary.windowMins)}`, c.primary.usedPercent)
+    if (c?.secondary) limit(`Codex · ${windowName('', c.secondary.windowMins)}`, c.secondary.usedPercent)
+  }
+  if (d.error) out.push({ level: 'warning', text: `Данные не обновляются: ${d.error.slice(0, 80)}` })
+  return out.sort((a, b) => (a.level === 'error' ? 0 : 1) - (b.level === 'error' ? 0 : 1))
+}
+
+// A shell command as a person would describe it: "запускает тесты", not "C:/…/sh.exe -c npx vitest run …".
+function describeCommand(raw: string): { text: string; isRaw: boolean } {
+  let cmd = raw.trim().replace(/^\S*?(?:sh|bash|pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*/i, '').replace(/^["']|["']$/g, '')
+  cmd = cmd.replace(/^(?:cd\s+\S+\s*&&\s*)+/, '').trim()
+  const has = (re: RegExp) => re.test(cmd)
+  if (has(/\b(pytest|vitest|jest|mocha|playwright test|cargo test|go test|node --test)\b|\b(npm|pnpm|yarn|bun) (run )?test/)) {
+    return { text: 'запускает тесты', isRaw: false }
+  }
+  if (has(/\b(tsc|eslint|ruff|mypy|pyright|cargo (check|clippy)|biome|prettier --check)\b/)) {
+    return { text: 'проверяет типы и стиль', isRaw: false }
+  }
+  if (has(/\b(npm|pnpm|yarn|bun) (install|ci|i|add)\b|\buv (sync|pip)\b|\bpip install\b/)) {
+    return { text: 'ставит зависимости', isRaw: false }
+  }
+  if (has(/\b(vite build|webpack|cargo build|next build)\b|\b(npm|pnpm|yarn) (run )?build\b/)) {
+    return { text: 'собирает проект', isRaw: false }
+  }
+  if (has(/^(rg|grep|fd|find)\b/)) return { text: 'ищет в коде', isRaw: false }
+  if (has(/^(cat|sed -n|head|tail|wc|ls|type|nl)\b/)) return { text: 'читает файлы', isRaw: false }
+  if (has(/^git\s+(\S+)/)) return { text: `git ${cmd.split(/\s+/)[1]}`, isRaw: false }
+  return { text: cmd, isRaw: true }
+}
+
 // A session that sends no heartbeat (started before this plugin version) is still named after the project its
 // Codex jobs work in: `C:/rpg/.claude/worktrees/x` → rpg; jobs in sibling folders `C:/rpg-wt/a`, `C:/rpg-wt/b` → rpg-wt.
 function projectOfJobs(jobs: Job[]): string {
@@ -425,7 +482,8 @@ export const register: Register = on => {
       // Silence is the stall signal: amber after 5 min, red after 15 (the wrapper's own watchdog fires at 15).
       const quiet = idle !== null && idle >= 900 ? 'error' : idle !== null && idle >= 300 ? 'warning' : null
       const act = j.activity
-      const doing = !isRunning || !act ? '' : act.kind === 'command' ? `выполняет: ${act.text}`
+      const cmd = act?.kind === 'command' ? describeCommand(act.text) : null
+      const doing = !isRunning || !act ? '' : cmd ? (cmd.isRaw ? `выполняет: ${cmd.text}` : cmd.text)
         : act.kind === 'thinking' ? 'думает' : act.kind === 'editing' ? `правит${act.text ? `: ${act.text}` : ' файлы'}`
         : act.kind === 'writing' ? 'пишет ответ' : act.kind === 'starting' ? 'запускается' : ''
       return (
@@ -442,7 +500,7 @@ export const register: Register = on => {
               {'   '}тишина {duration(idle ?? 0)}{quiet === 'error' ? ' — похоже, завис' : ' — возможно, завис'}
             </Text>
           ) : doing ? (
-            <Text size="caption" color="subtle" mono={act?.kind === 'command'} wrap="truncate-end">{'   '}{doing}</Text>
+            <Text size="caption" color="subtle" mono={!!cmd?.isRaw} wrap="truncate-end">{'   '}{doing}</Text>
           ) : null}
         </Box>
       )
@@ -485,71 +543,79 @@ export const register: Register = on => {
     const orphans = jobs.filter(j => !j.owner)
     const showBuild = snap.build && (snap.build.building || !snap.build.exeAt)
 
+    const alerts = attentionItems(d)
+    const hasError = alerts.some(a => a.level === 'error')
+    const statusColor = alerts.length === 0 ? 'success' : hasError ? 'error' : 'warning'
+    const statusText = alerts.length === 0 ? 'всё в порядке' : `требует внимания · ${alerts.length}`
+    const runningAll = jobs.filter(j => j.state === 'running').length
+    const waitingAll = jobs.length - runningAll
+    const daemonColor = !daemon.running ? 'subtle' : daemon.healthy === false ? 'error'
+      : daemon.appServer === 'down' ? 'warning' : 'success'
+    const daemonText = !daemon.running ? 'спит, проснётся с первым заданием'
+      : daemon.healthy === false ? 'не отвечает'
+      : daemon.appServer === 'down' ? 'Codex перезапускается'
+      : `${daemon.runningJobs ?? 0}${daemon.max ? `/${daemon.max}` : ''} в работе · очередь ${daemon.queuedJobs ?? 0}`
+
+    // One resource: label on the left, value and a short meter on the right, the reset time under it when it matters.
+    const ResourceRow = ({ label, value, pct, color, hint }: {
+      label: string; value: string; pct: number; color: string; hint?: string
+    }) => (
+      <Box flexDirection="column">
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+          <Text size="footnote">{label}</Text>
+          <Box flexDirection="row" alignItems="center" gap={1}>
+            <Text size="footnote" tabular weight="medium" color={color}>{value}</Text>
+            <Meter percent={pct} color={color} width={10} />
+          </Box>
+        </Box>
+        {hint ? <Text size="caption" color="subtle">{hint}</Text> : null}
+      </Box>
+    )
+
     return (
       <Box flexDirection="column" paddingX={1} paddingTop={1}>
-        <Card id="memory" title="Память" summary={`${gb(free)} свободно`} meter={{ percent: usedPct, color: ramColor }}>
-          {free < 1024 ? <Text size="caption" color="error">Мало памяти: новые задачи ждут в очереди</Text> : null}
-          <Row label="Всего" detail={gb(snap.ram.totalMb)} />
-          <Row label="Занято" detail={`${Math.round(usedPct)}%`} />
-        </Card>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center" marginBottom={1} gap={1}>
+          <Box flexDirection="row" alignItems="center" gap={1}>
+            <Text weight="semibold">Luna</Text>
+            <Text size="footnote" color={statusColor}>● {statusText}</Text>
+          </Box>
+          <Text size="caption" color="subtle" tabular>{new Date(now).toLocaleTimeString('ru-RU')}</Text>
+        </Box>
 
-        <Card
-          id="limits"
-          title="Лимиты"
-          summary={allPct.some(p => p > 0) ? `до ${Math.round(worst)}%` : 'нет данных'}
-          meter={allPct.some(p => p > 0) ? { percent: worst, color: severity(worst) } : undefined}
-        >
-          {claudeLimits.length === 0 ? <Row label="Claude" detail="после первого ответа" dim /> : null}
+        {alerts.length > 0 ? (
+          <Box flexDirection="column" borderStyle="round" borderColor="promptBorder" paddingX={1} paddingY={1}
+            marginBottom={1} gap={1}>
+            {alerts.map(a => <Text size="footnote" color={a.level} wrap="truncate-end">● {a.text}</Text>)}
+          </Box>
+        ) : null}
+
+        <Card id="resources" title="Ресурсы"
+          summary={`ОЗУ ${gb(free)} · Codex ${runningAll}${waitingAll ? `+${waitingAll}` : ''}`}>
+          <ResourceRow label="Память" value={`${gb(free)} свободно`} pct={usedPct} color={ramColor} />
           {claudeLimits.map(l => (
-            <LimitRow label={`Claude · ${windowName(l.kind, null)}`} pct={l.percentUsed} resets={l.resetsAt} />
+            <ResourceRow label={`Claude · ${windowName(l.kind, null)}`} value={`${Math.round(l.percentUsed)}%`}
+              pct={l.percentUsed} color={severity(l.percentUsed)}
+              hint={l.percentUsed >= 70 ? resetsIn(l.resetsAt ?? null, now) : undefined} />
           ))}
-          {!codex ? <Row label="Codex" detail="когда запустится демон" dim /> : null}
+          {claudeLimits.length === 0 ? <Row label="Claude" detail="после первого ответа" dim /> : null}
           {codex?.primary ? (
-            <LimitRow label={`Codex · ${windowName('', codex.primary.windowMins)}`} pct={codex.primary.usedPercent}
-              resets={codex.primary.resetsAt} />
+            <ResourceRow label={`Codex · ${windowName('', codex.primary.windowMins)}`}
+              value={`${Math.round(codex.primary.usedPercent)}%`} pct={codex.primary.usedPercent}
+              color={severity(codex.primary.usedPercent)}
+              hint={codex.primary.usedPercent >= 70 ? resetsIn(codex.primary.resetsAt, now) : undefined} />
           ) : null}
           {codex?.secondary ? (
-            <LimitRow label={`Codex · ${windowName('', codex.secondary.windowMins)}`} pct={codex.secondary.usedPercent}
-              resets={codex.secondary.resetsAt} />
+            <ResourceRow label={`Codex · ${windowName('', codex.secondary.windowMins)}`}
+              value={`${Math.round(codex.secondary.usedPercent)}%`} pct={codex.secondary.usedPercent}
+              color={severity(codex.secondary.usedPercent)}
+              hint={codex.secondary.usedPercent >= 70 ? resetsIn(codex.secondary.resetsAt, now) : undefined} />
           ) : null}
-          {codex ? (
-            <Text size="caption" color={codex.reached ? 'error' : 'subtle'}>
-              {codex.reached ? `Лимит Codex достигнут · ` : ''}{codex.planType ? `${codex.planType} · ` : ''}
-              обновлено {duration(codex.ageS)} назад
-            </Text>
-          ) : null}
-        </Card>
-
-        <Card
-          id="daemon"
-          title="Демон Codex"
-          summary={!daemon.running ? 'спит'
-            : daemon.appServer === 'down' ? 'перезапускается'
-            : `${daemon.runningJobs ?? 0}${daemon.max ? `/${daemon.max}` : ''} в работе · очередь ${daemon.queuedJobs ?? 0}`}
-        >
-          {!daemon.running ? (
-            <Text size="caption" color="subtle">Запустится сам с первым заданием, засыпает после 10 минут простоя</Text>
-          ) : (
-            <Box flexDirection="column">
-              <Row label="Состояние" detail={daemon.healthy === false ? 'не отвечает'
-                : daemon.appServer === 'down' ? 'Codex перезапускается' : 'работает'} />
-              {daemon.uptimeS != null ? <Row label="Запущен" detail={`${duration(daemon.uptimeS)} назад`} /> : null}
-              {daemon.max ? <Row label="Предел" detail={`${daemon.max} заданий одновременно`} /> : null}
-              {(daemon.owners ?? []).filter(o => o.running + o.queued > 0).map(o => {
-                const beat = beats.find(b => b.sessionId === o.owner)
-                const name = o.owner === d.sessionId ? 'эта сессия'
-                  : beat?.name || `сессия ${o.owner.slice(0, 8)}`
-                return (
-                  <Row glyph="▸" label={name}
-                    detail={`${o.running} в работе${o.queued ? ` · ${o.queued} ждут` : ''}`} />
-                )
-              })}
-            </Box>
-          )}
+          {!codex ? <Row label="Codex" detail="лимиты появятся с первым заданием" dim /> : null}
+          <Row glyph="◆" glyphColor={daemonColor} label="Демон Codex" detail={daemonText} />
         </Card>
 
         {groups.length === 0 && orphans.length === 0 ? (
-          <Card id="sessions-empty" title="Сессии" summary="нет данных" />
+          <Text size="footnote" color="subtle">Заданий Codex нет. Сессии появятся здесь, когда начнут работать.</Text>
         ) : null}
 
         {groups.map(g => {
@@ -559,9 +625,9 @@ export const register: Register = on => {
           const name = b?.name || projectOfJobs(g.jobs)
           const title = (name || (isMe ? 'Эта сессия' : 'Без папки')) + (isMe && name ? ' · эта' : '')
           const running = g.jobs.filter(j => j.state === 'running').length
-          const codex = g.jobs.length ? ` · Codex ${running}${g.jobs.length > running ? `+${g.jobs.length - running}` : ''}` : ''
+          const codexPart = g.jobs.length ? ` · Codex ${running}${g.jobs.length > running ? `+${g.jobs.length - running}` : ''}` : ''
           return (
-            <Card id={`s-${g.id}`} title={title} summary={`${claudeSummary(b, stale, now)}${codex}`}>
+            <Card id={`s-${g.id}`} title={title} summary={`${claudeSummary(b, stale, now)}${codexPart}`}>
               <ClaudeRow beat={b} stale={stale} />
               {(b?.agents ?? []).map(a => (
                 <Row glyph="◇" glyphColor="claude" label={`агент: ${a.description || 'без описания'}`}
@@ -585,13 +651,11 @@ export const register: Register = on => {
           </Card>
         ) : null}
 
-        <Text size="caption" color="subtle" tabular>
-          обновлено {new Date(now).toLocaleTimeString('ru-RU')}
-          {snap.at ? ` · данные от ${new Date(snap.at).toLocaleTimeString('ru-RU')}` : ''}
-        </Text>
-        {d.error ? <Text size="caption" color="warning" wrap="truncate-end">Опрос не удался: {d.error}</Text> : null}
-        {d.beatNote ? <Text size="caption" color="warning" wrap="truncate-end">Пульс этой сессии: {d.beatNote}</Text> : null}
+        {d.beatNote ? (
+          <Text size="caption" color="subtle" wrap="truncate-end">Статус этой сессии не отправляется: {d.beatNote}</Text>
+        ) : null}
       </Box>
     )
   })
+
 }
