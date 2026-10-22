@@ -531,16 +531,24 @@ namespace LunaWidget
             slots = Slots("C:rpg", "B:krim", "dead:rpg");
             eq("new fills free slot", Names(CardOrder.Apply(new List<SessionView> { S("B", "krim"), S("N", "rpg"), S("C", "rpg") }, slots, out changed)), "rpg:C,krim:B,rpg:N");
             // 9. Migration: old name list + id list written together by the same drag (aligned) become slots.
-            var mig = CardOrder.Migrate(new List<string> { "rpg", NS, "rpg" }, new List<string> { "old1", "~no-session", "old2" });
-            eq("migration aligned", Names(CardOrder.Apply(new List<SessionView> { S("x1", "rpg"), S("~no-session", NS), S("x2", "rpg") }, mig, out changed)),
-                "rpg:x1," + NS + ":~no-session,rpg:x2");
+            var live9 = new List<SessionView> { S("x1", "rpg"), S("~no-session", NS), S("x2", "rpg") };
+            var mig = CardOrder.Migrate(new List<string> { "rpg", NS, "rpg" }, new List<string> { "old1", "~no-session", "old2" }, live9);
+            eq("migration aligned", Names(CardOrder.Apply(live9, mig, out changed)), "rpg:x1," + NS + ":~no-session,rpg:x2");
             // 9b. Migration where the previous build appended names of projects not on screen (names longer than ids).
-            mig = CardOrder.Migrate(new List<string> { "rpg", NS, "rpg", "krim" }, new List<string> { "old1", "~no-session", "old2" });
-            eq("migration with extra names", Names(CardOrder.Apply(new List<SessionView> { S("~no-session", NS), S("x1", "rpg"), S("x2", "rpg") }, mig, out changed)),
-                "rpg:x1," + NS + ":~no-session,rpg:x2");
-            // 10. Migration from the oldest format (distinct names, longer id list): live ids keep their order.
-            mig = CardOrder.Migrate(new List<string> { "rpg", "krim" }, new List<string> { "A", "B", "C" });
-            eq("migration oldest", Names(CardOrder.Apply(new List<SessionView> { S("A", "rpg"), S("B", "krim"), S("C", "rpg") }, mig, out changed)), "rpg:A,krim:B,rpg:C");
+            var live9b = new List<SessionView> { S("~no-session", NS), S("x1", "rpg"), S("x2", "rpg") };
+            mig = CardOrder.Migrate(new List<string> { "rpg", NS, "rpg", "krim" }, new List<string> { "old1", "~no-session", "old2" }, live9b);
+            eq("migration with extra names", Names(CardOrder.Apply(live9b, mig, out changed)), "rpg:x1," + NS + ":~no-session,rpg:x2");
+            // 10. Migration from the oldest format (one name per project, longer id list): live ids keep their order.
+            var live10 = new List<SessionView> { S("A", "rpg"), S("B", "krim"), S("C", "rpg") };
+            mig = CardOrder.Migrate(new List<string> { "rpg", "krim" }, new List<string> { "A", "B", "C" }, live10);
+            eq("migration oldest", Names(CardOrder.Apply(live10, mig, out changed)), "rpg:A,krim:B,rpg:C");
+            // 10b. Oldest format with a long name list: order=[rpg,krim,docs], ids=[r1,r2] both rpg; krim and docs come back
+            // later and must land in their saved project order.
+            var live10b = new List<SessionView> { S("r1", "rpg"), S("r2", "rpg") };
+            mig = CardOrder.Migrate(new List<string> { "rpg", "krim", "docs" }, new List<string> { "r1", "r2" }, live10b);
+            CardOrder.Apply(live10b, mig, out changed);
+            eq("oldest long list", Names(CardOrder.Apply(new List<SessionView> { S("r1", "rpg"), S("r2", "rpg"), S("d", "docs"), S("k", "krim") }, mig, out changed)),
+                "rpg:r1,rpg:r2,krim:k,docs:d");
             // 11. Dragging: move N before B, keeping the dead slot of A where it was.
             slots = Slots("A:rpg", "B:krim", "N:rpg");
             CardOrder.Move(slots, "N", "B");
@@ -611,17 +619,31 @@ namespace LunaWidget
             slots.Insert(at < 0 ? slots.Count : at, slot);
         }
 
-        // From the older settings. The previous build wrote one name per on-screen card, aligned with the id list, and
-        // then appended the names of projects not on screen; so when there are at least as many names as ids, the first
-        // names belong to the ids by index and the rest become free places. Fewer names than ids means the oldest
-        // format (one name per project): the ids keep their order and the names become free places after them.
-        public static List<CardSlot> Migrate(List<string> names, List<string> ids)
+        // From the older settings: `ids` is the exact on-screen card order of the last drag in both older builds; `names`
+        // was either one name per card aligned with `ids` (plus absent projects appended) or one name per project
+        // (oldest build). List lengths cannot tell them apart, so the live sessions decide: if every live id has its own
+        // project at its index in `names`, the lists are aligned; otherwise `names` is a per-project order. Run once,
+        // with the sessions known, before the first Apply.
+        public static List<CardSlot> Migrate(List<string> names, List<string> ids, List<SessionView> live)
         {
-            if (names.Count >= ids.Count)
+            var liveName = live.GroupBy(x => x.Id).ToDictionary(g => g.Key, g => g.First().Name);
+            bool aligned = names.Count >= ids.Count
+                && ids.Select((id, i) => new { id, i }).All(p => !liveName.ContainsKey(p.id) || liveName[p.id] == names[p.i]);
+            if (aligned)
                 return ids.Select((id, i) => new CardSlot { Id = id, Name = names[i] })
                     .Concat(names.Skip(ids.Count).Select((nm, i) => new CardSlot { Id = "~free-" + i, Name = nm })).ToList();
-            return ids.Select(id => new CardSlot { Id = id, Name = "" })
-                .Concat(names.Select((nm, i) => new CardSlot { Id = "~free-" + i, Name = nm })).ToList();
+            // Per-project order: live cards keep their exact dragged order; each absent project gets a free place where
+            // its rank in `names` puts it among the projects on screen.
+            Func<string, int> rank = nm => { var k = names.IndexOf(nm); return k < 0 ? int.MaxValue : k; };
+            var slots = ids.Where(liveName.ContainsKey).Select(id => new CardSlot { Id = id, Name = liveName[id] }).ToList();
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (slots.Any(s => s.Name == names[i])) continue;
+                var free = new CardSlot { Id = "~free-" + i, Name = names[i] };
+                int at = slots.FindIndex(s => rank(s.Name) > i);
+                if (at < 0) slots.Add(free); else slots.Insert(at, free);
+            }
+            return slots;
         }
 
         public static string Serialize(List<CardSlot> slots)
@@ -660,7 +682,8 @@ namespace LunaWidget
         readonly List<Target> targets = new List<Target>();
         readonly List<KeyValuePair<Rectangle, string>> cardHeads = new List<KeyValuePair<Rectangle, string>>(); // header rect → session id
         readonly Dictionary<string, string> cardNames = new Dictionary<string, string>();                      // session id → project name
-        List<CardSlot> slots = new List<CardSlot>(); // saved places of the session cards (see CardOrder)
+        List<CardSlot> slots = new List<CardSlot>(); // saved places of the session cards (see CardOrder); null until migrated
+        List<string> oldNames, oldIds;               // settings of earlier builds, waiting for the first data to migrate
         string pressCard; Point pressAt; string dragCard; int dropIndex = -1;
 
         Font fTitle, fHead, fBody, fSmall, fIcon, fMono;
@@ -681,10 +704,10 @@ namespace LunaWidget
             if (st.TryGetValue("cards", out v)) slots = CardOrder.Parse(v);
             else
             {
-                // Settings from earlier builds: a name list and an id list.
-                var oldNames = st.TryGetValue("order", out v) ? v.Split('\u001F').Where(x => x != "").ToList() : new List<string>();
-                var oldIds = st.TryGetValue("idorder", out v) ? v.Split('\u001F').Where(x => x != "").ToList() : new List<string>();
-                slots = CardOrder.Migrate(oldNames, oldIds);
+                // Settings from earlier builds: migrated on the first data, when the live sessions' projects are known.
+                oldNames = st.TryGetValue("order", out v) ? v.Split('\u001F').Where(x => x != "").ToList() : new List<string>();
+                oldIds = st.TryGetValue("idorder", out v) ? v.Split('\u001F').Where(x => x != "").ToList() : new List<string>();
+                slots = null;
             }
             Width = userW > 0 ? userW : S(380); Height = userH > 0 ? userH : S(200);
             if (st.TryGetValue("x", out v) && st.ContainsKey("y")) { int x, y; if (int.TryParse(v, out x) && int.TryParse(st["y"], out y)) Location = new Point(x, y); }
@@ -763,6 +786,14 @@ namespace LunaWidget
         List<SessionView> Ordered(List<SessionView> sessions)
         {
             bool changed;
+            if (slots == null)
+            {
+                // Migrate only from a successful poll: the live sessions decide how the old lists line up.
+                if (data == null || !data.Ok) return sessions;
+                slots = CardOrder.Migrate(oldNames ?? new List<string>(), oldIds ?? new List<string>(), sessions);
+                oldNames = oldIds = null;
+                SaveSlots();
+            }
             var result = CardOrder.Apply(sessions, slots, out changed);
             if (changed) SaveSlots();
             return result;
@@ -1101,7 +1132,7 @@ namespace LunaWidget
                 // closed sessions stay where they are.
                 var ids = cardHeads.Select(c => c.Value).ToList();
                 int from = ids.IndexOf(dragCard);
-                if (from >= 0 && dropIndex >= 0)
+                if (from >= 0 && dropIndex >= 0 && slots != null)
                 {
                     var others = ids.Where(id => id != dragCard).ToList();
                     int at = Math.Min(others.Count, dropIndex > from ? dropIndex - 1 : dropIndex);
