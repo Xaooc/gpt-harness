@@ -180,7 +180,10 @@ starts a daemon on the new binary.
   | `~/.claude/learning/PAUSED` | learning runs |
   | `~/.claude/learning/CAPTURE_OFF` | learning capture |
   | `LUNA_DAEMON=0` (env) | the daemon; jobs fall back to one process each |
+  | `~/.claude/luna-daemon-off` (file) | the daemon, unless `LUNA_DAEMON` is explicitly set |
 
+- **CPU priority:** inherited by default; `LUNA_LOW_PRIORITY=1` opts the Codex tree into BelowNormal.
+- **Small TEMP:** exec jobs and the daemon use dedicated temporary directories; `LUNA_JOB_TEMP=0` keeps inherited TEMP.
 - **State and logs:** `~/.claude/luna-run/` (daemon, heavy gate, reaper, swap logs) and `~/.claude/learning/`.
 - **Updating:** `git pull`, then `node install.mjs --check`. Mid-run replacement is safe for `luna.sh` and
   `luna-watch.sh` (whole-script `{ … }` wrapper) and for Node scripts. A running daemon keeps the old code until it

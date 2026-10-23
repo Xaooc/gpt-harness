@@ -299,13 +299,13 @@
       "src": "claude/scripts/lib/luna-daemon-client-test.sh",
       "dest": "scripts/lib/luna-daemon-client-test.sh",
       "kind": "file",
-      "sha256": "d248eabf8799ce952457d662d650ce665416f5b681ffd8bebc7937901f8e60d0"
+      "sha256": "4a1be4f2e46235204b16514deda49d211bcd31ecb1ee3832e1da6daf7a2bc2fd"
     },
     {
       "src": "claude/scripts/lib/luna-daemon-stub.mjs",
       "dest": "scripts/lib/luna-daemon-stub.mjs",
       "kind": "file",
-      "sha256": "8ecf2b6992874c1e718e801e979b064caa1677a4887d3729937970ad651afb8b"
+      "sha256": "1269b506334d2f0da1bc85624062e92964ac975290d4bd449794f73807e65e62"
     },
     {
       "src": "claude/scripts/lib/luna-loadtest.mjs",
@@ -323,7 +323,7 @@
       "src": "claude/scripts/luna-daemon.mjs",
       "dest": "scripts/luna-daemon.mjs",
       "kind": "file",
-      "sha256": "691e50e95fa0023806106d06c02739f95acad757bf49d10b907eb1143c8d21d3"
+      "sha256": "850fdcffae355b9fa3148e8b4b98459ab7ed880769629e956f6bd5319f770784"
     },
     {
       "src": "claude/scripts/luna-harness-plugin-patch.mjs",
@@ -341,7 +341,7 @@
       "src": "claude/scripts/luna-overview.mjs",
       "dest": "scripts/luna-overview.mjs",
       "kind": "file",
-      "sha256": "c0e915318b2f0d2b48008d2078fb3f4670f5cc328387489a476dbf4ba6d47e74"
+      "sha256": "fb51ef8145d739edc82af81ed4262f9a7bf69c008f4f407319b98e278c53228a"
     },
     {
       "src": "claude/scripts/luna-overview.sh",
@@ -359,7 +359,7 @@
       "src": "claude/scripts/luna-pool.mjs",
       "dest": "scripts/luna-pool.mjs",
       "kind": "file",
-      "sha256": "b46ee6f31c09c0da48eb4ff6ce6e6c52d8f85cf41019450254dce7f1e792110c"
+      "sha256": "eb78d5bc10c460ee601873f9eaa6e1682f0a6ed07c3c0e4edd957917634514e8"
     },
     {
       "src": "claude/scripts/luna-reap-brokers.mjs",
@@ -395,7 +395,7 @@
       "src": "claude/scripts/luna.sh",
       "dest": "scripts/luna.sh",
       "kind": "file",
-      "sha256": "e6265bfb0616d88210cf146e7937bf1c2264ad5ec172971da9bf102581171aa3"
+      "sha256": "43e8451f97f859c81ae3d6c6ca3f92df587d2774868dd22b93352a6f56fcf430"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
@@ -407,7 +407,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "4cfe8cf92e4801a13fa559f97a4665f015dce7e34fa717011444485c01e3985d"
+      "sha256": "64dc9f33cb369044c687afc8f7d955828d9289728ab66ff413bfeddf3b6d8391"
     }
   ],
   "settings": "settings/hooks.json",

@@ -14,7 +14,7 @@
 #     -f file     read the prompt from a file (preferred for long prompts)
 #     -e effort   reasoning effort: low|medium|high|xhigh|max (default: max).
 #                 Pick it per task вЂ” see the "Effort routing" table in the luna skill.
-#     -m model    override model (default: gpt-6-luna)
+#     -m model    override model: luna = gpt-6-luna (default), sol = gpt-6.1-sol, or a full slug
 #     -t tier     service tier (default: "default" = normal; "fast" = priority, ~1.5x speed but burns more quota)
 #
 # Files next to <out>:
@@ -71,8 +71,25 @@ DAEMON_DIED=0
 DAEMON_FALLBACK_USED=0
 DAEMON_REASON="startup failed"
 DAEMON_READMIT=0
+DAEMON_UNHEALTHY_SINCE=0
 DAEMON_SCRIPT="$(cd "$(dirname "$0")" && pwd)/luna-daemon.mjs"
 DAEMON_HOME="${LUNA_DAEMON_HOME:-$HOME/.claude/luna-run}"
+# An explicit environment setting takes precedence over the shared file switch.
+if [ "${LUNA_DAEMON+x}" != x ] && [ -e "$HOME/.claude/luna-daemon-off" ]; then LUNA_DAEMON=0; fi
+JOB_TEMP=""
+JOB_TEMP_REASON=""
+cleanup_job_temp() {
+  [ -z "$JOB_TEMP" ] || rm -rf -- "$JOB_TEMP" 2>/dev/null || true
+  JOB_TEMP=""
+}
+# Best effort: abandoned jobs cannot leave a growing sandbox TEMP tree behind.
+find "$DAEMON_HOME/tmp" -mindepth 1 -maxdepth 1 -type d -name 'job-*' -mmin +1440 \
+  -print0 2>/dev/null | while IFS= read -r -d '' stale_temp; do
+  owner=""
+  [ ! -f "$stale_temp/.owner" ] || read -r owner < "$stale_temp/.owner"
+  case "$owner" in ''|*[!0-9]*|0) ;; *) kill -0 "$owner" 2>/dev/null && continue ;; esac
+  rm -rf -- "$stale_temp" 2>/dev/null || true
+done
 HEAVY_GATE_JS="$HOME/.claude/scripts/heavy-gate.mjs"
 if command -v cygpath >/dev/null 2>&1; then HEAVY_GATE_JS="$(cygpath -m "$HEAVY_GATE_JS")"; fi
 if [ "${LUNA_DAEMON:-1}" != 0 ] && command -v node >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
@@ -86,7 +103,8 @@ cleanup_prompts() {
 # Learning-loop job registry: runs last (from the EXIT trap), after the final status write. It records only terminal
 # states and never fails the job. LUNA_NO_REGISTRY=1 disables it.
 record_job() {
-  [ "${LUNA_NO_REGISTRY:-0}" != 1 ] && [ -n "${OUT:-}" ] && [ -f "$HOME/.claude/scripts/learning/registry.mjs" ] || return 0
+  [ "${LUNA_NO_REGISTRY:-0}" != 1 ] && [ -n "${OUT:-}" ] &&
+    [ -f "$HOME/.claude/scripts/learning/registry.mjs" ] || return 0
   node "$HOME/.claude/scripts/learning/registry.mjs" record "$OUT" >/dev/null 2>&1 || true
   return 0
 }
@@ -101,7 +119,7 @@ mark_active() {
   return 0
 }
 unmark_active() { [ -z "$ACTIVE_FILE" ] || rm -f -- "$ACTIVE_FILE"; return 0; }
-trap 'cleanup_prompts; unmark_active; record_job' EXIT
+trap 'cleanup_job_temp; cleanup_prompts; unmark_active; record_job' EXIT
 SESSION_ARGS=()
 [ "${LUNA_KEEP_SESSION:-0}" = "1" ] || SESSION_ARGS+=(--ephemeral)
 ARGV="$*"
@@ -177,6 +195,11 @@ while getopts "wrC:o:f:e:m:t:" opt; do
   esac
 done
 shift $((OPTIND - 1))
+# Model aliases (kept from the pre-harness wrapper; skills and CLAUDE.md use -m sol / -m luna).
+case "$MODEL" in
+  luna) MODEL="gpt-6-luna" ;;
+  sol)  MODEL="gpt-6.1-sol" ;;
+esac
 
 # Absolutize paths before anything can fail, so the status file lands next to <out>.
 abs() { case "$1" in /*|[A-Za-z]:*) printf '%s' "$1" ;; *) printf '%s' "$PWD/$1" ;; esac; }
@@ -237,6 +260,11 @@ status() { # status <state> [extra key=value lines...]
     echo "codex_bin=$CODEX_BIN"
     echo "shell=${LUNA_CODEX_SHELL_PATH:+busybox-sh}"
     echo "engine=$ENGINE"
+    if [ -n "$JOB_TEMP_REASON" ]; then echo "job_temp=inherited reason=$JOB_TEMP_REASON"; fi
+    if [ "${THREAD_FALLBACK_USED:-0}" = 1 ]; then
+      echo 'fallback=exec'
+      echo 'reason=thread-start-timeout'
+    fi
     if [ "$ENGINE" = daemon ] && [ -n "$DAEMON_JOB" ]; then echo "daemon_job=$DAEMON_JOB"; fi
     if [ -n "$RETRY_EFFORT" ]; then
       echo "retry=1"
@@ -264,12 +292,13 @@ fi
 PFILE="$(abs "$PFILE")"
 [ -r "$PFILE" ] || die 2 "prompt file not readable: $PFILE"
 [ -d "$DIR" ] || die 2 "working directory does not exist: $DIR"
-# Custom Codex build (LUNA_CUSTOM_CODEX_ROOT, see LUNA-PATCH.md): model commands run in busybox sh (~5 MB) instead of PowerShell
-# (~65 MB per command). Used automatically when both files exist; LUNA_CUSTOM_CODEX=0 forces the stock Codex. Exported, so
-# a daemon started by this wrapper uses the same binary and shell. The shell keys exist only in the custom build: they're
-# passed only together with it.
+# Custom Codex build (LUNA_CUSTOM_CODEX_ROOT, see LUNA-PATCH.md): model commands run in busybox sh (~5 MB)
+# instead of PowerShell (~65 MB per command). Used automatically when both files exist; LUNA_CUSTOM_CODEX=0
+# forces the stock Codex. Exported, so a daemon started by this wrapper uses the same binary and shell.
+# The shell keys exist only in the custom build: they're passed only together with it.
 if [ -z "${LUNA_CUSTOM_CODEX_ROOT:-}" ] && [ -f "$HOME/.claude/luna-harness.env" ]; then
-  LUNA_CUSTOM_CODEX_ROOT="$(sed -n 's/^LUNA_CUSTOM_CODEX_ROOT=//p' "$HOME/.claude/luna-harness.env" | head -n 1 | tr -d '\r')"
+  LUNA_CUSTOM_CODEX_ROOT="$(sed -n 's/^LUNA_CUSTOM_CODEX_ROOT=//p' "$HOME/.claude/luna-harness.env" |
+    head -n 1 | tr -d '\r')"
 fi
 LUNA_CUSTOM_CODEX_ROOT="${LUNA_CUSTOM_CODEX_ROOT:-${USERPROFILE:-$HOME}/codex-build}"
 if command -v cygpath >/dev/null 2>&1; then
@@ -540,7 +569,7 @@ lock_release() {
   LOCK_TOKEN=""
 }
 release() { lock_release; }
-trap 'release; cleanup_prompts; unmark_active; record_job' EXIT
+trap 'release; cleanup_job_temp; cleanup_prompts; unmark_active; record_job' EXIT
 kill_child_tree() {
   if [ -n "${CPID:-}" ] && kill -0 "$CPID" 2>/dev/null; then
     if [ -r "/proc/$CPID/winpid" ]; then
@@ -566,6 +595,11 @@ attempt_prompt() {
 
 native_path() {
   if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
+}
+
+daemon_unhealthy() {
+  [ "$DAEMON_UNHEALTHY_SINCE" != 0 ] || DAEMON_UNHEALTHY_SINCE=$(date +%s)
+  return 1
 }
 
 daemon_health() {
@@ -599,17 +633,24 @@ daemon_health() {
       process.stdout.write([d.pid, d.port, d.token, matches ? "match" : "mismatch"].join(" ") + "\n");
     } catch { process.exit(1); }
   ' "$(native_path "$DAEMON_HOME/daemon.json")" "$(native_path "${CODEX_CMD[0]}")" 2>/dev/null)
-  [ -n "$DAEMON_PID" ] && [ -n "$DAEMON_PORT" ] && [ -n "$DAEMON_TOKEN" ] || return 1
+  [ -n "$DAEMON_PID" ] && [ -n "$DAEMON_PORT" ] && [ -n "$DAEMON_TOKEN" ] || {
+    daemon_unhealthy; return 1;
+  }
+  # A live owner needs no startup admission; never retain that lock across a health deadline.
+  if [ "$HAVE_LOCK" = 1 ] && daemon_process_alive "$DAEMON_PID"; then release; fi
   local response
   response=$(curl --noproxy '*' -fs --max-time 3 -H "X-Luna-Token: $DAEMON_TOKEN" \
-    "http://127.0.0.1:$DAEMON_PORT/health") || return 1
+    "http://127.0.0.1:$DAEMON_PORT/health") || { daemon_unhealthy; return 1; }
   # Validate health and identity, including the short crash-loop drain window.
   printf '%s' "$response" | node -e '
     try {
       const d = JSON.parse(require("fs").readFileSync(0, "utf8"));
       process.exit(d.ok === true && d.pid === Number(process.argv[1]) ? 0 : 1);
     } catch { process.exit(1); }
-  ' "$DAEMON_PID" 2>/dev/null || return 1
+  ' "$DAEMON_PID" 2>/dev/null || { daemon_unhealthy; return 1; }
+  # A response arriving after the busy deadline cannot revive this attempt.
+  daemon_busy_expired && return 1
+  DAEMON_UNHEALTHY_SINCE=0
   if [ "$identity" != match ]; then
     DAEMON_MISMATCH=1
     DAEMON_REASON="running daemon uses a different Codex binary or shell"
@@ -626,17 +667,61 @@ restore_marker() {
 daemon_process_alive() {
   local pid="${1:-}"
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  node -e '
-    try { process.kill(Number(process.argv[1]), 0); }
-    catch (e) { process.exit(e.code === "ESRCH" ? 1 : 0); }
-  ' "$pid" 2>/dev/null
+  node -e 'try { process.kill(Number(process.argv[1]), 0); } catch (e) {
+    process.exit(e.code === "EPERM" ? 0 : 1);
+  }' "$pid" >/dev/null 2>&1 || return 1
+  local key="$pid:$DAEMON_TOKEN"
+  case "|${DAEMON_ALIVE_CACHE:-}|" in
+    *"|$key=0|"*) return 0 ;;
+    *"|$key=1|"*) return 1 ;;
+  esac
+  if LUNA_DAEMON_HOME="$(native_path "$DAEMON_HOME")" node "$(native_path "$DAEMON_SCRIPT")" --alive \
+      >/dev/null 2>&1; then
+    DAEMON_ALIVE_RC=0
+  else
+    DAEMON_ALIVE_RC=1
+  fi
+  DAEMON_ALIVE_CACHE="${DAEMON_ALIVE_CACHE:+$DAEMON_ALIVE_CACHE|}$key=$DAEMON_ALIVE_RC"
+  return "$DAEMON_ALIVE_RC"
+}
+
+daemon_busy_expired() {
+  [ "$DAEMON_UNHEALTHY_SINCE" != 0 ] || return 1
+  [ $(( $(date +%s) - DAEMON_UNHEALTHY_SINCE )) -ge "$DAEMON_BUSY_MAX_S" ] || return 1
+  DAEMON_REASON="live daemon health timeout after ${DAEMON_BUSY_MAX_S}s"
+  return 0
 }
 
 daemon_ensure() {
+  local pause=1 elapsed remaining
+  while :; do
+    if [ "$DAEMON_UNHEALTHY_SINCE" != 0 ]; then
+      elapsed=$(( $(date +%s) - DAEMON_UNHEALTHY_SINCE ))
+      status waiting-daemon "reason=health-slow" "waited_s=$elapsed"
+    fi
+    daemon_busy_expired && return 1
+    if daemon_health; then
+      [ "$DAEMON_MISMATCH" = 0 ] && return 0
+      return 1
+    fi
+    daemon_process_alive "$DAEMON_PID" || break
+    release
+    elapsed=$(( $(date +%s) - DAEMON_UNHEALTHY_SINCE ))
+    daemon_busy_expired && return 1
+    status waiting-daemon "reason=health-slow" "waited_s=$elapsed"
+    remaining=$(( DAEMON_BUSY_MAX_S - elapsed ))
+    [ "$pause" -le "$remaining" ] || pause=$remaining
+    sleep "$pause"
+    [ "$pause" -ge 10 ] || pause=$(( pause * 2 > 10 ? 10 : pause * 2 ))
+  done
+  # Slow-daemon waits release admission. Reacquire it before a genuinely new startup.
+  if [ "${LUNA_NO_GATE:-0}" != 1 ] && [ "$HAVE_LOCK" != 1 ]; then DAEMON_READMIT=1; return 1; fi
+  daemon_busy_expired && return 1
   if daemon_health; then
     [ "$DAEMON_MISMATCH" = 0 ] && return 0
     return 1
   fi
+  if daemon_process_alive "$DAEMON_PID"; then release; daemon_ensure; return $?; fi
   DAEMON_REASON="startup failed"
   # A daemon can idle-exit after admission. Recheck the startup RAM before spawning it.
   if [ "${LUNA_NO_GATE:-0}" != 1 ] && [ -r /proc/meminfo ]; then
@@ -658,10 +743,12 @@ daemon_ensure() {
   ' "$(native_path "$DAEMON_SCRIPT")" "$(native_path "$DAEMON_HOME")" 2>/dev/null || return 1
   local deadline=$(( $(date +%s) + 30 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    daemon_busy_expired && return 1
     if daemon_health; then
       [ "$DAEMON_MISMATCH" = 0 ] && return 0
       return 1
     fi
+    if daemon_process_alive "$DAEMON_PID"; then release; daemon_ensure; return $?; fi
     sleep 1
   done
   DAEMON_REASON="health timeout after 30s"
@@ -819,6 +906,8 @@ daemon_wait() {
     if daemon_health && [ "$DAEMON_PID" = "$saved_pid" ] && [ "$DAEMON_TOKEN" = "$saved_token" ]; then
       failures=0; busy_since=0
     else
+      epoch=$(date +%s)
+      [ "$busy_since" != 0 ] || busy_since=$epoch
       discovery_pid=""; discovery_token=""
       read -r discovery_pid discovery_token < <(node -e '
         try {
@@ -833,7 +922,6 @@ daemon_wait() {
       if [ -n "$discovery_pid" ] && [ "$discovery_pid" = "$saved_pid" ] &&
           [ "$discovery_token" = "$saved_token" ] && daemon_process_alive "$saved_pid"; then
         epoch=$(date +%s)
-        [ "$busy_since" != 0 ] || busy_since=$epoch
         busy_elapsed=$(( epoch - busy_since ))
         if [ "$busy_note" = 0 ] || [ $(( epoch - busy_note )) -ge 30 ]; then
           echo "luna.sh: daemon not responding for ${busy_elapsed}s (process alive); waiting" >&2
@@ -866,12 +954,14 @@ run_attempt() {
   if [ "${LUNA_NO_GATE:-0}" != "1" ]; then
     waited=0; last_note=0; last_lock_note=0
     while :; do
-      if [ "$ENGINE" = daemon ] && daemon_health; then release; break; fi
+      if [ "$ENGINE" = daemon ]; then
+        if daemon_health || daemon_process_alive "$DAEMON_PID"; then release; break; fi
+      fi
       short=0
       if lock_acquire; then
         if [ "$ENGINE" = daemon ]; then
           # Only starting the shared daemon consumes client-side admission RAM.
-          if daemon_health; then release; break; fi
+          if daemon_health || daemon_process_alive "$DAEMON_PID"; then release; break; fi
           JOB_MB="${LUNA_DAEMON_START_MB:-150}"
         fi
         [ -r /proc/meminfo ] || break   # macOS: skip only the RAM comparison
@@ -939,9 +1029,10 @@ run_attempt() {
     return
   fi
 
-  # Below-normal CPU priority; inherited by codex and everything it runs (tests,
-  # python, node), so the desktop stays responsive under load.
-  if [ -r "/proc/$$/winpid" ]; then            # Windows (Git Bash)
+  # Normal priority is inherited by default; BelowNormal can starve the code-mode host under load.
+  if [ "${LUNA_LOW_PRIORITY:-0}" != 1 ]; then
+    :
+  elif [ -r "/proc/$$/winpid" ]; then          # Windows (Git Bash)
     WPID=$(cat "/proc/$$/winpid")
     if command -v wmic >/dev/null 2>&1; then
       wmic process where "ProcessId=$WPID" call setpriority 16384 >/dev/null 2>&1
@@ -954,7 +1045,28 @@ run_attempt() {
 
   # Prompt goes via stdin ("-"): no arg-length limits, no quoting issues,
   # and codex never blocks waiting on an inherited stdin.
-  "${CODEX_CMD[@]}" exec \
+  JOB_ENV=()
+  if [ "${LUNA_JOB_TEMP:-1}" != 0 ]; then
+    JOB_TEMP="$DAEMON_HOME/tmp/job-$$-$RANDOM"
+    JOB_TEMP_REASON=mkdir-failed
+    if mkdir -p "$JOB_TEMP" 2>/dev/null; then
+      JOB_TEMP_REASON=owner-write-failed
+    fi
+    if [ "$JOB_TEMP_REASON" = owner-write-failed ] &&
+        { printf '%s\n' "$$" > "$JOB_TEMP/.owner"; } 2>/dev/null; then
+      JOB_TEMP_REASON=""
+      job_temp_native="$JOB_TEMP"
+      if command -v cygpath >/dev/null 2>&1; then job_temp_native="$(cygpath -w "$JOB_TEMP")"; fi
+      JOB_ENV=(env "TEMP=$job_temp_native" "TMP=$job_temp_native" "TMPDIR=$job_temp_native")
+    else
+      cleanup_job_temp
+      if [ "${JOB_TEMP_WARNED:-0}" != 1 ]; then
+        echo "luna.sh: warning: job_temp=inherited reason=$JOB_TEMP_REASON" >&2
+        JOB_TEMP_WARNED=1
+      fi
+    fi
+  fi
+  ${JOB_ENV[@]+"${JOB_ENV[@]}"} "${CODEX_CMD[@]}" exec \
     ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     ${SHELL_ARGS[@]+"${SHELL_ARGS[@]}"} \
     -m "$MODEL" \
@@ -990,9 +1102,11 @@ run_attempt() {
     printf 'luna.sh: watchdog: %s\n' "$STALL_REASON" >> "$OUT.log"
     echo "luna.sh: watchdog: $STALL_REASON" >&2
     rc=124
+    cleanup_job_temp
     return
   done
   wait "$CPID"; rc=$?
+  cleanup_job_temp
 }
 
 # Real codex exec logs use a standalone "exec" line before each command.
@@ -1003,6 +1117,16 @@ while :; do
   commands_before=$(command_count)
   if [ "$ENGINE" = daemon ]; then DAEMON_WAIT_STARTED=$(date +%s); fi
   run_attempt
+  if [ "$DAEMON_ERROR" = thread-start-timeout ] && [ "${THREAD_FALLBACK_USED:-0}" = 0 ]; then
+    THREAD_FALLBACK_USED=1
+    DAEMON_FALLBACK_USED=1
+    printf '%s\n' 'luna.sh: fallback=exec reason=thread-start-timeout' >> "$OUT.log"
+    ENGINE=exec; DAEMON_JOB=""; CPID=""
+    DAEMON_ERROR=""; DAEMON_DIED=0
+    : > "$OUT"
+    if [ "$SANDBOX" = workspace-write ]; then JOB_MB="${LUNA_JOB_MB:-700}"; else JOB_MB="${LUNA_JOB_MB:-250}"; fi
+    continue
+  fi
   if [ "$DAEMON_DIED" = 1 ]; then
     if [ "$SANDBOX" = read-only ] && [ "$DAEMON_FALLBACK_USED" = 0 ]; then
       DAEMON_FALLBACK_USED=1
@@ -1018,7 +1142,8 @@ while :; do
   fi
   [ -z "$DAEMON_ERROR" ] || break
   [ -z "$STALL_REASON" ] || break
-  if [ "$SANDBOX" = "read-only" ] && [ "${LUNA_NO_REFUSAL_RETRY:-0}" != "1" ]; then
+  if [ "$SANDBOX" = "read-only" ] && [ "${LUNA_NO_REFUSAL_RETRY:-0}" != "1" ] &&
+      [ "${THREAD_FALLBACK_USED:-0}" = 0 ]; then
     commands_after=$(command_count)
     if [ "$commands_before" = "$commands_after" ] && [ -s "$OUT" ] && refusal_file_matches "$OUT"; then
       if [ -n "$RETRY_EFFORT" ]; then

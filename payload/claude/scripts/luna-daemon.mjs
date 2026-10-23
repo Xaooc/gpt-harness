@@ -12,6 +12,8 @@
 // LUNA_DAEMON_APP_SERVER_CMD: tests only, JSON argv array replacing codex app-server.
 // LUNA_DAEMON_START_MB: client admission surcharge when starting this daemon (default 150 MB).
 // LUNA_DAEMON=0: client forces codex exec; otherwise node and curl enable this daemon.
+// LUNA_LOW_PRIORITY=1: lower only the app-server tree's CPU priority (default: inherited).
+// LUNA_JOB_TEMP=0: keep inherited TEMP instead of the daemon's small dedicated directory.
 // LUNA_CODEX_BIN / LUNA_DIRECT_EXE=0: override native resolution / use the shim.
 // LUNA_CODEX_SHELL_PATH: existing busybox sh.exe enables the custom build's shell configuration.
 // LUNA_WINDOWS_SANDBOX: defaults to unelevated; empty preserves Codex configuration.
@@ -37,12 +39,14 @@ import {
   appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync,
   realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync
 } from 'node:fs';
-import { appendFile, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, readFile, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
+import { createConnection } from 'node:net';
 import * as os from 'node:os';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -370,13 +374,13 @@ function buildLeanArgs(configPath) {
   return args;
 }
 
-function spawnServer(home, leanArgs) {
+function spawnServer(home, leanArgs, environment = process.env) {
   if (process.platform === 'win32') {
     const override = process.env.LUNA_CODEX_BIN || '';
     let executable = override && existsSync(override)
       ? override
       : '';
-    let env;
+    let env = environment;
     if (!executable && process.env.LUNA_DIRECT_EXE !== '0') {
       const candidates = [
         'node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe',
@@ -393,7 +397,7 @@ function spawnServer(home, leanArgs) {
           .find((candidate) => existsSync(candidate));
         if (!nativeExe) continue;
         executable = nativeExe;
-        env = { ...process.env };
+        env = { ...environment };
         env.CODEX_MANAGED_PACKAGE_ROOT = packageRoot;
         env.CODEX_MANAGED_BY_NPM = '1';
         delete env.CODEX_MANAGED_BY_BUN;
@@ -419,13 +423,13 @@ function spawnServer(home, leanArgs) {
     return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', command], {
       cwd: home,
       stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true, env
     });
   }
   return spawn('codex', ['app-server', ...leanArgs], {
     cwd: home,
     detached: true,
-    stdio: ['pipe', 'pipe', 'pipe']
+    stdio: ['pipe', 'pipe', 'pipe'], env: environment
   });
 }
 
@@ -572,7 +576,7 @@ function readInfo() {
   } catch { return null; }
 }
 
-function httpJson(info, method, route, body, token = info.token) {
+function httpJson(info, method, route, body, token = info.token, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? '' : JSON.stringify(body);
     let responding = false;
@@ -589,26 +593,97 @@ function httpJson(info, method, route, body, token = info.token) {
       });
       res.on('error', reject);
     });
-    req.setTimeout(3000, () => req.destroy(new Error('HTTP timeout')));
+    const timer = setTimeout(() => req.destroy(new Error('HTTP timeout')), timeoutMs);
+    req.once('close', () => clearTimeout(timer));
     req.on('error', (error) => { if (!responding) reject(new Error(`${method} ${route}: ${error.message}`)); });
     req.end(data);
   });
 }
 
-async function health(info = readInfo()) {
+async function health(info = readInfo(), timeoutMs = 3000) {
   if (!info) return null;
   try {
     process.kill(info.pid, 0);
-    const result = await httpJson(info, 'GET', '/health');
+    const result = await httpJson(info, 'GET', '/health', undefined, info.token, timeoutMs);
     return result.status === 200 && result.body.ok && result.body.pid === info.pid ? result.body : null;
   } catch { return null; }
 }
 
+// The kernel accepts connections even while the daemon's JavaScript loop is blocked.
+async function discoveryAlive(info = readInfo()) {
+  if (!info) return false;
+  try { process.kill(info.pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
+  if (process.platform === 'linux') {
+    try {
+      const command = await readFile(`/proc/${info.pid}/cmdline`, 'utf8');
+      if (!/luna-daemon\.mjs\0--serve(?:\0|$)/.test(command)) return false;
+    } catch { return false; }
+  }
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: '127.0.0.1', port: info.port });
+    const finish = (alive) => { clearTimeout(timer); socket.destroy(); resolve(alive); };
+    const timer = setTimeout(() => finish(false), 1000);
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+  });
+}
+
+class MemoryHelper {
+  constructor(launch, kill = killTree, report = event, clock = Date.now, timeoutMs = 120_000) {
+    Object.assign(this, { launch, kill, report, clock, timeoutMs });
+    this.interval = 60_000;
+    this.next = 0;
+    this.active = null;
+  }
+
+  tick(pid) {
+    if (this.active) { this.report('memory helper skipped: still running'); return; }
+    if (this.clock() < this.next) return;
+    let child;
+    try { child = this.launch(pid); } catch { this.failed(); return; }
+    const entry = { child, done: false, started: this.clock() };
+    this.active = entry;
+    const settle = (ok) => {
+      if (entry.done) return;
+      entry.done = true;
+      clearTimeout(entry.timer);
+      this.interval = ok ? 60_000 : Math.min(this.interval * 2, 600_000);
+      this.next = (ok ? entry.started : this.clock()) + this.interval;
+      this.active = null;
+    };
+    entry.timer = setTimeout(() => {
+      entry.killing = true;
+      this.report('memory helper killed: timeout');
+      void this.kill(child).finally(() => settle(false));
+    }, this.timeoutMs);
+    child.once('error', () => settle(false));
+    child.once('exit', (code) => { if (!entry.killing) settle(code === 0); });
+    entry.settle = settle;
+    child.unref?.();
+  }
+
+  failed() {
+    this.interval = Math.min(this.interval * 2, 600_000);
+    this.next = this.clock() + this.interval;
+  }
+
+  async stop() {
+    const entry = this.active;
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    entry.killing = true;
+    await this.kill(entry.child);
+    entry.settle(false);
+  }
+}
+
 class AppServer {
-  constructor(onEvent, onCrash) {
+  constructor(onEvent, onCrash, memoryHelper, environment = process.env) {
     this.onEvent = onEvent;
     this.onCrash = onCrash;
     this.pending = new Map();
+    this.lateThreads = new Set();
+    this.memoryHelper = memoryHelper;
     this.nextId = 1;
     this.dead = false;
     this.stopping = false;
@@ -629,9 +704,13 @@ class AppServer {
         throw new Error('LUNA_DAEMON_APP_SERVER_CMD must be a nonempty JSON argv array');
       }
       this.child = spawn(command[0], [...command.slice(1), ...args], {
-        cwd: HOME, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: process.platform !== 'win32'
+        cwd: HOME, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+        detached: process.platform !== 'win32', env: environment
       });
-    } else this.child = spawnServer(HOME, args);
+    } else this.child = spawnServer(HOME, args, environment);
+    if (this.child.pid && process.env.LUNA_LOW_PRIORITY === '1') {
+      try { os.setPriority(this.child.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
+    }
     this.codexBin = this.child.spawnfile;
     this.child.on('error', (error) => this.crash(`app-server exited (${error.code || error.message})`));
     this.child.on('exit', (code) => this.crash(`app-server exited (${code})`));
@@ -659,12 +738,7 @@ class AppServer {
 
   memoryPriority() {
     if (process.platform !== 'win32' || !this.memoryScript || !this.child.pid || this.dead) return;
-    const helper = spawn('powershell', [
-      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', this.memoryScript,
-      '-ProcessId', String(this.child.pid), '-Tree', '-Level', 'Low'
-    ], { detached: true, windowsHide: true, stdio: 'ignore' });
-    helper.on('error', () => {});
-    helper.unref();
+    this.memoryHelper?.tick(this.child.pid);
   }
 
   send(frame) {
@@ -678,6 +752,7 @@ class AppServer {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        if (method === 'thread/start') this.lateThreads.add(id);
         reject(new Error(`${method} timed out`));
       }, timeout);
       this.pending.set(id, { resolve, reject, timer });
@@ -690,7 +765,12 @@ class AppServer {
   }
 
   message(message) {
-    if (message.id !== undefined && !message.method && this.pending.has(message.id)) {
+    if (!message.method && this.lateThreads?.delete(message.id)) {
+      const threadId = message.result?.thread?.id || message.result?.threadId;
+      if (threadId) void this.rpc('thread/unsubscribe', { threadId }).catch((error) => {
+        event(`late thread cleanup: ${error.message}`);
+      });
+    } else if (message.id !== undefined && !message.method && this.pending.has(message.id)) {
       const entry = this.pending.get(message.id);
       this.pending.delete(message.id);
       clearTimeout(entry.timer);
@@ -758,6 +838,13 @@ class AppServer {
 }
 
 async function serve() {
+  const refuseDuplicate = async () => {
+    if (!await discoveryAlive()) return false;
+    process.stderr.write('luna-daemon: another daemon is alive\n');
+    process.exitCode = 73;
+    return true;
+  };
+  if (await refuseDuplicate()) return;
   const max = integer('LUNA_DAEMON_MAX', 12, 1);
   const ownerMax = integer('LUNA_DAEMON_OWNER_MAX', 0);
   const idleS = integer('LUNA_DAEMON_IDLE_S', 600);
@@ -780,6 +867,7 @@ async function serve() {
     if (Date.now() >= deadline) throw new Error('daemon start lock timed out');
     await sleep(100);
   }
+  if (await refuseDuplicate()) { lock.release(); return; }
   let http;
   let app;
   let starting;
@@ -788,6 +876,18 @@ async function serve() {
   let info;
   let idleTimer;
   let priorityTimer;
+  let loopTimer;
+  let degraded = false;
+  let threadTimeouts = 0;
+  let recycling = false;
+  let appTemp;
+  let appEnvironment = process.env;
+  let loopDelay = monitorEventLoopDelay({ resolution: 20 });
+  const loopSamples = [];
+  const memoryHelper = new MemoryHelper((pid) => spawn('powershell', [
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'luna-mempri.ps1'),
+    '-ProcessId', String(pid), '-Tree', '-Level', 'Low'
+  ], { detached: true, windowsHide: true, stdio: 'ignore' }));
   let limitsTimer;
   let limits;
   let limitsRead;
@@ -799,7 +899,7 @@ async function serve() {
   let lastHttpActivity = Date.now();
   const connections = new Set();
   const quietShutdowns = new Set();
-  const startedAt = nowIso();
+  const startedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
   const token = randomBytes(16).toString('hex');
   secrets.add(token);
   const jobs = new Map();
@@ -951,6 +1051,24 @@ async function serve() {
     running--;
     lastBusy = Date.now();
     void pump();
+  }
+
+  async function recycleApp() {
+    if (!degraded || running || recycling || stopping) return;
+    recycling = true;
+    const old = app;
+    event('app-server recycle: thread/start degraded, running=0');
+    clearTimeout(limitsTimer);
+    try {
+      await old?.stop();
+      if (app === old) app = null;
+      if (stopping) return;
+      await ensureApp();
+      degraded = false;
+      threadTimeouts = 0;
+      event('degraded off: app-server recycled');
+    } catch (error) { event(`app-server recycle failed: ${error.message}`); }
+    finally { recycling = false; }
   }
 
   function finish(job, state, rc, error = '') {
@@ -1142,9 +1260,14 @@ async function serve() {
     if (starting) return starting;
     if (app && !app.dead) return app;
     starting = (async () => {
-      const server = new AppServer(notification, crashed);
+      const server = new AppServer(notification, crashed, memoryHelper, appEnvironment);
       app = server;
-      await server.initialize();
+      try { await server.initialize(); }
+      catch (error) {
+        await server.stop();
+        if (app === server) app = null;
+        throw error;
+      }
       clearTimeout(limitsTimer);
       void refreshLimits('start').then(() => {
         if (!stopping && app === server && !server.dead) scheduleLimitsPoll(server);
@@ -1164,6 +1287,7 @@ async function serve() {
       const server = await ensureApp();
       job.server = server;
       if (terminal(job) || stopping) { job.server = null; releaseSlot(job); return; }
+      if (degraded) throw new Error('thread-start-timeout');
       const response = await server.rpc('thread/start', {
         cwd: job.cwd, sandbox: job.sandbox, approvalPolicy: 'never',
         ephemeral: job.ephemeral ?? (process.env.LUNA_KEEP_SESSION !== '1'),
@@ -1171,6 +1295,7 @@ async function serve() {
       });
       job.thread = response?.thread?.id || response?.threadId;
       if (!job.thread) throw new Error('thread/start returned no thread id');
+      threadTimeouts = 0;
       threads.set(job.thread, job);
       if (terminal(job) || stopping) { await unload(job); return; }
       await marker(job);
@@ -1192,6 +1317,13 @@ async function serve() {
         if (admissionJob === job) admissionTimer = setTimeout(() => releaseAdmission(job), rampMs);
       }
     } catch (error) {
+      if (error.message === 'thread/start timed out') {
+        error = new Error('thread-start-timeout');
+        if (++threadTimeouts >= 2 && !degraded) {
+          degraded = true;
+          event('degraded on: consecutive thread/start timeouts');
+        }
+      }
       if (!terminal(job)) finish(job, 'failed', 1, error.message);
       if (job.turn) await interruptAndUnload(job);
       else await unload(job);
@@ -1200,6 +1332,14 @@ async function serve() {
 
   async function pump() {
     if (stopping || crashLoop || admissionJob) return;
+    if (degraded) {
+      for (const job of [...queue]) {
+        if (job.ready) finish(job, 'failed', 1, 'thread-start-timeout');
+      }
+      void recycleApp();
+      return;
+    }
+    if (recycling) return;
     nextPump = Date.now() + 2000;
     const activeWrites = [...jobs.values()].filter((job) => job.slot && job.sandbox === 'workspace-write');
     const owners = ownerCounts(jobs.values());
@@ -1313,6 +1453,8 @@ async function serve() {
     shutdownPromise = (async () => {
       clearInterval(idleTimer);
       clearInterval(priorityTimer);
+      clearInterval(loopTimer);
+      loopDelay.disable();
       clearTimeout(limitsTimer);
       clearTimeout(admissionTimer);
       admission.release();
@@ -1329,6 +1471,8 @@ async function serve() {
       }
       await Promise.allSettled(interrupts);
       await app?.stop();
+      await memoryHelper.stop();
+      if (appTemp) await rm(appTemp, { recursive: true, force: true }).catch(() => {});
       if (!await settleWithin(Promise.allSettled([starting, ...preparations]), 5000)) {
         event('shutdown: startup and preparations did not settle within 5000 ms');
       }
@@ -1427,6 +1571,8 @@ async function serve() {
     lock.release();
     admission.release();
     app?.stopSync();
+    if (memoryHelper.active) killTreeSync(memoryHelper.active.child);
+    if (appTemp) { try { rmSync(appTemp, { recursive: true, force: true }); } catch {} }
     const current = readInfo();
     if (current?.pid === process.pid && current.token === token) {
       try { unlinkSync(INFO); } catch {}
@@ -1436,7 +1582,6 @@ async function serve() {
   process.on('SIGINT', () => { void shutdown(); });
   process.on('SIGTERM', () => { void shutdown(); });
   try {
-    if (await health()) { lock.release(); return; }
     try {
       if (existsSync(LOG)) {
         const lines = readFileSync(LOG, 'utf8').trimEnd().split(/\r?\n/).slice(-2000);
@@ -1444,7 +1589,32 @@ async function serve() {
       }
     } catch (error) { event(`daemon log trim failed: ${error.message}`); }
     event(`start pid=${process.pid}`);
-    try { os.setPriority(os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
+    if (process.env.LUNA_JOB_TEMP !== '0') {
+      const tempRoot = path.join(RUN, 'tmp');
+      mkdirSync(tempRoot, { recursive: true });
+      for (const entry of readdirSync(tempRoot, { withFileTypes: true })) {
+        const match = /^daemon-([1-9]\d*)$/.exec(entry.name);
+        if (!entry.isDirectory() || !match) continue;
+        try { process.kill(Number(match[1]), 0); }
+        catch (error) {
+          if (error.code === 'ESRCH') {
+            await rm(path.join(tempRoot, entry.name), { recursive: true, force: true }).catch(() => {});
+          }
+        }
+      }
+      appTemp = path.join(tempRoot, `daemon-${process.pid}`);
+      mkdirSync(appTemp, { recursive: true });
+      appEnvironment = { ...process.env, TEMP: appTemp, TMP: appTemp, TMPDIR: appTemp };
+    }
+    loopDelay.enable();
+    loopTimer = setInterval(() => {
+      loopDelay.disable();
+      loopSamples.push({ at: Date.now(), p99Ns: loopDelay.count ? loopDelay.percentile(99) : 0,
+        count: loopDelay.count });
+      while (loopSamples.length && loopSamples[0].at <= Date.now() - 60_000) loopSamples.shift();
+      loopDelay = monitorEventLoopDelay({ resolution: 20 });
+      loopDelay.enable();
+    }, 1000);
     await ensureApp();
     if (stopping) throw new Error('daemon stopped');
     http = createServer(async (req, res) => {
@@ -1526,6 +1696,7 @@ async function serve() {
         }
         if (req.method === 'GET' && req.url === '/health') {
           reply(200, { ok: !stopping && !crashLoop, pid: process.pid, appServerPid: app?.child.pid || null,
+            degraded, loopDelayMs: eventLoopDelayMs(loopDelay, loopSamples),
             appServer: starting ? 'restarting' : app && !app.dead ? 'up' : 'down',
             codexBin: app?.codexBin || info?.codexBin, shell: app?.shell || info?.shell,
             jobs: { running, queued: queue.filter((job) => !terminal(job)).length },
@@ -1652,6 +1823,7 @@ async function serve() {
         job.ready = true;
         lastBusy = Date.now();
         if (crashLoop) finish(job, 'failed', 1, 'app-server crash loop');
+        else if (degraded) finish(job, 'failed', 1, 'thread-start-timeout');
         reply(200, { id: job.id });
         void pump();
       } catch (error) {
@@ -1741,8 +1913,41 @@ async function serve() {
   } finally { lock.release(); }
 }
 
+function eventLoopDelayMs(current, samples, now = Date.now()) {
+  let p99Ns = current.count ? current.percentile(99) : 0;
+  for (const sample of samples) {
+    if (sample.at >= now - 60_000 && sample.at <= now && sample.count > 0) {
+      p99Ns = Math.max(p99Ns, sample.p99Ns);
+    }
+  }
+  return Math.round(p99Ns / 1e6);
+}
+
 async function unitChecks(root, check) {
   testLog = path.join(root, 'unit.log');
+  const identityServer = createServer();
+  await new Promise((resolve) => identityServer.listen(0, '127.0.0.1', resolve));
+  const identityInfo = { pid: process.pid, port: identityServer.address().port };
+  await new Promise((resolve) => identityServer.close(resolve));
+  let identityStarted = Date.now();
+  check('live non-daemon PID with an unbound port is not alive', !await discoveryAlive(identityInfo));
+  check('unbound port identity check finishes within two seconds', Date.now() - identityStarted < 2000);
+  identityStarted = Date.now();
+  check('dead PID is not alive', !await discoveryAlive({ ...identityInfo, pid: 2147483647 }));
+  check('dead PID identity check finishes within two seconds', Date.now() - identityStarted < 2000);
+  const currentDelay = monitorEventLoopDelay({ resolution: 10 });
+  const rotatedDelay = monitorEventLoopDelay({ resolution: 10 });
+  currentDelay.enable();
+  rotatedDelay.enable();
+  await sleep(60);
+  rotatedDelay.disable();
+  const rotatedWindow = { at: Date.now(), p99Ns: rotatedDelay.count ? rotatedDelay.percentile(99) : 0,
+    count: rotatedDelay.count };
+  await sleep(60);
+  currentDelay.disable();
+  const measuredDelay = eventLoopDelayMs(currentDelay, [rotatedWindow]);
+  check('event-loop health delay is numeric with a real rotated window', rotatedWindow.count > 0 &&
+    Number.isFinite(measuredDelay) && measuredDelay >= 0);
   check('settleWithin times out without rejecting', !await settleWithin(new Promise(() => {}), 20) &&
     await settleWithin(Promise.reject(new Error('x')), 1000));
   const window = { usedPercent: 0, windowDurationMins: 300, resetsAt: 2_000_000_000 };
@@ -1913,10 +2118,14 @@ async function unitChecks(root, check) {
         await Promise.all(responsiveFiles.map((target) => unlink(target).catch(() => {})));
       }
       responsive = responsiveWrites.every(Boolean) && maxLag < 250;
+      if (!responsive) {
+        process.stderr.write(`responsiveness attempt ${attempt + 1}: maxLag=${maxLag}ms ` +
+          `writes=${responsiveWrites.filter(Boolean).length}/${responsiveWrites.length}\n`);
+      }
     }
     check('event loop stays responsive during writes', responsive);
     const server = Object.create(AppServer.prototype);
-    Object.assign(server, { dead: false, nextId: 1, pending: new Map(), send() {},
+    Object.assign(server, { dead: false, nextId: 1, pending: new Map(), lateThreads: new Set(), send() {},
       crash() { throw new Error('RPC timeout must not crash'); } });
     for (const method of ['thread/start', 'turn/start', 'turn/interrupt', 'thread/unsubscribe',
       'account/rateLimits/read']) {
@@ -1924,6 +2133,51 @@ async function unitChecks(root, check) {
       try { await server.rpc(method, {}, 5); } catch (caught) { error = caught; }
       check(`${method} timeout is local`, error?.message === `${method} timed out` && server.pending.size === 0);
     }
+    const cleanup = [];
+    server.send = (frame) => {
+      cleanup.push(frame);
+      queueMicrotask(() => server.message({ id: frame.id, result: {} }));
+    };
+    server.message({ id: 1, result: { thread: { id: 'late-unit' } } });
+    await sleep(0);
+    check('late thread/start response is unsubscribed without a turn', cleanup.length === 1 &&
+      cleanup[0].method === 'thread/unsubscribe' && cleanup[0].params.threadId === 'late-unit');
+    const { EventEmitter } = await import('node:events');
+    let clock = 0;
+    let launches = 0;
+    let kills = 0;
+    let killed;
+    let fake;
+    const helperNotes = [];
+    const helper = new MemoryHelper(() => {
+      launches++;
+      fake = new EventEmitter();
+      return fake;
+    }, () => { kills++; return new Promise((resolve) => { killed = resolve; }); },
+    (line) => helperNotes.push(line), () => clock, 20);
+    helper.tick(1);
+    helper.tick(1);
+    helper.tick(1);
+    check('memory helper has at most one child across ticks', launches === 1 &&
+      helperNotes.filter((line) => line.includes('skipped')).length === 2);
+    await sleep(40);
+    helper.tick(1);
+    check('memory helper kills on deadline and excludes overlap during tree kill', kills === 1 && launches === 1);
+    killed();
+    await sleep(0);
+    helper.tick(1);
+    check('memory helper timeout doubles the base interval and backs off', helper.interval === 120_000 &&
+      helper.next === 120_000 && launches === 1 && helperNotes.some((line) => line.includes('killed')));
+    for (let i = 0; i < 4; i++) {
+      clock = helper.next;
+      helper.tick(1);
+      fake.emit('exit', 1);
+    }
+    check('memory helper failure backoff is capped at ten minutes', helper.interval === 600_000);
+    clock = helper.next;
+    helper.tick(1);
+    fake.emit('exit', 0);
+    check('memory helper success resets the base interval', helper.interval === 60_000 && !helper.active);
     const lock = daemonLock(() => {}, path.join(root, 'admit.lock'));
     const peer = daemonLock(() => {}, path.join(root, 'admit.lock'));
     check('shared admission lock is nonblocking and exclusive', lock.acquire() && !peer.acquire());
@@ -1972,8 +2226,22 @@ async function selfTest(unitOnly = false) {
     closeSync(output);
     processes.add(child);
     (instance.children ||= []).push(child);
-    child.on('error', () => {});
+    child.on('error', (error) => { child.launchError = error; });
     return child;
+  }
+  async function aliveExit(current) {
+    const started = Date.now();
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--alive'], {
+      env: current.env, stdio: 'ignore', windowsHide: true
+    });
+    processes.add(child);
+    return new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', (code) => {
+        check(`--alive finishes within two seconds (exit ${code})`, Date.now() - started < 2000);
+        resolve(code);
+      });
+    });
   }
   async function instance(idleS = 0, overrides = {}) {
     const home = path.join(root, `instance-${serial++}`);
@@ -1981,10 +2249,12 @@ async function selfTest(unitOnly = false) {
     const current = {
       home,
       env: {
-        ...process.env, LUNA_DAEMON_HOME: home, LUNA_DAEMON_MAX: '2', LUNA_DAEMON_IDLE_S: String(idleS),
+        ...process.env, HOME: home, CODEX_HOME: path.join(home, '.codex'),
+        LUNA_DAEMON_HOME: home, LUNA_DAEMON_MAX: '2', LUNA_DAEMON_IDLE_S: String(idleS),
         LUNA_KEEP_SESSION: '0', LUNA_ADMIT_LOCK: path.join(home, 'admit.lock'), LUNA_RAM_RESERVE_MB: '0',
         LUNA_DAEMON_TURN_MB: '0', LUNA_DAEMON_RAMP_MS: '10', LUNA_DAEMON_OWNER_MAX: '0',
         LUNA_DAEMON_LIMITS_POLL_S: '300', LUNA_STUB_LIMITS_FAIL_READ: '',
+        LUNA_LOW_PRIORITY: '0', LUNA_JOB_TEMP: '1',
         LUNA_STUB_LIMITS_NOTIFY_DURING_READ: '', LUNA_CODEX_SHELL_PATH: '',
         ...overrides,
         LUNA_DAEMON_APP_SERVER_CMD: JSON.stringify([
@@ -2000,6 +2270,8 @@ async function selfTest(unitOnly = false) {
   };
   async function ready(current) {
     const info = await until(async () => {
+      const launchError = current.children?.find((child) => child.launchError)?.launchError;
+      if (launchError) throw launchError;
       const value = infoFor(current);
       const live = value && await health(value);
       if (!live && current.children?.every((child) => child.exitCode !== null)) {
@@ -2058,20 +2330,87 @@ async function selfTest(unitOnly = false) {
       return failed ? 1 : 0;
     }
     const main = await instance();
+    check('--alive returns 2 for a temporary home without discovery', await aliveExit(main) === 2);
+    const staleTemp = path.join(main.home, 'tmp', 'daemon-2147483647');
+    const liveTemp = path.join(main.home, 'tmp', `daemon-${process.pid}`);
+    mkdirSync(staleTemp, { recursive: true });
+    mkdirSync(liveTemp, { recursive: true });
     // A stale discovery record is replaced while two launchers contend for the mkdir lock.
     writeFileSync(path.join(main.home, 'daemon.json'), JSON.stringify({
       pid: 2147483647, port: 1, token: '0'.repeat(32), version: 1
     }));
+    check('--alive returns 1 for dead discovery in a temporary home', await aliveExit(main) === 1);
     const first = launch(main);
     const second = launch(main);
     const info = await ready(main);
-    await until(() => first.exitCode === 0 || second.exitCode === 0, 45_000);
+    await until(() => first.exitCode === 73 || second.exitCode === 73, 45_000);
     const initialHealth = await health(info);
+    check('--alive returns 0 for a live daemon in a temporary home', await aliveExit(main) === 0);
     check('double start and stale discovery: one healthy daemon / app-server',
       [first.pid, second.pid].includes(info.pid) && initialHealth.appServerPid &&
       audit().filter((entry) => entry.event === 'spawn').length === 1);
     check('authenticated health', initialHealth.ok && initialHealth.jobs.running === 0 &&
       initialHealth.appServer === 'up');
+    if (process.platform === 'win32') {
+      check('daemon and app-server keep inherited CPU priority by default',
+        os.getPriority(info.pid) === os.getPriority(process.pid) &&
+        os.getPriority(initialHealth.appServerPid) === os.getPriority(process.pid));
+    } else process.stdout.write('SKIP Windows CPU priority assertion (not win32)\n');
+    const daemonTemp = path.join(main.home, 'tmp', `daemon-${info.pid}`);
+    const defaultSpawn = audit().find((entry) => entry.event === 'spawn' &&
+      entry.pid === initialHealth.appServerPid);
+    check('app-server receives dedicated TEMP/TMP/TMPDIR', existsSync(daemonTemp) &&
+      [defaultSpawn.temp, defaultSpawn.tmp, defaultSpawn.tmpdir].every((value) => value === daemonTemp));
+    check('startup removes dead daemon TEMP and preserves live PID TEMP',
+      !existsSync(staleTemp) && existsSync(liveTemp));
+    await sleep(200);
+    const discoveryBefore = readFileSync(path.join(main.home, 'daemon.json'));
+    const logBefore = readFileSync(path.join(main.home, 'daemon.log'));
+    const spawnsBefore = audit().filter((entry) => entry.event === 'spawn').length;
+    const duplicateLauncher = launch(main);
+    await until(() => duplicateLauncher.exitCode !== null);
+    const refusalLog = path.join(main.home, `launcher-${serial - 1}.log`);
+    check('live discovery refuses duplicate before touching discovery/log or starting app-server',
+      duplicateLauncher.exitCode === 73 && readFileSync(refusalLog, 'utf8').includes('another daemon is alive') &&
+      discoveryBefore.equals(readFileSync(path.join(main.home, 'daemon.json'))) &&
+      logBefore.equals(readFileSync(path.join(main.home, 'daemon.log'))) &&
+      audit().filter((entry) => entry.event === 'spawn').length === spawnsBefore);
+    const reusedPid = await instance();
+    const unusedPortServer = createServer();
+    await new Promise((resolve) => unusedPortServer.listen(0, '127.0.0.1', resolve));
+    const unusedPort = unusedPortServer.address().port;
+    await new Promise((resolve) => unusedPortServer.close(resolve));
+    writeFileSync(path.join(reusedPid.home, 'daemon.json'), JSON.stringify({
+      ...info, pid: process.pid, port: unusedPort,
+      startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString()
+    }));
+    check('--alive rejects a live non-daemon PID', await aliveExit(reusedPid) === 1);
+    launch(reusedPid);
+    const reusedInfo = await ready(reusedPid);
+    check('live non-daemon PID in stale discovery does not prevent startup', reusedInfo.pid !== process.pid);
+    await httpJson(reusedInfo, 'POST', '/stop');
+    const reusedTemp = path.join(reusedPid.home, 'tmp', `daemon-${reusedInfo.pid}`);
+    await until(() => !existsSync(reusedTemp));
+    check('daemon removes its dedicated TEMP on shutdown', !existsSync(reusedTemp));
+    const inheritedTemp = path.join(root, 'inherited-temp');
+    mkdirSync(inheritedTemp);
+    const lowPriority = await instance(0, {
+      LUNA_LOW_PRIORITY: '1', LUNA_JOB_TEMP: '0',
+      TEMP: inheritedTemp, TMP: inheritedTemp, TMPDIR: inheritedTemp
+    });
+    launch(lowPriority);
+    const lowInfo = await ready(lowPriority);
+    const lowHealth = await health(lowInfo);
+    const lowSpawn = audit().find((entry) => entry.event === 'spawn' && entry.pid === lowHealth.appServerPid);
+    check('LUNA_JOB_TEMP=0 preserves inherited TEMP/TMP/TMPDIR',
+      [lowSpawn.temp, lowSpawn.tmp, lowSpawn.tmpdir].every((value) => value === inheritedTemp) &&
+      !existsSync(path.join(lowPriority.home, 'tmp', `daemon-${lowInfo.pid}`)));
+    if (process.platform === 'win32') {
+      check('LUNA_LOW_PRIORITY=1 lowers only app-server CPU priority',
+        os.getPriority(lowInfo.pid) === os.getPriority(process.pid) &&
+        os.getPriority(lowHealth.appServerPid) === os.constants.priority.PRIORITY_BELOW_NORMAL);
+    }
+    await httpJson(lowInfo, 'POST', '/stop');
     const initialSpawn = audit().find((entry) => entry.event === 'spawn' && entry.pid === initialHealth.appServerPid);
     check('default shell omits custom build keys and reports binary and shell in discovery and health',
       !initialSpawn.args.some((arg) => /^(default_shell|default_shell_path|allow_login_shell)=/.test(arg)) &&
@@ -2369,6 +2708,51 @@ async function selfTest(unitOnly = false) {
     check('detached daemon survives launcher exit', launcher.exitCode === 0 && !!await health(detachedInfo));
     await httpJson(detachedInfo, 'POST', '/stop');
     await until(() => !existsSync(path.join(detached.home, 'daemon.json')));
+
+    const degradedTest = await instance(0, { LUNA_DAEMON_RPC_TIMEOUT_MS: '1000' });
+    launch(degradedTest);
+    const degradedInfo = await ready(degradedTest);
+    const beforeDegraded = await health(degradedInfo);
+    const streaming = await submit(degradedInfo, 'WAIT_STREAM survivor');
+    await until(() => readFileSync(streaming.log, 'utf8').includes('still streaming'));
+    const lateThread = await submit(degradedInfo, 'late-thread never turns', { model: 'late-thread' });
+    check('thread/start timeout has distinct no-turn error',
+      (await finished(degradedInfo, lateThread.id)).error === 'thread-start-timeout');
+    await until(() => audit().some((entry) => entry.pid === beforeDegraded.appServerPid &&
+      entry.method === 'thread/unsubscribe' && entry.params.threadId === 'thread-3'));
+    check('late thread id is unsubscribed and never starts a turn', !audit().some((entry) =>
+      entry.pid === beforeDegraded.appServerPid && entry.method === 'turn/start' &&
+      entry.params.threadId === 'thread-3'));
+    const hanging = await submit(degradedInfo, 'hang-thread never turns', { model: 'hang-thread' });
+    check('second consecutive thread/start timeout is also safe to replay',
+      (await finished(degradedInfo, hanging.id)).error === 'thread-start-timeout');
+    const duringDegraded = await health(degradedInfo);
+    check('health exposes degraded and a numeric event-loop p99', duringDegraded.degraded === true &&
+      Number.isFinite(duringDegraded.loopDelayMs) && duringDegraded.loopDelayMs >= 0 &&
+      duringDegraded.appServerPid === beforeDegraded.appServerPid);
+    const startsBefore = audit().filter((entry) => entry.pid === beforeDegraded.appServerPid &&
+      entry.method === 'thread/start').length;
+    const immediateAt = Date.now();
+    const immediate = await submit(degradedInfo, 'degraded immediate', { sandbox: 'workspace-write' });
+    check('degraded submissions fail immediately without thread/start',
+      (await finished(degradedInfo, immediate.id)).error === 'thread-start-timeout' &&
+      Date.now() - immediateAt < 1000 && audit().filter((entry) => entry.pid === beforeDegraded.appServerPid &&
+        entry.method === 'thread/start').length === startsBefore);
+    const streamBytes = statSync(streaming.log).size;
+    await until(() => statSync(streaming.log).size > streamBytes);
+    check('running jobs keep streaming during degraded mode', (await result(degradedInfo, streaming.id)).state ===
+      'running' && (await health(degradedInfo)).appServerPid === beforeDegraded.appServerPid);
+    await cancel(degradedInfo, streaming);
+    await until(async () => {
+      const current = await health(degradedInfo);
+      return current && !current.degraded && current.appServerPid !== beforeDegraded.appServerPid;
+    });
+    check('app-server recycles after running reaches zero and degraded clears',
+      (await finished(degradedInfo, (await submit(degradedInfo, 'healthy again')).id)).rc === 0);
+    const degradedLog = readFileSync(path.join(degradedTest.home, 'daemon.log'), 'utf8');
+    check('degraded transitions and recycle are logged', degradedLog.includes('degraded on:') &&
+      degradedLog.includes('app-server recycle:') && degradedLog.includes('degraded off:'));
+    await httpJson(degradedInfo, 'POST', '/stop');
 
     const local = await instance(0, { LUNA_DAEMON_RPC_TIMEOUT_MS: '1000', LUNA_DAEMON_LOG_MAX_BYTES: '512' });
     launch(local);
@@ -2681,6 +3065,9 @@ async function selfTest(unitOnly = false) {
     check('live duplicate output path still conflicts with 409', duplicated.status === 409);
     await cancel(orphanInfo, duplicate);
 
+    await httpJson(orphanInfo, 'POST', '/test/block?ms=5000');
+    check('--alive returns 0 while the live daemon event loop is frozen', await aliveExit(orphans) === 0);
+    await health(orphanInfo, 6000);
     const block = await httpJson(orphanInfo, 'POST', '/test/block?ms=1500');
     const healthStarted = Date.now();
     const blockedHealth = await httpJson(orphanInfo, 'GET', '/health');
@@ -2783,6 +3170,10 @@ async function selfTest(unitOnly = false) {
 try {
   const mode = process.argv[2];
   if (mode === '--serve') await serve();
+  else if (mode === '--alive') {
+    const info = readInfo();
+    process.exitCode = info ? (await discoveryAlive(info) ? 0 : 1) : 2;
+  }
   else if (mode === '--self-test' || mode === '--self-test-unit') {
     process.exitCode = await selfTest(mode === '--self-test-unit');
   }
@@ -2808,7 +3199,7 @@ try {
   } else if (mode === '--stop') {
     const info = readInfo();
     if (info && await health(info)) await httpJson(info, 'POST', '/stop');
-  } else throw new Error('usage: node luna-daemon.mjs --serve|--status|--jobs|--stop|--self-test');
+  } else throw new Error('usage: node luna-daemon.mjs --serve|--alive|--status|--jobs|--stop|--self-test');
 } catch (error) {
   process.stderr.write(`luna-daemon: ${cleanValue(error.message)}\n`);
   process.exitCode = 1;

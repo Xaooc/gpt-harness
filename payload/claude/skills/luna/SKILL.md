@@ -138,6 +138,11 @@ jobs.** Spend them wherever they raise the quality of the final result or cut wa
   `waiting-daemon` (queue full, HTTP 429), then `running`. See everything that's running: `node ~/.claude/scripts/luna-daemon.mjs --status`.
   `LUNA_DAEMON=0` forces the old one-process-per-job `codex exec` path; the wrapper falls back to it by itself if the daemon can't start.
   If the daemon dies mid-job, read-only jobs are retried once via exec; write jobs are never re-run.
+  CPU priority stays inherited; `LUNA_LOW_PRIORITY=1` lowers only the Codex tree. Exec jobs get a small per-job TEMP;
+  daemon jobs share a small daemon TEMP (`LUNA_JOB_TEMP=0` keeps inherited TEMP).
+  `~/.claude/luna-daemon-off` selects exec unless `LUNA_DAEMON` is explicitly set. Two consecutive `thread/start`
+  timeouts mark it degraded: running turns continue, new jobs fall back to exec, and the app-server recycles when idle.
+  `thread-start-timeout` guarantees no turn ran, so either read or write jobs fall back once (`fallback=exec`).
   `luna-panel.sh` (critics) now runs each brief as a `luna.sh -r` job, i.e. as threads in the same daemon with the same busybox shell
   and fair scheduling; `LUNA_POOL=1` opts back into the old one-app-server-per-panel `luna-pool.mjs` engine.
   HTTP resets fixed (2026-10-21): early rejections (401/413/404/429 before the body is read) now use a lingering close; crash-loop

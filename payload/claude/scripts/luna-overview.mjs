@@ -6,11 +6,13 @@ import * as fs from 'node:fs/promises';
 import { freemem, totalmem, homedir, tmpdir, uptime } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { readFileSync, statSync } from 'node:fs';
+import {
+  mkdirSync, readFileSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync
+} from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const DEADLINE_MS = 1750;
+const DEADLINE_MS = 3750;
 const TAIL_BYTES = 64 * 1024;
 const ACTIVE_LIMIT = 200;
 const LEGACY_MAX_AGE_MS = 10 * 60 * 1000;
@@ -49,7 +51,8 @@ function empty(now = Date.now()) {
   return {
     v: 1, at: new Date(now).toISOString(),
     ram: { freeMb: null, totalMb: null },
-    daemon: { running: false, appServer: null, healthy: false }, jobs: [], codexLimits: null, build: null,
+    daemon: { running: false, appServer: null, healthy: false, degraded: false },
+    jobs: [], codexLimits: null, build: null,
     sessions: []
   };
 }
@@ -223,7 +226,7 @@ function alive(pid) {
 async function fetchJson(info, route) {
   try {
     const response = await fetch(`http://127.0.0.1:${info.port}${route}`, {
-      headers: { 'X-Luna-Token': info.token }, signal: AbortSignal.timeout(1000), redirect: 'error'
+      headers: { 'X-Luna-Token': info.token }, signal: AbortSignal.timeout(3000), redirect: 'error'
     });
     if (!response.ok) {
       await response.body?.cancel();
@@ -248,21 +251,80 @@ function daemonJobs(list, now) {
     })).sort(newest).slice(0, 30);
 }
 
+async function healthCollection(directory, info, health, now = Date.now()) {
+  const ok = health?.ok === true;
+  const file = path.join(directory, 'daemon-health.json');
+  const lock = `${file}.lock`;
+  const owner = path.join(lock, String(process.pid));
+  const deadline = Date.now() + 500;
+  let locked = false;
+  // As with the daemon's mkdir lock, only a dead owner or an old empty lock is reclaimed.
+  while (!locked) {
+    try {
+      mkdirSync(lock);
+      writeFileSync(owner, '');
+      locked = true;
+    } catch (error) {
+      if (error.code !== 'EEXIST' || Date.now() >= deadline) break;
+      try {
+        const owners = readdirSync(lock);
+        if (owners.length === 1 && /^[1-9]\d*$/.test(owners[0])) {
+          try { process.kill(Number(owners[0]), 0); }
+          catch (cause) { if (cause.code === 'ESRCH') unlinkSync(path.join(lock, owners[0])); }
+        }
+        if (owners.length || Date.now() - statSync(lock).mtimeMs > 10_000) rmdirSync(lock);
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  let state;
+  try {
+    const previous = await readJson(file);
+    const same = previous?.pid === info.pid && previous?.startedAt === info.startedAt;
+    state = { pid: info.pid, startedAt: info.startedAt,
+      lastOkAt: same ? number(previous.lastOkAt) : null,
+      firstMissAt: same ? number(previous.firstMissAt) : null,
+      degraded: ok ? health.degraded === true : same && previous.degraded === true };
+    if (ok) state.lastOkAt = Math.max(now, state.lastOkAt ?? now);
+    else if (now > (state.lastOkAt ?? -Infinity) &&
+        (state.firstMissAt === null || state.firstMissAt <= (state.lastOkAt ?? -Infinity))) {
+      state.firstMissAt = now;
+    }
+    const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    if (locked) {
+      try {
+        await fs.writeFile(temp, JSON.stringify(state));
+        await fs.rename(temp, file);
+      } catch {}
+      finally { await fs.unlink(temp).catch(() => {}); }
+    }
+  } finally {
+    if (locked) {
+      try { unlinkSync(owner); rmdirSync(lock); } catch {}
+    }
+  }
+  return { healthy: ok || !(state.firstMissAt !== null &&
+    now - state.firstMissAt >= 10_000 &&
+    state.firstMissAt > (state.lastOkAt ?? -Infinity)), degraded: state.degraded };
+}
+
 async function daemonStatus(directory, now, snapshot) {
   const info = await readJson(path.join(directory, 'daemon.json'));
   if (!info || !alive(info.pid)) return;
   const result = {
     running: true, pid: info.pid, uptimeS: seconds(info.startedAt, now), max: null,
-    runningJobs: null, queuedJobs: null, owners: [], jobs: [], appServer: null, healthy: false
+    runningJobs: null, queuedJobs: null, owners: [], jobs: [], appServer: null, healthy: true, degraded: false
   };
   snapshot.daemon = result;
   if (!Number.isInteger(info.port) || info.port < 1 || info.port > 65535 || typeof info.token !== 'string') {
+    Object.assign(result, await healthCollection(directory, info, null));
     return;
   }
-  // The independent 1 s deadlines overlap, rather than consuming the entire 2 s budget in sequence.
+  // Independent 3 s HTTP deadlines overlap within the collector's outer deadline.
   await Promise.all([
-    fetchJson(info, '/health').then((health) => {
-      result.healthy = health?.ok === true;
+    fetchJson(info, '/health').then(async (health) => {
+      if (health?.pid !== undefined && health.pid !== info.pid) health = null;
+      Object.assign(result, await healthCollection(directory, info, health));
       result.appServer = ['up', 'down', 'restarting'].includes(health?.appServer) ? health.appServer : null;
       result.uptimeS = number(health?.uptimeS) ?? result.uptimeS;
       result.max = number(health?.max);
@@ -359,7 +421,8 @@ function human(snapshot) {
 }
 
 async function selfTest() {
-  const saved = Object.fromEntries(['LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME'].map((key) => [key, process.env[key]]));
+  const saved = Object.fromEntries(['HOME', 'LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME']
+    .map((key) => [key, process.env[key]]));
   const directory = await fs.mkdtemp(path.join(tmpdir(), 'luna-overview-test-'));
   const now = Date.now();
   const result = { passed: 0, failed: 0, errors: [] };
@@ -368,6 +431,7 @@ async function selfTest() {
     catch (error) { result.failed++; result.errors.push(`${name}: ${error.message}`); }
   };
   try {
+    process.env.HOME = directory;
     process.env.LUNA_OVERVIEW_HOME = directory;
     process.env.LUNA_DAEMON_HOME = path.join(directory, 'daemon');
     const config = { ...configuration(), build: path.join(directory, 'build') };
@@ -409,7 +473,7 @@ async function selfTest() {
       assert.equal(snapshot.at, new Date(now).toISOString());
       assert.deepEqual(Object.keys(snapshot.ram), ['freeMb', 'totalMb']);
       assert.equal(typeof snapshot.ram.freeMb, 'number');
-      assert.deepEqual(snapshot.daemon, { running: false, appServer: null, healthy: false });
+      assert.deepEqual(snapshot.daemon, { running: false, appServer: null, healthy: false, degraded: false });
       assert.deepEqual(Object.keys(snapshot.jobs[0]), [
         'out', 'state', 'model', 'effort', 'sandbox', 'engine', 'ageS', 'dir', 'error', 'queuePos',
         'owner', 'idleS', 'activity'
@@ -529,17 +593,65 @@ async function selfTest() {
         const projected = empty(now);
         await daemonStatus(config.daemon, now, projected);
         check(`daemon health projection ${ok}/${appServer}`, () => {
-          assert.equal(projected.daemon.healthy, ok === true);
+          assert.equal(projected.daemon.healthy, true);
           assert.equal(projected.daemon.appServer, expected);
         });
       }
+      const healthFile = path.join(config.daemon, 'daemon-health.json');
+      await fs.unlink(healthFile);
       globalThis.fetch = async () => { throw new Error('health unavailable'); };
       const unavailable = empty(now);
       await daemonStatus(config.daemon, now, unavailable);
-      check('unavailable health stays unhealthy with unknown app-server', () => {
+      check('one missed health keeps the daemon healthy with unknown app-server', () => {
         assert.equal(unavailable.daemon.running, true);
-        assert.equal(unavailable.daemon.healthy, false);
+        assert.equal(unavailable.daemon.healthy, true);
         assert.equal(unavailable.daemon.appServer, null);
+      });
+      const discovery = await readJson(path.join(config.daemon, 'daemon.json'));
+      const firstMissAt = (await readJson(healthFile)).firstMissAt;
+      const soon = await healthCollection(config.daemon, discovery, null, firstMissAt + 9999);
+      const twice = await healthCollection(config.daemon, discovery, null, firstMissAt + 10_000);
+      check('misses become unhealthy only after ten seconds without success', () => {
+        assert.equal(soon.healthy, true);
+        assert.equal(twice.healthy, false);
+        assert.equal(JSON.parse(readFileSync(healthFile)).firstMissAt, firstMissAt);
+      });
+      const okAt = firstMissAt + 10_001;
+      const recovered = await healthCollection(config.daemon, discovery, { ok: true, degraded: true }, okAt);
+      check('successful health records lastOkAt and surfaces degraded', () => {
+        assert.equal(recovered.healthy, true);
+        assert.equal(recovered.degraded, true);
+        assert.equal(JSON.parse(readFileSync(healthFile)).lastOkAt, okAt);
+      });
+      const afterReset = await healthCollection(config.daemon, discovery, null, okAt + 1);
+      check('a single miss after success stays healthy and keeps degraded', () => {
+        assert.equal(afterReset.healthy, true);
+        assert.equal(afterReset.degraded, true);
+        assert.equal(JSON.parse(readFileSync(healthFile)).firstMissAt, okAt + 1);
+      });
+      await fs.unlink(healthFile);
+      const concurrent = await Promise.all([
+        healthCollection(config.daemon, discovery, null, now),
+        healthCollection(config.daemon, discovery, null, now + 1)
+      ]);
+      const outage = await Promise.all([
+        healthCollection(config.daemon, discovery, null, now + 10_000),
+        healthCollection(config.daemon, discovery, null, now + 20_000)
+      ]);
+      check('interleaving collectors preserve the first miss throughout a long outage', () => {
+        assert.ok(concurrent.every((sample) => sample.healthy));
+        assert.ok(outage.every((sample) => !sample.healthy));
+        assert.equal(JSON.parse(readFileSync(healthFile)).firstMissAt, now);
+      });
+      const interleaved = await Promise.all([
+        healthCollection(config.daemon, discovery, { ok: true }, now + 20_001),
+        healthCollection(config.daemon, discovery, null, now + 20_002)
+      ]);
+      const reset = await healthCollection(config.daemon, discovery, null, now + 20_003);
+      check('interleaved success resets the outage without losing lastOkAt', () => {
+        assert.ok(interleaved.every((sample) => sample.healthy));
+        assert.equal(reset.healthy, true);
+        assert.equal(JSON.parse(readFileSync(healthFile)).lastOkAt, now + 20_001);
       });
     } finally {
       globalThis.fetch = originalFetch;

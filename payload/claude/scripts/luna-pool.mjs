@@ -1162,7 +1162,6 @@ async function runPool(config) {
   process.on('unhandledRejection', onUncaught);
 
   try {
-    try { os.setPriority(os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
     const admissionStarted = Date.now();
     for (const job of jobs) job.queuedAt = admissionStarted;
     let lastRamNote = 0;
@@ -1197,6 +1196,9 @@ async function runPool(config) {
       await Promise.race([sleep(300 + Math.floor(Math.random() * 201)), abortPromise]);
     }
     server = spawnServer(home, leanArgs);
+    if (server.pid && process.env.LUNA_LOW_PRIORITY === '1') {
+      try { os.setPriority(server.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
+    }
     rampAdmission();
     server.on('error', (error) => {
       spawnError = error;

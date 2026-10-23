@@ -13,6 +13,7 @@ const audit = (value) => {
   if (process.argv[2]) appendFileSync(process.argv[2], `${JSON.stringify({ at: Date.now(), ...value })}\n`, 'utf8');
 };
 audit({ event: 'spawn', pid: process.pid, args: process.argv.slice(3),
+  temp: process.env.TEMP, tmp: process.env.TMP, tmpdir: process.env.TMPDIR,
   managedPackageRoot: process.env.CODEX_MANAGED_PACKAGE_ROOT, managedByNpm: process.env.CODEX_MANAGED_BY_NPM });
 
 const rateLimits = {
@@ -54,6 +55,10 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     if (p.model === 'hang-thread') return;
     const threadId = `thread-${++sequence}`;
     threads.set(threadId, { model: p.model });
+    if (p.model === 'late-thread') {
+      setTimeout(() => reply({ thread: { id: threadId } }), 1500);
+      return;
+    }
     reply({ thread: { id: threadId } });
   } else if (method === 'turn/start') {
     const threadId = p.threadId;
@@ -79,6 +84,11 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       if (prompt.startsWith('FLOOD')) {
         notify('item/commandExecution/outputDelta', { threadId, turnId, delta: 'x'.repeat(8192) });
       }
+      if (prompt.startsWith('WAIT_STREAM')) {
+        thread.stream = setInterval(() => {
+          notify('item/commandExecution/outputDelta', { threadId, turnId, delta: 'still streaming' });
+        }, 100);
+      }
       if (prompt.startsWith('WAIT') || prompt.startsWith('SLOW_START') ||
           prompt.startsWith('FLOOD_WAIT') || thread.model === 'hang') return;
       thread.timer = setTimeout(() => {
@@ -101,12 +111,14 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     const thread = threads.get(p.threadId);
     if (thread?.model === 'hang-interrupt') return;
     if (thread) clearTimeout(thread.timer);
+    if (thread) clearInterval(thread.stream);
     reply({});
     notify('turn/completed', { threadId: p.threadId, turn: { id: p.turnId, status: 'interrupted', items: [] } });
   } else if (method === 'thread/unsubscribe') {
     const thread = threads.get(p.threadId);
     if (thread?.model === 'hang-unsubscribe') return;
     if (thread) clearTimeout(thread.timer);
+    if (thread) clearInterval(thread.stream);
     threads.delete(p.threadId);
     reply({ status: thread ? 'unsubscribed' : 'notLoaded' });
     notify('thread/closed', { threadId: p.threadId });

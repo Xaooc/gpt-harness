@@ -5,6 +5,9 @@ set -u
 SCRIPT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/luna-client-test.XXXXXX") || exit 1
 ROOT=$(cd "$ROOT" && pwd -P) || exit 1
+TEST_HOME="$ROOT/home"
+mkdir -p "$TEST_HOME"
+export HOME="$TEST_HOME"
 passed=0; failed=0; serial=0
 declare -a clients=()
 native() {
@@ -57,6 +60,7 @@ try {
     const seconds = Number(route);
     const result = await api('POST', `/test/block?ms=${seconds * 1000}`);
     if (result.status !== 200) throw new Error(`freeze HTTP ${result.status}: ${result.reason}`);
+    if (arg) appendFileSync(arg, 'blocked\n');
     await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
   } else if (action === 'turns') {
     const entries = readFileSync(home, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
@@ -97,6 +101,9 @@ while [ $# -gt 0 ]; do
   case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
 done
 cat >/dev/null
+printf 'TEMP=%s\nTMP=%s\nTMPDIR=%s\n' "${TEMP:-}" "${TMP:-}" "${TMPDIR:-}"
+if [ -f "${TEMP:-}/.owner" ]; then printf 'TEMP_OWNER=%s\n' "$(cat "$TEMP/.owner")"; fi
+if [ "${LUNA_FAKE_WAIT:-0}" = 1 ]; then sleep 60; fi
 printf 'fake exec answer\n' > "$out"
 printf 'fake-exec\n' >> "$LUNA_FAKE_AUDIT"
 SH
@@ -136,6 +143,7 @@ start_daemon() {
   export LUNA_DAEMON_TEST_HOOKS=1
   export LUNA_DAEMON_IDLE_S=0 LUNA_DAEMON_RAMP_MS=10 LUNA_DAEMON_RPC_TIMEOUT_MS=1000
   export LUNA_RAM_RESERVE_MB=0 LUNA_DAEMON_TURN_MB=0 LUNA_DAEMON=1 LUNA_NO_GATE=1
+  export LUNA_LOW_PRIORITY=0 LUNA_JOB_TEMP=1 LUNA_NO_REGISTRY=1
   export LUNA_RAMP_S=0 LUNA_WAIT_MAX_S=40 LUNA_IDLE_MAX_S=0 LUNA_TIMEOUT_S=0
   export LUNA_NO_PREAMBLE=1 LUNA_NO_REFUSAL_RETRY=1 LUNA_STUB_DELAY_MS=1500
   export LUNA_FAKE_AUDIT="$(native "$ROOT/fake-audit")"
@@ -156,7 +164,7 @@ start_daemon() {
 run_client() {
   local name="$1" mode="$2" prompt="$3"
   OUT="$ROOT/$name.md"
-  bash "$SCRIPT_DIR/luna.sh" "$mode" -C "$ROOT" -o "$OUT" "$prompt" \
+  bash "$SCRIPT_DIR/luna.sh" "$mode" ${CLIENT_MODEL:+-m "$CLIENT_MODEL"} -C "$ROOT" -o "$OUT" "$prompt" \
     > "$OUT.stdout" 2> "$OUT.stderr" &
   CLIENT=$!; clients+=("$CLIENT")
 }
@@ -164,7 +172,12 @@ reap() { if wait "$1"; then RC=0; else RC=$?; fi; }
 equals() { [ "$1" = "$2" ]; }
 starts_with() { case "$1" in "$2"*) return 0 ;; *) return 1 ;; esac; }
 hard_kill() { taskkill //PID "$(cat /proc/$1/winpid)" //T //F >/dev/null 2>&1 || true; }
-killed_without_trap() { [ "$(field state "$OUT.status")" = running ]; }
+killed_without_trap() {
+  case "$(field state "$OUT.status")" in
+    starting|queued|running|waiting-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 cancelled_in_audit() {
   local turn
   turn=$(field turn "$1.daemon")
@@ -384,7 +397,134 @@ else
 fi
 unset LUNA_DAEMON_CLIENT_CHECK_MS LUNA_DAEMON_ORPHAN_GRACE_S
 
+if start_daemon; then
+  for mode in -r -w; do
+    before=$(wc -l < "$ROOT/fake-audit")
+    CLIENT_MODEL=hang-thread run_client "thread-timeout-${mode#-}" "$mode" 'no turn should run'
+    reap "$CLIENT"
+    check "$mode thread-start-timeout falls back successfully" equals "$RC" 0
+    check "$mode thread-start-timeout invokes exec exactly once" \
+      equals "$(( before + 1 ))" "$(wc -l < "$ROOT/fake-audit")"
+    check "$mode thread-start-timeout records fallback" equals "$(field fallback "$OUT.status")" exec
+    check "$mode thread-start-timeout records reason" equals "$(field reason "$OUT.status")" thread-start-timeout
+    check "$mode thread-start-timeout writes an exec answer" grep -q 'fake exec answer' "$OUT"
+  done
+  check 'timed-out thread starts never start a daemon turn' \
+    equals "$(helper turns "$(native "$DAEMON_DIR/audit")" $'no turn should run\n')" 0
+  helper stop "$LUNA_DAEMON_HOME" >/dev/null
+else
+  check 'thread-start-timeout daemon starts' false
+fi
+
+if start_daemon; then
+  before=$(grep -c '"event":"spawn"' "$DAEMON_DIR/audit")
+  discovery_before=$(cat "$DAEMON_DIR/daemon.json")
+  log_before=$(cat "$DAEMON_DIR/daemon.log")
+  helper freeze "$LUNA_DAEMON_HOME" 25 "$(native "$ROOT/startup-blocked")" &
+  freeze_pid=$!
+  end=$((SECONDS + 10))
+  while [ ! -f "$ROOT/startup-blocked" ] && [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
+  LUNA_NO_GATE=0 LUNA_DAEMON_BUSY_MAX_S=3 run_client slow-start -w hello
+  check 'alive slow startup reports waiting-daemon' wait_state "$OUT" waiting-daemon
+  check 'alive slow startup releases shared admission while waiting' test ! -d "$DAEMON_DIR/admit.lock"
+  reap "$CLIENT"; check 'alive slow startup falls back after busy budget' equals "$RC" 0
+  check 'alive slow startup uses exec' grep -q 'fake exec answer' "$OUT"
+  check 'alive slow startup preserves discovery' equals "$discovery_before" "$(cat "$DAEMON_DIR/daemon.json")"
+  check 'alive slow startup spawns no second app-server' \
+    equals "$before" "$(grep -c '"event":"spawn"' "$DAEMON_DIR/audit")"
+  check 'alive slow startup never launches a second daemon' equals "$log_before" "$(cat "$DAEMON_DIR/daemon.log")"
+  reap "$freeze_pid"; check 'startup freeze helper succeeds' equals "$RC" 0
+  helper stop "$LUNA_DAEMON_HOME" >/dev/null
+else
+  check 'slow-start daemon starts' false
+fi
+
+# The switch lives only under TEST_HOME; an explicit environment value wins.
+if start_daemon; then
+  mkdir -p "$HOME/.claude"
+  touch "$HOME/.claude/luna-daemon-off"
+  unset LUNA_DAEMON
+  run_client file-off -r hello
+  reap "$CLIENT"; check 'daemon-off file selects exec' equals "$(field engine "$OUT.status")" exec
+  LUNA_DAEMON=1 run_client file-overridden -r hello
+  reap "$CLIENT"; check 'explicit LUNA_DAEMON=1 ignores off file' equals "$(field engine "$OUT.status")" daemon
+  rm -f "$HOME/.claude/luna-daemon-off"
+  helper stop "$LUNA_DAEMON_HOME" >/dev/null
+else
+  check 'off-switch daemon starts' false
+fi
+
+export LUNA_DAEMON=0
+DAEMON_DIR="$ROOT/exec-temp"; mkdir -p "$DAEMON_DIR/tmp"
+export LUNA_DAEMON_HOME="$(native "$DAEMON_DIR")"
+mkdir -p "$ROOT/priority-stubs"
+cat > "$ROOT/priority-stubs/wmic" <<'SH'
+#!/usr/bin/env bash
+printf 'priority\n' >> "$LUNA_PRIORITY_AUDIT"
+SH
+cp "$ROOT/priority-stubs/wmic" "$ROOT/priority-stubs/renice"
+cat > "$ROOT/priority-stubs/powershell" <<'SH'
+#!/usr/bin/env bash
+case "$*" in *PriorityClass*) printf 'priority\n' >> "$LUNA_PRIORITY_AUDIT" ;; esac
+SH
+chmod +x "$ROOT/priority-stubs/"*
+export PATH="$ROOT/priority-stubs:$PATH"
+export LUNA_PRIORITY_AUDIT="$(native "$ROOT/priority-audit")"
+: > "$ROOT/priority-audit"
+temp_path() {
+  local value
+  value=$(field TEMP "$OUT.log")
+  if command -v cygpath >/dev/null 2>&1; then cygpath -u "$value"; else printf '%s\n' "$value"; fi
+}
+mkdir -p "$DAEMON_DIR/tmp/job-stale" "$DAEMON_DIR/tmp/job-fresh" "$DAEMON_DIR/tmp/other-stale"
+mkdir -p "$DAEMON_DIR/tmp/job-live-owner" "$DAEMON_DIR/tmp/job-dead-owner"
+printf '%s\n' "$$" > "$DAEMON_DIR/tmp/job-live-owner/.owner"
+printf '%s\n' 2147483647 > "$DAEMON_DIR/tmp/job-dead-owner/.owner"
+touch -d '2 days ago' "$DAEMON_DIR/tmp/job-stale" "$DAEMON_DIR/tmp/other-stale"
+touch -d '2 days ago' "$DAEMON_DIR/tmp/job-live-owner" "$DAEMON_DIR/tmp/job-dead-owner"
+unset LUNA_LOW_PRIORITY
+run_client exec-temp -r hello
+reap "$CLIENT"; check 'exec with small TEMP succeeds' equals "$RC" 0
+job_temp=$(temp_path)
+check 'exec passes TEMP under daemon home tmp/job-*' starts_with "$job_temp" "$DAEMON_DIR/tmp/job-"
+check 'exec TEMP/TMP/TMPDIR match' equals "$(field TEMP "$OUT.log")" "$(field TMP "$OUT.log")"
+check 'exec TMPDIR matches TEMP' equals "$(field TEMP "$OUT.log")" "$(field TMPDIR "$OUT.log")"
+check 'exec removes per-job TEMP after completion' test ! -d "$job_temp"
+check 'exec writes its wrapper owner PID in TEMP' equals "$(field TEMP_OWNER "$OUT.log")" "$CLIENT"
+check 'startup sweeps job TEMP older than 24 hours' test ! -d "$DAEMON_DIR/tmp/job-stale"
+check 'startup preserves old job TEMP with a live owner' test -d "$DAEMON_DIR/tmp/job-live-owner"
+check 'startup removes old job TEMP with a dead owner' test ! -d "$DAEMON_DIR/tmp/job-dead-owner"
+check 'startup preserves fresh job TEMP' test -d "$DAEMON_DIR/tmp/job-fresh"
+check 'startup preserves unrelated stale directory' test -d "$DAEMON_DIR/tmp/other-stale"
+check 'default priority does not invoke a priority command' test ! -s "$ROOT/priority-audit"
+LUNA_LOW_PRIORITY=1 run_client exec-low-priority -r hello
+reap "$CLIENT"; check 'opt-in priority invokes the priority command' test -s "$ROOT/priority-audit"
+LUNA_FAKE_WAIT=1 LUNA_IDLE_MAX_S=1 run_client exec-temp-watchdog -r hello
+reap "$CLIENT"; check 'exec TEMP watchdog returns 124' equals "$RC" 124
+job_temp=$(temp_path)
+check 'watchdog child received dedicated job TEMP' starts_with "$job_temp" "$DAEMON_DIR/tmp/job-"
+check 'watchdog removes per-job TEMP' test ! -d "$job_temp"
+mkdir -p "$ROOT/inherited-temp"
+inherited_temp=$(native "$ROOT/inherited-temp")
+TEMP="$inherited_temp" TMP="$inherited_temp" TMPDIR="$inherited_temp" LUNA_JOB_TEMP=0 \
+  run_client exec-inherited-temp -r hello
+reap "$CLIENT"; check 'LUNA_JOB_TEMP=0 exec succeeds' equals "$RC" 0
+check 'LUNA_JOB_TEMP=0 passes inherited TEMP' equals "$(field TEMP "$OUT.log")" "$inherited_temp"
+check 'inherited TEMP remains after completion' test -d "$ROOT/inherited-temp"
+mkdir -p "$ROOT/unwritable-temp"
+touch "$ROOT/unwritable-temp/tmp"
+LUNA_DAEMON_HOME="$(native "$ROOT/unwritable-temp")" \
+  TEMP="$inherited_temp" TMP="$inherited_temp" TMPDIR="$inherited_temp" \
+  run_client exec-unwritable-temp -r hello
+reap "$CLIENT"; check 'unwritable job TEMP still runs exec successfully' equals "$RC" 0
+check 'unwritable job TEMP passes inherited TEMP' equals "$(field TEMP "$OUT.log")" "$inherited_temp"
+check 'unwritable job TEMP records inherited fallback and reason' \
+  grep -q '^job_temp=inherited reason=mkdir-failed$' "$OUT.status"
+check 'unwritable job TEMP prints one warning' \
+  equals "$(grep -c 'warning: job_temp=inherited reason=mkdir-failed' "$OUT.stderr")" 1
+
 # A file as the state directory prevents daemon startup, without touching any real daemon.
+export LUNA_DAEMON=1
 touch "$ROOT/not-a-directory"
 export LUNA_DAEMON_HOME="$(native "$ROOT/not-a-directory")"
 run_client fallback -r hello
