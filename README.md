@@ -14,7 +14,7 @@ A ready-made Claude Code + Codex setup: Claude orchestrates, Codex executes. One
 | Broker reaper and Codex plugin patches | Reap process leaks; on Windows, patch the plugin for the review gate |
 | Luna pane (`/luna`) and tray widget (`widget/`) | Live status: RAM, Claude/Codex limits, jobs per session — inside Claude Code and as a Windows tray widget |
 | **Self-learning** (after google-research/harness2), see [SELF-LEARNING.md](SELF-LEARNING.md) | Collects corrections and outcomes, proposes rule edits daily, filtered by code and a critic, with rollback |
-| `codex-build/` | Windows build of Codex 0.162.1 with the busybox patch, so commands run in a 6 MB shell |
+| `codex-build/` | Windows build of Codex 0.164.0 with the busybox patch, so commands run in a 6 MB shell |
 | Global `CLAUDE.md` | The owner's rules, tailored to the selected platform |
 
 ## Self-learning, after the idea of [google-research/harness2](https://github.com/google-research/harness2)

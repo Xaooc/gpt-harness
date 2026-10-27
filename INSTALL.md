@@ -57,7 +57,7 @@ The same Claude Code + Codex setup as the source machine:
 - **Luna pane:** a Claude Code plugin, `/luna`, showing live RAM, Claude/Codex limits and jobs per session.
 - **Self-learning loop:** captures corrections and job outcomes, proposes rule edits daily, gated by code and a Sol
   critic, every edit revertible. It starts with **empty data** on this machine.
-- **Custom Codex build:** Codex 0.162.1 plus a patch, so model commands run in busybox `sh` (~6 MB) instead of
+- **Custom Codex build:** Codex 0.164.0 plus a patch, so model commands run in busybox `sh` (~6 MB) instead of
   PowerShell (~65 MB). You build it here (step 7).
 
 ## 0. Facts to collect first (no changes)
@@ -65,7 +65,7 @@ Run these and keep the output:
 ```bash
 node --version                 # need v20+; v22.17 tested
 git --version; ls "C:/Program Files/Git/bin/bash.exe"
-codex --version                # need codex-cli 0.162.1 (npm @openai/codex)
+codex --version                # need codex-cli 0.164.0 (npm @openai/codex)
 claude --version               # Claude Code CLI if present (the desktop app also works)
 powershell -NoProfile -Command "[int]((Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize/1MB)"  # GB RAM, 16+ recommended
 powershell -NoProfile -Command "Get-PSDrive -PSProvider FileSystem | Select Name,@{n='FreeGB';e={[int]($_.Free/1GB)}}"
@@ -74,7 +74,7 @@ powershell -NoProfile -Command "Get-PSDrive -PSProvider FileSystem | Select Name
 ## 1. Prerequisites [ASK for anything missing]
 - **Node.js 20+:** `winget install OpenJS.NodeJS.LTS`.
 - **Git for Windows:** `winget install Git.Git`. It provides Git Bash; every `.sh` here runs in it.
-- **Codex CLI 0.162.1, exactly this version:** `npm i -g @openai/codex@0.162.1`. Then `codex login`; the user
+- **Codex CLI 0.164.0, exactly this version:** `npm i -g @openai/codex@0.164.0`. Then `codex login`; the user
   signs in with their ChatGPT account. The account must have the models `gpt-6.1-sol` and `gpt-6-luna`; check with
   `codex debug models | grep -E "gpt-6.1-sol|gpt-6-luna"`.
 - **Claude Code 2.1.299 or newer** (desktop app or CLI). This is the tested version. It needs:
@@ -83,7 +83,7 @@ powershell -NoProfile -Command "Get-PSDrive -PSProvider FileSystem | Select Name
     `bash ~/.claude/scripts/luna-watch.sh -i 300 <out.md>` with Bash `run_in_background` instead, and check its
     output whenever you get control back.
 
-Check: every command in step 0 succeeds; `codex --version` prints `codex-cli 0.162.1`; `claude --version` prints
+Check: every command in step 0 succeeds; `codex --version` prints `codex-cli 0.164.0`; `claude --version` prints
 2.1.299 or newer (or the desktop app's About shows a Claude Code version that new).
 
 ## 1b. GSD (recommended)
@@ -196,7 +196,7 @@ Rules for the build:
 - Run the build in the background and do no other heavy work meanwhile.
 - Keep `-Jobs 2`: 4 jobs ran a 16 GB machine out of memory.
 
-Check: `<root>\dist\bin\codex.exe --version` prints `codex-cli 0.162.1`. A new readiness job shows
+Check: `<root>\dist\bin\codex.exe --version` prints `codex-cli 0.164.0`. A new readiness job shows
 `shell=busybox-sh` in its status. Then run `node ~/.claude/scripts/luna-daemon.mjs --stop` once, so the next job
 starts a daemon on the new binary.
 

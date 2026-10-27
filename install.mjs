@@ -248,10 +248,10 @@ function preflight(ctx) {
   // A constant shell command supports the codex.cmd shim on Windows without quoting user input.
   const codex = runCommand('codex --version', [], { shell: true, env: homeEnvironment(ctx) });
   const version = commandOutput(codex).replace(/\s+/g, ' ');
-  const expected = codex.status === 0 && /\b0\.162\.1\b/.test(version);
+  const expected = codex.status === 0 && /\b0\.164\.0\b/.test(version);
   report(ctx, expected ? 'ok' : 'warn', codex.status === 0
-    ? `Codex: ${version}${expected ? '' : ' (expected 0.162.1 for the custom build and plugin patches)'}`
-    : 'codex --version failed; install Codex 0.162.1');
+    ? `Codex: ${version}${expected ? '' : ' (expected 0.164.0 for the custom build and plugin patches)'}`
+    : 'codex --version failed; install Codex 0.164.0');
   const powershell = findExecutable('pwsh') ?? findExecutable('powershell');
   report(ctx, powershell ? 'ok' : 'warn', powershell ? `PowerShell: ${powershell}` : 'PowerShell not found');
 }
