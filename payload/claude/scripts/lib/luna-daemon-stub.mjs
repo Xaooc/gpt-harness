@@ -65,7 +65,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     const turnId = `turn-${++sequence}`;
     const thread = threads.get(threadId);
     thread.turnId = turnId;
-    const prompt = p.input[0].text;
+    const prompt = p.input[0].text.replace(/^LUNA-JOB-ID: [a-f0-9]{32}\r?\n/, '');
     thread.prompt = prompt;
     thread.turns = (thread.turns || 0) + 1;
     const failure = /^MODEL_FAIL_(ONCE|ALWAYS):(.*)$/s.exec(prompt);

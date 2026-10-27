@@ -98,7 +98,9 @@ DAEMON_PROFILE=default
 if [ "${LUNA_DAEMON+x}" != x ] && [ -e "$HOME/.claude/luna-daemon-off" ]; then LUNA_DAEMON=0; fi
 JOB_TEMP=""
 JOB_TEMP_REASON=""
+PRESERVE_LIVE_CHILD=0
 cleanup_job_temp() {
+  [ "$PRESERVE_LIVE_CHILD" != 1 ] || return 0
   [ -z "$JOB_TEMP" ] || rm -rf -- "$JOB_TEMP" 2>/dev/null || true
   JOB_TEMP=""
 }
@@ -128,6 +130,7 @@ capture_session() {
     sed -nE 's/^session id: ([0-9a-f-]{36})$/\1/p' | head -n 1)
 }
 cleanup_session() {
+  [ "$PRESERVE_LIVE_CHILD" != 1 ] || return 0
   if [ "${LUNA_KEEP_SESSION:-0}" != 1 ] && [ "${MODEL_RETRIES:-0}" != 0 ]; then
     capture_session
     if [[ "$EXEC_SESSION_ID" =~ ^[0-9a-f-]{36}$ ]] && [ -d "${CODEX_HOME:-$HOME/.codex}/sessions" ]; then
@@ -264,6 +267,10 @@ STATUS="$OUT.status"
 LOCK_PID=$$
 [ ! -r "/proc/$$/winpid" ] || LOCK_PID=$(cat "/proc/$$/winpid")
 WRAPPER_START=$(luna_pid_start "$LOCK_PID")
+# Derived from the job's output and directory, so resubmitting the same job keeps the same prompt (reattach) while
+# concurrent jobs (distinct -o) never share a marker; the rollout time window excludes earlier runs (2026-10-27).
+JOB_MARKER=$(printf '%s\n%s' "$OUT" "$DIR" | sha256sum | cut -c1-32)
+[[ "$JOB_MARKER" =~ ^[a-f0-9]{32}$ ]] || { echo 'luna.sh: cannot generate job marker' >&2; exit 2; }
 OWNER="${LUNA_OWNER:-${CLAUDE_CODE_SESSION_ID:-pid-$LOCK_PID}}"
 
 CODEX_CMD=()
@@ -301,31 +308,54 @@ resolve_codex() {
 now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 STARTED="$(now)"
 STATUS_CLAIMED=0
+declare -A STATUS_ID_AT STATUS_ID_VALUE
 
 status_publish() ( # Serialize publishers and preserve a rejected duplicate's terminal status.
   local temp="$1" claim="$2" lock="$STATUS.lock" owner_file="$STATUS.lock/owner-$BASHPID"
   local held=0 collision owner pid probe modified epoch status_pid="" status_state="" status_error="" key value
-  local attempts=0 missing=0
+  local attempts=0 deadline=$(( SECONDS + 20 )) recorded_start actual owner_text owner_check
   trap '[ "$held" != 1 ] || { rm -f -- "$owner_file"; rmdir -- "$lock" 2>/dev/null || true; }; rm -f -- "$temp"' EXIT
   trap 'exit 1' INT TERM HUP
   while :; do
     until mkdir "$lock" 2>/dev/null; do
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "luna.sh: warning: status lock deadline exceeded for $STATUS; publishing anyway" >&2
+        break 2
+      fi
       if [ ! -d "$lock" ]; then
-        [ ! -e "$lock" ] || exit 1
-        missing=$(( missing + 1 )); [ "$missing" -lt 200 ] || exit 1
         sleep 0.05
         continue
       fi
-      missing=0
       attempts=$(( attempts + 1 ))
       if [ $(( attempts % 20 )) = 0 ]; then
-        # A killed publisher may leave its lock behind. Remove only its dead owner's file.
+        # A killed publisher or a reused PID may leave its lock behind.
         for owner in "$lock"/owner-*; do
+          [ "$SECONDS" -lt "$deadline" ] || break
           [ -f "$owner" ] || continue
           pid="${owner##*/owner-}"
+          owner_text=$(cat "$owner" 2>/dev/null) || continue
+          recorded_start=""
+          while IFS='=' read -r key value; do
+            case "$key" in pid) pid="$value" ;; pid_start) recorded_start="$value" ;; esac
+          done <<< "$owner_text"
           case "$pid" in ''|*[!0-9]*|0) continue ;; esac
-          probe=$(kill -0 "$pid" 2>&1) && continue
-          case "$probe" in *[Pp]ermission*|*[Pp]ermitted*|*[Dd]enied*) continue ;; esac
+          if probe=$(kill -0 "$pid" 2>&1); then
+            [ -n "$recorded_start" ] || continue
+            key="$pid:$recorded_start"
+            epoch=$(date +%s)
+            if [ "${STATUS_ID_AT[$key]+set}" != set ] || [ $(( epoch - STATUS_ID_AT[$key] )) -ge 120 ]; then
+              actual=""
+              if [ "$SECONDS" -lt $(( deadline - 4 )) ]; then actual=$(luna_pid_start "$pid" msys); fi
+              STATUS_ID_AT[$key]=$epoch; STATUS_ID_VALUE[$key]="${actual:-unknown}"
+              printf '%s\t%s\t%s\n' "$key" "$epoch" "${STATUS_ID_VALUE[$key]}"
+            fi
+            actual="${STATUS_ID_VALUE[$key]}"
+            [ "$actual" != unknown ] && [ "$actual" != "$recorded_start" ] || continue
+          else
+            case "$probe" in *[Pp]ermission*|*[Pp]ermitted*|*[Dd]enied*) continue ;; esac
+          fi
+          owner_check=$(cat "$owner" 2>/dev/null) || continue
+          [ "$owner_check" = "$owner_text" ] || continue
           rm -- "$owner" 2>/dev/null && rmdir -- "$lock" 2>/dev/null || true
         done
         # A process killed between mkdir and creating its owner file leaves an empty lock.
@@ -339,7 +369,7 @@ status_publish() ( # Serialize publishers and preserve a rejected duplicate's te
       sleep 0.05
     done
     held=1
-    : > "$owner_file" || exit 1
+    printf 'pid=%s\npid_start=%s\n' "$$" "$WRAPPER_START" > "$owner_file" || exit 1
     # If an abandoned empty lock was reclaimed during mkdir, only one publisher may proceed.
     collision=0
     for owner in "$lock"/owner-*; do
@@ -350,6 +380,10 @@ status_publish() ( # Serialize publishers and preserve a rejected duplicate's te
     rm -f -- "$owner_file"
     rmdir -- "$lock" 2>/dev/null || true
     held=0
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      echo "luna.sh: warning: status lock deadline exceeded for $STATUS; publishing anyway" >&2
+      break
+    fi
     sleep 0.05
   done
   if [ "$claim" != 1 ] && [ -r "$STATUS" ]; then
@@ -368,7 +402,8 @@ status_publish() ( # Serialize publishers and preserve a rejected duplicate's te
 )
 
 status() { # status <state> [extra key=value lines...]
-  local state="$1" temp="$STATUS.tmp.$LOCK_PID.$RANDOM" claim=0; shift
+  local state="$1" temp="$STATUS.tmp.$LOCK_PID.$RANDOM" claim=0 cache_updates cache_key cache_at cache_value rc
+  shift
   [ "$STATUS_CLAIMED" = 1 ] || claim=1
   {
     echo "state=$state"
@@ -376,6 +411,7 @@ status() { # status <state> [extra key=value lines...]
     echo "wrapper_pid=$$"
     echo "wrapper_start=$WRAPPER_START"
     echo "wrapper_command=$0"
+    echo "job_marker=$JOB_MARKER"
     echo "pid_start=${CSTART:-}"
     echo "child_start=${CSTART:-}"
     echo "owner=$OWNER"
@@ -410,7 +446,12 @@ status() { # status <state> [extra key=value lines...]
     fi
     for kv in "$@"; do echo "$kv"; done
   } > "$temp" 2>/dev/null || { rm -f -- "$temp"; return 1; }
-  if status_publish "$temp" "$claim"; then STATUS_CLAIMED=1; else return 1; fi
+  if cache_updates=$(status_publish "$temp" "$claim"); then rc=0; else rc=$?; fi
+  while IFS=$'\t' read -r cache_key cache_at cache_value; do
+    [ -n "$cache_key" ] || continue
+    STATUS_ID_AT[$cache_key]=$cache_at; STATUS_ID_VALUE[$cache_key]=$cache_value
+  done <<< "$cache_updates"
+  if [ "$rc" = 0 ]; then STATUS_CLAIMED=1; else return 1; fi
 }
 die() { # die <rc> <message> вЂ” setup failures are visible on stderr AND in the status file
   echo "luna.sh: $2 (argv: $ARGV)" >&2
@@ -735,14 +776,26 @@ lock_release() {
 release() { lock_release; }
 trap 'release; cleanup_request; cleanup_session; cleanup_job_temp; cleanup_prompts; unmark_active; record_job' EXIT
 kill_child_tree() {
-  if [ -n "${CPID:-}" ] && kill -0 "$CPID" 2>/dev/null; then
-    if [ -r "/proc/$CPID/winpid" ]; then
-      CPID_WINPID=$(cat "/proc/$CPID/winpid")
-      taskkill //PID "$CPID_WINPID" //T //F >/dev/null 2>&1
-    else
-      kill -TERM "$CPID" 2>/dev/null || true
-    fi
+  [ -n "${CPID:-}" ] && kill -0 "$CPID" 2>/dev/null || return 0
+  if ! luna_verify_exec "$CPID" "${CSTART:-}" "$CODEX_BIN"; then
+    echo "luna.sh: warning: cannot verify Codex child $CPID; not stopped" >&2
+    PRESERVE_LIVE_CHILD=1
+    [ -z "$JOB_TEMP" ] || printf '%s\n' "$CPID" > "$JOB_TEMP/.owner" 2>/dev/null || true
+    return 1
   fi
+  if [ -r "/proc/$CPID/winpid" ]; then
+    CPID_WINPID=$(cat "/proc/$CPID/winpid")
+    if taskkill //PID "$CPID_WINPID" //T //F >/dev/null 2>&1; then return 0; fi
+  else
+    if kill -TERM "$CPID" 2>/dev/null; then return 0; fi
+  fi
+  if kill -0 "$CPID" 2>/dev/null; then
+    PRESERVE_LIVE_CHILD=1
+    [ -z "$JOB_TEMP" ] || printf '%s\n' "$CPID" > "$JOB_TEMP/.owner" 2>/dev/null || true
+    echo "luna.sh: warning: could not stop Codex child $CPID" >&2
+    return 1
+  fi
+  return 0
 }
 interrupt() {
   if [ -n "$RETRY_SLEEP_PID" ]; then
@@ -758,6 +811,7 @@ interrupt() {
 trap interrupt INT TERM HUP
 
 attempt_prompt() {
+  printf 'LUNA-JOB-ID: %s\n' "$JOB_MARKER"
   [ -z "$RETRY_EFFORT" ] || printf '%s\n\n' "$REFUSAL_RETRY_PROMPT"
   cat "$PFILE"
 }
@@ -822,6 +876,7 @@ daemon_health() {
   DAEMON_PID=""; DAEMON_PORT=""; DAEMON_TOKEN=""; DAEMON_START=""
   DAEMON_MISMATCH=0
   local identity
+  DAEMON_DISCOVERY_STAMP=$(stat -c '%y:%s:%i' "$DAEMON_HOME/daemon.json" 2>/dev/null || true)
   read -r DAEMON_PID DAEMON_PORT DAEMON_TOKEN identity DAEMON_START < <(node -e '
     try {
       const fs = require("fs"), path = require("path");
@@ -854,6 +909,7 @@ daemon_health() {
   [ -n "$DAEMON_PID" ] && [ -n "$DAEMON_PORT" ] && [ -n "$DAEMON_TOKEN" ] || {
     daemon_unhealthy; return 1;
   }
+  daemon_process_alive "$DAEMON_PID" || { daemon_unhealthy; return 1; }
   # A live owner needs no startup admission; never retain that lock across a health deadline.
   if [ "$HAVE_LOCK" = 1 ] && daemon_process_alive "$DAEMON_PID"; then release; fi
   local response
@@ -908,12 +964,13 @@ restore_marker() {
 daemon_process_alive() {
   local pid="${1:-}" expected="${2:-$DAEMON_START}" actual epoch identity_key
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  node -e 'try { process.kill(Number(process.argv[1]), 0); } catch (e) {
-    process.exit(e.code === "EPERM" ? 0 : 1);
-  }' "$pid" >/dev/null 2>&1 || return 1
+  if ! luna_pid_alive "$pid"; then
+    DAEMON_ID_KEY=""; DAEMON_ALIVE_CACHE=""
+    return 1
+  fi
   if [ -n "$expected" ]; then
-    epoch=$(date +%s); identity_key="$pid:$expected"
-    if [ "${DAEMON_ID_KEY:-}" != "$identity_key" ] || [ $(( epoch - ${DAEMON_ID_AT:-0} )) -ge 60 ]; then
+    epoch=$(date +%s); identity_key="$pid:$expected:${DAEMON_TOKEN:-}:${DAEMON_DISCOVERY_STAMP:-}"
+    if [ "${DAEMON_ID_KEY:-}" != "$identity_key" ] || [ $(( epoch - ${DAEMON_ID_AT:-0} )) -ge 120 ]; then
       actual=$(luna_pid_start "$pid")
       DAEMON_ID_KEY="$identity_key"; DAEMON_ID_AT="$epoch"; DAEMON_ID_MISMATCH=0
       if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then DAEMON_ID_MISMATCH=1; fi
@@ -932,7 +989,9 @@ daemon_process_alive() {
   else
     DAEMON_ALIVE_RC=1
   fi
-  DAEMON_ALIVE_CACHE="${DAEMON_ALIVE_CACHE:+$DAEMON_ALIVE_CACHE|}$key=$DAEMON_ALIVE_RC"
+  if [ "$DAEMON_ALIVE_RC" = 0 ]; then
+    DAEMON_ALIVE_CACHE="${DAEMON_ALIVE_CACHE:+$DAEMON_ALIVE_CACHE|}$key=0"
+  fi
   return "$DAEMON_ALIVE_RC"
 }
 
@@ -1024,6 +1083,16 @@ daemon_cancel() {
   case "$retries" in ''|*[!0-9]*) ;; *) MODEL_RETRY_COUNT="$retries" ;; esac
 }
 
+daemon_capture_start() {
+  local key="$CPID:${DAEMON_TOKEN:-}:${DAEMON_DISCOVERY_STAMP:-}" epoch
+  epoch=$(date +%s)
+  if [ "${DAEMON_START_KEY:-}" != "$key" ] || [ $(( epoch - ${DAEMON_START_AT:-0} )) -ge 120 ]; then
+    DAEMON_PROBED_START=$(luna_pid_start "$CPID")
+    DAEMON_START_KEY="$key"; DAEMON_START_AT=$epoch
+  fi
+  CSTART="${DAEMON_PROBED_START:-}"
+}
+
 daemon_submit() {
   local response code curl_rc
   mkdir -p "$DAEMON_HOME/tmp" || return 1
@@ -1076,7 +1145,7 @@ daemon_submit() {
   ' 2>/dev/null) || { daemon_recover_submission; return $?; }
   CPID="$DAEMON_PID"
   CSTART="$DAEMON_START"
-  [ -n "$CSTART" ] || CSTART=$(luna_pid_start "$CPID")
+  [ -n "$CSTART" ] || daemon_capture_start
 }
 
 daemon_recover_submission() {
@@ -1085,7 +1154,7 @@ daemon_recover_submission() {
   while IFS='=' read -r key value; do
     if [ "$key" = id ] && [[ "$value" =~ ^[a-f0-9]{32}$ ]]; then
       DAEMON_JOB="$value"; CPID="$DAEMON_PID"; CSTART="$DAEMON_START"
-      [ -n "$CSTART" ] || CSTART=$(luna_pid_start "$CPID")
+      [ -n "$CSTART" ] || daemon_capture_start
       return 0
     fi
   done < "$OUT.daemon"
@@ -1138,7 +1207,7 @@ daemon_marker() {
 
 daemon_wait() {
   local failures=0 epoch current_size busy_since=0 busy_note=0 busy_elapsed
-  local discovery_pid discovery_token
+  local discovery_pid discovery_token health_ok
   attempt_started=0; last_output=0
   log_size=$(wc -c < "$OUT.log")
   release
@@ -1182,8 +1251,11 @@ daemon_wait() {
     fi
     # Keep the original connection identity for cancellation, even if discovery is replaced.
     local saved_pid="$DAEMON_PID" saved_port="$DAEMON_PORT" saved_token="$DAEMON_TOKEN" saved_start="$DAEMON_START"
-    if (daemon_health && [ "$DAEMON_PID" = "$saved_pid" ] && [ "$DAEMON_TOKEN" = "$saved_token" ] &&
-        [ "$DAEMON_START" = "$saved_start" ]); then
+    health_ok=0
+    if daemon_health && [ "$DAEMON_PID" = "$saved_pid" ] && [ "$DAEMON_TOKEN" = "$saved_token" ] &&
+        [ "$DAEMON_START" = "$saved_start" ]; then health_ok=1; fi
+    DAEMON_PID="$saved_pid"; DAEMON_PORT="$saved_port"; DAEMON_TOKEN="$saved_token"; DAEMON_START="$saved_start"
+    if [ "$health_ok" = 1 ]; then
       failures=0; busy_since=0
     else
       epoch=$(date +%s)
@@ -1268,8 +1340,7 @@ run_exec_attempt() {
     else
       continue
     fi
-    kill_child_tree
-    wait "$CPID" 2>/dev/null || true
+    if kill_child_tree; then wait "$CPID" 2>/dev/null || true; fi
     printf 'luna.sh: watchdog: %s\n' "$STALL_REASON" >> "$OUT.log"
     echo "luna.sh: watchdog: $STALL_REASON" >&2
     rc=124
@@ -1370,7 +1441,7 @@ run_attempt() {
   fi
 
   # Normal priority is inherited by default; BelowNormal can starve the code-mode host under load.
-  if [ "${LUNA_LOW_PRIORITY:-0}" != 1 ]; then
+  if [ "${LUNA_LOW_PRIORITY:-0}" != 1 ] || [ "${LUNA_PRIORITY_SET:-0}" = 1 ]; then
     :
   elif [ -r "/proc/$$/winpid" ]; then          # Windows (Git Bash)
     WPID=$(cat "/proc/$$/winpid")
@@ -1382,6 +1453,7 @@ run_attempt() {
   else
     renice -n 10 -p $$ >/dev/null 2>&1         # Linux / macOS
   fi
+  LUNA_PRIORITY_SET=1
 
   # Prompt goes via stdin ("-"): no arg-length limits, no quoting issues,
   # and codex never blocks waiting on an inherited stdin.
@@ -1424,9 +1496,15 @@ run_attempt() {
       EXEC_SESSION_ID=$(node -e '
         const url = require("url").pathToFileURL(process.argv[1]).href;
         import(url).then((m) => process.stdout.write(m.findSession(process.argv[2], process.argv[3],
-          Number(process.argv[4])))).catch(() => process.exit(1));
+          Number(process.argv[4]), process.argv[5]))).catch(() => process.exit(1));
       ' "$(native_path "$(dirname "$DAEMON_SCRIPT")/lib/process-identity.mjs")" \
-        "$(native_path "${CODEX_HOME:-$HOME/.codex}")" "$(native_path "$DIR")" "$EXEC_STARTED_MS" 2>/dev/null)
+        "$(native_path "${CODEX_HOME:-$HOME/.codex}")" "$(native_path "$DIR")" \
+        "$EXEC_STARTED_MS" "$JOB_MARKER" 2>/dev/null)
+    fi
+    if [ "$EXEC_SESSION_ID" = ambiguous-session ]; then
+      EXEC_SESSION_ID=""; MODEL_RETRY_ERROR=ambiguous-session
+      printf '%s\n' 'luna: model error but multiple matching sessions; not retried' >> "$OUT.log"
+      break
     fi
     if [ -z "$EXEC_SESSION_ID" ]; then
       MODEL_RETRY_ERROR=no-session

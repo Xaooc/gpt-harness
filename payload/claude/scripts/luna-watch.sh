@@ -32,7 +32,7 @@ pid_alive() {
   luna_pid_alive "$pid" msys || luna_pid_alive "$pid" || return 1
   [ -n "$expected" ] || return 0
   now=$(now_s); key="$pid:$expected:$mode"
-  if [ $(( now - ${identity_at[$out]:-0} )) -ge 60 ]; then
+  if [ "${identity_key[$out]:-}" != "$key" ] || [ $(( now - ${identity_at[$out]:-0} )) -ge 60 ]; then
     actual=$(luna_pid_start "$pid" "$mode")
     identity_at[$out]=$now; identity_key[$out]="$key"; identity_bad[$out]=0
     if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then identity_bad[$out]=1; fi
@@ -51,10 +51,31 @@ daemon_job_pid() {
       const fs = require("fs"), d = JSON.parse(fs.readFileSync(`${process.argv[1]}/daemon.json`, "utf8"));
       const marker = fs.readFileSync(`${process.argv[2]}.daemon`, "utf8");
       const get = (key) => marker.match(new RegExp(`^${key}=(.*)$`, "m"))?.[1]?.trim();
-      if (get("id") === process.argv[3] && Number(get("daemon_pid")) === d.pid) {
+      if (get("id") === process.argv[3] && Number(get("daemon_pid")) === d.pid &&
+          (!get("daemon_start") || get("daemon_start") === d.pid_start)) {
         process.stdout.write(`${d.pid}\n`);
       }
     } catch {}
+  ' "$directory" "$out" "$job" 2>/dev/null
+}
+daemon_replaced() {
+  local out="$1" profile="$2" job="$3" directory
+  directory=$(luna_daemon_home "$profile") || return 1
+  if command -v cygpath >/dev/null 2>&1; then
+    directory=$(cygpath -m "$directory"); out=$(cygpath -m "$out")
+  fi
+  node -e '
+    const fs = require("fs");
+    try {
+      const marker = fs.readFileSync(`${process.argv[2]}.daemon`, "utf8");
+      const get = (key) => marker.match(new RegExp(`^${key}=(.*)$`, "m"))?.[1]?.trim() || "";
+      const id = get("id"), pid = Number(get("daemon_pid")), start = get("daemon_start");
+      if (!/^[a-f0-9]{32}$/.test(id) || (process.argv[3] && id !== process.argv[3]) ||
+          !Number.isSafeInteger(pid) || pid < 1 || !start) process.exit(1);
+      let discovery;
+      try { discovery = JSON.parse(fs.readFileSync(`${process.argv[1]}/daemon.json`, "utf8")); } catch {}
+      process.exit(discovery?.pid === pid && discovery?.pid_start === start ? 1 : 0);
+    } catch { process.exit(1); }
   ' "$directory" "$out" "$job" 2>/dev/null
 }
 
@@ -86,6 +107,10 @@ while :; do
       if [ -n "$started" ]; then started_epoch="$(date -d "$started" +%s 2>/dev/null)" || started_epoch=""; fi
       if [ "$BOOT_EPOCH" -gt 0 ] && [ -n "$started_epoch" ] && [ "$started_epoch" -lt "$BOOT_EPOCH" ]; then
         gone_reason="started before last boot"
+      elif [ "$engine" = daemon ] && [ -n "$(field wrapper_pid "$st")" ] &&
+          ! pid_alive "$(field wrapper_pid "$st")" "$(field wrapper_start "$st")" msys "$out:wrapper" &&
+          daemon_replaced "$out" "$(field daemon_profile "$st")" "$(field daemon_job "$st")"; then
+        gone_reason="daemon discovery changed and wrapper is gone"
       elif [ -n "$pid" ] && ! pid_alive "$pid" "$pid_start" "$pid_mode" "$out"; then
         gone_reason="pid $pid is dead"
       fi
@@ -94,6 +119,12 @@ while :; do
       # The wrapper writes its final status just after the child exits: give it a moment before calling it GONE.
       sleep 3; state="$(field state "$st")"
       [ "$state" = running ] || continue
+      if [ "$gone_reason" = 'daemon discovery changed and wrapper is gone' ]; then
+        if pid_alive "$(field wrapper_pid "$st")" "$(field wrapper_start "$st")" msys "$out:wrapper" ||
+            ! daemon_replaced "$out" "$(field daemon_profile "$st")" "$(field daemon_job "$st")"; then
+          continue
+        fi
+      fi
       echo "GONE $out state=running but $gone_reason"
       done_[$out]=1; continue
     fi

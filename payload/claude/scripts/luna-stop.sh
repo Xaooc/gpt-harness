@@ -45,20 +45,14 @@ wrapper_present() {
   case "$diagnostic" in *'No such process'*|*'no such process'*) return 1 ;; *) return 0 ;; esac
 }
 verify_wrapper() {
-  local pid="$1" expected="$2" command="$3" actual
+  local pid="$1" expected="$2"
   luna_pid_alive "$pid" msys || return 1
-  if [ -n "$expected" ]; then
-    actual=$(luna_pid_start "$pid" msys)
-    if [ -n "$actual" ]; then [ "$actual" = "$expected" ]; return $?; fi
-  fi
-  luna_verify_wrapper "$pid" "$command" && return 0
-  sleep 1
-  luna_verify_wrapper "$pid" "$command"
+  luna_verify_wrapper "$pid" "$expected"
 }
 stop_verified_child() {
-  local pid="$1" expected="$2" winpid
+  local pid="$1" expected="$2" bin="$3" winpid
   [ -n "$pid" ] && [ -n "$expected" ] || return 1
-  luna_owned_pid "$pid" "$expected" msys || return 1
+  luna_verify_exec "$pid" "$expected" "$bin" || return 1
   winpid=$(luna_win_pid "$pid" msys) || return 1
   if command -v taskkill >/dev/null 2>&1; then
     taskkill //PID "$winpid" //T //F >/dev/null 2>&1
@@ -71,7 +65,7 @@ stop_exec_child() {
   [ "$(field engine "$st")" = exec ] || return 1
   start=$(field child_start "$st")
   [ -n "$start" ] || start=$(field pid_start "$st")
-  stop_verified_child "$(field pid "$st")" "$start"
+  stop_verified_child "$(field pid "$st")" "$start" "$(field codex_bin "$st")"
 }
 rc_all=0
 for out in "$@"; do
@@ -101,7 +95,6 @@ for out in "$@"; do
   fi
   wp="$(field wrapper_pid "$st")"
   ws="$(field wrapper_start "$st")"
-  wrapper_command="$(field wrapper_command "$st")"
   if [ -n "$wp" ] && ! wrapper_present "$wp"; then
     if stop_exec_child "$st"; then
       echo "$out: wrapper gone; stopped verified Codex child"
@@ -114,7 +107,7 @@ for out in "$@"; do
     echo "$out: wrapper pid '${wp:-?}' not alive; state=$state (use luna-status.sh / luna-daemon.mjs --status)" >&2
     [ "$rc_all" = 3 ] || rc_all=1; continue
   fi
-  if [ -z "$wp" ] || ! verify_wrapper "$wp" "$ws" "$wrapper_command"; then
+  if [ -z "$wp" ] || ! verify_wrapper "$wp" "$ws"; then
     if stop_exec_child "$st"; then
       echo "$out: stopped verified Codex child; wrapper $wp could not be verified"
       continue
@@ -126,7 +119,7 @@ for out in "$@"; do
   kill -TERM "$wp" 2>/dev/null
   for _ in $(seq 1 5); do wrapper_present "$wp" || break; sleep 1; done
   if wrapper_present "$wp"; then
-    if ! verify_wrapper "$wp" "$ws" "$wrapper_command"; then
+    if ! verify_wrapper "$wp" "$ws"; then
       echo "luna-stop: cannot verify wrapper $wp; not stopped" >&2
       rc_all=3; continue
     fi

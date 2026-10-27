@@ -299,13 +299,13 @@
       "src": "claude/scripts/lib/luna-daemon-client-test.sh",
       "dest": "scripts/lib/luna-daemon-client-test.sh",
       "kind": "file",
-      "sha256": "2f26fad2bfe4e77fce211e2a2367fe19c6fc0655721828927af0ce5a13f31186"
+      "sha256": "c5fb72857f920ff62bfaf991ddbb098f559c88039e80e0841176121f9c2f0f77"
     },
     {
       "src": "claude/scripts/lib/luna-daemon-stub.mjs",
       "dest": "scripts/lib/luna-daemon-stub.mjs",
       "kind": "file",
-      "sha256": "ae97acd9b5625bd01f6d1c1dd8fba3296774ed0b13a95cc3ac7fb7c5d2ac9344"
+      "sha256": "8eec2659f686d4850b8430d291ee4fd06539786d2e342cc479893baceb12453e"
     },
     {
       "src": "claude/scripts/lib/luna-loadtest.mjs",
@@ -323,7 +323,7 @@
       "src": "claude/scripts/luna-daemon.mjs",
       "dest": "scripts/luna-daemon.mjs",
       "kind": "file",
-      "sha256": "2b959d1fe96c4d9767def2b14ac5925e7a58539e0d1a7253ac003c128bdbaa77"
+      "sha256": "0b0718cec8f665b55b1be77bf62d1b1c1b8e91d32ad3cc415c27eebf94f60536"
     },
     {
       "src": "claude/scripts/luna-harness-plugin-patch.mjs",
@@ -341,7 +341,7 @@
       "src": "claude/scripts/luna-overview.mjs",
       "dest": "scripts/luna-overview.mjs",
       "kind": "file",
-      "sha256": "a803645effb743747ab0f0b79e0c56362d4ccccb2dc3c46f6dd870ff4c4df9ee"
+      "sha256": "801ecc0ad40ea7e4e767cacd982875e56fd9e044216f7a2c0bdd991527e5a84b"
     },
     {
       "src": "claude/scripts/luna-overview.sh",
@@ -377,7 +377,7 @@
       "src": "claude/scripts/luna-stop.sh",
       "dest": "scripts/luna-stop.sh",
       "kind": "file",
-      "sha256": "101a00bd9486cd6d79522171a75909094c84392c86d8754f05ffcf56edbab534"
+      "sha256": "de3d288583a186e1dd778c952ac0f8fc690dd9148a8ed243ac1c11a0d09fa0b6"
     },
     {
       "src": "claude/scripts/luna-swap-when-idle.sh",
@@ -389,13 +389,13 @@
       "src": "claude/scripts/luna-watch.sh",
       "dest": "scripts/luna-watch.sh",
       "kind": "file",
-      "sha256": "b2a296b4b34ef2c040f85cb408f81ac2e086f5d8d1751c01c6b29919dd466a83"
+      "sha256": "9af0efd86d558f799a0cae5282c7b5409f0de6c3753ed20af16e46245726971c"
     },
     {
       "src": "claude/scripts/luna.sh",
       "dest": "scripts/luna.sh",
       "kind": "file",
-      "sha256": "14aee1ca0ddf9a7712bba88f84d89a25b6adadbd6339e315e03006ab6c8e12f4"
+      "sha256": "c8660a21084e4703859da0f37f0116f7c5af1e67bb92493ff08ce98de88e68ce"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
@@ -473,13 +473,13 @@
       "src": "claude/scripts/lib/process-identity.mjs",
       "dest": "scripts/lib/process-identity.mjs",
       "kind": "file",
-      "sha256": "bd224e5b731e0102fc4037b517c93665d131297614938fc62e37cad3fbeef731"
+      "sha256": "158c0caf51290140fb0cc64e01d82808b6fd45cce0af4fa45d05142618d78896"
     },
     {
       "src": "claude/scripts/lib/luna-win-runtime.sh",
       "dest": "scripts/lib/luna-win-runtime.sh",
       "kind": "file",
-      "sha256": "5c40c06bfc6cd50a059417411795779d29aa762c69ef451c98b73dbfbb55eeb8"
+      "sha256": "4259b8ca2b585559acf0a3493a77c0b608c40781c0b3c2066ed2c5fdf07b5aee"
     }
   ],
   "settings": "settings/hooks.json",

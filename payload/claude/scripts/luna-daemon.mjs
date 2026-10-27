@@ -294,13 +294,15 @@ function removeLockDirectory(directory) {
   try { rmdirSync(directory); } catch {}
 }
 
-function daemonLock(report = event, directory = path.join(RUN, 'daemon.lock')) {
+function daemonLock(report = event, directory = path.join(RUN, 'daemon.lock'), startup = directory ===
+    path.join(RUN, 'daemon.lock')) {
   let token = null;
+  const ownerKey = startup ? 'nonce' : 'token';
   let identityKey = '', identityAt = 0, identityMismatch = false;
 
   function reclaim() {
     const owner = readLockOwner(directory);
-    const judgedToken = owner?.token ?? '';
+    const judgedToken = owner?.nonce ?? owner?.token ?? '';
     const now = Date.now();
     let reason;
     let orphanMtime;
@@ -345,7 +347,8 @@ function daemonLock(report = event, directory = path.join(RUN, 'daemon.lock')) {
     }
     const stale = `${directory}.stale.${randomBytes(8).toString('hex')}`;
     try { renameSync(directory, stale); } catch { return false; }
-    let changed = (readLockOwner(stale)?.token ?? '') !== judgedToken;
+    const movedOwner = readLockOwner(stale);
+    let changed = (movedOwner?.nonce ?? movedOwner?.token ?? '') !== judgedToken;
     if (orphanMtime !== undefined) {
       try { changed ||= statSync(stale).mtimeMs !== orphanMtime; } catch { changed = true; }
     }
@@ -387,7 +390,7 @@ function daemonLock(report = event, directory = path.join(RUN, 'daemon.lock')) {
         const ownerPath = path.join(directory, 'owner');
         writeFileSync(`${ownerPath}.tmp`,
           `pid=${process.pid}\npid_start=${selfStart()}\n` +
-          `kind=luna-daemon\nsince=${Math.floor(Date.now() / 1000)}\ntoken=${token}\n`);
+          `kind=luna-daemon\nsince=${Math.floor(Date.now() / 1000)}\n${ownerKey}=${token}\n`);
         renameSync(`${ownerPath}.tmp`, ownerPath);
       } catch (error) {
         token = null;
@@ -402,7 +405,7 @@ function daemonLock(report = event, directory = path.join(RUN, 'daemon.lock')) {
       const myToken = token;
       token = null;
       try { renameSync(directory, released); } catch { return; }
-      if (readLockOwner(released)?.token === myToken) {
+      if (readLockOwner(released)?.[ownerKey] === myToken) {
         removeLockDirectory(released);
       } else {
         try {
@@ -2391,6 +2394,11 @@ async function unitChecks(root, check) {
     lock.release();
     check('shared admission lock releases for next caller', peer.acquire());
     peer.release();
+    const startup = daemonLock(() => {}, path.join(root, 'daemon.lock'), true);
+    check('daemon startup lock publishes a non-secret nonce instead of a token', startup.acquire() &&
+      /^nonce=[a-f0-9]{16}$/m.test(readFileSync(path.join(root, 'daemon.lock', 'owner'), 'utf8')) &&
+      !/^token=/m.test(readFileSync(path.join(root, 'daemon.lock', 'owner'), 'utf8')));
+    startup.release();
   } finally {
     renameFault = null;
     await flushEvents();

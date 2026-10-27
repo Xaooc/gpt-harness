@@ -95,7 +95,8 @@ try {
     await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
   } else if (action === 'turns') {
     const entries = readFileSync(home, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
-    const turns = entries.filter((entry) => entry.method === 'turn/start' && entry.params.input[0].text === route);
+    const turns = entries.filter((entry) => entry.method === 'turn/start' &&
+      entry.params.input[0].text.replace(/^LUNA-JOB-ID: [a-f0-9]{32}\r?\n/, '') === route);
     process.stdout.write(`${turns.length}\n`);
   } else if (action === 'cancel' || action === 'owner' || action === 'orphaned') {
     const marker = readFileSync(route, 'utf8');
@@ -155,10 +156,23 @@ if [ "$mode" = first ] && [ -n "${LUNA_FAKE_ERROR:-}" ]; then
   id=01234567-89ab-cdef-0123-456789abcdef
   if [ "$ephemeral" = 0 ] && [ "${LUNA_FAKE_NO_SESSION:-0}" != 1 ]; then
     mkdir -p "$CODEX_HOME/sessions/test"
-    if command -v cygpath >/dev/null 2>&1; then dir=$(cygpath -m "$dir"); fi
-    node -e 'process.stdout.write(JSON.stringify({type:"session_meta",payload:{id:process.argv[1],
-      cwd:require("path").resolve(process.argv[2]),timestamp:new Date().toISOString()}})+"\n")' "$id" "$dir" \
-      > "$CODEX_HOME/sessions/test/rollout-$id.jsonl"
+    session_dir="$CODEX_HOME/sessions/test"
+    if command -v cygpath >/dev/null 2>&1; then
+      dir=$(cygpath -m "$dir"); session_dir=$(cygpath -m "$session_dir")
+    fi
+    printf '%s' "$prompt" | node -e '
+      const fs = require("fs"), path = require("path"), [id, dir, extra, sessionDir] = process.argv.slice(1);
+      const prompt = fs.readFileSync(0, "utf8"), cwd = path.resolve(dir), timestamp = new Date().toISOString();
+      const write = (session, text) => {
+        const meta = {type:"session_meta",payload:{id:session,cwd,timestamp}};
+        const input = {type:"event_msg",payload:{type:"user_message",message:text}};
+        fs.writeFileSync(path.join(sessionDir, `rollout-${session}.jsonl`),
+          `${JSON.stringify(meta)}\n${JSON.stringify(input)}\n`);
+      };
+      write(id, prompt);
+      if (extra) write("fedcba98-7654-3210-fedc-ba9876543210", extra === "same" ? prompt :
+        prompt.replace(/^LUNA-JOB-ID: [a-f0-9]{32}/, `LUNA-JOB-ID: ${"b".repeat(32)}`));
+    ' "$id" "$dir" "${LUNA_FAKE_EXTRA_SESSION:-}" "$session_dir"
   fi
   [ "${LUNA_FAKE_QUIET_SESSION:-0}" = 1 ] || printf 'session id: %s\n' "$id"
   printf 'ERROR: %s\n' "$LUNA_FAKE_ERROR"
@@ -612,10 +626,53 @@ check 'live unrelated legacy wrapper is not stopped' equals "$stop_rc" 3
 check 'unverified wrapper is reported accurately' grep -q "cannot verify wrapper $$; not stopped" "$unverified.stderr"
 check 'unverified wrapper process remains alive' kill -0 "$$"
 
+wrapper_start=$(luna_pid_start "$$" msys)
+printf 'state=running\nengine=daemon\nwrapper_pid=%s\nwrapper_start=%s\nwrapper_command=%s\n' \
+  "$$" "$wrapper_start" 'luna-daemon-client-test.sh' > "$unverified.status"
+bash "$SCRIPT_DIR/luna-stop.sh" "$unverified" > "$unverified.stdout" 2> "$unverified.stderr"
+stop_rc=$?
+check 'matching start and recorded command substring do not verify a wrapper' equals "$stop_rc" 3
+check 'wrapper substring spoof leaves the process alive' kill -0 "$$"
+
+cat > "$ROOT/luna.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 60 & child=$!
+trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit' TERM INT HUP
+wait "$child"
+SH
+bash "$ROOT/luna.sh" & test_child=$!
+child_start=$(luna_pid_start "$test_child" msys)
+printf 'state=running\nengine=daemon\nwrapper_pid=%s\nwrapper_start=%s\n' \
+  "$test_child" "$child_start" > "$unverified.status"
+bash "$SCRIPT_DIR/luna-stop.sh" "$unverified" > "$unverified.stdout" 2> "$unverified.stderr"
+stop_rc=$?
+check 'another installation with the same script name is not verified' equals "$stop_rc" 3
+check 'other installation wrapper remains alive' kill -0 "$test_child"
+kill -TERM "$test_child" 2>/dev/null || true
+wait "$test_child" 2>/dev/null || true
+test_child=""
+
 sleep 60 & test_child=$!
 child_start=$(luna_pid_start "$test_child" msys)
-printf 'state=running\nengine=exec\nwrapper_pid=%s\npid=%s\nchild_start=%s\n' \
-  "$$" "$test_child" "$child_start" > "$unverified.status"
+printf 'state=running\nengine=exec\nwrapper_pid=%s\npid=%s\nchild_start=%s\ncodex_bin=%s\n' \
+  "$$" "$test_child" "$child_start" "$(native "$ROOT/fake-exec")" > "$unverified.status"
+bash "$SCRIPT_DIR/luna-stop.sh" "$unverified" > "$unverified.stdout" 2> "$unverified.stderr"
+stop_rc=$?
+check 'unrelated child is not stopped when wrapper is unverified' equals "$stop_rc" 3
+check 'unrelated child remains alive' kill -0 "$test_child"
+kill -TERM "$test_child" 2>/dev/null || true
+wait "$test_child" 2>/dev/null || true
+test_child=""
+
+node -e '
+  const fs = require("fs");
+  try { fs.linkSync(process.execPath, process.argv[1]); }
+  catch { fs.copyFileSync(process.execPath, process.argv[1]); }
+' "$(native "$ROOT/codex.exe")"
+"$ROOT/codex.exe" -e 'setInterval(() => {}, 1000)' & test_child=$!
+child_start=$(luna_pid_start "$test_child" msys)
+printf 'state=running\nengine=exec\nwrapper_pid=%s\npid=%s\nchild_start=%s\ncodex_bin=%s\n' \
+  "$$" "$test_child" "$child_start" "$(native "$ROOT/codex.exe")" > "$unverified.status"
 bash "$SCRIPT_DIR/luna-stop.sh" "$unverified" > "$unverified.stdout" 2> "$unverified.stderr"
 stop_rc=$?
 check 'verified exec child is stopped when wrapper is unverified' equals "$stop_rc" 0
@@ -624,10 +681,58 @@ kill -TERM "$test_child" 2>/dev/null || true
 wait "$test_child" 2>/dev/null || true
 test_child=""
 
+mkdir -p "$ROOT/status-stale.md.status.lock"
+printf 'pid=%s\npid_start=wrong-start\n' "$$" > "$ROOT/status-stale.md.status.lock/owner-$$"
+LUNA_DAEMON=0 run_client status-stale -r hello
+reap "$CLIENT"
+check 'status lock with a reused live PID is reclaimed' equals "$RC:$(field state "$OUT.status")" '0:done'
+check 'status lock reclaim preserves the live unrelated PID' kill -0 "$$"
+check 'status lock reclaim removes the stale lock' test ! -d "$ROOT/status-stale.md.status.lock"
+
+mkdir -p "$ROOT/status-deadline.md.status.lock"
+printf 'pid=%s\npid_start=%s\n' "$$" "$wrapper_start" > "$ROOT/status-deadline.md.status.lock/owner-$$"
+status_began=$SECONDS
+LUNA_DAEMON=0 run_client status-deadline -r hello
+end=$((SECONDS + 30))
+while [ ! -f "$OUT.status" ] && [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
+check 'status publishes after the live lock deadline' test -f "$OUT.status"
+check 'status lock deadline is at most 20 seconds plus startup overhead' test $((SECONDS - status_began)) -le 25
+check 'status lock deadline logs one warning' \
+  equals "$(grep -c 'status lock deadline exceeded' "$OUT.stderr" 2>/dev/null || true)" 1
+check 'status lock deadline preserves the live owner' test -f "$ROOT/status-deadline.md.status.lock/owner-$$"
+rm -f "$ROOT/status-deadline.md.status.lock/owner-$$"
+rmdir "$ROOT/status-deadline.md.status.lock"
+reap "$CLIENT"
+check 'job completes after the contested status lock is released' equals "$RC:$(field state "$OUT.status")" '0:done'
+
+WATCH_HOME="$ROOT/watch-daemon"; mkdir -p "$WATCH_HOME/daemon-net"
+watch_out="$ROOT/watch-restart.md"
+watch_pid=$(luna_win_pid "$$" msys)
+watch_start=$(luna_pid_start "$$" msys)
+watch_id=0123456789abcdef0123456789abcdef
+printf 'state=running\nengine=daemon\ndaemon_profile=net\ndaemon_job=%s\n' "$watch_id" > "$watch_out.status"
+printf 'wrapper_pid=2147483647\npid=%s\npid_start=%s\n' "$watch_pid" "$watch_start" >> "$watch_out.status"
+printf 'id=%s\ndaemon_pid=%s\ndaemon_start=%s\n' "$watch_id" "$watch_pid" "$watch_start" > "$watch_out.daemon"
+node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({pid: 2147483646, pid_start: "new"}))' \
+  "$(native "$WATCH_HOME/daemon-net/daemon.json")"
+LUNA_DAEMON_HOME="$WATCH_HOME" bash "$SCRIPT_DIR/luna-watch.sh" -p 1 "$watch_out" > "$watch_out.watch"
+check 'watcher reports GONE when profile discovery names a new daemon' \
+  grep -q '^GONE .*daemon discovery changed and wrapper is gone' "$watch_out.watch"
+node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({pid: Number(process.argv[2]),
+  pid_start: "different-start"}))' "$(native "$WATCH_HOME/daemon-net/daemon.json")" "$watch_pid"
+LUNA_DAEMON_HOME="$WATCH_HOME" bash "$SCRIPT_DIR/luna-watch.sh" -p 1 "$watch_out" > "$watch_out.watch"
+check 'watcher reports GONE when a daemon PID is reused with a different start' \
+  grep -q '^GONE .*daemon discovery changed and wrapper is gone' "$watch_out.watch"
+rm -f "$WATCH_HOME/daemon-net/daemon.json"
+LUNA_DAEMON_HOME="$WATCH_HOME" bash "$SCRIPT_DIR/luna-watch.sh" -p 1 "$watch_out" > "$watch_out.watch"
+check 'watcher reports GONE when profile discovery is absent' \
+  grep -q '^GONE .*daemon discovery changed and wrapper is gone' "$watch_out.watch"
+
 export LUNA_DAEMON=0
 DAEMON_DIR="$ROOT/exec-temp"; mkdir -p "$DAEMON_DIR/tmp"
 export LUNA_DAEMON_HOME="$(native "$DAEMON_DIR")"
 mkdir -p "$ROOT/priority-stubs"
+LUNA_REAL_POWERSHELL=$(command -v powershell); export LUNA_REAL_POWERSHELL
 cat > "$ROOT/priority-stubs/wmic" <<'SH'
 #!/usr/bin/env bash
 printf 'priority\n' >> "$LUNA_PRIORITY_AUDIT"
@@ -635,7 +740,10 @@ SH
 cp "$ROOT/priority-stubs/wmic" "$ROOT/priority-stubs/renice"
 cat > "$ROOT/priority-stubs/powershell" <<'SH'
 #!/usr/bin/env bash
-case "$*" in *PriorityClass*) printf 'priority\n' >> "$LUNA_PRIORITY_AUDIT" ;; esac
+case "$*" in
+  *PriorityClass*) printf 'priority\n' >> "$LUNA_PRIORITY_AUDIT" ;;
+  *) exec "$LUNA_REAL_POWERSHELL" "$@" ;;
+esac
 SH
 chmod +x "$ROOT/priority-stubs/"*
 export PATH="$ROOT/priority-stubs:$PATH"
@@ -669,7 +777,11 @@ check 'startup preserves unrelated stale directory' test -d "$DAEMON_DIR/tmp/oth
 check 'default priority does not invoke a priority command' test ! -s "$ROOT/priority-audit"
 LUNA_LOW_PRIORITY=1 run_client exec-low-priority -r hello
 reap "$CLIENT"; check 'opt-in priority invokes the priority command' test -s "$ROOT/priority-audit"
-LUNA_FAKE_WAIT=1 LUNA_IDLE_MAX_S=1 run_client exec-temp-watchdog -r hello
+cat > "$HOME/exec" <<'JS'
+for (const key of ['TEMP', 'TMP', 'TMPDIR']) console.log(`${key}=${process.env[key] || ''}`);
+setInterval(() => {}, 1000);
+JS
+LUNA_CODEX_BIN="$(native "$ROOT/codex.exe")" LUNA_IDLE_MAX_S=1 run_client exec-temp-watchdog -r hello
 reap "$CLIENT"; check 'exec TEMP watchdog returns 124' equals "$RC" 124
 job_temp=$(temp_path)
 check 'watchdog child received dedicated job TEMP' starts_with "$job_temp" "$DAEMON_DIR/tmp/job-"
@@ -720,6 +832,19 @@ reap "$CLIENT"
 check 'missing log session id resumes the matching rollout' equals "$RC:$(field model_retry "$OUT.status")" '0:1'
 check 'rollout recovery resumes the recorded id' \
   grep -qx '01234567-89ab-cdef-0123-456789abcdef' "$ROOT/store-retry-args"
+
+LUNA_FAKE_ERROR='Selected model is at capacity.' LUNA_FAKE_QUIET_SESSION=1 LUNA_FAKE_EXTRA_SESSION=other \
+  LUNA_FAKE_RESUME_PROMPT="$(native "$ROOT/other-resume-prompt")" run_client exec-other-session -w hello
+reap "$CLIENT"
+check 'recovery ignores a different job in the same cwd and time' \
+  equals "$RC:$(field model_retry "$OUT.status")" '0:1'
+
+LUNA_FAKE_ERROR='Selected model is at capacity.' LUNA_FAKE_QUIET_SESSION=1 LUNA_FAKE_EXTRA_SESSION=same \
+  run_client exec-ambiguous-session -w hello
+reap "$CLIENT"
+check 'duplicate job markers prevent session recovery' \
+  equals "$RC:$(field model_retry_error "$OUT.status")" '1:ambiguous-session'
+check 'ambiguous sessions are explained in the log' grep -q 'multiple matching sessions; not retried' "$OUT.log"
 
 LUNA_FAKE_ERROR='Selected model is at capacity.' LUNA_FAKE_QUIET_SESSION=1 LUNA_FAKE_NO_SESSION=1 \
   run_client exec-no-session -w hello

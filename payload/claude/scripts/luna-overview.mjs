@@ -6,9 +6,10 @@ import * as fs from 'node:fs/promises';
 import { freemem, totalmem, homedir, tmpdir, uptime } from 'node:os';
 import path from 'node:path';
 import { processStartAsync, sameStart } from './lib/process-identity.mjs';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import {
-  mkdirSync, readFileSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync
+  mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync
 } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -91,6 +92,57 @@ function statusValues(text) {
   return values;
 }
 
+async function cachedStart(run, pid, expected, identity = '', now = Date.now(), probe = processStartAsync) {
+  const file = path.join(run, 'identity-cache.json'), lock = `${file}.lock`;
+  const key = createHash('sha256').update(JSON.stringify([pid, expected, identity])).digest('hex');
+  const readCache = () => {
+    try {
+      const value = JSON.parse(readFileSync(file, 'utf8'));
+      return object(value) ? value : {};
+    } catch { return {}; }
+  };
+  const fresh = (value) => object(value) && typeof value.actual === 'string' &&
+    Number.isFinite(value.at) && now >= value.at && now - value.at < 120_000;
+  let cache = readCache();
+  if (fresh(cache[key])) return cache[key].actual;
+  try {
+    mkdirSync(run, { recursive: true });
+    mkdirSync(lock);
+  } catch {
+    // A concurrent collector owns the probe. Preserve the job until its result is available.
+    try {
+      if (Date.now() - statSync(lock).mtimeMs > 10_000) {
+        const owners = readdirSync(lock);
+        for (const owner of owners) {
+          if (!/^[1-9]\d*$/.test(owner)) continue;
+          try { process.kill(Number(owner), 0); }
+          catch (error) { if (error.code === 'ESRCH') unlinkSync(path.join(lock, owner)); }
+        }
+        rmdirSync(lock);
+      }
+    } catch {}
+    return '';
+  }
+  const owner = path.join(lock, String(process.pid));
+  const temp = `${file}.${process.pid}.tmp`;
+  try {
+    writeFileSync(owner, '');
+    cache = readCache();
+    if (fresh(cache[key])) return cache[key].actual;
+    const actual = await probe(pid);
+    cache[key] = { at: now, actual };
+    cache = Object.fromEntries(Object.entries(cache).filter(([, value]) => fresh(value))
+      .sort((a, b) => b[1].at - a[1].at).slice(0, 512));
+    writeFileSync(temp, JSON.stringify(cache), { mode: 0o600 });
+    renameSync(temp, file);
+    return actual;
+  } catch { return ''; }
+  finally {
+    try { unlinkSync(temp); } catch {}
+    try { unlinkSync(owner); rmdirSync(lock); } catch {}
+  }
+}
+
 async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
   const directory = path.join(run, 'active');
   let entries;
@@ -129,7 +181,7 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
             if (error.code === 'ESRCH') live = false;
           }
           const recordedStart = indexStart || values.wrapper_start;
-          if (live && recordedStart) live = sameStart(await processStartAsync(pid), recordedStart);
+          if (live && recordedStart) live = sameStart(await cachedStart(run, pid, recordedStart), recordedStart);
           if (!live) {
             await fs.unlink(file).catch(() => {});
             continue;
@@ -344,10 +396,14 @@ async function healthCollection(directory, info, health, now = Date.now()) {
     state.firstMissAt > (state.lastOkAt ?? -Infinity)), degraded: state.degraded };
 }
 
-async function daemonStatus(directory, now, snapshot, profile = 'default') {
+async function daemonStatus(directory, now, snapshot, profile = 'default', cacheRoot = directory) {
   const info = await readJson(path.join(directory, 'daemon.json'));
   if (!info || !alive(info.pid)) return;
-  if (info.pid_start && !sameStart(await processStartAsync(info.pid), info.pid_start)) return;
+  const discovery = await fs.stat(path.join(directory, 'daemon.json')).catch(() => null);
+  const identity = `${info.token || ''}:${discovery?.mtimeMs || 0}:${discovery?.size || 0}`;
+  if (info.pid_start && !sameStart(await cachedStart(cacheRoot, info.pid, info.pid_start, identity), info.pid_start)) {
+    return;
+  }
   const result = {
     running: true, pid: info.pid, uptimeS: seconds(info.startedAt, now), max: null,
     runningJobs: null, queuedJobs: null, owners: [], jobs: [], appServer: null, healthy: true, degraded: false
@@ -436,8 +492,8 @@ async function collect(config, snapshot, now) {
     snapshot.ram = { freeMb: Math.round(freemem() / 1048576), totalMb: Math.round(totalmem() / 1048576) };
   } catch {}
   await Promise.allSettled([
-    daemonStatus(config.daemon, now, snapshot),
-    daemonStatus(path.join(config.daemon, 'daemon-net'), now, snapshot, 'net'),
+    daemonStatus(config.daemon, now, snapshot, 'default', config.run),
+    daemonStatus(path.join(config.daemon, 'daemon-net'), now, snapshot, 'net', config.run),
     activeJobs(config.run, now).then((jobs) => {
       conflictJobs = jobs.filter((job) => job._conflict);
       snapshot.jobs = jobs.filter((job) => !job._conflict);
@@ -487,6 +543,16 @@ async function selfTest() {
     await fs.mkdir(path.join(directory, 'active'));
     await fs.mkdir(config.daemon);
     await fs.mkdir(path.join(config.build, 'dist', 'bin'), { recursive: true });
+    let probes = 0;
+    const probe = async () => { probes++; return 'actual'; };
+    const cacheFirst = await cachedStart(directory, 123, 'expected', 'discovery-a', now, probe);
+    const cacheAgain = await cachedStart(directory, 123, 'expected', 'discovery-a', now + 119_999, probe);
+    const cacheChanged = await cachedStart(directory, 123, 'expected', 'discovery-b', now + 119_999, probe);
+    const cacheExpired = await cachedStart(directory, 123, 'expected', 'discovery-a', now + 120_000, probe);
+    check('identity cache rechecks only after discovery changes or 120 seconds', () => {
+      assert.deepEqual([cacheFirst, cacheAgain, cacheChanged, cacheExpired], Array(4).fill('actual'));
+      assert.equal(probes, 3);
+    });
     await fs.writeFile(path.join(config.daemon, 'daemon.json'), JSON.stringify({
       pid: 0, port: 1, token: 'SECRET-NEVER-PRINT', startedAt: new Date(now).toISOString()
     }));
@@ -575,7 +641,9 @@ async function selfTest() {
     check('terminal conflict marker is filtered', () => {
       assert.ok(!finishedConflicts.some((job) => job.out === conflictOut));
     });
-    await Promise.all([fs.unlink(conflictIndex), fs.unlink(`${conflictOut}.status`), fs.unlink(`${conflictOut}.daemon`)]);
+    await Promise.all([
+      fs.unlink(conflictIndex), fs.unlink(`${conflictOut}.status`), fs.unlink(`${conflictOut}.daemon`)
+    ]);
     check('local drive paths only', () => {
       for (const value of ['C:/work/job', 'd:\\work\\job']) assert.equal(localPath(value), true);
       for (const value of ['\\\\server\\share\\job', '//server/share/job', '\\\\?\\C:\\job',

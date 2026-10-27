@@ -1,7 +1,7 @@
 // Windows process creation times use the same FILETIME ticks as GetProcessTimes and CIM.
 import { execFile, execFileSync } from 'node:child_process';
 import {
-  closeSync, mkdirSync, mkdtempSync, openSync, readSync, readdirSync, realpathSync, rmSync, statSync,
+  closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync,
   utimesSync, writeFileSync
 } from 'node:fs';
 import os from 'node:os';
@@ -22,9 +22,52 @@ function sessionTime(payload, stat) {
   return { time, latest: time + 10 ** (3 - digits) - 1 };
 }
 
-// Codex rollout metadata identifies a session when the CLI did not print its ID.
-export function findSession(home, cwd, startMs) {
-  if (typeof home !== 'string' || !home || typeof cwd !== 'string' || !cwd || !Number.isFinite(startMs)) return '';
+function hasJobMarker(lines, marker, truncated) {
+  const expected = `LUNA-JOB-ID: ${marker}`;
+  const contains = (value) => typeof value === 'string' && value.split(/\r?\n/).includes(expected);
+  const text = (value) => contains(value) || (Array.isArray(value) && value.some((item) =>
+    contains(item?.text) || contains(item?.message)));
+  return lines.some((line, index) => {
+    try {
+      let item;
+      try { item = JSON.parse(line); }
+      catch {
+        if (!truncated || index !== lines.length - 1) return false;
+        // A user message can exceed the read limit. Close its JSON string and containers at the marker.
+        const pos = line.indexOf(expected);
+        if (pos < 0 || !/(?:"|\\n)$/.test(line.slice(0, pos)) ||
+            !/^(?:"|(?:\\r)?\\n)/.test(line.slice(pos + expected.length))) return false;
+        const prefix = line.slice(0, pos + expected.length), stack = [];
+        let quoted = false, escaped = false;
+        for (const char of prefix) {
+          if (quoted) {
+            if (escaped) escaped = false;
+            else if (char === '\\') escaped = true;
+            else if (char === '"') quoted = false;
+          } else if (char === '"') quoted = true;
+          else if (char === '{') stack.push('}');
+          else if (char === '[') stack.push(']');
+          else if (char === '}' || char === ']') stack.pop();
+        }
+        if (!quoted || escaped) return false;
+        item = JSON.parse(`${prefix}"${stack.reverse().join('')}`);
+      }
+      const payload = item.payload;
+      if (item.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
+        return text(payload.content);
+      }
+      if (item.type === 'event_msg' && ['user_message', 'user_input'].includes(payload?.type)) {
+        return text(payload.message) || text(payload.input) || text(payload.content) || text(payload.text);
+      }
+    } catch {}
+    return false;
+  });
+}
+
+// Only an unambiguous rollout bearing this job's marker can be resumed.
+export function findSession(home, cwd, startMs, marker) {
+  if (typeof home !== 'string' || !home || typeof cwd !== 'string' || !cwd || !Number.isFinite(startMs) ||
+      typeof marker !== 'string' || !/^[a-f0-9]{32}$/.test(marker)) return '';
   const key = (file) => {
     let resolved = path.resolve(nativePath(file));
     try { resolved = realpathSync(resolved); } catch {}
@@ -32,7 +75,7 @@ export function findSession(home, cwd, startMs) {
   };
   const expected = key(cwd);
   const directories = [path.join(nativePath(home), 'sessions')];
-  let newest = null;
+  let found = '';
   while (directories.length) {
     const dir = directories.pop();
     let entries;
@@ -48,8 +91,8 @@ export function findSession(home, cwd, startMs) {
         fd = openSync(file, 'r');
         const buffer = Buffer.alloc(65536);
         const bytes = readSync(fd, buffer, 0, buffer.length, 0);
-        const first = buffer.subarray(0, bytes).toString('utf8').split(/\r?\n/, 1)[0];
-        const meta = JSON.parse(first);
+        const lines = buffer.subarray(0, bytes).toString('utf8').split(/\r?\n/);
+        const meta = JSON.parse(lines.shift());
         if (meta.type !== 'session_meta' || typeof meta.payload?.cwd !== 'string' ||
             String(meta.payload.id).toLowerCase() !== match[1].toLowerCase() || key(meta.payload.cwd) !== expected) {
           continue;
@@ -59,13 +102,13 @@ export function findSession(home, cwd, startMs) {
         const created = sessionTime(meta.payload, stat);
         // A coarse timestamp that overlaps the start is ambiguous unless the file's birth time confirms it.
         if (created.time < startMs && (created.latest < startMs || stat.birthtimeMs < startMs)) continue;
-        if (newest && created.time < newest.created) continue;
-        if (newest && created.time === newest.created && stat.mtimeMs <= newest.modified) continue;
-        newest = { id: match[1], created: created.time, modified: stat.mtimeMs };
+        if (!hasJobMarker(lines, marker, bytes === buffer.length)) continue;
+        if (found) return 'ambiguous-session';
+        found = match[1].toLowerCase();
       } catch {} finally { if (fd !== undefined) closeSync(fd); }
     }
   }
-  return newest?.id.toLowerCase() || '';
+  return found;
 }
 
 function query(pid) {
@@ -128,6 +171,8 @@ function selfTest() {
   const cwd = path.join(root, 'work');
   const id = '01234567-89ab-cdef-0123-456789abcdef';
   const otherId = 'fedcba98-7654-3210-fedc-ba9876543210';
+  const marker = 'a'.repeat(32);
+  const lookup = (home, directory, start) => findSession(home, directory, start, marker);
   const base = Math.floor((Date.now() + 60_000) / 1000) * 1000;
   let passed = 0, failed = 0, serial = 0;
   const check = (name, ok) => {
@@ -140,47 +185,48 @@ function selfTest() {
     mkdirSync(dir, { recursive: true });
     return { home, dir };
   };
-  const write = (dir, sessionId, payload, nameId = sessionId) => {
+  const write = (dir, sessionId, payload, nameId = sessionId, jobMarker = marker) => {
     const file = path.join(dir, `rollout-2026-10-27T00-00-00-${nameId}.jsonl`);
     writeFileSync(file, `${JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd, ...payload } })}\n` +
-      '{"type":"event_msg"}\n');
+      `${JSON.stringify({ type: 'event_msg', payload: { type: 'user_message',
+        message: `LUNA-JOB-ID: ${jobMarker}\nprompt` } })}\n`);
     return file;
   };
   try {
     mkdirSync(cwd);
-    check('rejects invalid lookup arguments', findSession('', cwd, base) === '' && findSession(root, cwd, NaN) === '');
-    check('missing sessions directory is harmless', findSession(root, cwd, base) === '');
+    check('rejects invalid lookup arguments', lookup('', cwd, base) === '' && lookup(root, cwd, NaN) === '');
+    check('missing sessions directory is harmless', lookup(root, cwd, base) === '');
 
     const recent = fixture();
     const current = write(recent.dir, id, { timestamp: new Date(base + 500).toISOString() });
     check('recorded timestamp handles an older filesystem birth time',
-      statSync(current).birthtimeMs < base && findSession(recent.home, cwd, base) === id);
+      statSync(current).birthtimeMs < base && lookup(recent.home, cwd, base) === id);
     check('normalizes dot segments and a trailing slash',
-      findSession(recent.home, path.join(cwd, '..', 'work') + path.sep, base) === id);
-    check('rejects a different working directory', findSession(recent.home, root, base) === '');
+      lookup(recent.home, path.join(cwd, '..', 'work') + path.sep, base) === id);
+    check('rejects a different working directory', lookup(recent.home, root, base) === '');
 
     if (process.platform === 'win32') {
       const msys = (value) => value.replace(/\\/g, '/').replace(/^([a-z]):\//i, '/$1/');
       const cygwin = (value) => msys(value).replace(/^\/([a-z])\//i, '/cygdrive/$1/');
-      check('matches Windows case and slash variants', findSession(recent.home, cwd.toUpperCase().replace(/\\/g, '/'),
+      check('matches Windows case and slash variants', lookup(recent.home, cwd.toUpperCase().replace(/\\/g, '/'),
         base) === id);
-      check('converts MSYS home and cwd paths', findSession(msys(recent.home), msys(cwd), base) === id);
-      check('converts cygdrive home and cwd paths', findSession(cygwin(recent.home), cygwin(cwd), base) === id);
+      check('converts MSYS home and cwd paths', lookup(msys(recent.home), msys(cwd), base) === id);
+      check('converts cygdrive home and cwd paths', lookup(cygwin(recent.home), cygwin(cwd), base) === id);
       const metaMsys = fixture();
       write(metaMsys.dir, id, { cwd: msys(cwd), timestamp: new Date(base).toISOString() });
-      check('matches an MSYS cwd recorded in metadata', findSession(metaMsys.home, cwd, base) === id);
+      check('matches an MSYS cwd recorded in metadata', lookup(metaMsys.home, cwd, base) === id);
     }
 
     const stale = fixture();
     const staleFile = write(stale.dir, id, { timestamp: new Date(base - 5000).toISOString() });
     utimesSync(staleFile, new Date(base + 5000), new Date(base + 5000));
-    check('rejects an old session even if its file was modified later', findSession(stale.home, cwd, base) === '');
+    check('rejects an old session even if its file was modified later', lookup(stale.home, cwd, base) === '');
 
     const timezone = fixture();
     const offset = new Date(base + 3 * 3600_000).toISOString().replace('Z', '+03:00');
     write(timezone.dir, id, { timestamp: offset });
-    check('compares timezone offsets as UTC instants', findSession(timezone.home, cwd, base) === id &&
-      findSession(timezone.home, cwd, base + 1) === '');
+    check('compares timezone offsets as UTC instants', lookup(timezone.home, cwd, base) === id &&
+      lookup(timezone.home, cwd, base + 1) === '');
 
     const seconds = fixture();
     const secondsFile = write(seconds.dir, id, {});
@@ -188,39 +234,56 @@ function selfTest() {
     const secondsBase = Math.floor(secondsBirth / 1000) * 1000;
     write(seconds.dir, id, { timestamp: new Date(secondsBase).toISOString().replace('.000Z', 'Z') });
     check('uses birth time to confirm an overlapping second-only timestamp',
-      findSession(seconds.home, cwd, Math.floor(secondsBirth)) === id);
+      lookup(seconds.home, cwd, Math.floor(secondsBirth)) === id);
     const ambiguousSeconds = fixture();
     write(ambiguousSeconds.dir, id, { timestamp: new Date(base).toISOString().replace('.000Z', 'Z') });
     check('rejects an ambiguous second-only timestamp without birth-time confirmation',
-      findSession(ambiguousSeconds.home, cwd, base + 999) === '');
+      lookup(ambiguousSeconds.home, cwd, base + 999) === '');
     const tenths = fixture();
     const tenthsFile = write(tenths.dir, id, {});
     const tenthsBirth = statSync(tenthsFile).birthtimeMs;
     const tenthsBase = Math.floor(tenthsBirth / 100) * 100;
     write(tenths.dir, id, { timestamp: new Date(tenthsBase).toISOString().replace(/(\.\d)\d\dZ$/, '$1Z') });
     check('uses birth time to confirm an overlapping fractional timestamp',
-      findSession(tenths.home, cwd, Math.floor(tenthsBirth)) === id);
+      lookup(tenths.home, cwd, Math.floor(tenthsBirth)) === id);
     const ambiguousTenths = fixture();
     write(ambiguousTenths.dir, id, { timestamp: new Date(base + 100).toISOString().replace('.100Z', '.1Z') });
     check('rejects an ambiguous fractional timestamp without birth-time confirmation',
-      findSession(ambiguousTenths.home, cwd, base + 199) === '');
+      lookup(ambiguousTenths.home, cwd, base + 199) === '');
 
     const latest = fixture();
     const older = write(latest.dir, id, { timestamp: new Date(base + 1000).toISOString() });
     write(latest.dir, otherId, { timestamp: new Date(base + 2000).toISOString() });
     utimesSync(older, new Date(base + 9000), new Date(base + 9000));
-    check('selects the newest matching session instead of the newest modification',
-      findSession(latest.home, cwd, base) === otherId);
+    check('rejects two rollouts with the same marker as ambiguous',
+      findSession(latest.home, cwd, base, marker) === 'ambiguous-session');
+
+    const separate = fixture();
+    write(separate.dir, id, { timestamp: new Date(base + 1000).toISOString() });
+    write(separate.dir, otherId, { timestamp: new Date(base + 2000).toISOString() }, otherId, 'b'.repeat(32));
+    check('ignores another job with the same cwd and time', findSession(separate.home, cwd, base, marker) === id);
+    check('requires a valid job marker', findSession(separate.home, cwd, base, '') === '');
+
+    const long = fixture();
+    const longFile = write(long.dir, id, { timestamp: new Date(base).toISOString() });
+    const meta = readFileSync(longFile, 'utf8').split('\n')[0];
+    const response = { type: 'response_item', payload: { type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: `LUNA-JOB-ID: ${marker}\n${'x'.repeat(70_000)}` }] } };
+    writeFileSync(longFile, `${meta}\n${JSON.stringify(response)}\n`);
+    check('finds a response user marker in a message exceeding 64 KB', lookup(long.home, cwd, base) === id);
+    response.payload.role = 'assistant';
+    writeFileSync(longFile, `${meta}\n${JSON.stringify(response)}\n`);
+    check('rejects a marker in an assistant message', lookup(long.home, cwd, base) === '');
 
     const invalid = fixture();
     write(invalid.dir, id, { timestamp: new Date(base).toISOString() }, otherId);
-    check('rejects an id that does not match the filename', findSession(invalid.home, cwd, base) === '');
+    check('rejects an id that does not match the filename', lookup(invalid.home, cwd, base) === '');
     const legacy = fixture();
     write(legacy.dir, id, {});
     check('metadata without a timestamp retains the filesystem birth-time fallback',
-      findSession(legacy.home, cwd, Date.now() - 2000) === id && findSession(legacy.home, cwd, base) === '');
+      lookup(legacy.home, cwd, Date.now() - 2000) === id && lookup(legacy.home, cwd, base) === '');
     write(legacy.dir, otherId, { timestamp: 'invalid' });
-    check('invalid timestamps also use the birth-time fallback', findSession(legacy.home, cwd, base) === '');
+    check('invalid timestamps also use the birth-time fallback', lookup(legacy.home, cwd, base) === '');
   } finally {
     if (path.dirname(root) !== tempRoot || !path.basename(root).startsWith('luna-session-test-')) {
       throw new Error('invalid self-test cleanup path');
