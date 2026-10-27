@@ -13,6 +13,8 @@ export const paths = Object.freeze({
   events: path.resolve(LEARN_DIR, "events.jsonl"),
   eventsOld: path.resolve(LEARN_DIR, "events.1.jsonl"),
   jobs: path.resolve(LEARN_DIR, "jobs.jsonl"),
+  attest: path.resolve(LEARN_DIR, "attest.jsonl"),
+  attestOld: path.resolve(LEARN_DIR, "attest.1.jsonl"),
   extractState: path.resolve(LEARN_DIR, "extract-state.json"),
   loopState: path.resolve(LEARN_DIR, "loop-state.json"),
   config: path.resolve(LEARN_DIR, "config.json"),
@@ -229,6 +231,20 @@ export function eventId(...parts) {
 
 export function sha256(text) {
   return createHash("sha256").update(text).digest("hex");
+}
+
+export function canonicalJson(value) {
+  const json = JSON.stringify(value);
+  if (json === undefined) return undefined;
+  const encode = (item) => {
+    if (Array.isArray(item)) return `[${item.map(encode).join(",")}]`;
+    if (item !== null && typeof item === "object") {
+      const fields = Object.keys(item).sort().map((key) => `${JSON.stringify(key)}:${encode(item[key])}`);
+      return `{${fields.join(",")}}`;
+    }
+    return JSON.stringify(item);
+  };
+  return encode(JSON.parse(json));
 }
 
 export function toWinPath(p) {

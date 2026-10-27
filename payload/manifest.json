@@ -221,13 +221,13 @@
       "src": "claude/scripts/learning/DESIGN.md",
       "dest": "scripts/learning/DESIGN.md",
       "kind": "file",
-      "sha256": "7bbc099c2463b96e903a2d46a4e2ed7733bf8b2f5b69df5de25e35f1c1fdda10"
+      "sha256": "42f5797fb5fde7d9a4864aaa028dcdcee251b4ab000c2b60f0281e7a60291d47"
     },
     {
       "src": "claude/scripts/learning/common.mjs",
       "dest": "scripts/learning/common.mjs",
       "kind": "file",
-      "sha256": "cd25b5e27296c863cbf05860138b8a8dbc56663ac37afb109868172808c3e3e1"
+      "sha256": "4d8f3b87466b8898c1e8d0c5dd23995adc73e491068714f964660e099f6c1cde"
     },
     {
       "src": "claude/scripts/learning/core.mjs",
@@ -239,7 +239,7 @@
       "src": "claude/scripts/learning/extract.mjs",
       "dest": "scripts/learning/extract.mjs",
       "kind": "file",
-      "sha256": "38184d61be680d5d4ff4abcd2a681290b45390bfaff4e033f70d9188e8e9cad7"
+      "sha256": "c0d0c73fcaa0c63b8943bbf82b2d1a1655de694f780f2e04e7095205f47b29bf"
     },
     {
       "src": "claude/scripts/learning/loop.mjs",
@@ -269,7 +269,7 @@
       "src": "claude/scripts/learning/test/common.test.mjs",
       "dest": "scripts/learning/test/common.test.mjs",
       "kind": "file",
-      "sha256": "29efbf2d5a0881d21a724adadcd0722197b28279dcdbef7f0a3abe7952ed1de2"
+      "sha256": "13d182fcbac43b1d4fa5a75279567183624b675afa3eda8d5f8b302b8f8a38f7"
     },
     {
       "src": "claude/scripts/learning/test/core.test.mjs",
@@ -281,7 +281,7 @@
       "src": "claude/scripts/learning/test/extract.test.mjs",
       "dest": "scripts/learning/test/extract.test.mjs",
       "kind": "file",
-      "sha256": "2b16e7dfad2d3eceb5df67aa85b05e7769cb309f6ffb3fc3edf4d929ea3aaa5b"
+      "sha256": "3b3b1357f7f866d78524275fbbcbb922001fff4d715f4424965b15c4a9da2ad5"
     },
     {
       "src": "claude/scripts/learning/test/fake-luna.mjs",
@@ -407,7 +407,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "64dc9f33cb369044c687afc8f7d955828d9289728ab66ff413bfeddf3b6d8391"
+      "sha256": "087f69ae739f896a7f56ff7f52a8b40485cdfb53ab4d092777bea8b456481d80"
     }
   ],
   "settings": "settings/hooks.json",

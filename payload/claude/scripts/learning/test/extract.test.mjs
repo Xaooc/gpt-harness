@@ -15,8 +15,9 @@ const {
 } = await import("../registry.mjs");
 const {
   extract, classifyUserText, verifyEventProvenance, isGenuineHumanEntry, entryText, isTrustedJobPath, isTrustedJob,
+  eventDigest,
 } = await import("../extract.mjs");
-const { HOME_CLAUDE, LEARN_DIR, paths, readJson, readJsonl, toWinPath } = common;
+const { HOME_CLAUDE, LEARN_DIR, paths, readJson, readJsonl, toWinPath, canonicalJson } = common;
 const statusRoot = path.join(HOME_CLAUDE, "luna-run");
 const hook = fileURLToPath(new URL("../../../hooks/learning-capture.mjs", import.meta.url));
 const timestamp = "2026-10-20T10:00:00.000Z";
@@ -666,6 +667,271 @@ test("large registries read the last 64 MiB and discard the first partial line",
   assert.equal(isTrustedJob(out), true);
 });
 
+test("job events capture the SHA-256 of the raw status bytes", async () => {
+  const out = write(path.join(statusRoot, "review.out.md"), "Assumption: local defaults\nTop concern: finding\n");
+  write(out.replace(".out.md", ".brief.md"), "Review scope");
+  const status = job(out, "done", "error=проверка\r\n");
+  const sha = createHash("sha256").update(fs.readFileSync(status)).digest("hex");
+  assert.equal((await run()).new_events, 3);
+  assert.deepEqual(events().map((event) => event.type), ["luna_job", "executor_assumption", "critic_output"]);
+  for (const event of events()) assert.equal(event.data.status_sha256, sha, event.type);
+  assert.deepEqual(readJsonl(paths.attest), events().map((event) => ({
+    v: 1, id: event.id, type: event.type, out: normaliseJobOut(out),
+    status_sha256: sha, event_sha256: eventDigest(event),
+  })));
+  assert.equal((await run()).new_events, 0);
+  assert.equal(readJsonl(paths.attest).length, 3);
+});
+
+test("canonicalJson sorts nested keys, preserves array order and follows JSON undefined handling", () => {
+  const left = { z: [{ y: 2, x: 1 }, undefined, { b: undefined, a: 3 }], a: { d: 4, c: 5 } };
+  const right = { a: { c: 5, d: 4 }, z: [{ x: 1, y: 2 }, undefined, { a: 3 }] };
+  assert.equal(canonicalJson(left), canonicalJson(right));
+  assert.equal(canonicalJson(left), '{"a":{"c":5,"d":4},"z":[{"x":1,"y":2},null,{"a":3}]}');
+  assert.notEqual(canonicalJson([1, 2]), canonicalJson([2, 1]));
+});
+
+test("eventDigest covers every event field except captured and ignores nested key order", () => {
+  const event = {
+    v: 1, id: "id", type: "luna_job", ts: timestamp, captured: timestamp,
+    session: "session", project: "project", source: "source", quote: "quote", context: "context",
+    data: { state: "done", findings: { high: 1, low: 2 } }, extra: "covered",
+  };
+  const { captured, ...rest } = event;
+  const expected = createHash("sha256").update(canonicalJson(rest)).digest("hex");
+  assert.equal(eventDigest(event), expected);
+  assert.equal(eventDigest({ ...event, captured: "later" }), expected);
+  assert.equal(eventDigest(rest), expected);
+  assert.equal(eventDigest({ ...event, data: { findings: { low: 2, high: 1 }, state: "done" } }), expected);
+  for (const key of Object.keys(rest)) {
+    assert.notEqual(eventDigest({ ...event, [key]: "changed" }), expected, key);
+  }
+});
+
+test("capture does not attest untrusted job events or events without a status hash", async () => {
+  const out = write(path.join(HOME_CLAUDE, "repo", "review.out.md"), "Assumption: local defaults\nTop concern: finding\n");
+  write(out.replace(".out.md", ".brief.md"), "Review scope");
+  job(out);
+  transcript([human("нет, исправь"), bash(`bash luna.sh -o "${toWinPath(out)}"`)]);
+  assert.equal((await run()).new_events, 4);
+  const untrusted = events().filter((event) => event.type !== "user_correction");
+  assert.deepEqual(untrusted.map((event) => event.type), ["luna_job", "executor_assumption", "critic_output"]);
+  for (const event of untrusted) assert.equal(event.data.trusted, false);
+  assert.equal(events("user_correction")[0].data.status_sha256, undefined);
+  assert.deepEqual(readJsonl(paths.attest), []);
+  assert.equal(fs.existsSync(paths.attest), false);
+});
+
+async function captureRegisteredReview() {
+  const out = write(path.join(statusRoot, "review.out.md"), "Assumption: local defaults\nTop concern: finding\n");
+  write(out.replace(".out.md", ".brief.md"), "Review scope");
+  const status = job(out);
+  const jobRoots = {
+    registry: path.join(LEARN_DIR, "registry-override.jsonl"),
+    attest: path.join(LEARN_DIR, "attest-override.jsonl"),
+    attestOld: path.join(LEARN_DIR, "attest-old-override.jsonl"),
+  };
+  assert.equal(recordJob(out, jobRoots), true);
+  assert.equal((await run({ jobRoots })).new_events, 3);
+  fs.renameSync(paths.attest, jobRoots.attest);
+  return { out, status, jobRoots, captured: events() };
+}
+
+test("missing sources require capture-time attestations and reject subsequent row edits", async () => {
+  const { out, status, jobRoots, captured } = await captureRegisteredReview();
+  fs.unlinkSync(out);
+  fs.unlinkSync(status);
+  for (const event of captured) {
+    assert.deepEqual(await verifyEventProvenance(event, jobRoots), { ok: true, reason: "verified" });
+    assert.equal((await verifyEventProvenance({ ...event, captured: "later" }, jobRoots)).ok, true);
+    const reason = event.type === "luna_job"
+      ? "status file gone and not in registry" : "output file gone and not in registry";
+    const changedData = event.type === "luna_job" ? { ...event.data, state: "failed" }
+      : event.type === "executor_assumption" ? { ...event.data, job_state: "failed" }
+        : { ...event.data, findings: { ...event.data.findings, high: 99 } };
+    for (const change of [
+      { quote: "forged quote" }, { data: changedData },
+      { session: "forged-session" }, { project: "forged-project" },
+    ]) {
+      assert.deepEqual(await verifyEventProvenance({ ...event, ...change }, jobRoots), { ok: false, reason });
+    }
+  }
+});
+
+test("missing sources fail without attest files, while present sources need none", async () => {
+  const { out, status, jobRoots, captured } = await captureRegisteredReview();
+  fs.unlinkSync(jobRoots.attest);
+  for (const event of captured) {
+    assert.deepEqual(await verifyEventProvenance(event, jobRoots), { ok: true, reason: "verified" });
+  }
+  fs.unlinkSync(out);
+  fs.unlinkSync(status);
+  for (const event of captured) {
+    assert.deepEqual(await verifyEventProvenance(event, jobRoots), {
+      ok: false, reason: event.type === "luna_job"
+        ? "status file gone and not in registry" : "output file gone and not in registry",
+    });
+  }
+});
+
+test("fallback finds rotated attestations and skips malformed or mismatched records without caching", async () => {
+  const { out, status, jobRoots, captured } = await captureRegisteredReview();
+  const records = readJsonl(jobRoots.attest);
+  fs.unlinkSync(out);
+  fs.unlinkSync(status);
+  fs.renameSync(jobRoots.attest, jobRoots.attestOld);
+  for (const event of captured) {
+    const record = records.find((row) => row.id === event.id);
+    const reason = event.type === "luna_job"
+      ? "status file gone and not in registry" : "output file gone and not in registry";
+    assert.deepEqual(await verifyEventProvenance(event, jobRoots), { ok: true, reason: "verified" });
+    write(jobRoots.attestOld, "not json\nnull\n[]\n");
+    for (const change of [
+      { id: "other" }, { type: "other" }, { out: path.join(statusRoot, "other.out.md") },
+      { status_sha256: "0".repeat(64) }, { event_sha256: "0".repeat(64) },
+    ]) {
+      write(jobRoots.attest, encode({ ...record, ...change }));
+      assert.deepEqual(await verifyEventProvenance(event, jobRoots), { ok: false, reason });
+    }
+    const normalisedAlias = toWinPath(path.dirname(out)) + "/./" + path.basename(out);
+    fs.appendFileSync(jobRoots.attestOld, encode({ ...record, out: normalisedAlias }));
+    assert.deepEqual(await verifyEventProvenance(event, jobRoots), { ok: true, reason: "verified" });
+    write(jobRoots.attestOld, records.map((row) => encode(row)).join(""));
+  }
+});
+
+test("missing status provenance requires the captured hash and matching registry output", async () => {
+  const out = path.join(statusRoot, "job.out.md");
+  const status = job(out);
+  const record = registryRecord(out);
+  await run();
+  const [event] = events("luna_job");
+  assert.equal(readJsonl(paths.attest).some((record) => record.event_sha256 === eventDigest(event)), true);
+  fs.unlinkSync(status);
+  for (const records of [[], [{ ...record, status_sha256: "0".repeat(64) }],
+    [{ ...record, out: path.join(statusRoot, "other.out.md") }]]) {
+    write(paths.jobs, records.map((row) => encode(row)).join(""));
+    assert.deepEqual(await verifyEventProvenance(event), {
+      ok: false, reason: "status file gone and not in registry",
+    });
+  }
+  write(paths.jobs, encode(record));
+  assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
+  for (const status_sha256 of [undefined, null, "", "bad", "g".repeat(64), 42]) {
+    assert.deepEqual(await verifyEventProvenance({ ...event, data: { ...event.data, status_sha256 } }), {
+      ok: false, reason: "status file gone and not in registry",
+    });
+  }
+});
+
+test("missing job files use the configured registry and require trusted to be exactly true", async () => {
+  const out = write(path.join(statusRoot, "review.out.md"), "Assumption: local defaults\nTop concern: finding\n");
+  write(out.replace(".out.md", ".brief.md"), "Review scope");
+  const status = job(out);
+  const registry = path.join(LEARN_DIR, "override.jsonl");
+  assert.equal(recordJob(out, { registry }), true);
+  await run();
+  assert.equal(readJsonl(paths.attest).length, 3);
+  fs.unlinkSync(out);
+  fs.unlinkSync(status);
+  for (const event of events()) {
+    const reason = event.type === "luna_job"
+      ? "status file gone and not in registry" : "output file gone and not in registry";
+    assert.deepEqual(await verifyEventProvenance(event), { ok: false, reason });
+    assert.deepEqual(await verifyEventProvenance(event, { registry }), { ok: true, reason: "verified" });
+    for (const trusted of [false, undefined, null, "true", 1]) {
+      assert.deepEqual(await verifyEventProvenance({ ...event, data: { ...event.data, trusted } }, { registry }), {
+        ok: false, reason,
+      });
+    }
+  }
+});
+
+test("missing assumptions and critic outputs require a matching status hash in the registry", async () => {
+  const out = write(path.join(statusRoot, "review.out.md"), "Assumption: local defaults\nTop concern: finding\n");
+  write(out.replace(".out.md", ".brief.md"), "Review scope");
+  job(out);
+  const record = registryRecord(out);
+  await run();
+  assert.equal(readJsonl(paths.attest).length, 3);
+  fs.unlinkSync(out);
+  for (const event of events().filter((event) => event.type !== "luna_job")) {
+    for (const records of [[], [{ ...record, status_sha256: "0".repeat(64) }]]) {
+      write(paths.jobs, records.map((row) => encode(row)).join(""));
+      assert.deepEqual(await verifyEventProvenance(event), {
+        ok: false, reason: "output file gone and not in registry",
+      });
+    }
+    write(paths.jobs, encode(record));
+    assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
+    const legacy = { ...event, data: { ...event.data } };
+    delete legacy.data.status_sha256;
+    assert.deepEqual(await verifyEventProvenance(legacy), {
+      ok: false, reason: "output file gone and not in registry",
+    });
+  }
+});
+
+test("registry fallback still requires isTrustedJob after files are deleted", async () => {
+  const out = write(path.join(HOME_CLAUDE, "repo", "job.out.md"), "Assumption: local defaults\n");
+  const status = job(out);
+  assert.equal(recordJob(out), true);
+  transcript([bash(`bash luna.sh -o "${toWinPath(out)}"`)]);
+  await run();
+  assert.equal(readJsonl(paths.attest).length, 2);
+  fs.unlinkSync(out);
+  const [event] = events("executor_assumption");
+  assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
+  fs.unlinkSync(status);
+  assert.equal(isTrustedJob(out), false);
+  for (const captured of events()) {
+    assert.deepEqual(await verifyEventProvenance(captured), {
+      ok: false, reason: captured.type === "luna_job"
+        ? "status file gone and not in registry" : "output file gone and not in registry",
+    });
+  }
+});
+
+test("old status events remain valid with unchanged files and fail when their data changes", async () => {
+  const out = path.join(statusRoot, "job.out.md");
+  job(out);
+  await run();
+  const [captured] = events("luna_job");
+  const event = { ...captured, data: { ...captured.data } };
+  delete event.data.status_sha256;
+  assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
+  job(out, "failed");
+  assert.deepEqual(await verifyEventProvenance(event), { ok: false, reason: "status mismatch" });
+});
+
+test("new status events detect byte changes even when parsed status fields are unchanged", async () => {
+  const out = path.join(statusRoot, "job.out.md");
+  const status = job(out);
+  await run();
+  const [event] = events("luna_job");
+  fs.appendFileSync(status, "ignored line without equals\n");
+  assert.deepEqual(await verifyEventProvenance(event), { ok: false, reason: "status mismatch" });
+});
+
+test("registry fallback does not accept non-file sources or a missing assumption status alone", async () => {
+  const out = write(path.join(statusRoot, "review.out.md"), "Assumption: local defaults\nTop concern: finding\n");
+  write(out.replace(".out.md", ".brief.md"), "Review scope");
+  const status = job(out);
+  assert.equal(recordJob(out), true);
+  await run();
+  const [event] = events("luna_job");
+  const [assumption] = events("executor_assumption");
+  fs.unlinkSync(status);
+  assert.equal((await verifyEventProvenance(assumption)).ok, false);
+  fs.mkdirSync(status);
+  assert.deepEqual(await verifyEventProvenance(event), { ok: false, reason: "invalid status source" });
+  fs.unlinkSync(out);
+  fs.mkdirSync(out);
+  for (const captured of events().filter((row) => row.type !== "luna_job")) {
+    assert.deepEqual(await verifyEventProvenance(captured), { ok: false, reason: "invalid output source" });
+  }
+});
+
 test("status provenance recomputes every data field and the sanitised error quote", async () => {
   const out = path.join(statusRoot, "job.out.md");
   job(out, "incomplete", "retry=1\nmissing=Verification\nerror=bad <b>result</b>\n");
@@ -680,7 +946,8 @@ test("status provenance recomputes every data field and the sanitised error quot
     })).ok, false, field);
     const missing = { ...event.data };
     delete missing[field];
-    assert.equal((await verifyEventProvenance({ ...event, data: missing })).ok, false, `missing ${field}`);
+    assert.equal((await verifyEventProvenance({ ...event, data: missing })).ok,
+      field === "status_sha256", `missing ${field}`);
   }
   assert.equal((await verifyEventProvenance({ ...event, quote: "forged error" })).ok, false);
   job(out, "incomplete", "retry=0\nmissing=Verification\nerror=changed\n");
@@ -696,6 +963,9 @@ test("assumption provenance requires the exact Assumption source line and saniti
   const [event] = events("executor_assumption");
   assert.equal(event.quote, "use local defaults [redacted]");
   assert.equal((await verifyEventProvenance(event)).ok, true);
+  const legacy = { ...event, data: { ...event.data } };
+  delete legacy.data.status_sha256;
+  assert.equal((await verifyEventProvenance(legacy)).ok, true);
   for (const source of [`${toWinPath(out)}#L1`, `${toWinPath(out)}#L3`, `${toWinPath(out)}#L0`, out]) {
     assert.equal((await verifyEventProvenance({ ...event, source })).ok, false, source);
   }
@@ -715,6 +985,9 @@ test("critic provenance recomputes counts, findings text, Top concern and brief 
   await run();
   const [event] = events("critic_output");
   assert.equal((await verifyEventProvenance(event)).ok, true);
+  const legacy = { ...event, data: { ...event.data } };
+  delete legacy.data.status_sha256;
+  assert.equal((await verifyEventProvenance(legacy)).ok, true);
   for (const changed of [
     { quote: "invented concern" },
     { data: { ...event.data, findings: { ...event.data.findings, high: 2 } } },
@@ -1231,6 +1504,24 @@ test("a 200 MB transcript reads only its new 10 KB tail in under one second", as
   assert.ok(elapsed < 1000, `incremental capture took ${elapsed} ms`);
   assert.match(events()[0].source, /#L1000002$/);
   assert.equal(readJson(paths.extractState, null).files[toWinPath(file)].offset, fs.statSync(file).size);
+});
+
+test("attestation rotation retains new records and replaces the previous generation", async () => {
+  write(paths.attest, " ".repeat(5 * 1024 * 1024 + 1) + "\n");
+  write(paths.attestOld, encode({ id: "obsolete" }));
+  const out = path.join(statusRoot, "job.out.md");
+  const status = job(out);
+  assert.equal(recordJob(out), true);
+  assert.equal((await run()).new_events, 1);
+  const [event] = events("luna_job");
+  assert.equal(fs.existsSync(paths.attest), false);
+  assert.deepEqual(readJsonl(paths.attestOld), [{
+    v: 1, id: event.id, type: event.type, out: normaliseJobOut(out),
+    status_sha256: event.data.status_sha256, event_sha256: eventDigest(event),
+  }]);
+  fs.unlinkSync(status);
+  assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
+  assert.equal((await run()).new_events, 0);
 });
 
 test("rotation preserves newly appended events under the events lock", async () => {

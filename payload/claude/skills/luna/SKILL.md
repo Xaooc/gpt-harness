@@ -112,7 +112,7 @@ jobs.** Spend them wherever they raise the quality of the final result or cut wa
 
 ## Slicing and parallelism
 
-- **Keep each slice to ~40 minutes of Luna work or less.** Split anything bigger into slices with their own acceptance commands (e.g. "parser + evaluator" and "scheme + golden tests" instead of one "engine" job).
+- **Keep each Luna slice to ~40 minutes, including acceptance checks.** Split work across slices without reducing requested scope; give each slice its own acceptance commands.
 - **Run independent slices at the same time.** Slices are independent when their write sets (files) don't overlap. Never let two write-mode jobs touch the same files. A slice that only *imports* another slice's API can start once that API's names/types are fixed in the brief.
 - **Don't idle while a job runs.** Launch the next independent slice, do Claude-owned work (design/UI, reviewing the previous slice, drafting the next brief), or run critics on the previous slice.
 - Concurrency is RAM-gated by the wrapper: a job starts only while available RAM minus its estimate (250 MB read-only, 700 MB write) stays above a reserve (max(1 GB, 6% of RAM)). Starts are spaced ~5 s apart through a lock shared across sessions. Knobs: `LUNA_RAM_RESERVE_MB`, `LUNA_JOB_MB`, `LUNA_NO_GATE=1`. Set `LUNA_JOB_MB` to match what the job's acceptance commands actually run: `LUNA_JOB_MB=300` for a write job whose checks are only syntax/lint (e.g. `node --check`, `bash -n`), and raise it for heavy suites (a big jest/pytest run can take 1–2 GB).
@@ -209,6 +209,12 @@ or any other picture a task needs. It was verified on 2026-09-29: it works throu
   concrete corrections.
 - **Variants are cheap** (quota is not a concern). For important visuals, launch 2–4 parallel jobs with
   different prompts or seeds, each writing its own file (`hero-a.png`, `hero-b.png` …). Opus picks the best.
+- **Stylize, never ask for high detail** (user rule, 2026-10-22). Prompts like "rich texture", "highly detailed", "many fine
+  details" make the model produce noise, ripples and cobweb-like hairlines. Ask for a stylized illustration: large clean
+  shapes, soft gradients, a limited palette, readable silhouettes, minimal texture; explicitly forbid noise, grain, speckle,
+  hairline cracks and dense micro-detail; draw paving, brick and roof tiles as broad simple shapes. Keep the area under UI or
+  game objects calm and put detail at the edges. Anything the user should touch or move is a separate sprite, not painted
+  into the background.
 - **Keep text out of images.** Put headings and labels in HTML/CSS, because generated lettering is unreliable.
 - It takes about 1 min per image at `medium`, with a PNG of roughly 1–2 MB. Optimise before shipping to production.
 

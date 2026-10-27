@@ -22,7 +22,8 @@ test("paths stay under the temporary learning directory and ensureDirs creates d
   assert.equal(common.SCRIPTS_DIR, fileURLToPath(new URL("../", import.meta.url)));
   assert.equal(Object.isFrozen(paths), true);
   const names = {
-    events: "events.jsonl", eventsOld: "events.1.jsonl", jobs: "jobs.jsonl", extractState: "extract-state.json",
+    events: "events.jsonl", eventsOld: "events.1.jsonl", jobs: "jobs.jsonl", attest: "attest.jsonl", attestOld: "attest.1.jsonl",
+    extractState: "extract-state.json",
     loopState: "loop-state.json", config: "config.json", adoptedJsonl: "adopted.jsonl",
     adoptedMd: "adopted.md", candidates: "candidates.jsonl", needsUser: "needs-user.md", logMd: "log.md",
     reportsDir: "reports", runsDir: "runs", backupsDir: "backups", locksDir: "locks",

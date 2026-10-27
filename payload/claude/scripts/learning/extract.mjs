@@ -6,9 +6,9 @@ import { pathToFileURL } from "node:url";
 import {
   HOME_CLAUDE, LEARN_DIR, SCRIPTS_DIR, paths, ensureDirs, nowIso, tryLock, withLock,
   readJson, writeJsonAtomic, appendJsonl, loadEvents, sanitizeQuote, eventId, toWinPath,
-  spawnDetached, findNode,
+  spawnDetached, findNode, sha256, canonicalJson, readJsonl,
 } from "./common.mjs";
-import { registryHas, statusSha256 } from "./registry.mjs";
+import { normaliseJobOut, registryHas, statusSha256 } from "./registry.mjs";
 
 const LEFT = "(?<![\\p{L}\\p{N}])";
 const RIGHT = "(?![\\p{L}\\p{N}])";
@@ -290,6 +290,26 @@ function containsQuote(text, quote) {
   return !!collapse(prefix) && collapse(text).includes(collapse(prefix));
 }
 
+export function eventDigest(event) {
+  const { captured, ...rest } = event;
+  return sha256(canonicalJson(rest));
+}
+
+function hasRegisteredProvenance(event, out, jobRoots) {
+  const sha = event.data?.status_sha256;
+  if (!(event.data?.trusted === true && typeof sha === "string" && /^[0-9a-f]{64}$/i.test(sha)
+    && isTrustedJob(out, jobRoots) && registryHas(out, sha, jobRoots?.registry ?? paths.jobs))) return false;
+  const normalisedOut = normaliseJobOut(out);
+  if (normalisedOut === null) return false;
+  const digest = eventDigest(event);
+  for (const file of [jobRoots?.attest ?? paths.attest, jobRoots?.attestOld ?? paths.attestOld]) {
+    if (readJsonl(file).some((record) => record.id === event.id && record.type === event.type
+      && normaliseJobOut(record.out) === normalisedOut && record.status_sha256 === sha
+      && record.event_sha256 === digest)) return true;
+  }
+  return false;
+}
+
 export async function verifyEventProvenance(event, jobRoots) {
   try {
     if (["user_correction", "user_interrupt", "critic_synthesis"].includes(event?.type)) {
@@ -330,20 +350,41 @@ export async function verifyEventProvenance(event, jobRoots) {
       }
     } else if (event?.type === "luna_job") {
       const file = toWinPath(event.source);
-      if (!file.endsWith(".status") || !fs.statSync(file).isFile()) throw new Error("invalid status source");
+      if (!file.endsWith(".status")) throw new Error("invalid status source");
       const out = file.slice(0, -7);
+      let info, values;
+      try {
+        info = fs.statSync(file);
+        if (!info.isFile()) throw new Error("invalid status source");
+        values = parseStatus(file);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        if (!hasRegisteredProvenance(event, out, jobRoots)) throw new Error("status file gone and not in registry");
+        return { ok: true, reason: "verified" };
+      }
       if (!isTrustedJob(out, jobRoots)) throw new Error("untrusted job path");
-      const { data, quote } = statusData(out, parseStatus(file), fs.statSync(file), jobRoots);
+      const { data, quote } = statusData(out, values, info, jobRoots);
+      if (!Object.hasOwn(event.data ?? {}, "status_sha256")) delete data.status_sha256;
       if (!TERMINAL_STATES.test(data.state || "") || event.data?.trusted !== true
         || !isDeepStrictEqual(data, event.data) || event.quote !== quote) {
         throw new Error("status mismatch");
       }
     } else if (["executor_assumption", "critic_output"].includes(event?.type)) {
       const file = toWinPath(event.data?.out_path);
+      let text;
+      try {
+        if (!fs.statSync(file).isFile()) throw new Error("invalid output source");
+        text = fs.readFileSync(file, "utf8");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        if (!hasRegisteredProvenance(event, file, jobRoots)) throw new Error("output file gone and not in registry");
+        return { ok: true, reason: "verified" };
+      }
       if (!isTrustedJob(file, jobRoots)) throw new Error("untrusted job path");
       if (event.data?.trusted !== true) throw new Error("trusted flag mismatch");
-      if (!fs.statSync(file).isFile()) throw new Error("invalid output source");
-      const text = fs.readFileSync(file, "utf8");
+      // The hash is capture metadata; live outputs retain their existing content/state checks.
+      const outputData = { ...event.data };
+      delete outputData.status_sha256;
       if (event.type === "executor_assumption") {
         const source = /^(.*)#L([1-9]\d*)$/.exec(event.source || "");
         const line = source && text.split(/\r?\n/)[Number(source[2]) - 1];
@@ -352,13 +393,13 @@ export async function verifyEventProvenance(event, jobRoots) {
           throw new Error("assumption line mismatch");
         }
         const state = jobState(parseStatus(`${file}.status`), fs.statSync(`${file}.status`));
-        if (!TERMINAL_STATES.test(state || "") || !isDeepStrictEqual(event.data, {
+        if (!TERMINAL_STATES.test(state || "") || !isDeepStrictEqual(outputData, {
           out_path: file, job_state: state, trusted: true,
         })) throw new Error("assumption data mismatch");
       } else {
         const expected = criticOf(file, text, jobRoots);
         if (toWinPath(event.source) !== file || !hasCriticBrief(file)
-          || !isDeepStrictEqual(event.data, expected.data) || event.quote !== expected.quote) {
+          || !isDeepStrictEqual(outputData, expected.data) || event.quote !== expected.quote) {
           throw new Error("critic output mismatch");
         }
       }
@@ -475,11 +516,13 @@ function statusMeta(file) {
 }
 
 function parseStatus(file) {
+  const bytes = fs.readFileSync(file);
   const values = {};
-  for (const line of fs.readFileSync(file, "utf8").replace(/^\uFEFF/u, "").split(/\r?\n/)) {
+  for (const line of bytes.toString("utf8").replace(/^\uFEFF/u, "").split(/\r?\n/)) {
     const equals = line.indexOf("=");
     if (equals > 0) values[line.slice(0, equals).trim()] = line.slice(equals + 1).trim();
   }
+  values.status_sha256 = sha256(bytes);
   return values;
 }
 
@@ -553,6 +596,7 @@ function statusData(out, values, info, jobRoots) {
     elapsed_s: Number.isFinite(started) && Number.isFinite(finished) ? (finished - started) / 1000 : null,
     out_path: out, trusted: isTrustedJob(out, jobRoots),
     notable: currentState !== "done" || values.retry === "1" || values.refusal_suspected === "1" || !!values.missing,
+    status_sha256: values.status_sha256,
   };
   return { data, quote: sanitizeQuote(values.error || "", 400), ts };
 }
@@ -577,12 +621,13 @@ function captureStatus(out, meta, state, emit, jobRoots) {
       const assumption = assumptionOf(line);
       if (assumption === null || assumptions >= 20) continue;
       emit("executor_assumption", meta, `${out}#L${index + 1}`, assumption, "", {
-        out_path: out, job_state: currentState, trusted: data.trusted,
+        out_path: out, job_state: currentState, trusted: data.trusted, status_sha256: data.status_sha256,
       }, ts, eventId("executor_assumption", out, String(index + 1)));
       assumptions++;
     }
     if (hasCriticBrief(out)) {
       const critic = criticOf(out, text, jobRoots);
+      critic.data.status_sha256 = data.status_sha256;
       emit("critic_output", meta, out, critic.quote, "", critic.data, ts, eventId("critic_output", out));
     }
   }
@@ -674,7 +719,18 @@ export async function extract(opts = {}) {
       if (captureStatus(out, meta, state, emit, opts.jobRoots)) statusFiles++;
     }
     const appended = withLock("events", { waitMs: 5000 }, () => {
+      const attestations = events.filter((event) => ["luna_job", "executor_assumption", "critic_output"].includes(event.type)
+        && event.data?.trusted === true && typeof event.data.status_sha256 === "string"
+        && /^[0-9a-f]{64}$/i.test(event.data.status_sha256)).map((event) => ({
+        v: 1, id: event.id, type: event.type, out: normaliseJobOut(event.data.out_path),
+        status_sha256: event.data.status_sha256, event_sha256: eventDigest(event),
+      }));
+      appendJsonl(paths.attest, attestations);
       appendJsonl(paths.events, events);
+      if ((stat(paths.attest)?.size ?? 0) > 5 * 1024 * 1024) {
+        fs.rmSync(paths.attestOld, { force: true });
+        fs.renameSync(paths.attest, paths.attestOld);
+      }
       if ((stat(paths.events)?.size ?? 0) > 20 * 1024 * 1024) {
         fs.rmSync(paths.eventsOld, { force: true });
         fs.renameSync(paths.events, paths.eventsOld);

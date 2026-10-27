@@ -97,6 +97,9 @@ Independence: cited events are grouped by `data.uuid` (else by identical quote t
 the session of its earliest event. Every cited event is re-verified against its source (`verifyEventProvenance`:
 the transcript line at `data.byte` must still be a genuine human message containing the quote and re-classify the
 same way; status/out files must still say the same) — a forged row in events.jsonl fails the gate.
+When a job's status/output file is gone, a trusted event may use its captured `status_sha256` instead.
+This fallback requires `isTrustedJob(out)` and an exact `(out, status_sha256)` match in `jobs.jsonl`.
+The event row itself must match a capture-time digest in `attest.jsonl` (all fields except `captured`), so edits to a row after its source is deleted fail.
 A regression revert needs the same threshold using events newer than the adoption.
 
 ## Protected content (read-only for the loop)
