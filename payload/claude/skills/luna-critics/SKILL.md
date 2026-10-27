@@ -56,7 +56,7 @@ Adding more critics is limited by Claude's synthesis, not by quota. Every findin
 
 Defaults: always include **Рядовой пользователь** for anything user-facing; include **Дизайнер** for user-facing interfaces or visual changes and **Взломщик** for anything that touches input, network, auth, files, or secrets. Add other relevant personas, or invent a sharper one that fits the task.
 
-**After any Sol/Luna implementation, include Ревизор пробелов.** The executors are literal:
+**After any Terra/Luna implementation, include Ревизор пробелов.** The executors are literal:
 they do what the brief says and miss what it didn't say (see the `luna` skill). This critic exists
 to catch exactly that. Give it the **user's original goal** (not just the brief) plus the diff, and point it
 at the `Assumption:` lines in the executor's result.
@@ -106,11 +106,10 @@ background Bash call:
 bash ~/.claude/scripts/luna-panel.sh "<scratchpad>/critics" "<repo root>"      # 3rd arg / LUNA_PAR = hard upper bound (default 16)
 ```
 
-Engine: `luna-pool.mjs` runs every critic as a thread inside ONE `codex app-server`, which
-is about half the RAM of separate processes. It admits jobs by free RAM, times out stuck turns
-(`LUNA_TURN_TIMEOUT_S`, default 2400), and always runs with MCP/plugins/apps disabled.
-`LUNA_POOL=0` forces the old one-process-per-critic engine. A pool startup failure falls
-back to that engine automatically. `LUNA_POOL_DRY_RUN=1` prints the plan and starts nothing.
+Engine: each critic runs through `luna.sh` in the shared daemon (default `LUNA_DAEMON_MAX=12`),
+with fair scheduling across sessions. `LUNA_POOL=1` opts into one `codex app-server` per panel;
+`LUNA_TURN_TIMEOUT_S` defaults to 2400 there. A pool startup failure falls back to the shared daemon.
+`LUNA_POOL_DRY_RUN=1` prints the pool plan and starts nothing (use with `LUNA_POOL=1`).
 
 Effort: critics run at `high` by default (`LUNA_PANEL_EFFORT` changes the default). Give one
 critic its own effort through the file name: `attacker.max.brief.md` → `max`. Use `max` only

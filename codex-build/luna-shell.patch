@@ -30,7 +30,7 @@ index cbee27c..7cd37de 100644
 +unchanged. Windows `sh` snapshots are disabled. Sandbox selection and restricted-token spawning are unchanged.
 +Remote environments retain their reported native shell; configured sessions still ignore model shell requests there.
 diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
-index 3e5cc07..ea7f5ed 100644
+index 7f70fb8..3db9b82 100644
 --- a/codex-rs/config/src/config_toml.rs
 +++ b/codex-rs/config/src/config_toml.rs
 @@ -5,6 +5,7 @@ use std::collections::HashMap;
@@ -91,7 +91,7 @@ index 3e5cc07..ea7f5ed 100644
      /// Sandbox mode to use.
      pub sandbox_mode: Option<SandboxMode>,
  
-@@ -1017,6 +1054,41 @@ mod tests {
+@@ -1024,6 +1061,41 @@ mod tests {
      const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
      const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
  
@@ -134,10 +134,10 @@ index 3e5cc07..ea7f5ed 100644
      fn sandbox_mode_uses_executor_platform_and_sandbox_level() {
          use Platform::Linux;
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 5864a5d..01cbc45 100644
+index cce71e4..1ed3eb9 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -1504,6 +1504,17 @@
+@@ -1569,6 +1569,17 @@
        ],
        "type": "string"
      },
@@ -155,7 +155,7 @@ index 5864a5d..01cbc45 100644
      "ExperimentalRequestUserInput": {
        "additionalProperties": false,
        "properties": {
-@@ -6882,6 +6893,18 @@
+@@ -7195,6 +7206,18 @@
        "description": "Default permissions profile to apply. Names starting with `:` refer to built-in profiles; other names are resolved from the `[permissions]` table.",
        "type": "string"
      },
@@ -175,10 +175,10 @@ index 5864a5d..01cbc45 100644
        "additionalProperties": true,
        "default": null,
 diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
-index 806bd80..5e1a30a 100644
+index c45fb2b..f3ddc30 100644
 --- a/codex-rs/core/src/config/config_tests.rs
 +++ b/codex-rs/core/src/config/config_tests.rs
-@@ -6053,6 +6053,64 @@ async fn default_zsh_path_sets_runtime_zsh_path() -> std::io::Result<()> {
+@@ -6209,6 +6209,64 @@ async fn log_dir_routes_logs_without_moving_state() -> std::io::Result<()> {
      Ok(())
  }
  
@@ -241,14 +241,14 @@ index 806bd80..5e1a30a 100644
 +}
 +
  #[tokio::test]
- async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Result<()> {
-     let codex_home = TempDir::new()?;
+ async fn managed_sqlite_home_preserves_configured_log_dir() -> std::io::Result<()> {
+     let home = TempDir::new()?;
 diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
-index 1eb2cdf..e66eb09 100644
+index 3f6c1cc..ac0a328 100644
 --- a/codex-rs/core/src/config/mod.rs
 +++ b/codex-rs/core/src/config/mod.rs
-@@ -1010,6 +1010,12 @@ pub struct Config {
-     /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
+@@ -1036,6 +1036,12 @@ pub struct Config {
+     /// Ignored compatibility field for clients that still pass a patched zsh path.
      pub zsh_path: Option<PathBuf>,
  
 +    /// Explicit shell for model commands; overrides shell discovery and per-command shell requests.
@@ -260,9 +260,9 @@ index 1eb2cdf..e66eb09 100644
      /// Value to use for `reasoning.effort` when making a request using the
      /// Responses API.
      pub model_reasoning_effort: Option<ReasoningEffort>,
-@@ -4429,6 +4435,9 @@ impl Config {
-             main_execve_wrapper_exe,
-             zsh_path,
+@@ -4577,6 +4583,9 @@ impl Config {
+             main_execve_wrapper_exe: None,
+             zsh_path: None,
  
 +            default_shell: cfg.default_shell,
 +            default_shell_path: cfg.default_shell_path,
@@ -271,10 +271,10 @@ index 1eb2cdf..e66eb09 100644
              show_raw_agent_reasoning: cfg
                  .show_raw_agent_reasoning
 diff --git a/codex-rs/core/src/context/world_state/environment_render_tests.rs b/codex-rs/core/src/context/world_state/environment_render_tests.rs
-index 219a13d..e7d30c1 100644
+index 37d133f..dda8e86 100644
 --- a/codex-rs/core/src/context/world_state/environment_render_tests.rs
 +++ b/codex-rs/core/src/context/world_state/environment_render_tests.rs
-@@ -124,6 +124,25 @@ fn serialize_environment_context_with_foreign_windows_cwd() {
+@@ -125,6 +125,25 @@ fn serialize_environment_context_with_foreign_windows_cwd() {
      );
  }
  
@@ -291,7 +291,7 @@ index 219a13d..e7d30c1 100644
 +        None,
 +        None,
 +    );
-+    let rendered = context.render();
++    let rendered = context.render().expect_text();
 +    assert!(rendered.contains("<shell>sh</shell>"));
 +    assert!(!rendered.contains("powershell"));
 +    assert!(!rendered.contains("shell_version"));
@@ -300,372 +300,27 @@ index 219a13d..e7d30c1 100644
  #[test]
  fn serialize_environment_context_with_network() {
      let network = NetworkContext::new(
-diff --git a/codex-rs/core/src/session/review.rs b/codex-rs/core/src/session/review.rs
-index 44ec95f..c95cc78 100644
---- a/codex-rs/core/src/session/review.rs
-+++ b/codex-rs/core/src/session/review.rs
-@@ -35,7 +35,10 @@ pub(super) async fn spawn_review_thread(
-     let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
-         review_features.get(),
-         crate::tools::tool_user_shell_type(sess.services.user_shell.as_ref()),
--        sess.services.shell_zsh_path.as_ref(),
-+        sess.services
-+            .shell_zsh_path
-+            .as_ref()
-+            .filter(|_| config.default_shell.is_none()),
-         sess.services.main_execve_wrapper_exe.as_ref(),
-     );
- 
 diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
-index 263f08f..cf55df6 100644
+index e3bcb2b..a9c4f45 100644
 --- a/codex-rs/core/src/session/session.rs
 +++ b/codex-rs/core/src/session/session.rs
-@@ -1238,9 +1238,17 @@ impl Session {
-                 session_source: session_configuration.session_source.clone(),
-                 cwd: session_configuration.cwd().to_path_buf(),
-                 rollout_path: rollout_path.clone(),
--                model: session_configuration.step_settings.collaboration_mode.model().to_string(),
-+                model: session_configuration
-+                    .step_settings
-+                    .collaboration_mode
-+                    .model()
-+                    .to_string(),
-                 provider_name: config.model_provider_id.clone(),
--                approval_policy: session_configuration.step_settings.approval_policy.value().to_string(),
-+                approval_policy: session_configuration
-+                    .step_settings
-+                    .approval_policy
-+                    .value()
-+                    .to_string(),
-                 sandbox_policy: format!(
-                     "{:?}",
-                     session_configuration.sandbox_policy(environment_selections)
-@@ -1280,7 +1288,9 @@ impl Session {
-             let effective_config = config.config_layer_stack.effective_config();
-             let config_path = config.codex_home.join(CONFIG_TOML_FILE);
-             if let Some(event) = unstable_features_warning_event(
--                effective_config.get("features").and_then(TomlValue::as_table),
-+                effective_config
-+                    .get("features")
-+                    .and_then(TomlValue::as_table),
-                 config.suppress_unstable_features_warning,
-                 &config.features,
-                 &config_path.display().to_string(),
-@@ -1295,7 +1305,11 @@ impl Session {
-             let account_email = telemetry_auth.and_then(CodexAuth::get_account_email);
-             let originator = session_configuration.originator.clone();
-             let terminal_type = user_agent();
--            let session_model = session_configuration.step_settings.collaboration_mode.model().to_string();
-+            let session_model = session_configuration
-+                .step_settings
-+                .collaboration_mode
-+                .model()
-+                .to_string();
-             let auth_env_telemetry = collect_auth_env_telemetry(
-                 session_configuration.provider.info(),
-                 auth_manager.codex_api_key_env_enabled(),
-@@ -1333,11 +1347,15 @@ impl Session {
-                 slug: Some(session_model),
-             };
-             crate::config::emit_session_start_metrics(config.as_ref(), &session_telemetry);
--            let is_worktree = session_configuration.cwd().canonicalize().ok().and_then(|cwd| {
--                codex_git_utils::repository_identity(&cwd).and_then(|_| {
--                    get_git_repo_root(&cwd).map(|root| root.join(".git").is_file())
--                })
--            });
-+            let is_worktree = session_configuration
-+                .cwd()
-+                .canonicalize()
-+                .ok()
-+                .and_then(|cwd| {
-+                    codex_git_utils::repository_identity(&cwd).and_then(|_| {
-+                        get_git_repo_root(&cwd).map(|root| root.join(".git").is_file())
-+                    })
-+                });
-             let is_worktree_tag = match is_worktree {
-                 Some(true) => "true",
-                 Some(false) => "false",
-@@ -1355,16 +1373,16 @@ impl Session {
-             );
- 
-             let mcp_server_names =
--                codex_mcp::effective_mcp_servers(
--                    &mcp_projection.config,
--                    auth.as_ref(),
--                )
-+                codex_mcp::effective_mcp_servers(&mcp_projection.config, auth.as_ref())
-                     .into_iter()
-                     .filter_map(|(name, server)| server.enabled().then_some(name))
-                     .collect::<Vec<_>>();
-             session_telemetry.conversation_starts(
-                 config.model_provider.name.as_str(),
--                session_configuration.step_settings.collaboration_mode.reasoning_effort(),
-+                session_configuration
-+                    .step_settings
-+                    .collaboration_mode
-+                    .reasoning_effort(),
-                 config
-                     .model_reasoning_summary
-                     .unwrap_or(ReasoningSummaryConfig::Auto),
-@@ -1377,33 +1395,10 @@ impl Session {
+@@ -1438,10 +1438,10 @@ impl Session {
                  mcp_server_names.iter().map(String::as_str).collect(),
              );
  
--            let use_zsh_fork_shell = config.features.enabled(Feature::ShellZshFork);
--            let default_shell = if let Some(user_shell_override) =
--                session_configuration.user_shell_override.clone()
--            {
--                user_shell_override
--            } else if use_zsh_fork_shell {
--                let zsh_path = config.zsh_path.as_ref().ok_or_else(|| {
--                    anyhow::anyhow!(
--                        "zsh fork feature enabled, but no packaged zsh fork is available for this install"
--                    )
--                })?;
--                if zsh_path.is_file() {
--                    shell::Shell {
--                        shell_type: shell::ShellType::Zsh,
--                        shell_path: zsh_path.clone(),
--                    }
--                } else {
--                    shell::get_shell(shell::ShellType::Zsh).ok_or_else(|| {
--                        anyhow::anyhow!(
--                            "zsh fork feature enabled, but packaged zsh fork `{}` is not usable",
--                            zsh_path.display()
--                        )
--                    })?
--                }
--            } else {
--                shell::default_user_shell()
--            };
+-            let default_shell = session_configuration
+-                .user_shell_override
+-                .clone()
+-                .unwrap_or_else(shell::default_user_shell);
 +            let default_shell = shell::select_session_shell(
 +                &config,
 +                session_configuration.user_shell_override.clone(),
 +            )?;
-             let credential_broker_available = config.features.enabled(Feature::NetworkProxy)
+             let credential_broker_available = (config.features.enabled(Feature::NetworkProxy)
+                 || config.features.enabled(Feature::CredentialMasking))
                  && config
-                     .config_layer_stack
-@@ -1431,7 +1426,10 @@ impl Session {
-                     codex_tools::UnifiedExecShellMode::for_session(
-                         config.features.get(),
-                         crate::tools::tool_user_shell_type(&default_shell),
--                        config.zsh_path.as_ref(),
-+                        config
-+                            .zsh_path
-+                            .as_ref()
-+                            .filter(|_| config.default_shell.is_none()),
-                         config.main_execve_wrapper_exe.as_ref(),
-                     ),
-                     codex_tools::UnifiedExecShellMode::Direct
-@@ -1508,12 +1506,12 @@ impl Session {
-             let (agents_md_result, instruction_warnings) = instruction_refresh;
-             // TODO(anp): Present AGENTS.md discovery errors more clearly to the user.
-             agents_md_result?;
--            post_session_configured_events.extend(
--                instruction_warnings.into_iter().map(|message| Event {
-+            post_session_configured_events.extend(instruction_warnings.into_iter().map(
-+                |message| Event {
-                     id: INITIAL_SUBMIT_ID.to_owned(),
-                     msg: EventMsg::Warning(WarningEvent { message }),
--                }),
--            );
-+                },
-+            ));
-             for err in &plugin_skill_errors {
-                 error!(
-                     "failed to load skill {}: {}",
-@@ -1537,7 +1535,8 @@ impl Session {
-                 .requirements_toml()
-                 .network
-                 .is_some();
--            let managed_network_requirements_enabled = config.managed_network_requirements_enabled();
-+            let managed_network_requirements_enabled =
-+                config.managed_network_requirements_enabled();
-             let network_approval = Arc::new(NetworkApprovalService::default());
-             // The managed proxy can call back into core for allowlist-miss decisions.
-             let network_policy_decider_session = if managed_network_requirements_configured {
-@@ -1563,35 +1562,34 @@ impl Session {
-                             Arc::clone(network_policy_decider_session),
-                         )
-                     });
--            let (network_proxy, session_network_proxy) =
--                if let Some(spec) = config
--                    .permissions
--                    .network
--                    .as_ref()
--                    .filter(|spec| spec.enabled())
--                {
--                    let current_exec_policy = exec_policy.current();
--                    let (network_proxy, session_network_proxy) = Self::start_managed_network_proxy(
--                        spec,
--                        current_exec_policy.as_ref(),
--                        config.permissions.permission_profile(),
--                        config.effective_local_windows_sandbox_type(),
--                        network_policy_decider.as_ref().map(Arc::clone),
--                        blocked_request_observer.as_ref().map(Arc::clone),
--                        managed_network_requirements_configured,
--                        network_proxy_audit_metadata.clone(),
--                    )
--                    .instrument(info_span!(
--                        "session_init.network_proxy",
--                        otel.name = "session_init.network_proxy",
--                        session_init.managed_network_requirements_enabled =
--                            managed_network_requirements_enabled,
--                    ))
--                    .await?;
--                    (Some(network_proxy), Some(session_network_proxy))
--                } else {
--                    (None, None)
--                };
-+            let (network_proxy, session_network_proxy) = if let Some(spec) = config
-+                .permissions
-+                .network
-+                .as_ref()
-+                .filter(|spec| spec.enabled())
-+            {
-+                let current_exec_policy = exec_policy.current();
-+                let (network_proxy, session_network_proxy) = Self::start_managed_network_proxy(
-+                    spec,
-+                    current_exec_policy.as_ref(),
-+                    config.permissions.permission_profile(),
-+                    config.effective_local_windows_sandbox_type(),
-+                    network_policy_decider.as_ref().map(Arc::clone),
-+                    blocked_request_observer.as_ref().map(Arc::clone),
-+                    managed_network_requirements_configured,
-+                    network_proxy_audit_metadata.clone(),
-+                )
-+                .instrument(info_span!(
-+                    "session_init.network_proxy",
-+                    otel.name = "session_init.network_proxy",
-+                    session_init.managed_network_requirements_enabled =
-+                        managed_network_requirements_enabled,
-+                ))
-+                .await?;
-+                (Some(network_proxy), Some(session_network_proxy))
-+            } else {
-+                (None, None)
-+            };
-             if let Some(network_proxy) = network_proxy.as_ref()
-                 && config
-                     .permissions
-@@ -1680,32 +1678,34 @@ impl Session {
-             let mcp_resource_client = Arc::new(McpResourceClient::new(Arc::clone(&mcp_runtime)));
-             let extension_metrics =
-                 extension_metrics::from_session_telemetry(session_telemetry.clone());
--            let workspace_routing = thread_extension_data
--                .get_or_init(|| config.workspace_routing_context());
-+            let workspace_routing =
-+                thread_extension_data.get_or_init(|| config.workspace_routing_context());
-             for contributor in extensions.thread_lifecycle_contributors() {
--                contributor.on_thread_start(codex_extension_api::ThreadStartInput {
--                    config: config.as_ref(),
--                    session_source: &session_configuration.session_source,
--                    persistent_thread_state_available: state_db_ctx.is_some(),
--                    environments: environment_selections,
--                    mcp_resource_client: Some(Arc::clone(&mcp_resource_client)),
--                    extension_metrics: Some(Arc::clone(&extension_metrics)),
--                    session_store: &session_extension_data,
--                    thread_store: &thread_extension_data,
--                }).await;
-+                contributor
-+                    .on_thread_start(codex_extension_api::ThreadStartInput {
-+                        config: config.as_ref(),
-+                        session_source: &session_configuration.session_source,
-+                        persistent_thread_state_available: state_db_ctx.is_some(),
-+                        environments: environment_selections,
-+                        mcp_resource_client: Some(Arc::clone(&mcp_resource_client)),
-+                        extension_metrics: Some(Arc::clone(&extension_metrics)),
-+                        session_store: &session_extension_data,
-+                        thread_store: &thread_extension_data,
-+                    })
-+                    .await;
-             }
- 
--            let executed_tool_calls = crate::state::ExecutedToolCalls::new(
--                &config.features,
--                &initial_history,
--            );
--            let codex_responses_headers = thread_extension_data.get::<crate::CodexResponsesHeaders>();
-+            let executed_tool_calls =
-+                crate::state::ExecutedToolCalls::new(&config.features, &initial_history);
-+            let codex_responses_headers =
-+                thread_extension_data.get::<crate::CodexResponsesHeaders>();
-             // Ephemeral title requests use request-level effort even when managed settings
-             // enable overrides. The client-supplied tag selects cache behavior, not permissions.
--            let title_request = config.ephemeral && matches!(
--                session_configuration.thread_source.as_ref(),
--                Some(ThreadSource::Feature(feature)) if feature == "thread_title"
--            );
-+            let title_request = config.ephemeral
-+                && matches!(
-+                    session_configuration.thread_source.as_ref(),
-+                    Some(ThreadSource::Feature(feature)) if feature == "thread_title"
-+                );
-             let reasoning_effort_override_enabled =
-                 config.features.enabled(Feature::ReasoningEffortOverride) && !title_request;
-             let services = SessionServices {
-@@ -1777,7 +1777,8 @@ impl Session {
-                     config.features.enabled(Feature::EnableRequestCompression),
-                     config.features.enabled(Feature::RuntimeMetrics),
-                     Self::build_model_client_beta_features_header(config.as_ref()),
--                    /*concurrent_reasoning_summaries_enabled*/ config
-+                    /*concurrent_reasoning_summaries_enabled*/
-+                    config
-                         .features
-                         .enabled(Feature::ConcurrentReasoningSummaries),
-                     attestation_provider,
-@@ -1827,18 +1828,22 @@ impl Session {
-                 multi_agent_version,
-                 mcp_refresh: McpRefresh::new(),
-                 mcp_tool_approval_metadata: Default::default(),
--        mcp_elicitation_reviewer_handle: OnceLock::new(),
-+                mcp_elicitation_reviewer_handle: OnceLock::new(),
-                 mcp_elicitation_lifecycle_handle: OnceLock::new(),
-                 mcp_prewarm_tx,
-                 mcp_prewarm_shutdown: CancellationToken::new(),
-                 mcp_prewarm_task: std::sync::Mutex::new(None),
-                 conversation: Arc::new(RealtimeConversationManager::new()),
--                realtime_history: (session_configuration.history_mode == ThreadHistoryMode::Paginated
-+                realtime_history: (session_configuration.history_mode
-+                    == ThreadHistoryMode::Paginated
-                     && services.live_thread.is_some())
-                 .then(|| Mutex::new(Default::default())),
-                 active_turn: Mutex::new(None),
-                 async_hook_results,
--                input_queue: InputQueue::with_controller(thread_id, Arc::clone(&services.agent_control)),
-+                input_queue: InputQueue::with_controller(
-+                    thread_id,
-+                    Arc::clone(&services.agent_control),
-+                ),
-                 services,
-                 git_enrichment_policy,
-                 fork_persistence,
-@@ -1911,7 +1916,9 @@ impl Session {
-                             session_source: &session_configuration.session_source,
-                             originator: &session_configuration.originator,
-                             disabled_plugin_ids: &session_configuration.disabled_plugin_ids,
--                            environments: McpEnvironmentScope::Selected(&resolved_environment_selections),
-+                            environments: McpEnvironmentScope::Selected(
-+                                &resolved_environment_selections,
-+                            ),
-                         },
-                         /*ready_selected_capability_roots*/ &[],
-                         /*executor_capability_discovery*/ None,
-diff --git a/codex-rs/core/src/session/turn_context.rs b/codex-rs/core/src/session/turn_context.rs
-index f74f555..b7b0d01 100644
---- a/codex-rs/core/src/session/turn_context.rs
-+++ b/codex-rs/core/src/session/turn_context.rs
-@@ -1040,7 +1040,7 @@ impl Session {
-         let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
-             per_turn_config.features.get(),
-             crate::tools::tool_user_shell_type(user_shell),
--            shell_zsh_path,
-+            shell_zsh_path.filter(|_| per_turn_config.default_shell.is_none()),
-             main_execve_wrapper_exe,
-         );
- 
 diff --git a/codex-rs/core/src/shell.rs b/codex-rs/core/src/shell.rs
-index da0fbbe..ca26bc5 100644
+index da0fbbe..252da89 100644
 --- a/codex-rs/core/src/shell.rs
 +++ b/codex-rs/core/src/shell.rs
 @@ -1,3 +1,4 @@
@@ -673,7 +328,7 @@ index da0fbbe..ca26bc5 100644
  use codex_exec_server::ShellInfo;
  use codex_shell_command::shell_detect::DetectedShell;
  use codex_utils_path_uri::PathConvention;
-@@ -167,6 +168,67 @@ pub fn default_user_shell() -> Shell {
+@@ -167,6 +168,43 @@ pub fn default_user_shell() -> Shell {
      codex_shell_command::shell_detect::default_user_shell().into()
  }
  
@@ -711,37 +366,13 @@ index da0fbbe..ca26bc5 100644
 +            )
 +        });
 +    }
-+    if config
-+        .features
-+        .enabled(codex_features::Feature::ShellZshFork)
-+    {
-+        let zsh_path = config.zsh_path.as_ref().ok_or_else(|| {
-+            anyhow::anyhow!(
-+                "zsh fork feature enabled, but no packaged zsh fork is available for this install"
-+            )
-+        })?;
-+        if zsh_path.is_file() {
-+            Ok(Shell {
-+                shell_type: ShellType::Zsh,
-+                shell_path: zsh_path.clone(),
-+            })
-+        } else {
-+            get_shell(ShellType::Zsh).ok_or_else(|| {
-+                anyhow::anyhow!(
-+                    "zsh fork feature enabled, but packaged zsh fork `{}` is not usable",
-+                    zsh_path.display()
-+                )
-+            })
-+        }
-+    } else {
-+        Ok(default_user_shell())
-+    }
++    Ok(default_user_shell())
 +}
 +
  #[cfg(all(test, target_os = "macos"))]
  fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Shell {
      codex_shell_command::shell_detect::default_user_shell_from_path(user_shell_path).into()
-@@ -176,3 +238,7 @@ fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Shell {
+@@ -176,3 +214,7 @@ fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Shell {
  #[cfg(unix)]
  #[path = "shell_tests.rs"]
  mod tests;
@@ -750,10 +381,10 @@ index da0fbbe..ca26bc5 100644
 +#[path = "configured_shell_tests.rs"]
 +mod configured_shell_tests;
 diff --git a/codex-rs/core/src/shell_snapshot.rs b/codex-rs/core/src/shell_snapshot.rs
-index 994506d..59f148f 100644
+index 01bd136..fd28860 100644
 --- a/codex-rs/core/src/shell_snapshot.rs
 +++ b/codex-rs/core/src/shell_snapshot.rs
-@@ -163,6 +163,9 @@ impl ShellSnapshot {
+@@ -164,6 +164,9 @@ impl ShellSnapshot {
          }
  
          let shell = shell?;
@@ -763,7 +394,7 @@ index 994506d..59f148f 100644
          // TODO(anp): Migrate shell snapshot creation to accept PathUri and defer native
          // conversion to the spawned shell process.
          let cwd = cwd.to_abs_path().ok()?;
-@@ -545,7 +548,10 @@ async fn write_shell_snapshot(
+@@ -546,7 +549,10 @@ async fn write_shell_snapshot(
      sandbox: Option<&ShellSnapshotSandbox>,
  ) -> Result<Option<SnapshotCredentials>> {
      let shell_type = shell.shell_type;
@@ -776,10 +407,10 @@ index 994506d..59f148f 100644
      }
      let (snapshot, credentials) = capture_snapshot(
 diff --git a/codex-rs/core/src/shell_snapshot_tests.rs b/codex-rs/core/src/shell_snapshot_tests.rs
-index 8c81650..abcd319 100644
+index fc191bf..83cc711 100644
 --- a/codex-rs/core/src/shell_snapshot_tests.rs
 +++ b/codex-rs/core/src/shell_snapshot_tests.rs
-@@ -1821,6 +1821,35 @@ async fn linux_sh_snapshot_includes_sections() -> Result<()> {
+@@ -1902,6 +1902,35 @@ async fn linux_sh_snapshot_includes_sections() -> Result<()> {
      Ok(())
  }
  
@@ -816,7 +447,7 @@ index 8c81650..abcd319 100644
  #[ignore]
  #[tokio::test]
 diff --git a/codex-rs/core/src/tools/handlers/shell_spec.rs b/codex-rs/core/src/tools/handlers/shell_spec.rs
-index ac3dcf9..81a0131 100644
+index 264a214..cc4862b 100644
 --- a/codex-rs/core/src/tools/handlers/shell_spec.rs
 +++ b/codex-rs/core/src/tools/handlers/shell_spec.rs
 @@ -1,3 +1,4 @@
@@ -824,37 +455,37 @@ index ac3dcf9..81a0131 100644
  use codex_tools::JsonSchema;
  use codex_tools::ResponsesApiTool;
  use codex_tools::ToolSpec;
-@@ -18,6 +19,7 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
+@@ -16,6 +17,7 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
+         options,
          /*include_environment_id*/ false,
-         /*include_shell_parameter*/ true,
          /*include_windows_shell_guidance*/ cfg!(windows),
 +        /*configured_shell_type*/ None,
      )
  }
  
-@@ -26,6 +28,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+@@ -23,6 +25,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+     options: CommandToolOptions,
      include_environment_id: bool,
-     include_shell_parameter: bool,
      include_windows_shell_guidance: bool,
 +    configured_shell_type: Option<ShellType>,
  ) -> ToolSpec {
      let yield_time_ms_description = if cfg!(windows) {
          "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms."
-@@ -66,7 +69,12 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
-         properties.insert(
-             "shell".to_string(),
-             JsonSchema::string(Some(
--                "Shell binary to launch. Defaults to the user's default shell.".to_string(),
-+                if configured_shell_type.is_some() {
-+                    "Ignored because default_shell is configured; commands use the session shell."
-+                } else {
-+                    "Shell binary to launch. Defaults to the user's default shell."
-+                }
-+                .to_string(),
-             )),
-         );
-     }
-@@ -97,7 +105,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+@@ -62,7 +65,12 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+     properties.insert(
+         "shell".to_string(),
+         JsonSchema::string(Some(
+-            "Shell binary to launch. Defaults to the user's default shell.".to_string(),
++            if configured_shell_type.is_some() {
++                "Ignored because default_shell is configured; commands use the session shell."
++            } else {
++                "Shell binary to launch. Defaults to the user's default shell."
++            }
++            .to_string(),
+         )),
+     );
+     properties.insert(
+@@ -90,7 +98,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
          description: if include_windows_shell_guidance {
              format!(
                  "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
@@ -863,7 +494,7 @@ index ac3dcf9..81a0131 100644
              )
          } else {
              "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
-@@ -343,6 +351,32 @@ fn windows_shell_guidance() -> &'static str {
+@@ -336,6 +344,32 @@ fn windows_shell_guidance() -> &'static str {
  - When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."#
  }
  
@@ -897,10 +528,10 @@ index ac3dcf9..81a0131 100644
  #[path = "shell_spec_tests.rs"]
  mod tests;
 diff --git a/codex-rs/core/src/tools/handlers/shell_spec_tests.rs b/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
-index c3d1aff..ab26bdf 100644
+index 7f8007b..c470d6c 100644
 --- a/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
 +++ b/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
-@@ -6,6 +6,63 @@ fn windows_shell_guidance_description() -> String {
+@@ -6,6 +6,61 @@ fn windows_shell_guidance_description() -> String {
      format!("\n\n{}", windows_shell_guidance())
  }
  
@@ -909,11 +540,9 @@ index c3d1aff..ab26bdf 100644
 +    for shell_type in [ShellType::Sh, ShellType::Bash, ShellType::Zsh] {
 +        let ToolSpec::Function(tool) = create_exec_command_tool_with_environment_id(
 +            CommandToolOptions {
-+                include_login_parameter: true,
 +                exec_permission_approvals_enabled: false,
 +            },
-+            false,
-+            true,
++            /*include_environment_id*/ false,
 +            /*include_windows_shell_guidance*/ true,
 +            Some(shell_type),
 +        ) else {
@@ -965,36 +594,26 @@ index c3d1aff..ab26bdf 100644
  fn exec_command_tool_matches_expected_spec() {
      let tool = create_exec_command_tool(CommandToolOptions {
 diff --git a/codex-rs/core/src/tools/handlers/unified_exec.rs b/codex-rs/core/src/tools/handlers/unified_exec.rs
-index 763fa15..63d99ce 100644
+index 6eeaf86..535bb6c 100644
 --- a/codex-rs/core/src/tools/handlers/unified_exec.rs
 +++ b/codex-rs/core/src/tools/handlers/unified_exec.rs
-@@ -102,6 +102,7 @@ pub(crate) fn get_command(
+@@ -98,6 +98,7 @@ pub(crate) fn get_command(
+     args: &ExecCommandArgs,
      session_shell: Arc<Shell>,
-     shell_mode: &UnifiedExecShellMode,
      allow_login_shell: bool,
 +    default_shell_configured: bool,
  ) -> Result<ResolvedCommand, String> {
      let use_login_shell = match args.login {
          Some(true) if !allow_login_shell => {
-@@ -113,21 +114,34 @@ pub(crate) fn get_command(
+@@ -109,11 +110,20 @@ pub(crate) fn get_command(
          None => allow_login_shell,
      };
  
--    let shell = match shell_mode {
--        UnifiedExecShellMode::Direct => args
--            .shell
--            .as_ref()
--            .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
--            .unwrap_or_else(|| session_shell.as_ref().clone()),
--        UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
--            if args.shell.is_some() {
--                return Err(
--                    "`shell` is not supported for local zsh-fork exec; omit `shell` to use zsh-fork, or target a remote environment where `shell` is supported.".to_string(),
--                );
--            }
--            Shell {
--                shell_type: ShellType::Zsh,
--                shell_path: zsh_fork_config.shell_zsh_path.as_path().to_path_buf(),
+-    let shell = args
+-        .shell
+-        .as_ref()
+-        .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
+-        .unwrap_or_else(|| session_shell.as_ref().clone());
 +    let shell = if default_shell_configured {
 +        if let Some(requested_shell) = &args.shell {
 +            tracing::debug!(
@@ -1004,33 +623,19 @@ index 763fa15..63d99ce 100644
 +        }
 +        session_shell.as_ref().clone()
 +    } else {
-+        match shell_mode {
-+            UnifiedExecShellMode::Direct => args
-+                .shell
-+                .as_ref()
-+                .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
-+                .unwrap_or_else(|| session_shell.as_ref().clone()),
-+            UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
-+                if args.shell.is_some() {
-+                    return Err(concat!(
-+                        "`shell` is not supported for local zsh-fork exec; ",
-+                        "omit `shell` to use zsh-fork, or target a remote environment ",
-+                        "where `shell` is supported."
-+                    )
-+                    .to_string());
-+                }
-+                Shell {
-+                    shell_type: ShellType::Zsh,
-+                    shell_path: zsh_fork_config.shell_zsh_path.as_path().to_path_buf(),
-+                }
-             }
-         }
-     };
++        args.shell
++            .as_ref()
++            .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)))
++            .unwrap_or_else(|| session_shell.as_ref().clone())
++    };
+     Ok(ResolvedCommand {
+         command: shell.derive_exec_args(&args.cmd, use_login_shell),
+         shell: ShellInvocation {
 diff --git a/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs b/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
-index faf8b90..c5e295a 100644
+index ce0a502..5de527f 100644
 --- a/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
 +++ b/codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
-@@ -64,6 +64,7 @@ pub(crate) struct ExecCommandHandlerOptions {
+@@ -61,6 +61,7 @@ pub(crate) struct ExecCommandHandlerOptions {
      pub(crate) exec_permission_approvals_enabled: bool,
      pub(crate) include_environment_id: bool,
      pub(crate) include_windows_shell_guidance: bool,
@@ -1038,7 +643,7 @@ index faf8b90..c5e295a 100644
  }
  
  #[derive(Clone, Copy)]
-@@ -88,6 +89,7 @@ impl Default for ExecCommandHandler {
+@@ -83,6 +84,7 @@ impl Default for ExecCommandHandler {
                  exec_permission_approvals_enabled: false,
                  include_environment_id: false,
                  include_windows_shell_guidance: cfg!(windows),
@@ -1046,15 +651,15 @@ index faf8b90..c5e295a 100644
              },
          }
      }
-@@ -123,6 +125,7 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
+@@ -116,6 +118,7 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
+             },
              self.options.include_environment_id,
-             self.options.include_shell_parameter,
              self.options.include_windows_shell_guidance,
 +            self.options.configured_shell_type,
          );
          let mut spec = match self.lifetime {
              ExecCommandLifetime::Interactive => spec,
-@@ -268,6 +271,15 @@ impl ExecCommandHandler {
+@@ -258,6 +261,15 @@ impl ExecCommandHandler {
              .unwrap_or_else(|| session.user_shell());
          // TODO(anp): Resolve requested shells in remote environments instead of restricting
          // commands to the reported default shell.
@@ -1070,19 +675,28 @@ index faf8b90..c5e295a 100644
          if environment.is_remote()
              && let Some(requested_shell) = args.shell.take()
          {
-@@ -290,6 +302,7 @@ impl ExecCommandHandler {
-             shell,
-             &shell_mode,
-             turn_environment.config().allow_login_shell,
+@@ -275,9 +287,13 @@ impl ExecCommandHandler {
+                 )));
+             }
+         }
+-        let resolved_command =
+-            get_command(&args, shell, turn_environment.config().allow_login_shell)
+-                .map_err(FunctionCallError::RespondToModel)?;
++        let resolved_command = get_command(
++            &args,
++            shell,
++            turn_environment.config().allow_login_shell,
 +            default_shell_configured,
-         )
-         .map_err(FunctionCallError::RespondToModel)?;
++        )
++        .map_err(FunctionCallError::RespondToModel)?;
          let command = resolved_command.command;
+         let ExecCommandArgs {
+             mut tty,
 diff --git a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
-index d834c24..c244939 100644
+index ecff8f5..a849665 100644
 --- a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
 +++ b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
-@@ -27,6 +27,43 @@ use tokio::sync::Mutex;
+@@ -25,6 +25,41 @@ use tokio::sync::Mutex;
  
  const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
  
@@ -1097,7 +711,6 @@ index d834c24..c244939 100644
 +    let configured = get_command(
 +        &args,
 +        Arc::new(session_shell.clone()),
-+        &UnifiedExecShellMode::Direct,
 +        /*allow_login_shell*/ true,
 +        /*default_shell_configured*/ true,
 +    )
@@ -1111,7 +724,6 @@ index d834c24..c244939 100644
 +    let unconfigured = get_command(
 +        &args,
 +        Arc::new(session_shell),
-+        &UnifiedExecShellMode::Direct,
 +        /*allow_login_shell*/ true,
 +        /*default_shell_configured*/ false,
 +    )
@@ -1126,83 +738,96 @@ index d834c24..c244939 100644
  async fn invocation_for_payload(
      tool_name: &str,
      call_id: &str,
-@@ -60,6 +97,7 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()>
+@@ -57,6 +92,7 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()>
+         &args,
          Arc::new(default_user_shell()),
-         &UnifiedExecShellMode::Direct,
          /*allow_login_shell*/ true,
 +        /*default_shell_configured*/ false,
      )
      .map_err(anyhow::Error::msg)?;
      let command = resolved.command;
-@@ -82,6 +120,7 @@ fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
+@@ -78,6 +114,7 @@ fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
+         &args,
          Arc::new(default_user_shell()),
-         &UnifiedExecShellMode::Direct,
          /*allow_login_shell*/ true,
 +        /*default_shell_configured*/ false,
      )
      .map_err(anyhow::Error::msg)?;
      let command = resolved.command;
-@@ -127,6 +166,7 @@ fn test_get_command_keeps_path_prepends_after_login_startup() -> anyhow::Result<
-         Arc::clone(&shell),
-         &UnifiedExecShellMode::Direct,
-         /*allow_login_shell*/ true,
+@@ -118,8 +155,13 @@ fn test_get_command_keeps_path_prepends_after_login_startup() -> anyhow::Result<
+         r#"{"cmd":"sh -c 'test \"$CODEX_TEST_LOGIN_PATH_RESET\" = 1 && printf \"%s\\n\" \"$PATH\" && command -v rg'"}"#,
+     )?;
+     let shell = Arc::new(get_shell(ShellType::Bash).expect("bash should be available"));
+-    let resolved = get_command(&args, Arc::clone(&shell), /*allow_login_shell*/ true)
+-        .map_err(anyhow::Error::msg)?;
++    let resolved = get_command(
++        &args,
++        Arc::clone(&shell),
++        /*allow_login_shell*/ true,
 +        /*default_shell_configured*/ false,
-     )
-     .map_err(anyhow::Error::msg)?;
++    )
++    .map_err(anyhow::Error::msg)?;
      assert_eq!(
-@@ -193,6 +233,7 @@ fn test_get_command_runs_login_shell_when_path_is_readonly() -> anyhow::Result<(
-         shell,
-         &UnifiedExecShellMode::Direct,
-         /*allow_login_shell*/ true,
-+        /*default_shell_configured*/ false,
-     )
-     .map_err(anyhow::Error::msg)?;
+         resolved.command,
+         shell.derive_exec_args(&args.cmd, /*use_login_shell*/ true)
+@@ -179,8 +221,10 @@ fn test_get_command_runs_login_shell_when_path_is_readonly() -> anyhow::Result<(
+         r#"{"cmd":"shopt -q login_shell || exit 90; case $- in *e*) ;; *) exit 91 ;; esac; /bin/sh -c 'printf \"%s\\n\" \"$PATH\"'; exit 23","login":true}"#,
+     )?;
+     let shell = Arc::new(get_shell(ShellType::Bash).expect("bash should be available"));
+-    let resolved =
+-        get_command(&args, shell, /*allow_login_shell*/ true).map_err(anyhow::Error::msg)?;
++    let resolved = get_command(
++        &args, shell, /*allow_login_shell*/ true, /*default_shell_configured*/ false,
++    )
++    .map_err(anyhow::Error::msg)?;
      let command = resolved
-@@ -254,6 +295,7 @@ fn test_get_command_does_not_change_nested_login_or_powershell() -> anyhow::Resu
-             Arc::clone(&shell),
-             &UnifiedExecShellMode::Direct,
-             /*allow_login_shell*/ true,
+         .shell
+         .derive_exec_args_with_path_prepends(&args.cmd, &[path_dir])
+@@ -236,8 +280,13 @@ fn test_get_command_does_not_change_nested_login_or_powershell() -> anyhow::Resu
+             shell_type,
+             shell_path: PathBuf::from(shell_path),
+         });
+-        let resolved = get_command(&args, Arc::clone(&shell), /*allow_login_shell*/ true)
+-            .map_err(anyhow::Error::msg)?;
++        let resolved = get_command(
++            &args,
++            Arc::clone(&shell),
++            /*allow_login_shell*/ true,
 +            /*default_shell_configured*/ false,
-         )
-         .map_err(anyhow::Error::msg)?;
++        )
++        .map_err(anyhow::Error::msg)?;
          assert_eq!(
-@@ -296,6 +338,7 @@ fn test_get_command_resolves_powershell_by_type() -> anyhow::Result<()> {
+             (
+                 resolved.command,
+@@ -277,6 +326,7 @@ fn test_get_command_resolves_powershell_by_type() -> anyhow::Result<()> {
+         &args,
          Arc::new(default_user_shell()),
-         &UnifiedExecShellMode::Direct,
          /*allow_login_shell*/ true,
 +        /*default_shell_configured*/ false,
      )
      .map_err(anyhow::Error::msg)?;
      let expected_shell = get_shell(ShellType::PowerShell)
-@@ -321,6 +364,7 @@ fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()> {
+@@ -301,6 +351,7 @@ fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()> {
+         &args,
          Arc::new(default_user_shell()),
-         &UnifiedExecShellMode::Direct,
          /*allow_login_shell*/ true,
 +        /*default_shell_configured*/ false,
      )
      .map_err(anyhow::Error::msg)?;
      let command = resolved.command;
-@@ -339,6 +383,7 @@ fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<(
+@@ -318,6 +369,7 @@ fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<(
+         &args,
          Arc::new(default_user_shell()),
-         &UnifiedExecShellMode::Direct,
          /*allow_login_shell*/ false,
 +        /*default_shell_configured*/ false,
      )
      .expect_err("explicit login should be rejected");
  
-@@ -412,6 +457,7 @@ fn test_get_command_rejects_explicit_shell_in_zsh_fork_mode() -> anyhow::Result<
-         Arc::new(default_user_shell()),
-         &shell_mode,
-         /*allow_login_shell*/ true,
-+        /*default_shell_configured*/ false,
-     )
-     .expect_err("explicit shell should be rejected");
- 
 diff --git a/codex-rs/core/src/tools/runtimes/unified_exec.rs b/codex-rs/core/src/tools/runtimes/unified_exec.rs
-index 2642a9c..7bf899a 100644
+index 35c70df..287232e 100644
 --- a/codex-rs/core/src/tools/runtimes/unified_exec.rs
 +++ b/codex-rs/core/src/tools/runtimes/unified_exec.rs
-@@ -610,11 +610,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
+@@ -605,11 +605,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
              ),
              environment_is_remote,
          );
@@ -1215,8 +840,8 @@ index 2642a9c..7bf899a 100644
          let sidecar_permissions = metrics_sidecar
              .as_ref()
              .map(PluginMetricsSidecar::additional_permissions);
-@@ -780,6 +776,14 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
-     }
+@@ -753,6 +749,14 @@ async fn warn_if_remote_credential_masking_unavailable(
+         .await;
  }
  
 +fn prefix_utf8_for_shell(command: Vec<String>, shell_type: ShellType) -> Vec<String> {
@@ -1230,7 +855,7 @@ index 2642a9c..7bf899a 100644
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -803,6 +807,30 @@ mod tests {
+@@ -775,6 +779,30 @@ mod tests {
      use std::time::Duration;
      use tempfile::tempdir;
  
@@ -1262,10 +887,10 @@ index 2642a9c..7bf899a 100644
          TurnEnvironment::new(
              TurnEnvironmentSelection {
 diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
-index 7e22134..a574592 100644
+index 24b60f3..5eb1da2 100644
 --- a/codex-rs/core/src/tools/spec_plan.rs
 +++ b/codex-rs/core/src/tools/spec_plan.rs
-@@ -1186,6 +1186,12 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
+@@ -1253,6 +1253,12 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
          exec_permission_approvals_enabled,
          include_environment_id,
          include_windows_shell_guidance: should_include_windows_shell_guidance(context.environments),
@@ -1279,10 +904,10 @@ index 7e22134..a574592 100644
      if features.enabled(Feature::UnifiedExec) {
          registry.add(ExecCommandHandler::new(options));
 diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
-index 395cc95..dc860ff 100644
+index 1a8a066..ec8a1f4 100644
 --- a/codex-rs/core/src/tools/spec_plan_tests.rs
 +++ b/codex-rs/core/src/tools/spec_plan_tests.rs
-@@ -1011,6 +1011,40 @@ async fn exec_command_guidance_follows_executor_platform_and_fallbacks() {
+@@ -1010,6 +1010,40 @@ async fn exec_command_guidance_follows_executor_platform_and_fallbacks() {
      }
  }
  
@@ -1324,12 +949,12 @@ index 395cc95..dc860ff 100644
  async fn disabling_shell_tools_disables_command_tools_for_all_environments() {
      let remote_environment = probe(|turn| {
 diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
-index a70b8c9..fc26619 100644
+index af50bd5..6f845b9 100644
 --- a/codex-rs/thread-manager-sample/src/main.rs
 +++ b/codex-rs/thread-manager-sample/src/main.rs
-@@ -343,6 +343,8 @@ async fn new_config(
+@@ -348,6 +348,8 @@ async fn new_config(
          codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
-         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe,
+         main_execve_wrapper_exe: None,
          zsh_path: None,
 +        default_shell: None,
 +        default_shell_path: None,
@@ -1338,28 +963,24 @@ index a70b8c9..fc26619 100644
          model_reasoning_summary: None,
 diff --git a/codex-rs/core/src/configured_shell_tests.rs b/codex-rs/core/src/configured_shell_tests.rs
 new file mode 100644
+index 0000000..8db5db1
 --- /dev/null
 +++ b/codex-rs/core/src/configured_shell_tests.rs
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,121 @@
 +use super::*;
 +use crate::config::Config;
-+use crate::config::ConfigOverrides;
-+use codex_config::config_toml::ConfigToml;
++use crate::config::ConfigBuilder;
 +use codex_features::Feature;
-+use codex_utils_absolute_path::AbsolutePathBuf;
 +use pretty_assertions::assert_eq;
 +
 +async fn config(codex_home: &std::path::Path) -> Config {
-+    let mut config = Config::load_from_base_config_with_overrides(
-+        ConfigToml::default(),
-+        ConfigOverrides {
-+            cwd: Some(codex_home.to_path_buf()),
-+            ..Default::default()
-+        },
-+        AbsolutePathBuf::try_from(codex_home).unwrap(),
-+    )
-+    .await
-+    .unwrap();
++    let mut config = ConfigBuilder::without_managed_config_for_tests()
++        .codex_home(codex_home.to_path_buf())
++        .fallback_cwd(Some(codex_home.to_path_buf()))
++        .without_project_context()
++        .build()
++        .await
++        .unwrap();
 +    config.features.disable(Feature::ShellZshFork).unwrap();
 +    config
 +}

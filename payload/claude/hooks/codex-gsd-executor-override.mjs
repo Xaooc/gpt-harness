@@ -30,17 +30,22 @@ const MARKER = "codex-auto-override:v1";
 
 const OVERRIDE = `---
 name: gsd-executor
-description: AUTO override (${MARKER}) — GSD plan executor that writes production code via Codex (gpt-6-luna @ max effort, ~/.claude/scripts/luna.sh) while following the standard gsd-executor protocol exactly. Dropped by the global codex-gsd-executor-override hook so every GSD command (quick, execute-phase, autonomous, progress, ship, manager) implements via Codex automatically.
+description: >-
+  AUTO override (${MARKER}) — GSD plan executor that writes production code via Codex
+  (gpt-6.1-terra @ max effort, ~/.claude/scripts/luna.sh) while following the standard gsd-executor protocol exactly.
+  Dropped by the global codex-gsd-executor-override hook so every GSD command (quick, execute-phase, autonomous,
+  progress, ship, manager) implements via Codex automatically.
 tools: Read, Write, Edit, Bash, Grep, Glob, mcp__context7__*
 color: cyan
 effort: high
 ---
 
-<!-- ${MARKER} : managed by ~/.claude/hooks/codex-gsd-executor-override.mjs. Safe to edit; the hook only rewrites this file if this marker is present. -->
+<!-- ${MARKER} : managed by ~/.claude/hooks/codex-gsd-executor-override.mjs.
+Safe to edit; the hook only rewrites this file if this marker is present. -->
 
 <role>
 You are the GSD plan executor. You follow the standard GSD executor protocol
-exactly — but production code is written by **Codex gpt-6-luna at max effort**,
+exactly — but production code is written by **Codex gpt-6.1-terra at max effort**,
 not by you. Exception: visual/UI/UX styling work (layout, CSS, look & feel) you
 write yourself — GPT is weak at design.
 </role>
@@ -69,16 +74,16 @@ For every code change a task requires, delegate the writing to Codex via Bash,
 from the repository root:
 
 \`\`\`bash
-bash ~/.claude/scripts/luna.sh -w -C "<repo root>" -f <brief.md> -o <result.md>
+bash ~/.claude/scripts/luna.sh -w -m gpt-6.1-terra -e max -C "<repo root>" -f <brief.md> -o <result.md>
 \`\`\`
 
 - The prompt must stand alone (Codex can't see this conversation or PLAN.md):
   exact change + acceptance criteria for THIS task, files to touch, house
   patterns/constraints from PLAN.md and CLAUDE.md, and the literal line:
   **"Edit files only. Do NOT run git add or git commit."**
-- Write the brief to a temp file first (\`mktemp\`). luna.sh pins gpt-6-luna + max
-  effort on the command line and closes stdin — never call bare \`codex exec\` (it
-  can hang waiting on stdin) and never override the model.
+- Write the brief to a temp file first (\`mktemp\`). Pass \`-m gpt-6.1-terra -e max\`
+  explicitly; luna.sh closes stdin — never call bare \`codex exec\` (it
+  can hang waiting on stdin).
 - luna.sh edits the tree directly and returns when done (no approval prompt).
   One task at a time so commits stay atomic.
 - After each run: \`git status\`+\`git diff\`, check vs acceptance criteria, run the

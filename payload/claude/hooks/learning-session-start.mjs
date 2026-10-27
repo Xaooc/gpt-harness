@@ -7,7 +7,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const { displayText } = await import("../scripts/learning/core.mjs").catch(() => ({}));
+function learningModule(name) {
+  const local = new URL(`../scripts/learning/${name}.mjs`, import.meta.url);
+  return fs.existsSync(fileURLToPath(local)) ? local.href
+    : pathToFileURL(path.join(os.homedir(), ".claude", "scripts", "learning", `${name}.mjs`)).href;
+}
+
+const { displayText } = await Promise.resolve().then(() => import(learningModule("core"))).catch(() => ({}));
 
 const DAY = 86400000;
 const sanitizeMessage = (text) => text.split(/\r?\n/).map((line) => {
@@ -75,9 +81,9 @@ export function buildOutput(message) {
 async function main() {
   const input = await readInput();
   if (!input || typeof input !== "object" || input.source === "compact") return;
-  const scripts = path.join(os.homedir(), ".claude", "scripts", "learning");
-  const common = await import(pathToFileURL(path.join(scripts, "common.mjs")).href);
-  const core = await import(pathToFileURL(path.join(scripts, "core.mjs")).href);
+  const common = await import(learningModule("common"));
+  const core = await import(learningModule("core"));
+  const scripts = common.SCRIPTS_DIR;
   common.ensureDirs();
   if (!common.isPaused()) common.spawnDetached(common.findNode(), [path.join(scripts, "loop.mjs"), "run", "--if-due"]);
   // Avoid waiting behind a running apply/report operation on the normal hook path.

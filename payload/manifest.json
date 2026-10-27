@@ -35,31 +35,31 @@
       "src": "claude/hooks/codex-gsd-executor-override.mjs",
       "dest": "hooks/codex-gsd-executor-override.mjs",
       "kind": "file",
-      "sha256": "ef69db35bbbc9b93618b631a97e93553df2b88a8090495cbd7d20365fd2a1d90"
+      "sha256": "16ff4547eafe710e31b7dcac820a1881f65d2bd209bfe3993eb76ce3baffe2a1"
     },
     {
       "src": "claude/hooks/codex-review-gate-autoenable.mjs",
       "dest": "hooks/codex-review-gate-autoenable.mjs",
       "kind": "file",
-      "sha256": "6e2a57f2a35044a403aa2d1a0522866cd4a90727147bf2004d4889927c0da989"
+      "sha256": "6af8d709d065771064b8683a522d194f698b23c43869be6cc22781579d7ed9d9"
     },
     {
       "src": "claude/hooks/codex-review-gate-run.mjs",
       "dest": "hooks/codex-review-gate-run.mjs",
       "kind": "file",
-      "sha256": "0246a18b96a3d756fec3c41f5320697b9cc2ee298d21f3526ea6c6aa511af426"
+      "sha256": "d8138821f03a3d4cb390848b9b640ae352db699780135d54d5215a88664409c1"
     },
     {
       "src": "claude/hooks/learning-capture.mjs",
       "dest": "hooks/learning-capture.mjs",
       "kind": "file",
-      "sha256": "b11783a6f8f193fdafab03dd1ece12248c6d2d3b7497ae79c5f527171e27e381"
+      "sha256": "5a06dbf6038775a72d33c5219a68f94cb8a80fbb6c39923643325d78e5d6cb73"
     },
     {
       "src": "claude/hooks/learning-session-start.mjs",
       "dest": "hooks/learning-session-start.mjs",
       "kind": "file",
-      "sha256": "bd6c67a16971c2d2f6bd26fd2076eb8ff689cea6edc15f6b61460b3eca11b756"
+      "sha256": "a1fe44988113973e7048aa69ff0f85b3293a885a45fe8fa9deaae563d1f06c17"
     },
     {
       "src": "claude/hooks/luna-clean-hook.mjs",
@@ -71,7 +71,7 @@
       "src": "claude/hooks/luna-skill-autoload.mjs",
       "dest": "hooks/luna-skill-autoload.mjs",
       "kind": "file",
-      "sha256": "5e85a10052abea7623bd2c370076ae3ef07f4c86a04a32786aa98286347896ef"
+      "sha256": "d4976427e8accb6950da3a96e49a1e3a4753c01cdc817b9a3cb3b5a82a0a1d2a"
     },
     {
       "src": "claude/learning/config.json",
@@ -89,7 +89,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "8cec5996333a08d21a7e3f5c867727f941e8017802bd22f89c96bdb89dce7bee"
+      "sha256": "9c5782a6857dd177ab6de50b41672fb73655ae16ed01f31aa7761354695b96c4"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
@@ -101,7 +101,7 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "7a55c636cec58302b686714b4fa8a4b242d37620e84f388016654b40d77c15bf"
+      "sha256": "7c92ab78b11973d2d6d2be271a73ed718cbd4f299ba3abff7f730b20b70b4a90"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",
@@ -209,7 +209,7 @@
       "src": "claude/scripts/heavy-gate.mjs",
       "dest": "scripts/heavy-gate.mjs",
       "kind": "file",
-      "sha256": "71e676601483a54996d690a6323c80ef99bf910f0e02db1f055de8ac3f7d37e7"
+      "sha256": "a331a74a2194a8fff64fbb8e4f50e6f7c57ac9116d7218bb48d69e1b77d77b81"
     },
     {
       "src": "claude/scripts/learning-revert.sh",
@@ -239,7 +239,7 @@
       "src": "claude/scripts/learning/extract.mjs",
       "dest": "scripts/learning/extract.mjs",
       "kind": "file",
-      "sha256": "c0d0c73fcaa0c63b8943bbf82b2d1a1655de694f780f2e04e7095205f47b29bf"
+      "sha256": "4014db71c050d3823be6ac66cb9c5fe92fc40cd6c29b11a3b5bdaadf44e8aa25"
     },
     {
       "src": "claude/scripts/learning/loop.mjs",
@@ -281,7 +281,7 @@
       "src": "claude/scripts/learning/test/extract.test.mjs",
       "dest": "scripts/learning/test/extract.test.mjs",
       "kind": "file",
-      "sha256": "3b3b1357f7f866d78524275fbbcbb922001fff4d715f4424965b15c4a9da2ad5"
+      "sha256": "5196d0bac3bfb18c3accdd69e0d1efe72ea78d1f1c678896869563a36ddb1a5f"
     },
     {
       "src": "claude/scripts/learning/test/fake-luna.mjs",
@@ -299,13 +299,13 @@
       "src": "claude/scripts/lib/luna-daemon-client-test.sh",
       "dest": "scripts/lib/luna-daemon-client-test.sh",
       "kind": "file",
-      "sha256": "4a1be4f2e46235204b16514deda49d211bcd31ecb1ee3832e1da6daf7a2bc2fd"
+      "sha256": "2f26fad2bfe4e77fce211e2a2367fe19c6fc0655721828927af0ce5a13f31186"
     },
     {
       "src": "claude/scripts/lib/luna-daemon-stub.mjs",
       "dest": "scripts/lib/luna-daemon-stub.mjs",
       "kind": "file",
-      "sha256": "1269b506334d2f0da1bc85624062e92964ac975290d4bd449794f73807e65e62"
+      "sha256": "ae97acd9b5625bd01f6d1c1dd8fba3296774ed0b13a95cc3ac7fb7c5d2ac9344"
     },
     {
       "src": "claude/scripts/lib/luna-loadtest.mjs",
@@ -323,7 +323,7 @@
       "src": "claude/scripts/luna-daemon.mjs",
       "dest": "scripts/luna-daemon.mjs",
       "kind": "file",
-      "sha256": "850fdcffae355b9fa3148e8b4b98459ab7ed880769629e956f6bd5319f770784"
+      "sha256": "2b959d1fe96c4d9767def2b14ac5925e7a58539e0d1a7253ac003c128bdbaa77"
     },
     {
       "src": "claude/scripts/luna-harness-plugin-patch.mjs",
@@ -341,7 +341,7 @@
       "src": "claude/scripts/luna-overview.mjs",
       "dest": "scripts/luna-overview.mjs",
       "kind": "file",
-      "sha256": "fb51ef8145d739edc82af81ed4262f9a7bf69c008f4f407319b98e278c53228a"
+      "sha256": "a803645effb743747ab0f0b79e0c56362d4ccccb2dc3c46f6dd870ff4c4df9ee"
     },
     {
       "src": "claude/scripts/luna-overview.sh",
@@ -359,13 +359,13 @@
       "src": "claude/scripts/luna-pool.mjs",
       "dest": "scripts/luna-pool.mjs",
       "kind": "file",
-      "sha256": "eb78d5bc10c460ee601873f9eaa6e1682f0a6ed07c3c0e4edd957917634514e8"
+      "sha256": "e2a10870ab7999d6aed6389d22731d9b1a00c10db830f8f22a63476720d79618"
     },
     {
       "src": "claude/scripts/luna-reap-brokers.mjs",
       "dest": "scripts/luna-reap-brokers.mjs",
       "kind": "file",
-      "sha256": "b46e3a7559ca6a48b5f1b73b3a5974ae2c176e587e71877c051c534dc851a617"
+      "sha256": "27983e9e49dfbd9ef92ae093b4a2acf1453835f480e8c7ef4df35b809030dbd7"
     },
     {
       "src": "claude/scripts/luna-status.sh",
@@ -377,37 +377,109 @@
       "src": "claude/scripts/luna-stop.sh",
       "dest": "scripts/luna-stop.sh",
       "kind": "file",
-      "sha256": "c5df4316d093f6db8d6121ca637614edd9a66d4e269ce564ec840f80abde354c"
+      "sha256": "101a00bd9486cd6d79522171a75909094c84392c86d8754f05ffcf56edbab534"
     },
     {
       "src": "claude/scripts/luna-swap-when-idle.sh",
       "dest": "scripts/luna-swap-when-idle.sh",
       "kind": "file",
-      "sha256": "b766cf57f25d02a21457af2fe861e506cf1110c0a91d7c6c4e44a9bf70eba772"
+      "sha256": "f6200fcd385c2d2115427f56cfbeb02bac02a519baad5233acc055bade84d9e8"
     },
     {
       "src": "claude/scripts/luna-watch.sh",
       "dest": "scripts/luna-watch.sh",
       "kind": "file",
-      "sha256": "0157ad74f7347297a0808643fe89f2a2a6f7dc956530e9f45097a9db87590daf"
+      "sha256": "b2a296b4b34ef2c040f85cb408f81ac2e086f5d8d1751c01c6b29919dd466a83"
     },
     {
       "src": "claude/scripts/luna.sh",
       "dest": "scripts/luna.sh",
       "kind": "file",
-      "sha256": "43e8451f97f859c81ae3d6c6ca3f92df587d2774868dd22b93352a6f56fcf430"
+      "sha256": "14aee1ca0ddf9a7712bba88f84d89a25b6adadbd6339e315e03006ab6c8e12f4"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
       "dest": "skills/luna-critics/SKILL.md",
       "kind": "file",
-      "sha256": "72d6d2e017612718a2848032cdf5795f5942afb42d3c63ff674aeb65e2be8730"
+      "sha256": "c2b58628dce7223aca9534d1329b35360e1db4d0a19d5005ed1ab8eefef4764b"
     },
     {
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "087f69ae739f896a7f56ff7f52a8b40485cdfb53ab4d092777bea8b456481d80"
+      "sha256": "0f226d30081f7aebbcc9242f589a3139914d4c5e31500c5415934d3d3183bc3b"
+    },
+    {
+      "src": "claude/scripts/pytest_gate.py",
+      "dest": "scripts/pytest_gate.py",
+      "kind": "file",
+      "sha256": "2513adc4988559be908f4b1b6e731e22ca717cb6de61b289ebb2b36f63246cec"
+    },
+    {
+      "src": "claude/scripts/disk/lib.mjs",
+      "dest": "scripts/disk/lib.mjs",
+      "kind": "file",
+      "sha256": "15ed7a0591089fa3057fffecc0ac2d1439aa374b309624a8ebe676ab52d4bdf6"
+    },
+    {
+      "src": "claude/scripts/disk/audit.mjs",
+      "dest": "scripts/disk/audit.mjs",
+      "kind": "file",
+      "sha256": "3d14f199c511d24c00b1de08a21287ff25ae967a9901fff4383b6d680794ed27"
+    },
+    {
+      "src": "claude/scripts/disk/wt-new.mjs",
+      "dest": "scripts/disk/wt-new.mjs",
+      "kind": "file",
+      "sha256": "3cafb162f76a84dc9fafcd3926d788b85a20a3227f51d40faf2ce4631d7a77e7"
+    },
+    {
+      "src": "claude/scripts/disk/wt-done.mjs",
+      "dest": "scripts/disk/wt-done.mjs",
+      "kind": "file",
+      "sha256": "18a218214f87d9d7043339ff7f0fc99b4754bd78a2739a6d14185a0941aeb2b3"
+    },
+    {
+      "src": "claude/scripts/disk/test/apply.test.mjs",
+      "dest": "scripts/disk/test/apply.test.mjs",
+      "kind": "file",
+      "sha256": "f84deeabd2b421db36bdf6397efcb9775a5d95c3699f958be4d937baff9d6672"
+    },
+    {
+      "src": "claude/scripts/disk/test/delete.test.mjs",
+      "dest": "scripts/disk/test/delete.test.mjs",
+      "kind": "file",
+      "sha256": "4598d438dbf1b189fe475e55bc2b41a9c4e6b499aae4219fd23719adaaba6081"
+    },
+    {
+      "src": "claude/scripts/disk/test/wt-done.test.mjs",
+      "dest": "scripts/disk/test/wt-done.test.mjs",
+      "kind": "file",
+      "sha256": "28d7c34f994531619703b574705512595cdc3d2077ad0e638cb9ba88a092bf2d"
+    },
+    {
+      "src": "claude/hooks/disk-audit-hook.mjs",
+      "dest": "hooks/disk-audit-hook.mjs",
+      "kind": "file",
+      "sha256": "edc6e619a976314f6a2e12a5cf0d0ba50e29bdd9c31948d9c99eb1f2b8908775"
+    },
+    {
+      "src": "claude/scripts/lib/codex-plugin.mjs",
+      "dest": "scripts/lib/codex-plugin.mjs",
+      "kind": "file",
+      "sha256": "c00f44114c7e4f9a39b5e733d1edeaafb29d17b491d1b9451ef7992dd20bc9af"
+    },
+    {
+      "src": "claude/scripts/lib/process-identity.mjs",
+      "dest": "scripts/lib/process-identity.mjs",
+      "kind": "file",
+      "sha256": "bd224e5b731e0102fc4037b517c93665d131297614938fc62e37cad3fbeef731"
+    },
+    {
+      "src": "claude/scripts/lib/luna-win-runtime.sh",
+      "dest": "scripts/lib/luna-win-runtime.sh",
+      "kind": "file",
+      "sha256": "5c40c06bfc6cd50a059417411795779d29aa762c69ef451c98b73dbfbb55eeb8"
     }
   ],
   "settings": "settings/hooks.json",

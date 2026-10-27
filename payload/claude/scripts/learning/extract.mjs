@@ -244,6 +244,7 @@ async function* transcriptLines(file, offset = 0) {
 function transcriptSource(source) {
   const match = typeof source === "string" && /^(.*)#L([1-9]\d*)$/.exec(source);
   if (!match) throw new Error("invalid transcript source");
+  if (match[1].split(/[/\\]/).includes("..")) throw new Error("invalid transcript path");
   const file = toWinPath(match[1]);
   if (!path.isAbsolute(file) || file.split("/").includes("..")) throw new Error("invalid transcript path");
   const projects = path.join(HOME_CLAUDE, "projects");
@@ -719,7 +720,8 @@ export async function extract(opts = {}) {
       if (captureStatus(out, meta, state, emit, opts.jobRoots)) statusFiles++;
     }
     const appended = withLock("events", { waitMs: 5000 }, () => {
-      const attestations = events.filter((event) => ["luna_job", "executor_assumption", "critic_output"].includes(event.type)
+      const attestations = events.filter((event) =>
+        ["luna_job", "executor_assumption", "critic_output"].includes(event.type)
         && event.data?.trusted === true && typeof event.data.status_sha256 === "string"
         && /^[0-9a-f]{64}$/i.test(event.data.status_sha256)).map((event) => ({
         v: 1, id: event.id, type: event.type, out: normaliseJobOut(event.data.out_path),

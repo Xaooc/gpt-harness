@@ -1,0 +1,61 @@
+import * as fs from 'node:fs';
+import path from 'node:path';
+import { tmpdir } from 'node:os';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { DEFAULTS, exists, git, safeDelete } from '../lib.mjs';
+import { removeWorktree } from '../wt-done.mjs';
+
+test('worktree removal refuses dirty and depended-on trees and preserves external symlink data', () => {
+  const root = fs.mkdtempSync(path.join(tmpdir(), 'disk wt test-'));
+  const previousHome = process.env.DISK_AUDIT_HOME;
+  process.env.DISK_AUDIT_HOME = path.join(root, 'home');
+  const repo = path.join(root, 'main');
+  const target = path.join(root, 'task');
+  const other = path.join(root, 'other');
+  const modules = path.join(root, 'shared-modules');
+  const config = { ...DEFAULTS, repos: [repo], sources: path.join(root, 'sources') };
+  try {
+    fs.mkdirSync(repo);
+    git(repo, ['init', '-b', 'main']);
+    git(repo, ['config', 'user.name', 'Disk test']);
+    git(repo, ['config', 'user.email', 'disk-test@localhost']);
+    git(repo, ['config', 'core.hooksPath', path.join(root, 'no-hooks')]);
+    git(repo, ['config', 'commit.gpgsign', 'false']);
+    fs.writeFileSync(path.join(repo, 'source'), 'committed');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules\ndata\n');
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-m', 'fixture']);
+    git(repo, ['worktree', 'add', '-b', 'task', '--', target]);
+    git(repo, ['worktree', 'lock', '--reason', 'owner=test; purpose=Проверка удаления; until=2099-01-01', '--', target]);
+    fs.writeFileSync(path.join(target, 'source'), 'uncommitted');
+    assert.throws(() => removeWorktree(target, { config }), /dirty worktree/);
+    assert.equal(fs.readFileSync(path.join(target, 'source'), 'utf8'), 'uncommitted');
+    git(target, ['restore', '--', 'source']);
+    git(repo, ['worktree', 'add', '-b', 'other', '--', other]);
+    fs.mkdirSync(path.join(target, 'data'));
+    const dependent = path.join(other, 'data');
+    fs.symlinkSync(path.join(target, 'data'), dependent, 'dir');
+    assert.throws(() => removeWorktree(target, { config }), /has dependents/);
+    assert.equal(fs.lstatSync(dependent).isSymbolicLink(), true);
+    assert.equal(safeDelete(dependent).removed, true);
+    fs.mkdirSync(modules);
+    fs.writeFileSync(path.join(modules, 'dependency'), 'shared installation');
+    const link = path.join(target, 'node_modules');
+    fs.symlinkSync(modules, link, 'dir');
+    const preview = removeWorktree(target, { config, dryRun: true });
+    assert.equal(preview.dryRun, true);
+    assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
+    assert.equal(exists(target), true);
+    const removed = removeWorktree(target, { config });
+    assert.equal(removed.dryRun, false);
+    assert.equal(exists(target), false);
+    assert.equal(fs.readFileSync(path.join(modules, 'dependency'), 'utf8'), 'shared installation');
+    assert.equal(git(repo, ['branch', '--list', 'task']).trim(), 'task');
+  } finally {
+    if (previousHome === undefined) delete process.env.DISK_AUDIT_HOME;
+    else process.env.DISK_AUDIT_HOME = previousHome;
+    assert.equal(path.dirname(root), path.resolve(tmpdir()));
+    assert.equal(safeDelete(root).removed, true);
+  }
+});

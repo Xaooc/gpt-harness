@@ -22,15 +22,16 @@ Codex orchestration is active in this session (global SessionStart hook). Before
 for the first time in this session, load the full \`luna\` skill with the Skill tool (and \`luna-critics\`
 before a review). Rules that always apply:
 - Claude orchestrates; Codex executes through \`bash ~/.claude/scripts/luna.sh\`. Any implementation that is
-  more than simple goes to Sol: \`-m gpt-6.1-sol -e high\` (when in doubt, Sol). Luna handles simple/mechanical
-  work, research scouts, critics and images.
+  more than simple uses \`-w -m gpt-6.1-terra -e max\` (when in doubt, max). Luna (\`gpt-6-luna\`, the default)
+  handles simple/mechanical work, research scouts, critics and images.
 - The executors are literal: they do exactly what the brief says and miss what it doesn't. Briefs must be
   exhaustive (ripples, edge cases, decisions, invariants, non-goals, intent, exact checks). Then review what
-  the brief did NOT say, and include the "Ревизор пробелов" critic after Sol/Luna implementations.
+  the brief did NOT say, and include the "Ревизор пробелов" critic after Terra implementations.
 - After every launch: check \`luna-status.sh\`, then ALWAYS arm a stall watcher with the Monitor tool:
-  \`bash ~/.claude/scripts/luna-watch.sh -i 300 <out.md> ...\` (600 for Sol). Act immediately on STALL/GONE.
+  \`bash ~/.claude/scripts/luna-watch.sh -i 300 <out.md> ...\` (600 for Terra max). Act immediately on STALL/GONE.
 - Stop a job with \`bash ~/.claude/scripts/luna-stop.sh <out.md>\`: stopping the Bash task does NOT stop it. Never edit
-  luna.sh / luna-pool.mjs / luna-daemon.mjs in place, because other sessions are running them (write .next, swap when idle).
+  luna.sh / luna-pool.mjs / luna-daemon.mjs in place, because other sessions are running them
+  (write .next, swap when idle).
 - Design/UI/UX/CSS/visuals are done by Opus itself, never delegated. Generate raster images proactively
   (Opus writes the prompt and judges, Luna generates), with no permission needed.
 - Clean up as you go (CLAUDE.md section 5): job artifacts, temp files, extra backups (max one per file),

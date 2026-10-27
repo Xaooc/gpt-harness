@@ -3,8 +3,8 @@ import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { ClaudeLimit, Collapsed, Job, LimitWindow, PanelData, SessionBeat, Snapshot } from '../types'
 
-// Live status of the Luna/Codex job system: RAM, Claude + Codex limits, the shared daemon, running jobs, the Codex build.
-// Data: `node ~/.claude/scripts/luna-overview.mjs` (one JSON object) every POLL_MS, plus $.session.usage() for Claude limits.
+// Live status of the Luna/Codex job system: RAM, limits, the daemon, running jobs and the Codex build.
+// Data: `node ~/.claude/scripts/luna-overview.mjs` every POLL_MS, plus $.session.usage() for Claude limits.
 
 const PANE = 'luna-panel'
 const TITLE = 'Luna'
@@ -103,7 +103,11 @@ async function tick($: EngineInterface): Promise<void> {
 }
 
 async function pollOnce($: EngineInterface): Promise<void> {
-  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
+  let home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME'))
+  if (!home) {
+    const result = await $.process.run(['node', '-p', 'require("os").homedir()'], { timeoutMs: 2000 })
+    home = result.stdout.trim()
+  }
   const sessionId = await currentSessionId($)
   const script = `${home.replace(/\\/g, '/')}/.claude/scripts/luna-overview.mjs`
   let snapshot: Snapshot | null = null
@@ -111,7 +115,8 @@ async function pollOnce($: EngineInterface): Promise<void> {
   try {
     lastBeatPoll = Date.now()
     const payload = await beatPayload($)
-    beatNote = payload ? '' : `нет ID сессии (${beatSessionId ? 'неподходящий: ' + beatSessionId.slice(0, 40) : 'пусто'})`
+    beatNote = payload ? '' :
+      `нет ID сессии (${beatSessionId ? 'неподходящий: ' + beatSessionId.slice(0, 40) : 'пусто'})`
     const run = await $.process.run(['node', script, ...(payload ? ['--beat'] : [])],
       { timeoutMs: 12_000, ...(payload ? { stdin: payload } : {}) })
     if (run.exitCode === 0 && run.stdout.trim()) snapshot = JSON.parse(run.stdout) as Snapshot
@@ -189,13 +194,18 @@ function attentionItems(d: PanelData): Alert[] {
   else if (free < 2048) out.push({ level: 'warning', text: `Памяти немного: ${gb(free)}` })
   for (const j of s.jobs) {
     if (j.state === 'running' && (j.idleS ?? 0) >= 900) {
-      out.push({ level: 'error', text: `${modelLabel(j.model)} «${jobName(j.out)}» молчит ${duration(j.idleS ?? 0)} — похоже, завис` })
+      const text = `${modelLabel(j.model)} «${jobName(j.out)}» молчит ${duration(j.idleS ?? 0)} — похоже, завис`
+      out.push({ level: 'error', text })
     }
   }
   const starved = s.jobs.filter(j => j.state === 'waiting-ram').length
-  if (starved) out.push({ level: 'warning', text: `${starved} ${starved === 1 ? 'задание ждёт' : 'заданий ждут'} памяти` })
+  if (starved) {
+    out.push({ level: 'warning', text: `${starved} ${starved === 1 ? 'задание ждёт' : 'заданий ждут'} памяти` })
+  }
   if (s.daemon.running && s.daemon.healthy === false) out.push({ level: 'error', text: 'Демон Codex не отвечает' })
-  else if (s.daemon.running && s.daemon.appServer === 'down') out.push({ level: 'warning', text: 'Codex перезапускается' })
+  else if (s.daemon.running && s.daemon.appServer === 'down') {
+    out.push({ level: 'warning', text: 'Codex перезапускается' })
+  }
   const limit = (label: string, pct: number) => {
     if (pct >= 90) out.push({ level: 'error', text: `Лимит ${label}: ${Math.round(pct)}%` })
     else if (pct >= 75) out.push({ level: 'warning', text: `Лимит ${label}: ${Math.round(pct)}%` })
@@ -213,13 +223,15 @@ function attentionItems(d: PanelData): Alert[] {
 
 // A shell command as a person would describe it: "запускает тесты", not "C:/…/sh.exe -c npx vitest run …".
 function describeCommand(raw: string): { text: string; isRaw: boolean } {
-  let cmd = raw.trim().replace(/^\S*?(?:sh|bash|pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*/i, '').replace(/^["']|["']$/g, '')
+  let cmd = raw.trim().replace(/^\S*?(?:sh|bash|pwsh|powershell)(?:\.exe)?\s+(?:-\w+\s+)*/i, '')
+    .replace(/^["']|["']$/g, '')
   cmd = cmd.replace(/^(?:cd\s+\S+\s*&&\s*)+/, '').trim()
   // Leading environment assignments (UV_CACHE_DIR=… TMPDIR=… uv run pytest) are not the command itself.
   cmd = cmd.replace(/^(?:(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, '').trim()
   cmd = cmd.replace(/^(?:cd\s+\S+\s*&&\s*)+/, '').trim()
   const has = (re: RegExp) => re.test(cmd)
-  if (has(/\b(pytest|vitest|jest|mocha|playwright test|cargo test|go test|node --test)\b|\b(npm|pnpm|yarn|bun) (run )?test/)) {
+  const tests = /\b(pytest|vitest|jest|mocha|playwright test|cargo test|go test|node --test)\b/
+  if (has(tests) || has(/\b(npm|pnpm|yarn|bun) (run )?test/)) {
     return { text: 'запускает тесты', isRaw: false }
   }
   if (has(/\b(tsc|eslint|ruff|mypy|pyright|cargo (check|clippy)|biome|prettier --check)\b/)) {
@@ -238,7 +250,7 @@ function describeCommand(raw: string): { text: string; isRaw: boolean } {
 }
 
 // A session that sends no heartbeat (started before this plugin version) is still named after the project its
-// Codex jobs work in: `C:/rpg/.claude/worktrees/x` → rpg; jobs in sibling folders `C:/rpg-wt/a`, `C:/rpg-wt/b` → rpg-wt.
+// Jobs in `C:/rpg/.claude/worktrees/x` → rpg; jobs in sibling folders `C:/rpg-wt/a`, `C:/rpg-wt/b` → rpg-wt.
 function projectOfJobs(jobs: Job[]): string {
   const dirs = jobs.map(j => (j.dir || '').replace(/\\/g, '/').replace(/\/+$/, '')).filter(Boolean)
     .map(d => d.replace(/\/\.claude\/worktrees\/[^/]+$/, '').replace(/\/\.worktrees\/[^/]+$/, ''))
@@ -346,7 +358,9 @@ export const register: Register = on => {
     const isMain = !(e as { agentId?: string }).agentId
     if (isMain) {
       beat.state = 'tool'
-      beat.tool = { name: e.tool, detail: toolDetail(e.tool, e as unknown as Record<string, unknown>), since: Date.now() }
+      beat.tool = {
+        name: e.tool, detail: toolDetail(e.tool, e as unknown as Record<string, unknown>), since: Date.now()
+      }
       queueBeat($)
     }
     try {
@@ -366,7 +380,7 @@ export const register: Register = on => {
 
   // The pane stays in front in every session without /luna. An open the plugin makes on its own is drawn only on a
   // wide surface (110-144 columns); an open answering the person's prompt is drawn at any width. So every prompt
-  // re-opens the pane when it is not on screen, unless the person closed it by hand in this session (/luna undoes that).
+  // re-opens the pane when it is not on screen, unless the person closed it by hand (/luna undoes that).
   on('prompt.submit', async ($, e, next) => {
     const result = await next(e)
     ensureTicker($)
@@ -632,7 +646,8 @@ export const register: Register = on => {
           const name = b?.name || projectOfJobs(g.jobs)
           const title = (name || (isMe ? 'Эта сессия' : 'Без папки')) + (isMe && name ? ' · эта' : '')
           const running = g.jobs.filter(j => j.state === 'running').length
-          const codexPart = g.jobs.length ? ` · Codex ${running}${g.jobs.length > running ? `+${g.jobs.length - running}` : ''}` : ''
+          const extra = g.jobs.length > running ? `+${g.jobs.length - running}` : ''
+          const codexPart = g.jobs.length ? ` · Codex ${running}${extra}` : ''
           return (
             <Card id={`s-${g.id}`} title={title} summary={`${claudeSummary(b, stale, now)}${codexPart}`}>
               <ClaudeRow beat={b} stale={stale} />
@@ -659,7 +674,9 @@ export const register: Register = on => {
         ) : null}
 
         {d.beatNote ? (
-          <Text size="caption" color="subtle" wrap="truncate-end">Статус этой сессии не отправляется: {d.beatNote}</Text>
+          <Text size="caption" color="subtle" wrap="truncate-end">
+            Статус этой сессии не отправляется: {d.beatNote}
+          </Text>
         ) : null}
       </Box>
     )

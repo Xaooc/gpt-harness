@@ -7,8 +7,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$expectedVersion = '0.162.1'
-$fix = 'npm i -g @openai/codex@0.162.1'
+$expectedVersion = '0.164.0'
+$fix = 'npm i -g @openai/codex@0.164.0'
 $BuildRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildRoot)
 if (-not $NpmCodexDir) {
     $npm = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -73,7 +73,7 @@ Get-ChildItem -LiteralPath $vendor -Force | Copy-Item -Destination $dist -Recurs
 $exe = Join-Path $dist 'bin\codex.exe'
 Copy-Item -LiteralPath $builtBinary -Destination $exe -Force
 $version = & $exe --version
-if ($LASTEXITCODE -ne 0 -or ($version -join "`n").Trim() -ne 'codex-cli 0.162.1') {
+if ($LASTEXITCODE -ne 0 -or ($version -join "`n").Trim() -ne 'codex-cli 0.164.0') {
     throw "Assembled Codex version check failed: $version"
 }
 Write-Host "Assembled $dist ($version), including codex-path and codex-resources."

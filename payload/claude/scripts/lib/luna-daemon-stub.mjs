@@ -67,6 +67,9 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
     thread.turnId = turnId;
     const prompt = p.input[0].text;
     thread.prompt = prompt;
+    thread.turns = (thread.turns || 0) + 1;
+    const failure = /^MODEL_FAIL_(ONCE|ALWAYS):(.*)$/s.exec(prompt);
+    if (failure) thread.failure = { mode: failure[1], error: failure[2] };
     if (prompt.startsWith('RPC_TIMEOUT')) {
       notify('turn/started', { threadId, turn: { id: turnId } });
       return;
@@ -92,6 +95,15 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       if (prompt.startsWith('WAIT') || prompt.startsWith('SLOW_START') ||
           prompt.startsWith('FLOOD_WAIT') || thread.model === 'hang') return;
       thread.timer = setTimeout(() => {
+        if (thread.failure && (thread.failure.mode === 'ALWAYS' || thread.turns === 1)) {
+          notify('turn/completed', { threadId, turn: {
+            id: turnId, status: 'failed', items: [], error: { message: thread.failure.error }
+          } });
+          setTimeout(() => notify('item/completed', { threadId, turnId, item: {
+            id: 'late-answer', type: 'agentMessage', phase: 'final_answer', text: 'late failed-turn output'
+          } }), 20);
+          return;
+        }
         notify('item/started', { threadId, item: { id: 'cmd', type: 'commandExecution', command: 'echo fake' } });
         notify('item/commandExecution/outputDelta', { threadId, itemId: 'cmd', turnId, delta: 'streaming output' });
         notify('item/completed', { threadId, item: {

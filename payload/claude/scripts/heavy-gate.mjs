@@ -7,6 +7,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import path from 'node:path';
+import { processStarts, sameStart } from './lib/process-identity.mjs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -15,6 +16,7 @@ import assert from 'node:assert/strict';
 
 const MB = 1024 * 1024;
 const DEFAULTS = { max: 2, minFreeMb: 2500, maxWaitS: 600, devMaxWaitS: 180 };
+const SHELL_PREFIXES = new Set('if then else elif fi do done while until for case esac ! { } ( ) time'.split(' '));
 
 function commandSegments(command) {
   const segments = [];
@@ -39,6 +41,8 @@ function commandSegments(command) {
       else word += char;
     } else if (char === '"' || char === "'") {
       quote = char; started = true;
+    } else if (char === '(' || char === ')') {
+      finishWord(); words.push(char);
     } else if (char === ';' || char === '|' || char === '\n' || (char === '&' && command[i + 1] === '&')) {
       finishSegment();
       if (command[i + 1] === char && (char === '|' || char === '&')) i += 1;
@@ -65,7 +69,7 @@ function packageCommand(args) {
 
 function stripAssignments(input) {
   const words = [...input];
-  while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) words.shift();
+  while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]) || SHELL_PREFIXES.has(words[0]))) words.shift();
   return words;
 }
 
@@ -90,6 +94,14 @@ function stripCommandPrefixes(input) {
     if (name === 'timeout' && /^\d+(\.\d+)?[smhd]?$/i.test(first)) {
       words.splice(0, 2); continue;
     }
+    if (name === 'env') {
+      words.shift();
+      while (words.length && (words[0].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]))) {
+        if (words[0] === '-u' || words[0] === '--unset') words.splice(0, 2);
+        else words.shift();
+      }
+      continue;
+    }
     if (name === 'nice') {
       words.shift();
       if (words[0] === '-n' || words[0] === '--adjustment') words.splice(0, 2);
@@ -101,7 +113,7 @@ function stripCommandPrefixes(input) {
   return words;
 }
 
-function heavySegment(input) {
+function heavySegment(input, depth = 0) {
   const initial = stripAssignments(input);
   if (initial.length && /^(npm|pnpm|yarn|bun)$/.test(commandName(initial[0])) &&
     packageCommand(initial.slice(1))) return true;
@@ -110,6 +122,11 @@ function heavySegment(input) {
   const name = commandName(words[0]);
   const args = words.slice(1);
   const first = (args[0] || '').toLowerCase();
+  if (/^(npm|pnpm|yarn|bun)$/.test(name) && packageCommand(args)) return true;
+  if (/^(bash|sh|dash|zsh)$/.test(name) && depth < 3) {
+    const index = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg));
+    if (index >= 0) return isHeavy(args[index + 1], depth + 1);
+  }
   if (args.length === 1 && /^(--version|--help|-h)$/.test(first)) return false;
   if (name === 'tsc') return !args.some((arg) => /^(--version|-v|--help|-h)$/.test(arg));
   if (/^(vitest|jest|mocha|ava|pytest|webpack|mvn|gradle|gradlew|msbuild)$/.test(name)) return true;
@@ -165,8 +182,8 @@ function devSegment(input) {
   return name === 'http.server';
 }
 
-export function isHeavy(command) {
-  return typeof command === 'string' && commandSegments(command).some(heavySegment);
+export function isHeavy(command, depth = 0) {
+  return typeof command === 'string' && commandSegments(command).some((words) => heavySegment(words, depth));
 }
 
 export function isDevServer(command) {
@@ -175,13 +192,32 @@ export function isDevServer(command) {
 
 function runtime(overrides = {}) {
   const home = path.resolve(process.env.USERPROFILE || os.homedir());
-  return {
+  let starts;
+  const ctx = {
     ...DEFAULTS, env: process.env, dir: path.join(home, '.claude', 'luna-run', 'heavy'),
     sentinel: path.join(home, '.claude', 'heavy-gate-off'), now: Date.now, freemem: os.freemem,
-    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), alive,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), batchProbe: processStarts,
     out: (value) => process.stdout.write(value), err: (value) => process.stderr.write(value),
     input: readInput, spawn, ...overrides
   };
+  const start = (pid) => {
+    if (!starts) {
+      const pids = [process.pid];
+      try {
+        for (const name of fs.readdirSync(ctx.dir).filter((item) => /^lease-[A-Za-z0-9._-]+\.json$/.test(item))) {
+          try {
+            const lease = JSON.parse(fs.readFileSync(path.join(ctx.dir, name), 'utf8'));
+            if (validLease(lease) && lease.kind === 'run' && lease.pid && alive(lease.pid)) pids.push(lease.pid);
+          } catch {}
+        }
+      } catch {}
+      starts = ctx.batchProbe(pids);
+    }
+    return starts.get(pid) || '';
+  };
+  if (!overrides.processStart) ctx.processStart = start;
+  if (!overrides.alive) ctx.alive = (pid, expected) => alive(pid) && sameStart(start(pid), expected);
+  return ctx;
 }
 
 function numberSetting(value, fallback, minimum, integer = false) {
@@ -225,12 +261,12 @@ function removeFile(file) {
 }
 
 function alive(pid) {
-  try { process.kill(pid, 0); return true; }
+  try { process.kill(pid, 0); }
   catch (error) {
     if (error.code === 'ESRCH') return false;
-    if (error.code === 'EPERM') return true;
-    throw error;
+    if (error.code !== 'EPERM') throw error;
   }
+  return true;
 }
 
 function validLease(lease) {
@@ -254,7 +290,7 @@ function liveLeases(ctx) {
       if (!(error instanceof SyntaxError)) throw error;
     }
     if (!validLease(lease) || lease.since + lease.ttlS * 1000 < ctx.now() ||
-      (lease.kind === 'run' && lease.pid !== null && !ctx.alive(lease.pid))) removeFile(file);
+      (lease.kind === 'run' && lease.pid !== null && !ctx.alive(lease.pid, lease.pid_start))) removeFile(file);
     else live.push(lease);
   }
   return live;
@@ -354,10 +390,18 @@ async function acquire(ctx, lease, mode) {
   }
 }
 
+function commandSummary(command) {
+  const words = stripCommandPrefixes(commandSegments(command)[0] || []);
+  const name = commandName(words[0] || '').replace(/[^a-z0-9_.-]/g, '').slice(0, 40);
+  const action = /^(run|test|build|check|install|ci|lint|--noEmit)$/i.test(words[1] || '') ? words[1] : '';
+  return `${name}${action ? ` ${action}` : ''}${words.length > 1 ? ' [redacted]' : ''}`;
+}
+
 function makeLease(ctx, id, session, command, kind, bg = false) {
   return {
     v: 1, id, session, kind, pid: kind === 'run' ? process.pid : null,
-    cmd: command.replace(/[\r\n]+/g, ' ').slice(0, 120), since: ctx.now(),
+    pid_start: kind === 'run' ? ctx.processStart(process.pid) : '',
+    cmd: commandSummary(command), since: ctx.now(),
     ttlS: kind === 'run' ? 7200 : bg ? 2700 : 720, bg
   };
 }
@@ -567,7 +611,7 @@ async function selfTest(out) {
     let errors = '';
     const ctx = runtime({
       env, dir: path.join(root, `heavy-${index++}`), sentinel: path.join(root, 'off'),
-      now: () => now, freemem: () => 8000 * MB, alive: () => true,
+      now: () => now, freemem: () => 8000 * MB, alive: () => true, processStart: () => '123',
       sleep: async (ms) => { now += ms; }, input: async () => '',
       out: (value) => { output += value; }, err: (value) => { errors += value; }
     });
@@ -585,6 +629,11 @@ async function selfTest(out) {
     });
   };
   const heavyCommands = [
+    "bash -c 'if true; then npm test; fi'", "bash -c 'for f in a; do pytest -q; done'",
+    "sh -c '{ tsc; }'", "bash -c '(npm test)'", 'time ! { tsc; }',
+    "bash -c 'npm test'", 'sh -lc "pytest -q"', "bash -ec 'npm test'",
+    "env FOO=bar bash -c 'npm test'", 'env FOO=bar npm test',
+    "dash -ec 'npm test'", "zsh -lc 'pytest -q'", "bash -c \"sh -c 'npm test'\"",
     'npx tsc --noEmit', 'cd frontend && npm run build', 'FOO=1 vitest run a.test.ts',
     'python -m pytest -q', 'uv run pytest tests/x.py', 'cargo build --release', 'npm ci', 'pnpm install',
     'node_modules/.bin/vitest run', 'C:\\x\\node_modules\\.bin\\tsc.cmd -p .',
@@ -607,6 +656,8 @@ async function selfTest(out) {
     'make lint', 'make typecheck', 'mingw32-make test', 'nmake build'
   ];
   const lightCommands = [
+    "bash -c 'if true; then echo hi; fi'", "sh -c '{ echo tsc; }'", "bash -c '(echo npm test)'",
+    "bash -c 'echo hi'", "env FOO=bar sh -lc 'echo hi'",
     'tsc --version', 'git commit -m "run tests"', 'rg vitest src', 'node scripts/x.mjs', 'npm ls',
     'echo npm install', 'cat package.json', 'eslint src/a.ts', '', 'tsc -v', 'tsc --help',
     'vitest --help', 'pytest -h', 'webpack --version', 'npm view x', 'ls', 'npx tsc --version',
@@ -626,9 +677,15 @@ async function selfTest(out) {
     'echo npm run dev'
   ];
   for (const command of heavyCommands) test(`heavy: ${command}`, () => assert.equal(isHeavy(command), true));
+  test('nested shell inspection stops at depth three', () => {
+    assert.equal(isHeavy("bash -c 'npm test'", 2), true);
+    assert.equal(isHeavy("bash -c 'npm test'", 3), false);
+  });
   for (const command of lightCommands) test(`light: ${command}`, () => assert.equal(isHeavy(command), false));
   for (const command of devCommands) test(`dev server: ${command}`, () => assert.equal(isDevServer(command), true));
-  for (const command of nonDevCommands) test(`not dev server: ${command}`, () => assert.equal(isDevServer(command), false));
+  for (const command of nonDevCommands) {
+    test(`not dev server: ${command}`, () => assert.equal(isDevServer(command), false));
+  }
   test('heavy commands take precedence over dev server classification', () => {
     assert.equal(isHeavy('npm run build'), true);
     assert.equal(isDevServer('npm run build'), false);
@@ -660,6 +717,22 @@ async function selfTest(out) {
     seed(ctx, 'alive', { kind: 'run', pid: 986 });
     assert.deepEqual(liveLeases(ctx).map((lease) => lease.id), ['alive']);
     assert.equal(fs.existsSync(leaseFile(ctx, 'dead')), false);
+  });
+  test('live lease creation times use one cached batch probe per invocation', () => {
+    let probes = 0;
+    const dir = path.join(root, `batch-${index++}`);
+    const ctx = runtime({ dir, batchProbe: (pids) => {
+      probes++;
+      assert.ok(pids.includes(process.pid));
+      return new Map([[process.pid, '123']]);
+    } });
+    fs.mkdirSync(dir, { recursive: true });
+    seed(ctx, 'one', { kind: 'run', pid: process.pid, pid_start: '123' });
+    seed(ctx, 'two', { kind: 'run', pid: process.pid, pid_start: '123' });
+    assert.equal(liveLeases(ctx).length, 2);
+    assert.equal(liveLeases(ctx).length, 2);
+    assert.equal(makeLease(ctx, 'self', '', 'tsc', 'run').pid_start, '123');
+    assert.equal(probes, 1);
   });
   test('corrupt leases pruned; exact TTL boundary remains live', () => {
     const { ctx } = fixture();
@@ -739,7 +812,8 @@ async function selfTest(out) {
     assert.deepEqual(JSON.parse(f.output()), {
       systemMessage: 'heavy-gate: dev server waited 2s for free RAM'
     });
-    assert.equal(fs.existsSync(f.ctx.dir) && fs.readdirSync(f.ctx.dir).some((name) => name.startsWith('lease-')), false);
+    assert.equal(fs.existsSync(f.ctx.dir) &&
+      fs.readdirSync(f.ctx.dir).some((name) => name.startsWith('lease-')), false);
     assert.equal(fs.readFileSync(path.join(f.ctx.dir, 'gate.log'), 'utf8').trim().split('\n').length, 1);
   });
   test('dev server with enough RAM is silent and creates no state', async () => {

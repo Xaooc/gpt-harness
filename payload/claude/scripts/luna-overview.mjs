@@ -5,6 +5,7 @@
 import * as fs from 'node:fs/promises';
 import { freemem, totalmem, homedir, tmpdir, uptime } from 'node:os';
 import path from 'node:path';
+import { processStartAsync, sameStart } from './lib/process-identity.mjs';
 import assert from 'node:assert/strict';
 import {
   mkdirSync, readFileSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync
@@ -36,7 +37,8 @@ function configuration() {
   if (!build) {
     try {
       build = readFileSync(path.join(home, '.claude', 'luna-harness.env'), 'utf8').replace(/\r/g, '')
-        .split('\n').find((line) => line.startsWith('LUNA_CUSTOM_CODEX_ROOT='))?.slice('LUNA_CUSTOM_CODEX_ROOT='.length);
+        .split('\n').find((line) => line.startsWith('LUNA_CUSTOM_CODEX_ROOT='))
+        ?.slice('LUNA_CUSTOM_CODEX_ROOT='.length);
     } catch {}
   }
   const run = path.resolve(process.env.LUNA_OVERVIEW_HOME || path.join(home, '.claude', 'luna-run'));
@@ -48,10 +50,11 @@ function configuration() {
 }
 
 function empty(now = Date.now()) {
+  const daemon = { running: false, appServer: null, healthy: false, degraded: false };
   return {
     v: 1, at: new Date(now).toISOString(),
     ram: { freeMb: null, totalMb: null },
-    daemon: { running: false, appServer: null, healthy: false, degraded: false },
+    daemon, daemons: { default: daemon, net: { ...daemon } },
     jobs: [], codexLimits: null, build: null,
     sessions: []
   };
@@ -112,18 +115,24 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
     while (cursor < entries.length) {
       const { file } = entries[cursor++];
       const text = await readText(file, 32 * 1024);
-      const [out, pidLine] = text?.split(/\r?\n/).map((line) => line.trim()) || [];
+      const [out, pidLine, indexStart] = text?.split(/\r?\n/).map((line) => line.trim()) || [];
       // Validate before any access to paths supplied by the index or job data.
       if (!localPath(out)) continue;
+      const status = await readText(`${out}.status`, TAIL_BYTES);
+      const values = status === null ? {} : statusValues(status);
       if (pidLine) {
         const pid = Number(pidLine);
         if (Number.isSafeInteger(pid) && pid > 0) {
+          let live = true;
           try { process.kill(pid, 0); }
           catch (error) {
-            if (error.code === 'ESRCH') {
-              await fs.unlink(file).catch(() => {});
-              continue;
-            }
+            if (error.code === 'ESRCH') live = false;
+          }
+          const recordedStart = indexStart || values.wrapper_start;
+          if (live && recordedStart) live = sameStart(await processStartAsync(pid), recordedStart);
+          if (!live) {
+            await fs.unlink(file).catch(() => {});
+            continue;
           }
         }
       } else {
@@ -134,14 +143,23 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
           continue;
         }
       }
-      const status = await readText(`${out}.status`, TAIL_BYTES);
       if (status === null) continue;
-      const values = statusValues(status);
       if (Date.parse(values.started) < boot) {
         await fs.unlink(file).catch(() => {});
         continue;
       }
-      if (terminal.has(values.state)) continue;
+      let conflict = null;
+      if (terminal.has(values.state)) {
+        if (values.state !== 'failed' || values.engine !== 'daemon' ||
+            values.error !== 'output or log already in use by another daemon job') continue;
+        const markerText = await readText(`${out}.daemon`, TAIL_BYTES);
+        const marker = markerText === null ? {} : statusValues(markerText);
+        if (!/^[a-f0-9]{32}$/.test(marker.id || '') || !['queued', 'running'].includes(marker.state)) continue;
+        conflict = { id: marker.id, profile: values.daemon_profile === 'net' ? 'net' : 'default' };
+        values.state = marker.state;
+        values.queue_pos = marker.queue_pos;
+        values.error = '';
+      }
       const queue = values.queue_pos;
       const activity = await logActivity(`${out}.log`, now, values.state || '');
       jobs.push({
@@ -149,11 +167,29 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
         sandbox: values.sandbox || '', engine: values.engine || '', ageS: seconds(values.started, now),
         dir: values.dir || '', error: values.error || '',
         queuePos: /^\d+$/.test(queue || '') && Number.isSafeInteger(Number(queue)) ? Number(queue) : null,
-        owner: values.owner || '', idleS: activity.idleS, activity: activity.activity
+        owner: values.owner || '', idleS: activity.idleS, activity: activity.activity,
+        ...(conflict ? { _conflict: conflict } : {})
       });
     }
   }));
   return jobs.sort(newest).slice(0, 40);
+}
+
+function reconcileConflictJobs(jobs, daemons) {
+  return jobs.filter((job) => {
+    if (!job._conflict) return true;
+    const live = daemons[job._conflict.profile]?.jobs?.find((item) => item.id === job._conflict.id);
+    delete job._conflict;
+    if (!live) {
+      Object.assign(job, { model: '', effort: '', sandbox: '', owner: '', ageS: null, dir: '', error: '' });
+      return true;
+    }
+    Object.assign(job, {
+      state: live.state, model: live.model, effort: live.effort, sandbox: live.sandbox,
+      owner: live.owner, ageS: live.ageS, dir: live.cwd, error: ''
+    });
+    return true;
+  }).sort(newest);
 }
 
 async function logActivity(file, now, state = '') {
@@ -308,14 +344,16 @@ async function healthCollection(directory, info, health, now = Date.now()) {
     state.firstMissAt > (state.lastOkAt ?? -Infinity)), degraded: state.degraded };
 }
 
-async function daemonStatus(directory, now, snapshot) {
+async function daemonStatus(directory, now, snapshot, profile = 'default') {
   const info = await readJson(path.join(directory, 'daemon.json'));
   if (!info || !alive(info.pid)) return;
+  if (info.pid_start && !sameStart(await processStartAsync(info.pid), info.pid_start)) return;
   const result = {
     running: true, pid: info.pid, uptimeS: seconds(info.startedAt, now), max: null,
     runningJobs: null, queuedJobs: null, owners: [], jobs: [], appServer: null, healthy: true, degraded: false
   };
-  snapshot.daemon = result;
+  snapshot.daemons[profile] = result;
+  if (profile === 'default') snapshot.daemon = result;
   if (!Number.isInteger(info.port) || info.port < 1 || info.port > 65535 || typeof info.token !== 'string') {
     Object.assign(result, await healthCollection(directory, info, null));
     return;
@@ -376,7 +414,8 @@ async function buildStatus(directory, now) {
 async function sessionBeats(run, now) {
   const dir = path.join(run, 'sessions');
   let names = [];
-  try { names = (await fs.readdir(dir)).filter((n) => /^[A-Za-z0-9._-]{1,128}.json$/.test(n)).slice(0, 100); } catch { return []; }
+  try { names = (await fs.readdir(dir)).filter((n) => /^[A-Za-z0-9._-]{1,128}.json$/.test(n)).slice(0, 100); }
+  catch { return []; }
   const beats = [];
   await Promise.allSettled(names.map(async (name) => {
     const file = path.join(dir, name);
@@ -392,28 +431,38 @@ async function sessionBeats(run, now) {
 }
 
 async function collect(config, snapshot, now) {
+  let conflictJobs = [];
   try {
     snapshot.ram = { freeMb: Math.round(freemem() / 1048576), totalMb: Math.round(totalmem() / 1048576) };
   } catch {}
   await Promise.allSettled([
     daemonStatus(config.daemon, now, snapshot),
-    activeJobs(config.run, now).then((jobs) => { snapshot.jobs = jobs; }),
-    readJson(path.join(config.run, 'codex-limits.json')).then((limits) => {
+    daemonStatus(path.join(config.daemon, 'daemon-net'), now, snapshot, 'net'),
+    activeJobs(config.run, now).then((jobs) => {
+      conflictJobs = jobs.filter((job) => job._conflict);
+      snapshot.jobs = jobs.filter((job) => !job._conflict);
+    }),
+    Promise.all([
+      readJson(path.join(config.run, 'codex-limits.json')),
+      readJson(path.join(config.daemon, 'daemon-net', 'codex-limits.json'))
+    ]).then((values) => {
+      const [limits] = values.filter(Boolean).sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0));
       snapshot.codexLimits = limits ? { ...limits, ageS: seconds(limits.at, now) } : null;
     }),
     buildStatus(config.build, now).then((build) => { snapshot.build = build; }),
     sessionBeats(config.run, now).then((sessions) => { snapshot.sessions = sessions; })
   ]);
+  snapshot.jobs = reconcileConflictJobs([...snapshot.jobs, ...conflictJobs], snapshot.daemons);
   return snapshot;
 }
 
 function human(snapshot) {
-  const { ram, daemon, jobs, codexLimits: limits, build } = snapshot;
+  const { ram, daemons, jobs, codexLimits: limits, build } = snapshot;
   return [
     `RAM ${ram.freeMb ?? '?'} / ${ram.totalMb ?? '?'} MB free`,
-    daemon.running
-      ? `Daemon ${daemon.pid}: ${daemon.runningJobs ?? '?'} running, ${daemon.queuedJobs ?? '?'} queued`
-      : 'Daemon stopped',
+    ...Object.entries(daemons).map(([profile, daemon]) => daemon.running
+      ? `Daemon ${profile} ${daemon.pid}: ${daemon.runningJobs ?? '?'} running, ${daemon.queuedJobs ?? '?'} queued`
+      : profile === 'default' ? 'Daemon stopped' : `Daemon ${profile} stopped`),
     `Active ${jobs.length}${jobs.length ? ': ' + jobs.map((job) => `${job.state} ${job.model}`).join(', ') : ''}`,
     limits ? `Codex limits: reached=${limits.reached ?? '?'}, age=${limits.ageS ?? '?'}s` : 'Codex limits unknown',
     build ? `Build ${build.building ? 'running' : 'idle'}: ${build.line}` : 'Build unknown'
@@ -468,7 +517,9 @@ async function selfTest() {
       assert.equal(configuration().daemon, directory);
     });
     check('JSON shape', () => {
-      assert.deepEqual(Object.keys(snapshot), ['v', 'at', 'ram', 'daemon', 'jobs', 'codexLimits', 'build', 'sessions']);
+      assert.deepEqual(Object.keys(snapshot), [
+        'v', 'at', 'ram', 'daemon', 'daemons', 'jobs', 'codexLimits', 'build', 'sessions'
+      ]);
       assert.equal(snapshot.v, 1);
       assert.equal(snapshot.at, new Date(now).toISOString());
       assert.deepEqual(Object.keys(snapshot.ram), ['freeMb', 'totalMb']);
@@ -492,6 +543,39 @@ async function selfTest() {
       assert.equal(snapshot.jobs.length, 3);
       assert.ok(localPath(snapshot.jobs[0].out));
     });
+    const conflictOut = path.join(directory, 'conflict-job');
+    const conflictIndex = path.join(directory, 'active', 'conflict');
+    const conflictId = 'a'.repeat(32);
+    await fs.writeFile(conflictIndex, `${conflictOut}\n${process.pid}\n`);
+    await fs.writeFile(`${conflictOut}.status`, [
+      'state=failed', 'engine=daemon', 'daemon_profile=net', `started=${new Date(now).toISOString()}`,
+      'model=rejected', 'error=output or log already in use by another daemon job', ''
+    ].join('\n'));
+    await fs.writeFile(`${conflictOut}.daemon`, `id=${conflictId}\nstate=running\n`);
+    const conflictJob = (await activeJobs(directory, now)).find((job) => job.out === conflictOut);
+    check('conflict keeps the live holder available for daemon reconciliation', () => {
+      assert.equal(conflictJob?._conflict.id, conflictId);
+      assert.equal(conflictJob?._conflict.profile, 'net');
+    });
+    check('conflict holder uses its own daemon metadata', () => {
+      const live = { id: conflictId, state: 'running', model: 'holder', effort: 'high', sandbox: 'read-only',
+        owner: 'holder-owner', ageS: 8, cwd: 'C:/holder' };
+      const [job] = reconcileConflictJobs([structuredClone(conflictJob)], { net: { jobs: [live] } });
+      assert.equal(job.model, 'holder');
+      assert.equal(job.owner, 'holder-owner');
+      assert.equal(job.dir, 'C:/holder');
+      assert.equal(job._conflict, undefined);
+      const [unknown] = reconcileConflictJobs([structuredClone(conflictJob)], { net: { jobs: [] } });
+      assert.equal(unknown.state, 'running');
+      assert.equal(unknown.model, '');
+      assert.equal(unknown.owner, '');
+    });
+    await fs.writeFile(`${conflictOut}.daemon`, `id=${conflictId}\nstate=cancelled\n`);
+    const finishedConflicts = await activeJobs(directory, now);
+    check('terminal conflict marker is filtered', () => {
+      assert.ok(!finishedConflicts.some((job) => job.out === conflictOut));
+    });
+    await Promise.all([fs.unlink(conflictIndex), fs.unlink(`${conflictOut}.status`), fs.unlink(`${conflictOut}.daemon`)]);
     check('local drive paths only', () => {
       for (const value of ['C:/work/job', 'd:\\work\\job']) assert.equal(localPath(value), true);
       for (const value of ['\\\\server\\share\\job', '//server/share/job', '\\\\?\\C:\\job',
@@ -597,6 +681,22 @@ async function selfTest() {
           assert.equal(projected.daemon.appServer, expected);
         });
       }
+      const netDir = path.join(config.daemon, 'daemon-net');
+      await fs.mkdir(netDir);
+      await fs.writeFile(path.join(netDir, 'daemon.json'), JSON.stringify({
+        pid: process.pid, port: 2, token: 'SECRET-NET', startedAt: new Date(now).toISOString()
+      }));
+      globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, appServer: 'up' }) });
+      const profiles = empty(now);
+      await Promise.all([
+        daemonStatus(config.daemon, now, profiles), daemonStatus(netDir, now, profiles, 'net')
+      ]);
+      check('default and network daemon statuses are independent', () => {
+        assert.equal(profiles.daemon.running, true);
+        assert.equal(profiles.daemons.default.running, true);
+        assert.equal(profiles.daemons.net.running, true);
+        assert.ok(human(profiles).includes('Daemon net'));
+      });
       const healthFile = path.join(config.daemon, 'daemon-health.json');
       await fs.unlink(healthFile);
       globalThis.fetch = async () => { throw new Error('health unavailable'); };
@@ -792,13 +892,16 @@ async function storeBeat(run, now) {
       chunks.push(chunk);
     }
     const beat = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (!beat || beat.v !== 1 || typeof beat.sessionId !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(beat.sessionId)) return;
+    if (!beat || beat.v !== 1 || typeof beat.sessionId !== 'string' ||
+        !/^[A-Za-z0-9._-]{1,128}$/.test(beat.sessionId)) return;
     const dir = path.join(run, 'sessions');
     await fs.mkdir(dir, { recursive: true });
     const file = path.join(dir, `${beat.sessionId}.json`);
     const temp = `${file}.${process.pid}.tmp`;
     await fs.writeFile(temp, JSON.stringify({ ...beat, updatedAt: now }), 'utf8');
-    await fs.rename(temp, file).catch(async () => { await fs.writeFile(file, JSON.stringify({ ...beat, updatedAt: now })); });
+    await fs.rename(temp, file).catch(async () => {
+      await fs.writeFile(file, JSON.stringify({ ...beat, updatedAt: now }));
+    });
     await fs.unlink(temp).catch(() => {});
   } catch {}
 }

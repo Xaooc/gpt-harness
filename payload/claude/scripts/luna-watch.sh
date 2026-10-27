@@ -14,6 +14,7 @@
 # Exits when every job has reached a terminal state.
 
 set -u
+. "$(cd "$(dirname "$0")" && pwd)/lib/luna-win-runtime.sh"
 IDLE_S="${LUNA_WATCH_IDLE_S:-300}"; POLL_S=15
 while getopts "i:p:" opt; do
   case "$opt" in i) IDLE_S="$OPTARG" ;; p) POLL_S="$OPTARG" ;; *) exit 2 ;; esac
@@ -21,16 +22,41 @@ done
 shift $((OPTIND - 1))
 [ $# -ge 1 ] || { echo "usage: luna-watch.sh [-i idle_s] [-p poll_s] <out.md> [...]" >&2; exit 2; }
 
-declare -A size stalled since_move done_
-BOOT_EPOCH="$(node -e 'process.stdout.write(String(Math.floor(Date.now()/1000-require("os").uptime())))' 2>/dev/null)" || BOOT_EPOCH=0
+declare -A size stalled since_move done_ identity_at identity_key identity_bad
+BOOT_EPOCH="$(node -e 'process.stdout.write(String(Math.floor(Date.now()/1000-require("os").uptime())))' \
+  2>/dev/null)" || BOOT_EPOCH=0
 now_s() { date +%s; }
 # luna.sh records an MSYS pid, luna-pool.mjs a Windows pid: alive if either view knows it.
 pid_alive() {
-  kill -0 "$1" 2>/dev/null && return 0
-  command -v tasklist >/dev/null 2>&1 || return 1
-  tasklist //FI "PID eq $1" //NH 2>/dev/null | grep -qE "(^|[[:space:]])$1([[:space:]]|$)"
+  local pid="$1" expected="$2" mode="$3" out="$4" now actual key
+  luna_pid_alive "$pid" msys || luna_pid_alive "$pid" || return 1
+  [ -n "$expected" ] || return 0
+  now=$(now_s); key="$pid:$expected:$mode"
+  if [ $(( now - ${identity_at[$out]:-0} )) -ge 60 ]; then
+    actual=$(luna_pid_start "$pid" "$mode")
+    identity_at[$out]=$now; identity_key[$out]="$key"; identity_bad[$out]=0
+    if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then identity_bad[$out]=1; fi
+  fi
+  [ "${identity_key[$out]:-}" != "$key" ] || [ "${identity_bad[$out]:-0}" != 1 ]
 }
 field() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -1; }
+daemon_job_pid() {
+  local out="$1" profile="$2" job="$3" directory
+  directory=$(luna_daemon_home "$profile") || return 1
+  if command -v cygpath >/dev/null 2>&1; then
+    directory=$(cygpath -m "$directory"); out=$(cygpath -m "$out")
+  fi
+  node -e '
+    try {
+      const fs = require("fs"), d = JSON.parse(fs.readFileSync(`${process.argv[1]}/daemon.json`, "utf8"));
+      const marker = fs.readFileSync(`${process.argv[2]}.daemon`, "utf8");
+      const get = (key) => marker.match(new RegExp(`^${key}=(.*)$`, "m"))?.[1]?.trim();
+      if (get("id") === process.argv[3] && Number(get("daemon_pid")) === d.pid) {
+        process.stdout.write(`${d.pid}\n`);
+      }
+    } catch {}
+  ' "$directory" "$out" "$job" 2>/dev/null
+}
 
 while :; do
   pending=0
@@ -45,13 +71,22 @@ while :; do
     esac
     pending=1
     pid="$(field pid "$st")"
+    pid_start="$(field pid_start "$st")"
+    pid_mode=""
+    engine=$(field engine "$st")
+    if [ "$engine" = exec ]; then
+      pid_mode=msys
+    elif [ "$engine" = daemon ] && [ -z "$pid" ]; then
+      pid=$(daemon_job_pid "$out" "$(field daemon_profile "$st")" "$(field daemon_job "$st")")
+      pid_start=$(field daemon_start "$out.daemon")
+    fi
     gone_reason=""
     if [ "$state" = running ]; then
       started="$(field started "$st")"; started_epoch=""
       if [ -n "$started" ]; then started_epoch="$(date -d "$started" +%s 2>/dev/null)" || started_epoch=""; fi
       if [ "$BOOT_EPOCH" -gt 0 ] && [ -n "$started_epoch" ] && [ "$started_epoch" -lt "$BOOT_EPOCH" ]; then
         gone_reason="started before last boot"
-      elif [ -n "$pid" ] && ! pid_alive "$pid"; then
+      elif [ -n "$pid" ] && ! pid_alive "$pid" "$pid_start" "$pid_mode" "$out"; then
         gone_reason="pid $pid is dead"
       fi
     fi
@@ -63,6 +98,12 @@ while :; do
       done_[$out]=1; continue
     fi
     [ "$state" = running ] || continue          # starting / waiting-ram: not a stall
+    if [ "$(field retry_waiting "$st")" = 1 ]; then
+      t=$(now_s)
+      if [ -n "${stalled[$out]:-}" ]; then echo "RESUMED $out after $(( t - ${since_move[$out]} ))s idle"; fi
+      since_move[$out]=$t; stalled[$out]=""
+      continue
+    fi
     cur=$(stat -c %s "$log" 2>/dev/null || echo 0); t=$(now_s)
     if [ "$cur" != "${size[$out]:-}" ]; then
       if [ -n "${stalled[$out]:-}" ]; then echo "RESUMED $out after $(( t - ${since_move[$out]} ))s idle"; fi

@@ -9,7 +9,8 @@ TEST_HOME="$ROOT/home"
 mkdir -p "$TEST_HOME"
 export HOME="$TEST_HOME"
 passed=0; failed=0; serial=0
-declare -a clients=()
+declare -a clients=() client_outs=()
+test_child=""
 native() {
   if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s\n' "$1"; fi
 }
@@ -17,9 +18,16 @@ HELPER=$(native "$ROOT/helper.mjs")
 PIDS=$(native "$ROOT/pids")
 helper() { node "$HELPER" "$@"; }
 cleanup() {
-  local pid daemon_home
-  for pid in "${clients[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
-  for daemon_home in "$ROOT"/daemon-*; do helper stop "$(native "$daemon_home")" >/dev/null 2>&1 || true; done
+  local pid daemon_home i
+  for i in "${!clients[@]}"; do
+    pid="${clients[$i]}"
+    verified_client "$pid" "${client_outs[$i]}" && kill -TERM "$pid" 2>/dev/null || true
+  done
+  for daemon_home in "$ROOT"/daemon-*; do
+    helper stop "$(native "$daemon_home/daemon-net")" >/dev/null 2>&1 || true
+    helper stop "$(native "$daemon_home")" >/dev/null 2>&1 || true
+  done
+  if [ -n "$test_child" ]; then kill -TERM "$test_child" 2>/dev/null || true; wait "$test_child" 2>/dev/null || true; fi
   helper cleanup ignored "$PIDS" >/dev/null 2>&1 || true
   # ROOT was resolved above and belongs only to this test; never delete a caller-supplied directory.
   case "$ROOT" in /luna-client-test.*|/*/luna-client-test.*) rm -rf -- "$ROOT" ;; esac
@@ -28,9 +36,28 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 cat > "$ROOT/helper.mjs" <<'JS'
 import { appendFileSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { request } from 'node:http';
+import path from 'node:path';
 const [action, home, route, arg] = process.argv.slice(2);
 const info = () => JSON.parse(readFileSync(`${home}/daemon.json`, 'utf8'));
+function processInfo(pid) {
+  if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return null;
+  const command = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}'; ` +
+    `if ($p) { [Console]::Out.WriteLine($p.CreationDate.ToString('o')); ` +
+    '[Console]::Out.WriteLine($p.CommandLine) }';
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
+    encoding: 'utf8', windowsHide: true, timeout: 10000
+  });
+  const [start, ...lines] = (result.stdout || '').trim().split(/\r?\n/);
+  return result.status === 0 && start && lines.length ? { start, command: lines.join(' ') } : null;
+}
+function recorded(pid, records, name) {
+  try { process.kill(pid, 0); } catch { return false; }
+  const current = processInfo(pid);
+  return current && records.some((item) => item.pid === pid && item.start === current.start) &&
+    current.command.toLowerCase().includes(name);
+}
 async function api(method, route, body) {
   const d = info();
   return new Promise((resolve, reject) => {
@@ -52,7 +79,11 @@ try {
   if (action === 'ready') {
     const d = info(), h = await api('GET', '/health');
     if (!h.ok || h.pid !== d.pid) process.exit(1);
-    appendFileSync(route, `${d.pid}\n${h.appServerPid}\n`);
+    for (const [pid, name] of [[d.pid, 'luna-daemon.mjs'], [h.appServerPid, 'luna-daemon-stub.mjs']]) {
+      const current = processInfo(pid);
+      if (!current || !current.command.toLowerCase().includes(name)) throw new Error('unverified test process');
+      appendFileSync(route, `${JSON.stringify({ pid, start: current.start })}\n`);
+    }
   } else if (action === 'api') {
     const body = arg ? readFileSync(arg, 'utf8') : undefined;
     process.stdout.write(JSON.stringify(await api(body ? 'POST' : 'GET', route, body)));
@@ -82,11 +113,23 @@ try {
     }
   } else if (action === 'stop') {
     await api('POST', '/stop');
+  } else if (action === 'verify-client') {
+    const current = processInfo(Number(route));
+    const [out, start] = arg.split('|');
+    const command = current?.command.toLowerCase() || '';
+    if (!current || (start && start !== current.start) || !command.includes('luna.sh') ||
+        !command.includes(path.basename(out).toLowerCase())) process.exit(1);
   } else if (action === 'kill') {
-    process.kill(info().pid, 'SIGKILL');
+    const records = readFileSync(route, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
+    const pid = info().pid;
+    if (!recorded(pid, records, 'luna-daemon.mjs')) throw new Error('daemon identity changed');
+    process.kill(pid, 'SIGKILL');
   } else if (action === 'cleanup') {
-    for (const pid of new Set(readFileSync(route, 'utf8').trim().split(/\s+/).map(Number))) {
-      if (pid > 0) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    const records = readFileSync(route, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
+    for (const pid of new Set(records.map((item) => item.pid))) {
+      if (recorded(pid, records, 'luna-daemon.mjs') || recorded(pid, records, 'luna-daemon-stub.mjs')) {
+        try { process.kill(pid, 'SIGKILL'); } catch {}
+      }
     }
   }
 } catch (error) {
@@ -96,14 +139,32 @@ try {
 JS
 cat > "$ROOT/fake-exec" <<'SH'
 #!/usr/bin/env bash
-out=""
+out=""; dir=""; mode=first; ephemeral=0
+if [ -n "${LUNA_FAKE_ARGS:-}" ]; then printf 'BEGIN\n%s\n' "$@" >> "$LUNA_FAKE_ARGS"; fi
 while [ $# -gt 0 ]; do
-  case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+  case "$1" in
+    -o) out="$2"; shift 2 ;; -C) dir="$2"; shift 2 ;;
+    resume) mode=resume; shift ;; --ephemeral) ephemeral=1; shift ;; *) shift ;;
+  esac
 done
-cat >/dev/null
+prompt=$(cat)
 printf 'TEMP=%s\nTMP=%s\nTMPDIR=%s\n' "${TEMP:-}" "${TMP:-}" "${TMPDIR:-}"
 if [ -f "${TEMP:-}/.owner" ]; then printf 'TEMP_OWNER=%s\n' "$(cat "$TEMP/.owner")"; fi
 if [ "${LUNA_FAKE_WAIT:-0}" = 1 ]; then sleep 60; fi
+if [ "$mode" = first ] && [ -n "${LUNA_FAKE_ERROR:-}" ]; then
+  id=01234567-89ab-cdef-0123-456789abcdef
+  if [ "$ephemeral" = 0 ] && [ "${LUNA_FAKE_NO_SESSION:-0}" != 1 ]; then
+    mkdir -p "$CODEX_HOME/sessions/test"
+    if command -v cygpath >/dev/null 2>&1; then dir=$(cygpath -m "$dir"); fi
+    node -e 'process.stdout.write(JSON.stringify({type:"session_meta",payload:{id:process.argv[1],
+      cwd:require("path").resolve(process.argv[2]),timestamp:new Date().toISOString()}})+"\n")' "$id" "$dir" \
+      > "$CODEX_HOME/sessions/test/rollout-$id.jsonl"
+  fi
+  [ "${LUNA_FAKE_QUIET_SESSION:-0}" = 1 ] || printf 'session id: %s\n' "$id"
+  printf 'ERROR: %s\n' "$LUNA_FAKE_ERROR"
+  exit 1
+fi
+if [ "$mode" = resume ]; then printf '%s\n' "$prompt" > "$LUNA_FAKE_RESUME_PROMPT"; fi
 printf 'fake exec answer\n' > "$out"
 printf 'fake-exec\n' >> "$LUNA_FAKE_AUDIT"
 SH
@@ -133,6 +194,15 @@ wait_turn() {
   done
   return 1
 }
+wait_daemon_ready() {
+  local launcher_pid="$1" end=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$end" ]; do
+    kill -0 "$launcher_pid" 2>/dev/null || return 1
+    helper ready "$LUNA_DAEMON_HOME" "$PIDS" >/dev/null 2>&1 && return 0
+    sleep 0.2
+  done
+  return 1
+}
 start_daemon() {
   serial=$((serial + 1))
   DAEMON_DIR="$ROOT/daemon-$serial"; mkdir -p "$DAEMON_DIR"
@@ -144,6 +214,7 @@ start_daemon() {
   export LUNA_DAEMON_IDLE_S=0 LUNA_DAEMON_RAMP_MS=10 LUNA_DAEMON_RPC_TIMEOUT_MS=1000
   export LUNA_RAM_RESERVE_MB=0 LUNA_DAEMON_TURN_MB=0 LUNA_DAEMON=1 LUNA_NO_GATE=1
   export LUNA_LOW_PRIORITY=0 LUNA_JOB_TEMP=1 LUNA_NO_REGISTRY=1
+  export LUNA_NET=0 LUNA_MODEL_RETRY_DELAY_S=0
   export LUNA_RAMP_S=0 LUNA_WAIT_MAX_S=40 LUNA_IDLE_MAX_S=0 LUNA_TIMEOUT_S=0
   export LUNA_NO_PREAMBLE=1 LUNA_NO_REFUSAL_RETRY=1 LUNA_STUB_DELAY_MS=1500
   export LUNA_FAKE_AUDIT="$(native "$ROOT/fake-audit")"
@@ -153,25 +224,32 @@ start_daemon() {
     "$(native "$SCRIPT_DIR/lib/luna-daemon-stub.mjs")" "$(native "$DAEMON_DIR/audit")")
   export LUNA_DAEMON_APP_SERVER_CMD
   node "$(native "$SCRIPT_DIR/luna-daemon.mjs")" --serve > "$DAEMON_DIR/launcher.log" 2>&1 &
-  clients+=("$!")
-  local end=$((SECONDS + 30))
-  while [ "$SECONDS" -lt "$end" ]; do
-    helper ready "$LUNA_DAEMON_HOME" "$PIDS" >/dev/null 2>&1 && return 0
-    sleep 0.2
-  done
-  return 1
+  wait_daemon_ready "$!"
 }
 run_client() {
   local name="$1" mode="$2" prompt="$3"
   OUT="$ROOT/$name.md"
   bash "$SCRIPT_DIR/luna.sh" "$mode" ${CLIENT_MODEL:+-m "$CLIENT_MODEL"} -C "$ROOT" -o "$OUT" "$prompt" \
     > "$OUT.stdout" 2> "$OUT.stderr" &
-  CLIENT=$!; clients+=("$CLIENT")
+  CLIENT=$!; clients+=("$CLIENT"); client_outs+=("$OUT")
 }
 reap() { if wait "$1"; then RC=0; else RC=$?; fi; }
-equals() { [ "$1" = "$2" ]; }
+equals() { [ "$1" = "$2" ] && return 0; printf '  got: [%s] expected: [%s]
+' "$1" "$2"; return 1; }
+not_contains() { ! grep -qF -- "$1" "$2"; }
 starts_with() { case "$1" in "$2"*) return 0 ;; *) return 1 ;; esac; }
-hard_kill() { taskkill //PID "$(cat /proc/$1/winpid)" //T //F >/dev/null 2>&1 || true; }
+verified_client() {
+  local pid="$1" out="$2" winpid start
+  winpid=$(cat "/proc/$pid/winpid" 2>/dev/null) || return 1
+  start=$(field wrapper_start "$out.status")
+  helper verify-client ignored "$winpid" "$(native "$out")|$start" >/dev/null 2>&1
+}
+hard_kill() {
+  if wait_state "$OUT" running && verified_client "$1" "$OUT" &&
+      taskkill //PID "$(cat "/proc/$1/winpid")" //T //F >/dev/null 2>&1; then return 0; fi
+  helper cancel "$LUNA_DAEMON_HOME" "$(native "$OUT.daemon")" >/dev/null 2>&1 || true
+  return 1
+}
 killed_without_trap() {
   case "$(field state "$OUT.status")" in
     starting|queued|running|waiting-*) return 0 ;;
@@ -192,6 +270,23 @@ if start_daemon; then
   check 'LUNA_OWNER is propagated ahead of session id' helper owner \
     "$LUNA_DAEMON_HOME" "$(native "$OUT.daemon")" client-owner
 
+  mkdir -p "$ROOT/curl-stubs"
+  LUNA_REAL_CURL=$(command -v curl); export LUNA_REAL_CURL
+  export LUNA_CURL_ARGS="$(native "$ROOT/curl-args")"
+  cat > "$ROOT/curl-stubs/curl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >> "$LUNA_CURL_ARGS"
+exec "$LUNA_REAL_CURL" "$@"
+SH
+  chmod +x "$ROOT/curl-stubs/curl"
+  token=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1])).token)' \
+    "$(native "$DAEMON_DIR/daemon.json")")
+  PATH="$ROOT/curl-stubs:$PATH" run_client curl-argv -r hello
+  reap "$CLIENT"
+  check 'curl capture job completes' equals "$RC" 0
+  check 'curl argv was captured' test -s "$ROOT/curl-args"
+  check 'daemon token never appears in curl argv' not_contains "$token" "$ROOT/curl-args"
+
   LUNA_OWNER= CLAUDE_CODE_SESSION_ID=client-session run_client session-owner -r hello
   reap "$CLIENT"
   check 'session id is the fallback owner' helper owner \
@@ -200,6 +295,10 @@ if start_daemon; then
   LUNA_OWNER= CLAUDE_CODE_SESSION_ID= run_client pid-owner -r hello
   reap "$CLIENT"
   check 'client pid is the final fallback owner' helper owner "$LUNA_DAEMON_HOME" "$(native "$OUT.daemon")" pid
+
+  CLIENT_MODEL=terra run_client terra-alias -r hello
+  reap "$CLIENT"
+  check 'terra alias selects gpt-6.1-terra' equals "$(field model "$OUT.status")" gpt-6.1-terra
 
   run_client holder -r 'WAIT holder'; holder_pid=$CLIENT; holder_out=$OUT
   check 'holder turn started' wait_turn "$holder_out"
@@ -221,7 +320,12 @@ if start_daemon; then
 
   run_client term -r 'WAIT term'
   check 'TERM target turn started' wait_turn "$OUT"
-  kill -TERM "$CLIENT"; reap "$CLIENT"
+  if wait_state "$OUT" running && verified_client "$CLIENT" "$OUT"; then
+    kill -TERM "$CLIENT"
+  else
+    helper cancel "$LUNA_DAEMON_HOME" "$(native "$OUT.daemon")" >/dev/null 2>&1 || true
+  fi
+  reap "$CLIENT"
   check 'TERM returns 130' equals "$RC" 130
   check 'cancel reaches daemon' cancelled_in_audit "$OUT"
 
@@ -230,7 +334,7 @@ if start_daemon; then
 
   run_client die-read -r 'WAIT die-read'
   check 'read retry target turn started' wait_turn "$OUT"
-  helper kill "$LUNA_DAEMON_HOME"
+  helper kill "$LUNA_DAEMON_HOME" "$PIDS" || helper cancel "$LUNA_DAEMON_HOME" "$(native "$OUT.daemon")"
   reap "$CLIENT"; check 'daemon death retries read-only through exec' equals "$RC" 0
   check 'fake exec wrote retry answer' grep -q 'fake exec answer' "$OUT"
 else
@@ -238,10 +342,33 @@ else
 fi
 
 if start_daemon; then
+  LUNA_NET=1 run_client net-one -w 'network one'; first_pid=$CLIENT; first_out=$OUT
+  LUNA_NET=1 run_client net-two -w 'network two'; second_pid=$CLIENT; second_out=$OUT
+  reap "$first_pid"; first_rc=$RC
+  reap "$second_pid"; second_rc=$RC
+  check 'network write jobs complete on the daemon' equals "$first_rc:$second_rc" '0:0'
+  check 'network jobs record the net profile' \
+    equals "$(field engine "$first_out.status"):$(field daemon_profile "$first_out.status")" 'daemon:net'
+  check 'network jobs share one daemon' equals "$(field daemon_pid "$first_out.daemon")" \
+    "$(field daemon_pid "$second_out.daemon")"
+  check 'network app-server receives network config' \
+    equals "$(grep '"event":"spawn"' "$DAEMON_DIR/audit" | grep -c 'sandbox_workspace_write.network_access=true')" 1
+  check 'network daemon process is recorded for cleanup' helper ready "$LUNA_DAEMON_HOME/daemon-net" "$PIDS"
+  node "$(native "$SCRIPT_DIR/luna-daemon.mjs")" --status > "$ROOT/both-status"
+  check 'status reports both daemon profiles' grep -q '"profile":"net"' "$ROOT/both-status"
+  helper stop "$LUNA_DAEMON_HOME/daemon-net" >/dev/null
+  helper stop "$LUNA_DAEMON_HOME" >/dev/null
+else
+  check 'network profile test daemon starts' false
+fi
+
+if start_daemon; then
   before=$(wc -l < "$ROOT/fake-audit" 2>/dev/null || echo 0)
   run_client die-write -w 'WAIT die-write'
   check 'write target turn started' wait_turn "$OUT"
-  helper kill "$LUNA_DAEMON_HOME"
+  check 'LUNA_NET=0 retains the daemon write path' \
+    equals "$(field engine "$OUT.status"):$(field net "$OUT.status")" 'daemon:0'
+  helper kill "$LUNA_DAEMON_HOME" "$PIDS" || helper cancel "$LUNA_DAEMON_HOME" "$(native "$OUT.daemon")"
   reap "$CLIENT"; check 'daemon death fails write job' equals "$RC" 1
   after=$(wc -l < "$ROOT/fake-audit" 2>/dev/null || echo 0)
   check 'write job never uses exec retry' equals "$before" "$after"
@@ -256,36 +383,35 @@ if start_daemon; then
   while [ -f "$DAEMON_DIR/daemon.json" ] && [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
   export LUNA_DAEMON_QUEUE_MAX=1
   node "$(native "$SCRIPT_DIR/luna-daemon.mjs")" --serve >> "$DAEMON_DIR/launcher.log" 2>&1 &
-  clients+=("$!")
-  end=$((SECONDS + 30))
-  until helper ready "$LUNA_DAEMON_HOME" "$PIDS" >/dev/null 2>&1; do
-    [ "$SECONDS" -lt "$end" ] || break
-    sleep 0.2
-  done
-  run_client full-holder -r 'WAIT full-holder'; holder_pid=$CLIENT; holder_out=$OUT
-  check 'queue-full holder started' wait_turn "$holder_out"
-  run_client full-queued -r 'DELAY:2500 full-queued'; queued_pid=$CLIENT; queued_out=$OUT
-  check 'queue-full queued client visible' wait_state "$queued_out" queued
-  run_client full-retry -r 'DELAY:1500 full-retry'; retry_pid=$CLIENT; retry_out=$OUT
-  check '429 reports waiting-daemon' wait_state "$retry_out" waiting-daemon
-  helper cancel "$LUNA_DAEMON_HOME" "$(native "$holder_out.daemon")" >/dev/null
-  reap "$retry_pid"; check '429 retries to success' equals "$RC" 0
-  check '429 uses daemon answer' grep -q 'answer DELAY:1500 full-retry' "$retry_out"
-  reap "$queued_pid"; reap "$holder_pid"
+  launcher_pid=$!
+  if wait_daemon_ready "$launcher_pid"; then
+    run_client full-holder -r 'WAIT full-holder'; holder_pid=$CLIENT; holder_out=$OUT
+    check 'queue-full holder started' wait_turn "$holder_out"
+    run_client full-queued -r 'DELAY:2500 full-queued'; queued_pid=$CLIENT; queued_out=$OUT
+    check 'queue-full queued client visible' wait_state "$queued_out" queued
+    run_client full-retry -r 'DELAY:1500 full-retry'; retry_pid=$CLIENT; retry_out=$OUT
+    check '429 reports waiting-daemon' wait_state "$retry_out" waiting-daemon
+    helper cancel "$LUNA_DAEMON_HOME" "$(native "$holder_out.daemon")" >/dev/null
+    reap "$retry_pid"; check '429 retries to success' equals "$RC" 0
+    check '429 uses daemon answer' grep -q 'answer DELAY:1500 full-retry' "$retry_out"
+    reap "$queued_pid"; reap "$holder_pid"
 
-  run_client expiry-holder -r 'WAIT expiry-holder'; holder_pid=$CLIENT; holder_out=$OUT
-  check '429 expiry holder started' wait_turn "$holder_out"
-  run_client expiry-queued -r 'WAIT expiry-queued'; queued_pid=$CLIENT; queued_out=$OUT
-  check '429 expiry queue populated' wait_state "$queued_out" queued
-  before=$(wc -l < "$ROOT/fake-audit")
-  LUNA_WAIT_MAX_S=1 run_client full-timeout -r hello
-  reap "$CLIENT"; check '429 wait budget returns 75' equals "$RC" 75
-  check '429 timeout reports daemon queue full' equals "$(field error "$OUT.status")" 'daemon queue full'
-  check '429 timeout never falls back to exec' equals "$before" "$(wc -l < "$ROOT/fake-audit")"
-  helper cancel "$LUNA_DAEMON_HOME" "$(native "$queued_out.daemon")" >/dev/null
-  helper cancel "$LUNA_DAEMON_HOME" "$(native "$holder_out.daemon")" >/dev/null
-  reap "$queued_pid"; reap "$holder_pid"
-  helper stop "$LUNA_DAEMON_HOME" >/dev/null
+    run_client expiry-holder -r 'WAIT expiry-holder'; holder_pid=$CLIENT; holder_out=$OUT
+    check '429 expiry holder started' wait_turn "$holder_out"
+    run_client expiry-queued -r 'WAIT expiry-queued'; queued_pid=$CLIENT; queued_out=$OUT
+    check '429 expiry queue populated' wait_state "$queued_out" queued
+    before=$(wc -l < "$ROOT/fake-audit")
+    LUNA_WAIT_MAX_S=1 run_client full-timeout -r hello
+    reap "$CLIENT"; check '429 wait budget returns 75' equals "$RC" 75
+    check '429 timeout reports daemon queue full' equals "$(field error "$OUT.status")" 'daemon queue full'
+    check '429 timeout never falls back to exec' equals "$before" "$(wc -l < "$ROOT/fake-audit")"
+    helper cancel "$LUNA_DAEMON_HOME" "$(native "$queued_out.daemon")" >/dev/null
+    helper cancel "$LUNA_DAEMON_HOME" "$(native "$holder_out.daemon")" >/dev/null
+    reap "$queued_pid"; reap "$holder_pid"
+    helper stop "$LUNA_DAEMON_HOME" >/dev/null
+  else
+    check 'queue-test daemon restarts' false
+  fi
 else
   check 'queue-test daemon starts' false
 fi
@@ -369,11 +495,24 @@ if start_daemon; then
   check '409 output conflict records rc 1' equals "$(field rc "$OUT.status")" 1
   check '409 output conflict error is preserved' equals "$(field error "$OUT.status")" \
     'output or log already in use by another daemon job'
+  sleep 2
+  check '409 status survives further holder polling' \
+    equals "$(field state "$OUT.status"):$(field rc "$OUT.status"):$(field error "$OUT.status")" \
+      'failed:1:output or log already in use by another daemon job'
   check '409 never falls back to exec' equals "$before" "$(wc -l < "$ROOT/fake-audit")"
   check '409 restores the live job marker' equals "$(field id "$holder_out.daemon")" \
     "$(printf '%s\n' "$holder_marker" | sed -n 's/^id=//p')"
-  helper cancel "$LUNA_DAEMON_HOME" "$(native "$holder_out.daemon")" >/dev/null
+  if bash "$SCRIPT_DIR/luna-stop.sh" "$holder_out" > "$holder_out.stop" 2>&1 &&
+      grep -q 'cancelled live daemon job' "$holder_out.stop"; then
+    check 'luna-stop cancels the live job after a 409' true
+  else
+    check 'luna-stop cancels the live job after a 409' false
+    helper cancel "$LUNA_DAEMON_HOME" "$(native "$holder_out.daemon")" >/dev/null
+  fi
   reap "$holder_pid"
+  check '409 status survives holder exit' \
+    equals "$(field state "$OUT.status"):$(field rc "$OUT.status"):$(field error "$OUT.status")" \
+      'failed:1:output or log already in use by another daemon job'
   helper stop "$LUNA_DAEMON_HOME" >/dev/null
 else
   check 'conflict-test daemon starts' false
@@ -454,6 +593,37 @@ else
   check 'off-switch daemon starts' false
 fi
 
+if LUNA_DAEMON_TEST_PROTOCOL=1 start_daemon; then
+  run_client old-protocol -r hello
+  reap "$CLIENT"
+  check 'old daemon protocol falls back to exec' equals "$RC:$(field engine "$OUT.status")" '0:exec'
+  check 'old daemon protocol is not sent a new turn' \
+    equals "$(helper turns "$(native "$DAEMON_DIR/audit")" $'hello\n')" 0
+else
+  check 'legacy protocol test daemon starts' false
+fi
+
+. "$SCRIPT_DIR/lib/luna-win-runtime.sh"
+unverified="$ROOT/unverified-wrapper"
+printf 'state=running\nengine=daemon\nwrapper_pid=%s\n' "$$" > "$unverified.status"
+bash "$SCRIPT_DIR/luna-stop.sh" "$unverified" > "$unverified.stdout" 2> "$unverified.stderr"
+stop_rc=$?
+check 'live unrelated legacy wrapper is not stopped' equals "$stop_rc" 3
+check 'unverified wrapper is reported accurately' grep -q "cannot verify wrapper $$; not stopped" "$unverified.stderr"
+check 'unverified wrapper process remains alive' kill -0 "$$"
+
+sleep 60 & test_child=$!
+child_start=$(luna_pid_start "$test_child" msys)
+printf 'state=running\nengine=exec\nwrapper_pid=%s\npid=%s\nchild_start=%s\n' \
+  "$$" "$test_child" "$child_start" > "$unverified.status"
+bash "$SCRIPT_DIR/luna-stop.sh" "$unverified" > "$unverified.stdout" 2> "$unverified.stderr"
+stop_rc=$?
+check 'verified exec child is stopped when wrapper is unverified' equals "$stop_rc" 0
+check 'child fallback reports what was stopped' grep -q 'stopped verified Codex child' "$unverified.stdout"
+kill -TERM "$test_child" 2>/dev/null || true
+wait "$test_child" 2>/dev/null || true
+test_child=""
+
 export LUNA_DAEMON=0
 DAEMON_DIR="$ROOT/exec-temp"; mkdir -p "$DAEMON_DIR/tmp"
 export LUNA_DAEMON_HOME="$(native "$DAEMON_DIR")"
@@ -522,6 +692,66 @@ check 'unwritable job TEMP records inherited fallback and reason' \
   grep -q '^job_temp=inherited reason=mkdir-failed$' "$OUT.status"
 check 'unwritable job TEMP prints one warning' \
   equals "$(grep -c 'warning: job_temp=inherited reason=mkdir-failed' "$OUT.stderr")" 1
+
+unset LUNA_NET
+export CODEX_HOME="$TEST_HOME/.codex"
+LUNA_DAEMON=0 LUNA_FAKE_ERROR='Selected model is at capacity.' \
+  LUNA_FAKE_ARGS="$(native "$ROOT/retry-args")" LUNA_FAKE_RESUME_PROMPT="$(native "$ROOT/resume-prompt")" \
+  LUNA_CODEX_SHELL_PATH='/luna-test-sh.exe' run_client exec-model-retry -w hello
+reap "$CLIENT"
+check 'write model retry succeeds through exec' equals "$RC:$(field state "$OUT.status")" '0:done'
+check 'write model retry records retry and network' \
+  equals "$(field model_retry "$OUT.status"):$(field net "$OUT.status")" '1:1'
+check 'explicit exec network write selects exec' equals "$(field engine "$OUT.status")" exec
+check 'resume includes continuation prompt' grep -q '^LUNA AUTO-RETRY 1/2:' "$ROOT/resume-prompt"
+check 'resume retains network access' \
+  equals "$(grep -Fc 'sandbox_workspace_write.network_access=true' "$ROOT/retry-args")" 2
+check 'resume retains Windows sandbox' equals "$(grep -Fc 'windows.sandbox="unelevated"' "$ROOT/retry-args")" 2
+check 'resume retains custom shell' equals "$(grep -Fc 'allow_login_shell=false' "$ROOT/retry-args")" 2
+check 'resume retains the model' equals "$(grep -Fxc 'gpt-6-luna' "$ROOT/retry-args")" 2
+check 'retry uses a persistent session' not_contains '--ephemeral' "$ROOT/retry-args"
+check 'retry removes its rollout' test ! -e \
+  "$CODEX_HOME/sessions/test/rollout-01234567-89ab-cdef-0123-456789abcdef.jsonl"
+
+LUNA_FAKE_ERROR='Selected model is at capacity.' LUNA_FAKE_QUIET_SESSION=1 \
+  LUNA_FAKE_ARGS="$(native "$ROOT/store-retry-args")" \
+  LUNA_FAKE_RESUME_PROMPT="$(native "$ROOT/store-resume-prompt")" run_client exec-store-retry -w hello
+reap "$CLIENT"
+check 'missing log session id resumes the matching rollout' equals "$RC:$(field model_retry "$OUT.status")" '0:1'
+check 'rollout recovery resumes the recorded id' \
+  grep -qx '01234567-89ab-cdef-0123-456789abcdef' "$ROOT/store-retry-args"
+
+LUNA_FAKE_ERROR='Selected model is at capacity.' LUNA_FAKE_QUIET_SESSION=1 LUNA_FAKE_NO_SESSION=1 \
+  run_client exec-no-session -w hello
+reap "$CLIENT"
+check 'missing rollout records no-session' equals "$RC:$(field model_retry_error "$OUT.status")" '1:no-session'
+check 'missing rollout is explained in the log' grep -q 'no session id; not retried' "$OUT.log"
+
+LUNA_MODEL_RETRY_DELAY_S=5 LUNA_FAKE_ERROR='Selected model is at capacity.' \
+  LUNA_FAKE_RESUME_PROMPT="$(native "$ROOT/jitter-prompt")" run_client exec-jitter -w hello
+end=$((SECONDS + 30))
+while [ "$(field retry_waiting "$OUT.status")" != 1 ] && [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
+delay_ms=$(field retry_delay_ms "$OUT.status")
+check 'exec retry delay is within jitter bounds' node -e '
+  const n = Number(process.argv[1]); process.exit(Number.isInteger(n) && n >= 5000 && n <= 6500 ? 0 : 1);
+' "$delay_ms"
+reap "$CLIENT"
+check 'jittered exec retry completes' equals "$RC" 0
+delay_s=$(node -e '
+  const n = Number(process.argv[1]); process.stdout.write((n / 1000).toFixed(3));
+' "$delay_ms")
+check 'exec retry log records the actual delay' grep -qF "in ${delay_s}s" "$OUT.log"
+
+LUNA_FAKE_ERROR="You've hit your usage limit. Try again later." run_client exec-model-usage -w hello
+reap "$CLIENT"
+check 'non-retryable model error fails through exec' equals "$RC:$(field state "$OUT.status")" '1:failed'
+check 'non-retryable model error records zero retries' equals "$(field model_retry "$OUT.status")" 0
+
+LUNA_MODEL_RETRIES=0 LUNA_FAKE_ERROR='Selected model is at capacity.' \
+  LUNA_FAKE_ARGS="$(native "$ROOT/no-retry-args")" run_client exec-no-retry -w hello
+reap "$CLIENT"
+check 'disabled model retry fails immediately' equals "$RC:$(field model_retry "$OUT.status")" '1:0'
+check 'disabled model retry uses an ephemeral session' grep -qx -- '--ephemeral' "$ROOT/no-retry-args"
 
 # A file as the state directory prevents daemon startup, without touching any real daemon.
 export LUNA_DAEMON=1

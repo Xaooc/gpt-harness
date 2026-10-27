@@ -96,6 +96,18 @@ test("human correction has explicit classification, previous assistant context a
   assert.equal(event.id, common.eventId(event.type, event.session, event.source));
 });
 
+test("provenance rejects parent path components with either separator", async () => {
+  const file = transcript([human("нет, я же сказал не трогать конфиг")]);
+  await run();
+  const [event] = events("user_correction");
+  assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
+  for (const separator of ["/", "\\"]) {
+    const source = `${path.dirname(file)}${separator}..${separator}project${separator}session.jsonl#L1`;
+    assert.deepEqual(await verifyEventProvenance({ ...event, source }),
+      { ok: false, reason: "invalid transcript path" });
+  }
+});
+
 test("copied transcript UUIDs deduplicate all entry event types and keep the first source", async () => {
   const rows = [
     human("нет, я же сказал не трогать конфиг", { uuid: "correction-uuid" }),
@@ -709,7 +721,8 @@ test("eventDigest covers every event field except captured and ignores nested ke
 });
 
 test("capture does not attest untrusted job events or events without a status hash", async () => {
-  const out = write(path.join(HOME_CLAUDE, "repo", "review.out.md"), "Assumption: local defaults\nTop concern: finding\n");
+  const out = write(path.join(HOME_CLAUDE, "repo", "review.out.md"),
+    "Assumption: local defaults\nTop concern: finding\n");
   write(out.replace(".out.md", ".brief.md"), "Review scope");
   job(out);
   transcript([human("нет, исправь"), bash(`bash luna.sh -o "${toWinPath(out)}"`)]);

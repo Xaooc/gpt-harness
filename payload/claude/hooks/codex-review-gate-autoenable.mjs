@@ -55,17 +55,10 @@ async function main() {
 
   // 3. Import the plugin's own state helpers so slug/hash math stays identical
   //    to what the Stop hook uses when it reads the flag back.
-  const pluginRoot = path.join(
-    os.homedir(),
-    ".claude",
-    "plugins",
-    "marketplaces",
-    "openai-codex",
-    "plugins",
-    "codex",
-    "scripts",
-    "lib",
-  );
+  const { codexPluginRoot } = await import("../scripts/lib/codex-plugin.mjs");
+  const installedRoot = codexPluginRoot();
+  if (!installedRoot) return;
+  const pluginRoot = path.join(installedRoot, "scripts", "lib");
   const statePath = path.join(pluginRoot, "state.mjs");
   const workspacePath = path.join(pluginRoot, "workspace.mjs");
   if (!fs.existsSync(statePath) || !fs.existsSync(workspacePath)) return;

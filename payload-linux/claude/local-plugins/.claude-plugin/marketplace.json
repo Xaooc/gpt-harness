@@ -1,0 +1,5 @@
+{
+  "name": "luna-local",
+  "owner": { "name": "local" },
+  "plugins": [{ "name": "luna-panel", "source": "./luna-panel" }]
+}

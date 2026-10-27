@@ -1,10 +1,16 @@
 # luna-harness package spec (shared contract for all build slices)
 
-Goal: a private git repo that an agent on ANOTHER Windows 10/11 machine clones, runs one installer, builds the custom
+Goal: a private git repo that an agent on another Windows or Linux machine clones and runs one installer. On Windows it builds the custom
 Codex, and gets exactly the same Claude Code + Codex orchestration as the source machine: the `luna`/`luna-critics`
 skills, the Luna daemon & wrappers, heavy-command gate, broker reaper, the Luna pane plugin, the self-learning loop
 (code + config, NO personal data), the patched Codex plugin, and the custom Codex build with busybox shell.
-The owner's personal rules (global CLAUDE.md, skills text) are shipped AS-IS (owner decision).
+The Windows owner's personal rules are shipped as-is. Linux carries the server rules with host-specific details removed.
+
+On Linux, the installer uses the server-derived `payload-linux/`, stock Codex 0.164.0 and an unpatched plugin.
+Linux prerequisites are Node 22+, bash, curl, python3 and `npm i -g @openai/codex@0.164.0`; GSD is recommended.
+No custom Codex build, busybox or tray widget is required. Set `LUNA_PROXY_ENV_FILE` for an optional proxy environment
+file; it defaults to `~/.config/luna-proxy.env` and falls back to `~/.config/bro-env.sh` if the default is absent.
+Linux disk-audit defaults to no repositories; configure `~/.claude/disk-audit.json` before auditing specific projects.
 
 ## Layout (repo root = C:/dev/luna-harness)
 ```
@@ -16,6 +22,10 @@ payload/manifest.json                 file list (slice S1)
 payload/claude/...                    mirrors ~/.claude (slice S1)
 payload/settings/hooks.json           settings fragments with placeholders (slice S1)
 payload/claude-md/harness-section.md  global CLAUDE.md content (slice S1)
+payload-linux/manifest.json           Linux file list and hashes
+payload-linux/claude/...              Linux server scripts, hooks, skills and local plugin
+payload-linux/settings/hooks.json     Linux hook registrations and local marketplace
+payload-linux/claude-md/harness-section.md  portable Linux global rules
 payload/codex-plugin-patches/         patched + orig plugin files and their manifest (slice S1)
 payload/claude/scripts/luna-harness-plugin-patch.mjs  shared patch engine + silent session repair command
 codex-build/                          custom Codex build kit (slice S3)
@@ -35,12 +45,16 @@ codex-build/                          custom Codex build kit (slice S3)
   verify sha256 after copy).
 - All files under `payload/codex-plugin-patches/` are also installed under
   `<CLAUDE_HOME>/luna-harness/codex-plugin-patches/` so session repair works without the checkout.
+- Linux uses the same schema without `pluginPatches`. Its `settingsSha256` and `claudeMdSha256` cover the two
+  non-installed source files, and `executable: true` marks scripts that need executable permissions on Linux.
+  Linux includes the snapshot's tests, pytest gate and disk/changeset tooling; GSD hooks and runtime data are excluded.
 
 ## Installation, upgrades, and uninstall
 
-Before writing, the installer verifies every source hash, parses settings (UTF-8 BOM accepted, comments rejected),
-validates a single ordered CLAUDE.md marker pair or no markers, substitutes the hook fragment, and validates both
-copies of every plugin patch. `--dry-run` performs validation and planning without creating files or directories.
+The installer selects `payload/` on `win32` and `payload-linux/` on `linux`; `--platform win32|linux` overrides this
+for testing. Before writing, it verifies source hashes, parses settings (UTF-8 BOM accepted, comments rejected),
+validates a single ordered CLAUDE.md marker pair or no markers, substitutes the hook fragment, and on Windows
+validates both copies of every plugin patch. `--dry-run` plans without writes; `--check` installs and runs checks.
 
 After installation, `<CLAUDE_HOME>/luna-harness.installed.json` is written atomically:
 ```json
@@ -85,6 +99,8 @@ Never remove `luna-run/`, `learning/`, or any `.bak-luna-harness*` / `.orig-luna
 ```
 Placeholders (installer substitutes): `{{NODE}}` = absolute node.exe path with forward slashes;
 `{{CLAUDE_HOME}}` = `<home>/.claude` with forward slashes; `{{CLAUDE_HOME_WIN}}` = same with backslashes.
+On Linux `{{NODE}}` is the Node executable, the local marketplace uses `{{CLAUDE_HOME}}/local-plugins`,
+and the heavy-gate hooks match `Bash` rather than `Bash|PowerShell`.
 Entries omit `matcher` when the source entry has none. Merge identity of a hook entry = event name + the script
 path inside the command (e.g. `scripts/heavy-gate.mjs` + first argument `hook-pre`).
 
@@ -120,12 +136,17 @@ originals, logs actions to `luna-run/plugin-patch.log`, and remembers unknown fi
 `--self-test` uses disposable fixtures. `CLAUDE_HOME` can override the default `<home>/.claude` for this script/hook.
 
 ## Machine-specific settings
+On Linux, `LUNA_PROXY_ENV_FILE` selects an optional file with proxy exports. If unset, the default is
+`~/.config/luna-proxy.env`, with `~/.config/bro-env.sh` as a legacy fallback when that default is absent.
+Linux does not create `luna-harness.env` or set a custom Codex build root.
+
 `<home>/.claude/luna-harness.env` (KEY=VALUE lines, written by the installer):
 - `LUNA_CUSTOM_CODEX_ROOT=<Windows path of the custom Codex build root>`; default when absent:
   `%USERPROFILE%\codex-build`. The custom codex binary is `<root>\dist\bin\codex.exe`.
 Scripts read this file when the env var of the same name is not set.
 
 ## Excluded from the package
-Backups (`*.bak-*`, `*.orig*` except inside codex-plugin-patches/orig), `luna-run/`, learning DATA (everything in
+Windows excludes backups (`*.bak-*`, `*.orig*` except inside codex-plugin-patches/orig), `luna-run/`, learning DATA (everything in
 `~/.claude/learning/` except `config.json`), GSD tooling (`scripts/changeset/`, `scripts/lib/cli-exit.cjs`,
 `scripts/lib/allowlist-ratchet.cjs`), `scripts/pytest_gate.py`, plugin caches other than the patch files.
+Linux excludes GSD hooks and the GSD managed-hooks registry, backups, caches, runtime data and the Windows tray app.

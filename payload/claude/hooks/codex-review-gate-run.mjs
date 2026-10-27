@@ -21,7 +21,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
-function main() {
+function main(codexPluginRoot) {
   // Read the Stop event payload CC sends on stdin (cwd, last_assistant_message,
   // session_id, ...). Forward it verbatim to the plugin hook.
   let input = "";
@@ -36,9 +36,8 @@ function main() {
   // both doubled every review and, racing on the same broker.json, orphaned one broker + codex.exe per turn.
   // While this sentinel exists the plugin's own hook does the review alone; delete it to bring this runner back.
   if (fs.existsSync(path.join(home, ".claude", "codex-gate-runner-off"))) return;
-  const pluginRoot = path.join(
-    home, ".claude", "plugins", "marketplaces", "openai-codex", "plugins", "codex",
-  );
+  const pluginRoot = codexPluginRoot(home);
+  if (!pluginRoot) return;
   const gateHook = path.join(pluginRoot, "scripts", "stop-review-gate-hook.mjs");
   const pluginData = path.join(home, ".claude", "plugins", "data", "codex-openai-codex");
   if (!fs.existsSync(gateHook)) return; // plugin source missing → no-op
@@ -61,7 +60,8 @@ function main() {
 }
 
 try {
-  main();
+  const { codexPluginRoot } = await import("../scripts/lib/codex-plugin.mjs");
+  main(codexPluginRoot);
 } catch {
   process.exitCode = 0;
 }

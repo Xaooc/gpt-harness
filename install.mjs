@@ -1,6 +1,6 @@
 /**
- * Node >= 20. Usage: node install.mjs [--home <dir>] [--codex-build-root <winpath>]
- *   [--dry-run] [--check] [--no-plugin-patch] [--yes] [--uninstall]
+ * Usage: node install.mjs [--home <dir>] [--platform win32|linux] [--codex-build-root <winpath>]
+ *   [--dry-run] [--check] [--no-plugin-patch] [--yes] [--uninstall] [--help]
  * Run node install.mjs --self-test for isolated tests using a tiny temporary payload.
  */
 import assert from 'node:assert/strict';
@@ -20,31 +20,41 @@ const BEGIN = '<!-- luna-harness:begin -->';
 const END = '<!-- luna-harness:end -->';
 const CHECK_TIMEOUT = 300_000;
 const RECORD = 'luna-harness.installed.json';
+const USAGE = 'Usage: node install.mjs [--home <dir>] [--platform win32|linux] [--codex-build-root <winpath>]\n'
+  + '  [--dry-run] [--check] [--no-plugin-patch] [--yes] [--uninstall] [--self-test] [--help]';
 
 function parseArgs(args) {
-  const options = { home: os.homedir(), payload: path.join(REPO_ROOT, 'payload') };
+  const options = { home: os.homedir(), platform: process.platform };
+  let platformExplicit = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--home' || arg === '--codex-build-root') {
+    if (arg === '--home' || arg === '--codex-build-root' || arg === '--platform') {
       const value = args[++i];
       if (!value || value.startsWith('--')) throw new Error(`Missing value for ${arg}`);
-      options[arg === '--home' ? 'home' : 'codexBuildRoot'] = value;
+      const key = arg === '--home' ? 'home' : arg === '--platform' ? 'platform' : 'codexBuildRoot';
+      options[key] = value;
+      if (arg === '--platform') platformExplicit = true;
     } else {
       const flags = {
         '--dry-run': 'dryRun', '--check': 'check', '--no-plugin-patch': 'noPluginPatch',
-        '--yes': 'yes', '--self-test': 'selfTest', '--uninstall': 'uninstall',
+        '--yes': 'yes', '--self-test': 'selfTest', '--uninstall': 'uninstall', '--help': 'help',
       };
       if (!flags[arg]) throw new Error(`Unknown option: ${arg}`);
       options[flags[arg]] = true;
     }
   }
+  if (!['win32', 'linux'].includes(options.platform) && (platformExplicit || (!options.help && !options.selfTest))) {
+    throw new Error(`Unsupported platform: ${options.platform}; expected win32 or linux`);
+  }
   options.home = path.resolve(options.home);
+  options.payload = path.join(REPO_ROOT, options.platform === 'linux' ? 'payload-linux' : 'payload');
   return options;
 }
 
 function makeContext(options) {
   return {
     ...options,
+    platform: options.platform ?? process.platform,
     claudeHome: path.join(options.home, '.claude'),
     written: 0,
     skipped: 0,
@@ -201,9 +211,36 @@ function homeEnvironment(ctx) {
 }
 
 function preflight(ctx) {
-  report(ctx, process.platform === 'win32' ? 'ok' : 'warn', `Platform: ${process.platform} (Windows intended)`);
-  if (Number(process.versions.node.split('.')[0]) < 20) throw new Error('Node >= 20 is required');
+  report(ctx, 'ok', `Platform: ${ctx.platform}`);
+  const minNode = ctx.platform === 'linux' ? 22 : 20;
+  if (Number(process.versions.node.split('.')[0]) < minNode) throw new Error(`Node >= ${minNode} is required`);
   report(ctx, 'ok', `Node ${process.versions.node}`);
+  if (ctx.platform === 'linux') {
+    if (process.platform !== 'linux') {
+      report(ctx, 'warn', `Linux PATH and Codex model checks skipped on ${process.platform}`);
+      return;
+    }
+    const required = ['node', 'bash', 'curl', 'python3'];
+    const found = Object.fromEntries(required.map(name => [name, findExecutable(name)]));
+    for (const name of required) {
+      report(ctx, found[name] ? 'ok' : 'warn', found[name] ? `${name}: ${found[name]}` : `${name} not found on PATH`);
+    }
+    ctx.bash = found.bash;
+    const codex = findExecutable('codex');
+    if (!codex) report(ctx, 'warn', 'codex not found on PATH; install @openai/codex@0.164.0');
+    else {
+      report(ctx, 'ok', `codex: ${codex}`);
+      if (ctx.dryRun) report(ctx, 'warn', 'Codex model check skipped during dry-run to avoid CLI writes');
+      else {
+        const models = runCommand(codex, ['debug', 'models'], { env: homeEnvironment(ctx) });
+        const available = models.status === 0 && /\bgpt-6\.1-terra\b/.test(commandOutput(models));
+        report(ctx, available ? 'ok' : 'warn', available ? 'Codex model available: gpt-6.1-terra'
+          : 'codex debug models did not list gpt-6.1-terra');
+      }
+    }
+    if (required.some(name => !found[name])) throw new Error('Missing required Linux PATH executables');
+    return;
+  }
   ctx.bash = findBash();
   report(ctx, ctx.bash ? 'ok' : 'warn', ctx.bash ? `Git Bash: ${ctx.bash}` : 'Git Bash not found');
   const curl = findExecutable('curl');
@@ -229,14 +266,29 @@ function installFiles(ctx, manifest) {
     if (!['file', 'config-if-absent', 'binary'].includes(file.kind)) {
       throw new Error(`Unknown payload kind: ${file.kind}`);
     }
+    if (file.executable !== undefined && typeof file.executable !== 'boolean') {
+      throw new Error(`Invalid executable flag: ${file.src}`);
+    }
     const source = resolveInside(ctx.payload, file.src);
     const bytes = fs.readFileSync(source);
     assertHash(bytes, file.sha256, source);
-    writeManaged(ctx, resolveInside(ctx.claudeHome, file.dest), bytes, {
+    const target = resolveInside(ctx.claudeHome, file.dest);
+    const wrote = writeManaged(ctx, target, bytes, {
       dest: ctx.prepared ? file.dest : undefined,
       configIfAbsent: file.kind === 'config-if-absent',
       sha256: file.kind === 'binary' ? file.sha256 : undefined,
     });
+    if (ctx.platform === 'linux' && process.platform !== 'win32' && file.executable && !ctx.dryRun) {
+      const mode = fs.statSync(target).mode & 0o777;
+      const executableMode = mode | ((mode & 0o444) >> 2) | 0o100;
+      if (mode !== executableMode) {
+        fs.chmodSync(target, executableMode);
+        if (!wrote) {
+          ctx.written++;
+          report(ctx, 'ok', `Made executable ${target}`);
+        }
+      }
+    }
   }
 }
 
@@ -524,7 +576,7 @@ function runChecks(ctx, runner = runCommand) {
     }
     if (check.bash && !ctx.bash) {
       failed++;
-      report(ctx, 'FAIL', `FAIL | ${check.label}: Git Bash unavailable`);
+      report(ctx, 'FAIL', `FAIL | ${check.label}: ${ctx.platform === 'linux' ? 'bash' : 'Git Bash'} unavailable`);
       continue;
     }
     let command = process.execPath;
@@ -556,8 +608,12 @@ function printSummary(ctx) {
   ctx.log(`Warnings: ${ctx.warnings.length}`);
   for (const warning of ctx.warnings) ctx.log(`  - ${warning}`);
   if (!ctx.uninstall) {
-    ctx.log('Next steps: build custom Codex using codex-build/BUILD.md if needed;');
-    ctx.log('  install codex@openai-codex via /plugin install codex@openai-codex, then re-run install.mjs.');
+    if (ctx.platform === 'linux') {
+      ctx.log('Next steps: install codex@openai-codex via /plugin install codex@openai-codex.');
+    } else {
+      ctx.log('Next steps: build custom Codex using codex-build/BUILD.md if needed;');
+      ctx.log('  install codex@openai-codex via /plugin install codex@openai-codex, then re-run install.mjs.');
+    }
   }
 }
 
@@ -617,6 +673,9 @@ function prepareInstall(ctx, manifest) {
     if (!['file', 'config-if-absent', 'binary'].includes(file.kind)) {
       throw new Error(`Unknown payload kind: ${file.kind}`);
     }
+    if (file.executable !== undefined && typeof file.executable !== 'boolean') {
+      throw new Error(`Invalid executable flag: ${file.src}`);
+    }
     const source = resolveInside(ctx.payload, file.src);
     assertHash(fs.readFileSync(source), file.sha256, source);
     const target = resolveInside(ctx.claudeHome, file.dest);
@@ -626,19 +685,30 @@ function prepareInstall(ctx, manifest) {
   }
   const settingsPath = path.join(ctx.claudeHome, 'settings.json');
   const settings = fs.existsSync(settingsPath) ? requireObject(readJson(settingsPath), 'settings.json') : {};
-  const fragment = substitutePlaceholders(readJson(resolveInside(ctx.payload, manifest.settings)), ctx.claudeHome);
+  const settingsSource = resolveInside(ctx.payload, manifest.settings);
+  if (ctx.platform === 'linux' || Object.hasOwn(manifest, 'settingsSha256')) {
+    assertHash(fs.readFileSync(settingsSource), manifest.settingsSha256, settingsSource);
+  }
+  const fragment = substitutePlaceholders(readJson(settingsSource), ctx.claudeHome);
   const hooks = hookIdentities(mergeSettings({}, structuredClone(fragment)));
   const droppedHooks = (ctx.record?.hooks ?? []).filter(identity => !hooks.includes(identity));
   removeHooks(null, settings, droppedHooks);
   mergeSettings(settings, structuredClone(fragment));
   const md = readOptional(path.join(ctx.claudeHome, 'CLAUDE.md'));
   if (md) markerRange(md.toString('utf8'));
-  fs.readFileSync(resolveInside(ctx.payload, manifest.claudeMd));
-  const patches = loadPatchSet(resolveInside(ctx.payload, manifest.pluginPatches));
-  for (const root of expandRoots(ctx.claudeHome, patches.roots)) {
-    for (const file of patches.files) resolveInside(root, file.rel);
+  const mdSource = resolveInside(ctx.payload, manifest.claudeMd);
+  const mdBytes = fs.readFileSync(mdSource);
+  if (ctx.platform === 'linux' || Object.hasOwn(manifest, 'claudeMdSha256')) {
+    assertHash(mdBytes, manifest.claudeMdSha256, mdSource);
   }
-  if (ctx.codexBuildRoot && /[\r\n]/.test(ctx.codexBuildRoot)) {
+  let patches = null;
+  if (ctx.platform === 'win32') {
+    patches = loadPatchSet(resolveInside(ctx.payload, manifest.pluginPatches));
+    for (const root of expandRoots(ctx.claudeHome, patches.roots)) {
+      for (const file of patches.files) resolveInside(root, file.rel);
+    }
+  }
+  if (ctx.platform === 'win32' && ctx.codexBuildRoot && /[\r\n]/.test(ctx.codexBuildRoot)) {
     throw new Error('Custom Codex root cannot contain a newline');
   }
   ctx.droppedHooks = droppedHooks;
@@ -712,7 +782,7 @@ function saveRecord(ctx, manifest, restoration, created) {
   const commit = runCommand('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT });
   const repoCommit = commit.status === 0 ? commit.stdout.trim() : null;
   const patches = ctx.prepared.patches;
-  const patchedFiles = ctx.noPluginPatch ? [] : expandRoots(ctx.claudeHome, patches.roots).flatMap(root =>
+  const patchedFiles = ctx.noPluginPatch || !patches ? [] : expandRoots(ctx.claudeHome, patches.roots).flatMap(root =>
     patches.files.flatMap(file => {
       const target = resolveInside(root, file.rel);
       const bytes = readOptional(target);
@@ -773,7 +843,10 @@ function uninstall(ctx) {
   const mdPath = path.join(ctx.claudeHome, 'CLAUDE.md');
   const md = readOptional(mdPath);
   const range = md ? markerRange(md.toString('utf8')) : null;
-  const patches = uninstallPatchSet(ctx);
+  const patches = ctx.platform === 'win32' ? uninstallPatchSet(ctx) : null;
+  if (!patches && ctx.platform === 'linux' && ctx.record.pluginFiles?.length) {
+    report(ctx, 'warn', 'Recorded Windows plugin patches were left untouched on Linux');
+  }
   if (previous) {
     const backup = readOptional(`${settingsPath}${BACKUP_SUFFIX}`);
     if (!backup) backupOnce(ctx, settingsPath);
@@ -830,9 +903,9 @@ function removeEmptyParents(ctx, dests) {
   }
 }
 
-function install(ctx) {
+function install(ctx, preflightFn = preflight) {
   if (ctx.uninstall) return uninstall(ctx);
-  preflight(ctx);
+  preflightFn(ctx);
   let checkStatus = 0;
   if (!(ctx.dryRun && ctx.check)) {
     const manifest = readJson(path.join(ctx.payload, 'manifest.json'));
@@ -843,17 +916,20 @@ function install(ctx) {
     const created = {
       createdSentinel: ctx.record?.createdSentinel === true
         || !fs.existsSync(path.join(ctx.claudeHome, 'codex-gate-runner-off')),
-      createdEnv: ctx.record?.createdEnv === true || !fs.existsSync(path.join(ctx.claudeHome, 'luna-harness.env')),
+      createdEnv: ctx.record?.createdEnv === true || (ctx.platform === 'win32'
+        && !fs.existsSync(path.join(ctx.claudeHome, 'luna-harness.env'))),
     };
     pruneUpgrade(ctx, manifest);
     installFiles(ctx, manifest);
     installSettings(ctx, resolveInside(ctx.payload, manifest.settings));
     installClaudeMd(ctx, resolveInside(ctx.payload, manifest.claudeMd));
-    installEnv(ctx);
+    if (ctx.platform === 'win32') installEnv(ctx);
     installSentinel(ctx);
-    if (ctx.noPluginPatch) skip(ctx, 'Plugin patches disabled by --no-plugin-patch');
-    else patchPlugins(ctx, resolveInside(ctx.payload, manifest.pluginPatches));
-    checkCustomCodex(ctx);
+    if (ctx.platform === 'win32') {
+      if (ctx.noPluginPatch) skip(ctx, 'Plugin patches disabled by --no-plugin-patch');
+      else patchPlugins(ctx, resolveInside(ctx.payload, manifest.pluginPatches));
+      checkCustomCodex(ctx);
+    }
     saveRecord(ctx, manifest, restoration, created);
   }
   if (ctx.check) checkStatus = runChecks(ctx);
@@ -929,6 +1005,7 @@ function snapshot(root) {
 function selfTest() {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'luna-harness-self-test-'));
   let passed = 0;
+  const winContext = options => makeContext({ platform: 'win32', ...options });
   const test = (name, action) => {
     action();
     passed++;
@@ -937,13 +1014,90 @@ function selfTest() {
   try {
     const fixture = fakePayload(temp);
     const { payload, manifest } = fixture;
-    const ctx = makeContext({ home: path.join(temp, 'home with spaces'), payload, log: () => {} });
+    const ctx = winContext({ home: path.join(temp, 'home with spaces'), payload, log: () => {} });
     const ch = ctx.claudeHome;
     const settingsPath = path.join(ch, 'settings.json');
     const fragmentPath = path.join(payload, manifest.settings);
     const mdSource = path.join(payload, manifest.claudeMd);
     const mdPath = path.join(ch, 'CLAUDE.md');
     const json = value => `${JSON.stringify(value, null, 2)}\n`;
+    test('platform selection and argument validation', () => {
+      assert.equal(parseArgs(['--platform', 'linux']).payload, path.join(REPO_ROOT, 'payload-linux'));
+      assert.equal(parseArgs(['--platform', 'win32']).payload, path.join(REPO_ROOT, 'payload'));
+      if (['win32', 'linux'].includes(process.platform)) {
+        assert.equal(parseArgs([]).platform, process.platform);
+      }
+      assert.throws(() => parseArgs(['--platform', 'darwin']), /Unsupported platform/);
+      assert.throws(() => parseArgs(['--platform', 'darwin', '--self-test']), /Unsupported platform/);
+      assert.throws(() => parseArgs(['--platform']), /Missing value/);
+      assert.equal(parseArgs(['--help']).help, true);
+      assert.match(USAGE, /--dry-run.*--check/);
+    });
+    test('Linux payload hashes cover installed files and both settings assets', () => {
+      const linuxPayload = path.join(REPO_ROOT, 'payload-linux');
+      const linuxManifest = readJson(path.join(linuxPayload, 'manifest.json'));
+      const listed = new Set(linuxManifest.files.map(file => resolveInside(linuxPayload, file.src)));
+      assert.deepEqual([...listed].sort(), walkFiles(path.join(linuxPayload, 'claude')).sort());
+      assert.ok(linuxManifest.files.some(file => file.dest === 'scripts/lib/luna-linux-test.mjs'));
+      const linuxCtx = makeContext({ home: path.join(temp, 'linux-hash-home'), platform: 'linux',
+        payload: linuxPayload, log: () => {} });
+      prepareInstall(linuxCtx, linuxManifest);
+      for (const key of ['settingsSha256', 'claudeMdSha256']) {
+        assert.match(linuxManifest[key], /^[a-f0-9]{64}$/);
+        assert.throws(() => prepareInstall(linuxCtx, { ...linuxManifest, [key]: '0'.repeat(64) }), /SHA256 mismatch/);
+        assert.throws(() => prepareInstall(linuxCtx, { ...linuxManifest, [key]: undefined }), /SHA256 mismatch/);
+      }
+      assert.equal(fs.existsSync(linuxCtx.home), false);
+    });
+    test('Linux install uses Linux hooks and skips Windows environment and patch steps', () => {
+      const home = path.join(temp, 'linux home with spaces');
+      const options = { home, platform: 'linux', payload: path.join(REPO_ROOT, 'payload-linux'), log: () => {} };
+      const linux = makeContext(options);
+      const plugin = path.join(linux.claudeHome, 'plugins/test/plugin.mjs');
+      atomicWrite(plugin, 'unpatched plugin');
+      const before = snapshot(home);
+      assert.equal(install(makeContext({ ...options, dryRun: true }), () => {}), 0);
+      assert.deepEqual(snapshot(home), before);
+      assert.equal(install(linux, () => {}), 0);
+      assert.equal(fs.readFileSync(plugin, 'utf8'), 'unpatched plugin');
+      assert.equal(fs.existsSync(path.join(linux.claudeHome, 'luna-harness.env')), false);
+      assert.equal(fs.existsSync(path.join(linux.claudeHome, 'bin/luna-sh')), false);
+      assert.equal(fs.existsSync(path.join(linux.claudeHome, 'luna-harness/codex-plugin-patches')), false);
+      assert.equal(fs.existsSync(path.join(linux.claudeHome, 'scripts/pytest_gate.py')), true);
+      const record = readJson(path.join(linux.claudeHome, RECORD));
+      assert.equal(record.createdEnv, false);
+      assert.deepEqual(record.pluginFiles, []);
+      const manifest = readJson(path.join(options.payload, 'manifest.json'));
+      const fragment = substitutePlaceholders(readJson(path.join(options.payload, manifest.settings)), linux.claudeHome);
+      const settings = readJson(path.join(linux.claudeHome, 'settings.json'));
+      assert.equal(fragment.extraKnownMarketplaces['luna-local'].source.path,
+        `${linux.claudeHome.replaceAll('\\', '/')}/local-plugins`);
+      for (const [event, entries] of Object.entries(fragment.hooks)) {
+        for (const entry of entries) for (const hook of entry.hooks) {
+          assert.ok(hook.command.startsWith(`"${process.execPath.replaceAll('\\', '/')}" `));
+          assert.ok(hook.command.includes(`"${linux.claudeHome.replaceAll('\\', '/')}/`));
+          assert.equal(settings.hooks[event].flatMap(item => item.hooks)
+            .filter(item => item.command === hook.command).length, 1);
+        }
+      }
+      assert.equal(fragment.hooks.PreToolUse.find(entry => entry.hooks[0].command.endsWith('hook-pre')).matcher,
+        'Bash');
+      assert.equal(fragment.hooks.PostToolUse.find(entry => entry.hooks[0].command.endsWith('hook-post')).matcher,
+        'Bash');
+      if (process.platform !== 'win32') {
+        const script = path.join(linux.claudeHome, 'scripts/luna.sh');
+        assert.ok(fs.statSync(script).mode & 0o100);
+      }
+      const second = makeContext(options);
+      assert.equal(install(second, () => {}), 0);
+      assert.equal(second.written, 0);
+      const installed = snapshot(home);
+      assert.equal(install(makeContext({ ...options, uninstall: true, dryRun: true })), 0);
+      assert.deepEqual(snapshot(home), installed);
+      assert.equal(install(makeContext({ ...options, uninstall: true })), 0);
+      assert.equal(fs.readFileSync(plugin, 'utf8'), 'unpatched plugin');
+      assert.equal(fs.existsSync(path.join(linux.claudeHome, RECORD)), false);
+    });
     test('placeholder substitution handles Windows backslashes and paths with spaces', () => {
       const result = substitutePlaceholders(readJson(fragmentPath), ch);
       assert.ok(result.hooks.PreToolUse[0].hooks[0].command.includes(process.execPath.replaceAll('\\', '/')));
@@ -1042,7 +1196,7 @@ function selfTest() {
       patchPlugins(ctx, patchManifest);
       assert.equal(fs.readFileSync(plugin, 'utf8'), 'unknown version');
       assert.ok(ctx.warnings.some(warning => warning.includes('plugin version differs')));
-      const missing = makeContext({ home: path.join(temp, 'missing-plugin'), payload, log: () => {} });
+      const missing = winContext({ home: path.join(temp, 'missing-plugin'), payload, log: () => {} });
       patchPlugins(missing, patchManifest);
       assert.ok(missing.warnings.some(warning => warning.includes('/plugin install codex@openai-codex')));
     });
@@ -1073,35 +1227,35 @@ function selfTest() {
       const plugin = path.join(ch, 'plugins/test/plugin.mjs');
       atomicWrite(plugin, fixture.original);
       const before = snapshot(temp);
-      const dry = makeContext({ home: ctx.home, payload, dryRun: true, log: () => {} });
+      const dry = winContext({ home: ctx.home, payload, dryRun: true, log: () => {} });
       install(dry);
       assert.deepEqual(snapshot(temp), before);
-      const missing = makeContext({ home: path.join(temp, 'absent-home'), payload, dryRun: true, log: () => {} });
+      const missing = winContext({ home: path.join(temp, 'absent-home'), payload, dryRun: true, log: () => {} });
       install(missing);
       assert.equal(fs.existsSync(missing.home), false);
       assert.deepEqual(snapshot(temp), before);
     });
     test('full fake-payload installs write zero files and create zero backups on second run', () => {
       const options = { home: path.join(temp, 'fresh-home'), payload, log: () => {} };
-      const first = makeContext(options);
+      const first = winContext(options);
       assert.equal(install(first), 0);
       assert.ok(first.written > 0);
       const before = snapshot(first.home);
-      const second = makeContext(options);
+      const second = winContext(options);
       assert.equal(install(second), 0);
       assert.equal(second.written, 0);
       assert.equal(second.backups, 0);
       assert.deepEqual(snapshot(first.home), before);
     });
     test('dry-run plus check only checks existing installation, even without payload', () => {
-      const check = makeContext({ home: path.join(temp, 'no-home'), payload: 'missing', dryRun: true,
+      const check = winContext({ home: path.join(temp, 'no-home'), payload: 'missing', dryRun: true,
         check: true, log: () => {} });
       assert.equal(install(check), 0);
       assert.equal(fs.existsSync(check.home), false);
     });
     test('check runner isolates home, skips missing files, and propagates child failures', () => {
       const messages = [];
-      const check = makeContext({ home: path.join(temp, 'check-home'), log: message => messages.push(message) });
+      const check = winContext({ home: path.join(temp, 'check-home'), log: message => messages.push(message) });
       const probe = path.join(check.claudeHome, 'scripts/heavy-gate.mjs');
       atomicWrite(probe, '// Fake check target; subprocess results injected for sandbox portability.\n');
       const hook = path.join(check.claudeHome, 'hooks/nested/check.mjs');
@@ -1131,7 +1285,7 @@ function selfTest() {
       const root = path.join(temp, name);
       const fixture = fakePayload(root);
       const options = { home: path.join(root, 'home'), payload: fixture.payload, log: () => {} };
-      const ctx = makeContext(options);
+      const ctx = winContext(options);
       return { ...fixture, ctx, options, ch: ctx.claudeHome };
     }
     test('auto-updated target and backup survive dry-run and real uninstall with the same warning', () => {
@@ -1143,12 +1297,12 @@ function selfTest() {
       atomicWrite(plugin, updated);
       const backup = fs.readFileSync(`${plugin}.orig-luna-harness`);
       const before = snapshot(fixture.ctx.home);
-      const dry = makeContext({ ...fixture.options, uninstall: true, dryRun: true });
+      const dry = winContext({ ...fixture.options, uninstall: true, dryRun: true });
       assert.equal(install(dry), 0);
       assert.deepEqual(snapshot(fixture.ctx.home), before);
       const warning = `${plugin}: changed since install; kept target and backup`;
       assert.ok(dry.warnings.includes(warning));
-      const remove = makeContext({ ...fixture.options, uninstall: true });
+      const remove = winContext({ ...fixture.options, uninstall: true });
       assert.equal(install(remove), 0);
       assert.ok(remove.warnings.includes(warning));
       assert.deepEqual(fs.readFileSync(plugin), updated);
@@ -1161,7 +1315,7 @@ function selfTest() {
       atomicWrite(`${plugin}.orig-luna-harness`, 'unrelated backup');
       assert.equal(install(fixture.ctx), 0);
       assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, []);
-      assert.equal(install(makeContext({ ...fixture.options, uninstall: true })), 0);
+      assert.equal(install(winContext({ ...fixture.options, uninstall: true })), 0);
       assert.equal(fs.readFileSync(plugin, 'utf8'), fixture.patchedB);
       assert.equal(fs.readFileSync(`${plugin}.orig-luna-harness`, 'utf8'), 'unrelated backup');
     });
@@ -1174,7 +1328,7 @@ function selfTest() {
       atomicWrite(backup, fixture.originalB);
       const before = snapshot(fixture.ctx.home);
       const dryMessages = [];
-      const dry = makeContext({ ...fixture.options, dryRun: true, log: message => dryMessages.push(message) });
+      const dry = winContext({ ...fixture.options, dryRun: true, log: message => dryMessages.push(message) });
       assert.equal(install(dry), 0);
       assert.deepEqual(snapshot(fixture.ctx.home), before);
       assert.ok(dryMessages.some(message => message.includes(`Would refresh backup: ${plugin}`)));
@@ -1187,7 +1341,7 @@ function selfTest() {
       assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, ['plugins/test/plugin.mjs']);
       const time = fs.statSync(backup).mtimeMs;
       atomicWrite(plugin, fixture.originalB);
-      assert.equal(install(makeContext(fixture.options)), 0);
+      assert.equal(install(winContext(fixture.options)), 0);
       assert.notEqual(fs.statSync(backup).mtimeMs, time);
       assert.equal(fs.readFileSync(backup, 'utf8'), fixture.originalB);
     });
@@ -1209,7 +1363,7 @@ function selfTest() {
       });
       const inactiveBefore = snapshot(inactive);
       const homeBefore = snapshot(fixture.ctx.home);
-      const dry = makeContext({ ...fixture.options, dryRun: true });
+      const dry = winContext({ ...fixture.options, dryRun: true });
       assert.equal(install(dry), 0);
       assert.deepEqual(snapshot(fixture.ctx.home), homeBefore);
       assert.ok(dry.warnings.includes(`${inactive}: left unpatched, unknown plugin files`));
@@ -1223,7 +1377,7 @@ function selfTest() {
         assert.equal(fs.readFileSync(path.join(active, file.rel), 'utf8'),
           fixture.patchedB.replaceAll('\n', '\r\n'));
       }
-      assert.equal(install(makeContext({ ...fixture.options, uninstall: true })), 0);
+      assert.equal(install(winContext({ ...fixture.options, uninstall: true })), 0);
       assert.deepEqual(snapshot(inactive), inactiveBefore);
       for (const file of patches.files) assert.deepEqual(fs.readFileSync(path.join(active, file.rel)), original);
     });
@@ -1252,9 +1406,9 @@ function selfTest() {
       atomicWrite(plugin, fixture.originalB);
       install(fixture.ctx);
       atomicWrite(`${plugin}.orig-luna-harness`, fixture.original);
-      assert.equal(install(makeContext(fixture.options)), 0);
+      assert.equal(install(winContext(fixture.options)), 0);
       assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, ['plugins/test/plugin.mjs']);
-      const remove = makeContext({ ...fixture.options, uninstall: true });
+      const remove = winContext({ ...fixture.options, uninstall: true });
       assert.equal(install(remove), 0);
       assert.ok(remove.warnings.some(message => message.includes(`${plugin}: backup does not match`)));
       assert.equal(fs.readFileSync(plugin, 'utf8'), fixture.patchedB);
@@ -1270,7 +1424,7 @@ function selfTest() {
         if (available) fs.cpSync(source, path.join(fixture.ch, 'luna-harness/codex-plugin-patches'),
           { recursive: true });
         atomicWrite(path.join(source, 'manifest.json'), 'corrupt');
-        const remove = makeContext({ ...fixture.options, uninstall: true });
+        const remove = winContext({ ...fixture.options, uninstall: true });
         assert.equal(install(remove), 0);
         assert.equal(fs.readFileSync(plugin, 'utf8'), available ? fixture.originalB : fixture.patchedB);
         assert.equal(fs.readFileSync(`${plugin}.orig-luna-harness`, 'utf8'), fixture.originalB);
@@ -1296,15 +1450,15 @@ function selfTest() {
       atomicWrite(unknown, 'unknown plugin');
       atomicWrite(`${unknown}.orig-luna-harness`, 'unrelated backup');
       const before = snapshot(fixture.ctx.home);
-      assert.equal(install(makeContext({ ...fixture.options, dryRun: true })), 0);
+      assert.equal(install(winContext({ ...fixture.options, dryRun: true })), 0);
       assert.deepEqual(snapshot(fixture.ctx.home), before);
       assert.equal(install(fixture.ctx), 0);
       assert.equal(fs.readFileSync(pluginA, 'utf8'), fixture.patched);
       assert.equal(fs.readFileSync(pluginB, 'utf8'), fixture.patchedB.replaceAll('\n', '\r\n'));
       assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, [relA, relB]);
-      assert.equal(install(makeContext(fixture.options)), 0);
+      assert.equal(install(winContext(fixture.options)), 0);
       assert.deepEqual(readJson(path.join(fixture.ch, RECORD)).pluginFiles, [relA, relB]);
-      assert.equal(install(makeContext({ ...fixture.options, uninstall: true })), 0);
+      assert.equal(install(winContext({ ...fixture.options, uninstall: true })), 0);
       assert.deepEqual(fs.readFileSync(pluginA), originalA);
       assert.deepEqual(fs.readFileSync(pluginB), originalB);
       assert.equal(fs.readFileSync(unknown, 'utf8'), 'unknown plugin');
@@ -1350,7 +1504,7 @@ function selfTest() {
       const settings = readJson(settingsPath);
       settings.hooks.PreToolUse[1].hooks.push(foreign);
       atomicWrite(settingsPath, json(settings));
-      const upgrade = makeContext(fixture.options);
+      const upgrade = winContext(fixture.options);
       install(upgrade);
       assert.equal(fs.existsSync(path.join(fixture.ch, 'bin/example.exe')), false);
       assert.equal(fs.readFileSync(script, 'utf8'), 'user edit to retired script');
@@ -1362,7 +1516,7 @@ function selfTest() {
       assert.ok(readJson(settingsPath).hooks.PreToolUse.every(entry => entry.hooks.length > 0));
       fragment.hooks = {};
       atomicWrite(fragmentPath, json(fragment));
-      install(makeContext(fixture.options));
+      install(winContext(fixture.options));
       assert.deepEqual(readJson(settingsPath).hooks.PreToolUse, [{ matcher: 'Bash', hooks: [foreign] }]);
     });
     test('user edits get timestamped backups while managed upgrades do not', () => {
@@ -1372,7 +1526,7 @@ function selfTest() {
       install(fixture.ctx);
       assert.equal(fs.readFileSync(`${script}${BACKUP_SUFFIX}`, 'utf8'), 'before first install');
       atomicWrite(script, 'my local edit');
-      const upgrade = makeContext(fixture.options);
+      const upgrade = winContext(fixture.options);
       install(upgrade);
       const backups = fs.readdirSync(path.dirname(script)).filter(name =>
         /^example\.mjs\.bak-luna-harness-\d{8}-\d{6}(?:-\d+)?$/.test(name));
@@ -1384,7 +1538,7 @@ function selfTest() {
       source.sha256 = sha256('new package version');
       atomicWrite(path.join(fixture.payload, 'manifest.json'), json(fixture.manifest));
       const before = fs.readdirSync(path.dirname(script)).filter(name => name.includes(BACKUP_SUFFIX));
-      install(makeContext(fixture.options));
+      install(winContext(fixture.options));
       assert.deepEqual(fs.readdirSync(path.dirname(script)).filter(name => name.includes(BACKUP_SUFFIX)), before);
       assert.equal(fs.readFileSync(script, 'utf8'), 'new package version');
     });
@@ -1396,7 +1550,7 @@ function selfTest() {
       assert.throws(() => install(fixture.ctx), /JSON|property|Unexpected/i);
       assert.deepEqual(snapshot(fixture.ctx.home), before);
       atomicWrite(settingsPath, '\uFEFF{"foreign":true}\r\n');
-      install(makeContext(fixture.options));
+      install(winContext(fixture.options));
       assert.equal(readJson(settingsPath).foreign, true);
     });
     test('corrupt later payload, invalid markers, and invalid fragment fail before any write', () => {
@@ -1409,12 +1563,12 @@ function selfTest() {
       atomicWrite(binary, original);
       atomicWrite(path.join(fixture.ch, 'CLAUDE.md'), `${END}\n${BEGIN}\n`);
       const before = snapshot(fixture.ctx.home);
-      assert.throws(() => install(makeContext(fixture.options)), /markers/);
+      assert.throws(() => install(winContext(fixture.options)), /markers/);
       assert.deepEqual(snapshot(fixture.ctx.home), before);
       atomicWrite(path.join(fixture.ch, 'CLAUDE.md'), 'User text');
       atomicWrite(path.join(fixture.payload, fixture.manifest.settings), '{"hooks":{"Stop":{}}}');
       const next = snapshot(fixture.ctx.home);
-      assert.throws(() => install(makeContext(fixture.options)), /array/);
+      assert.throws(() => install(winContext(fixture.options)), /array/);
       assert.deepEqual(snapshot(fixture.ctx.home), next);
     });
     test('uninstall round-trip restores exact settings and CLAUDE.md bytes and foreign hooks', () => {
@@ -1432,10 +1586,10 @@ function selfTest() {
       const installed = readJson(path.join(fixture.ch, RECORD));
       assert.equal(installed.createdEnv, true);
       const beforeDry = snapshot(fixture.ctx.home);
-      const dry = makeContext({ ...fixture.options, uninstall: true, dryRun: true });
+      const dry = winContext({ ...fixture.options, uninstall: true, dryRun: true });
       assert.equal(install(dry), 0);
       assert.deepEqual(snapshot(fixture.ctx.home), beforeDry);
-      assert.equal(install(makeContext({ ...fixture.options, uninstall: true })), 0);
+      assert.equal(install(winContext({ ...fixture.options, uninstall: true })), 0);
       assert.deepEqual(fs.readFileSync(settingsPath), settings);
       assert.deepEqual(fs.readFileSync(mdPath), md);
       assert.equal(readJson(settingsPath).hooks.Stop[0].hooks[0].command, 'echo foreign');
@@ -1450,11 +1604,11 @@ function selfTest() {
     test('uninstall of a fresh home removes managed settings and CLAUDE.md; reinstall keeps ownership', () => {
       const fixture = isolated('uninstall-fresh');
       install(fixture.ctx);
-      install(makeContext(fixture.options));
+      install(winContext(fixture.options));
       const record = readJson(path.join(fixture.ch, RECORD));
       assert.equal(record.createdEnv, true);
       assert.equal(record.createdSentinel, true);
-      install(makeContext({ ...fixture.options, uninstall: true }));
+      install(winContext({ ...fixture.options, uninstall: true }));
       for (const file of ['settings.json', 'CLAUDE.md', 'luna-harness.env', 'codex-gate-runner-off', RECORD]) {
         assert.equal(fs.existsSync(path.join(fixture.ch, file)), false, file);
       }
@@ -1467,7 +1621,7 @@ function selfTest() {
       atomicWrite(sentinel, 'user sentinel');
       atomicWrite(path.join(fixture.ch, 'learning/config.json'), '{"user":1}');
       install(fixture.ctx);
-      install(makeContext(fixture.options));
+      install(winContext(fixture.options));
       const record = readJson(path.join(fixture.ch, RECORD));
       assert.equal(record.createdEnv, false);
       assert.equal(record.createdSentinel, false);
@@ -1483,7 +1637,7 @@ function selfTest() {
       atomicWrite(settingsPath, json(settings));
       const mdPath = path.join(fixture.ch, 'CLAUDE.md');
       atomicWrite(mdPath, `${fs.readFileSync(mdPath, 'utf8')}User after\r\n`);
-      const remove = makeContext({ ...fixture.options, uninstall: true });
+      const remove = winContext({ ...fixture.options, uninstall: true });
       install(remove);
       assert.equal(fs.readFileSync(script, 'utf8'), 'edited installed file');
       assert.ok(remove.warnings.some(message => message.includes('Kept locally edited')));
@@ -1500,12 +1654,12 @@ function selfTest() {
     });
     test('uninstall without record or with invalid settings fails without writes', () => {
       const fixture = isolated('uninstall-invalid');
-      assert.throws(() => install(makeContext({ ...fixture.options, uninstall: true })), /record not found/);
+      assert.throws(() => install(winContext({ ...fixture.options, uninstall: true })), /record not found/);
       assert.equal(fs.existsSync(fixture.ctx.home), false);
       install(fixture.ctx);
       atomicWrite(path.join(fixture.ch, 'settings.json'), '{invalid');
       const before = snapshot(fixture.ctx.home);
-      assert.throws(() => install(makeContext({ ...fixture.options, uninstall: true })), /JSON|property|Unexpected/i);
+      assert.throws(() => install(winContext({ ...fixture.options, uninstall: true })), /JSON|property|Unexpected/i);
       assert.deepEqual(snapshot(fixture.ctx.home), before);
     });
     test('recreating a missing env or sentinel on upgrade records installer ownership', () => {
@@ -1519,10 +1673,10 @@ function selfTest() {
       assert.equal(readJson(path.join(fixture.ch, RECORD)).createdSentinel, false);
       fs.unlinkSync(env);
       fs.unlinkSync(sentinel);
-      install(makeContext(fixture.options));
+      install(winContext(fixture.options));
       assert.equal(readJson(path.join(fixture.ch, RECORD)).createdEnv, true);
       assert.equal(readJson(path.join(fixture.ch, RECORD)).createdSentinel, true);
-      install(makeContext({ ...fixture.options, uninstall: true }));
+      install(winContext({ ...fixture.options, uninstall: true }));
       assert.equal(fs.existsSync(env), false);
       assert.equal(fs.existsSync(sentinel), false);
     });
@@ -1545,11 +1699,13 @@ function main() {
   let ctx;
   try {
     const options = parseArgs(process.argv.slice(2));
+    if (options.help) { console.log(USAGE); return 0; }
     if (options.selfTest) return selfTest();
     ctx = makeContext(options);
     return install(ctx);
   } catch (error) {
     console.error(`[FAIL] ${error.message}`);
+    if (!ctx) console.error(USAGE);
     if (ctx) printSummary(ctx);
     return 2;
   }

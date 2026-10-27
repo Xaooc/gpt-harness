@@ -1,5 +1,43 @@
 # INSTALL — for the agent installing luna-harness on a new machine
 
+## Linux installation
+
+The installer selects `payload-linux/` automatically on Linux. Use Node.js 22 or newer, and have `bash`, `curl`,
+`python3`, and `node` on `PATH`. Install the stock Codex CLI and sign in:
+
+```bash
+npm i -g @openai/codex@0.164.0
+codex login
+codex debug models | grep 'gpt-6.1-terra'
+```
+
+Claude Code and its `codex@openai-codex` plugin are also needed. GSD is recommended, just as for Windows: install it
+before this harness using `npx -y @opengsd/gsd-core@latest`, or follow the GSD instructions below. Install the stock
+plugin via `/plugin install codex@openai-codex`; this Linux payload does not patch it or require a custom Codex build.
+
+From the cloned repository run:
+
+```bash
+node install.mjs --dry-run
+node install.mjs --check
+claude plugin install luna-panel@luna-local
+```
+
+`--check` installs the payload and runs the included checks; inspect the PASS/FAIL table. A missing Codex executable
+or missing `gpt-6.1-terra` in the model list is reported as a warning. Restart Claude Code after installation.
+The pane is installed through the local marketplace, and updates require the marketplace and plugin update commands
+shown in the Windows instructions below.
+
+Proxy configuration is optional. When `HTTPS_PROXY` is unset, the wrappers source
+`~/.config/luna-proxy.env`; set `LUNA_PROXY_ENV_FILE` to select another file. For existing installations,
+`~/.config/bro-env.sh` is used only when no override is set and the default file is absent. The shell sources this
+file as shell code, so use a trusted file; the daemon reads only supported proxy and PATH exports.
+
+The disk-audit hook starts with no repositories configured. To use it, add absolute repository paths and their live
+branches to `~/.claude/disk-audit.json`; existing server configurations are preserved.
+
+## Windows installation
+
 You are a Claude Code agent on a fresh Windows 10/11 machine. Follow this file top to bottom. Every step has a check;
 do not continue past a failed check — fix it or report it to your user. Steps marked **[ASK]** download, install or
 need admin rights: ask your user for a clear "yes" first and tell them what will be downloaded or changed.

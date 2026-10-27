@@ -1,4 +1,4 @@
-# Luna shell patch for Codex rust-v0.162.1
+# Luna shell patch for Codex rust-v0.164.0
 
 Select a lightweight shell for local model commands without changing the normal Codex installation.
 Omitting `default_shell` preserves upstream selection, argv, instructions, and sandbox behavior.
@@ -41,9 +41,7 @@ Paths below are relative to `codex-rs/`:
 | `core/src/config/config_tests.rs` | Verify TOML and CLI override layering for both keys. |
 | `core/src/shell.rs` | Select shells with explicit errors and existing fallback precedence. |
 | `core/src/configured_shell_tests.rs` | Selection, validation, override precedence, and sh argv tests. |
-| `core/src/session/session.rs` | Use shell selection and preserve explicit shell precedence. |
-| `core/src/session/turn_context.rs` | Prevent zsh-fork from replacing an explicitly configured executable. |
-| `core/src/session/review.rs` | Apply the same precedence to review turns. |
+| `core/src/session/session.rs` | Use shell selection and preserve explicit shell precedence, including review turns. |
 | `core/src/tools/handlers/unified_exec.rs` | Ignore model shell requests for configured sessions. |
 | `core/src/tools/handlers/unified_exec/exec_command.rs` | Pass shell policy and guidance through the handler. |
 | `core/src/tools/handlers/unified_exec_tests.rs` | Update callers and test configured/unconfigured requests. |

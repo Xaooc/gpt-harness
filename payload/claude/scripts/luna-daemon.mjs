@@ -34,7 +34,7 @@
 // Jobs may include ephemeral (boolean) so each caller's LUNA_KEEP_SESSION setting is preserved.
 // Terminal metadata expires after 600 s; no prompt, final answer, or child process is retained.
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import {
   appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync,
   realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync
@@ -51,12 +51,53 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME = path.resolve(process.env.HOME || homedir());
-const RUN = path.resolve(process.env.LUNA_DAEMON_HOME || path.join(HOME, '.claude', 'luna-run'));
+const BASE_RUN = path.resolve(process.env.LUNA_DAEMON_HOME || path.join(HOME, '.claude', 'luna-run'));
+const profileIndex = process.argv.indexOf('--profile');
+const profileFlag = profileIndex >= 0 ? process.argv[profileIndex + 1] :
+  process.argv.find((arg) => arg.startsWith('--profile='))?.slice('--profile='.length);
+if (profileIndex >= 0 && !profileFlag) throw new Error('missing daemon profile');
+const PROFILE = profileFlag || process.env.LUNA_DAEMON_PROFILE || 'default';
+if (!['default', 'net'].includes(PROFILE)) throw new Error('invalid daemon profile');
+const RUN = PROFILE === 'net' ? path.join(BASE_RUN, 'daemon-net') : BASE_RUN;
 const INFO = path.join(RUN, 'daemon.json');
 const LIMITS = path.join(RUN, 'codex-limits.json');
 const LOG = path.join(RUN, 'daemon.log');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const cleanValue = (value) => String(value ?? '').replace(/[\r\n\0]+/g, ' ').trim();
+let ownStart;
+function processStart(pid) {
+  if (process.platform !== 'win32' || !Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return '';
+  const command = `(Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}').CreationDate.ToString('o')`;
+  const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', command], {
+    encoding: 'utf8', windowsHide: true, timeout: 2500
+  });
+  return result.status === 0 ? (result.stdout || '').trim() : '';
+}
+function selfStart() {
+  if (ownStart === undefined) ownStart = processStart(process.pid);
+  return ownStart;
+}
+const MODEL_RETRY = new RegExp(
+  'at capacity|overloaded|server_error|internal server error|service unavailable|bad gateway|' +
+  'gateway timeout|stream disconnected|high demand|temporarily unavailable|"status":\\s*5[0-9][0-9]|' +
+  '\\b5[0-9]{2}\\b|try again later', 'i');
+const MODEL_NO_RETRY = new RegExp(
+  'usage limit|quota|insufficient|billing|unauthorized|forbidden|\\b4[0-9]{2}\\b|"status":\\s*4[0-9][0-9]|' +
+  '\\b(auth|authentication|authorization|unauthenticated)\\b|api[_ ]key|' +
+  'model_not_found|model not found|unknown model|not supported|invalid|' +
+  'context window|context length|context_length|too long|' +
+  '\\b(stop|stopped|stall|stalled|interrupted|cancelled|canceled)\\b|daemon (crash|crashed|died)', 'i');
+const retryableModelError = (error) => MODEL_RETRY.test(error) && !MODEL_NO_RETRY.test(error);
+const retryDelayMs = (base, retry, jitter = randomInt(301)) =>
+  BigInt(base) * BigInt(retry) * BigInt(1000 + jitter);
+const formatDelay = (ms) => `${ms / 1000n}.${String(ms % 1000n).padStart(3, '0')}`;
+const retryPrompt = (count, limit, error) =>
+  `LUNA AUTO-RETRY ${count}/${limit}: your previous turn was cut off by a model-side error ` +
+  `("${Array.from(cleanValue(error)).slice(0, 300).join('')}"), not by anything you did.\n` +
+  'Continue the SAME task in this same session from where you stopped. ' +
+  'Do not restart and do not redo finished steps:\n' +
+  'first check the current state (files you already edited; `git status` / `git diff` if this is a git repo), then\n' +
+  'finish the remaining work and end with the final message in exactly the format the original instructions require.';
 const nowIso = () => new Date().toISOString();
 const terminal = (job) => ['completed', 'failed', 'cancelled', 'stalled'].includes(job.state);
 const pathKey = (file) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
@@ -108,8 +149,9 @@ function fairQueue(queue, owners) {
 }
 
 function jobView(job) {
-  return job.publishing ? { state: job.shownState, rc: null, error: '' }
-    : { state: job.state, rc: job.rc, error: job.error };
+  const modelRetries = (job.modelRetryOffset || 0) + (job.modelRetryCount || 0);
+  return job.publishing ? { state: job.shownState, rc: null, error: '', modelRetries }
+    : { state: job.state, rc: job.rc, error: job.error, modelRetries };
 }
 
 function pruneTerminalJobs(jobs, now = Date.now()) {
@@ -129,7 +171,7 @@ function expiredLimit(job, now) {
   if (job.timeoutS && now - job.startedAt >= job.timeoutS * 1000) {
     return `exceeded total timeout ${job.timeoutS}s`;
   }
-  if (job.idleMaxS && now - job.lastActivity >= job.idleMaxS * 1000) {
+  if (!job.retryWaiting && job.idleMaxS && now - job.lastActivity >= job.idleMaxS * 1000) {
     return `no events for ${job.idleMaxS}s`;
   }
   return '';
@@ -190,16 +232,23 @@ const secrets = new Set();
 let renameFault = null; // In-process self-test hook; never enabled by job input.
 let testLog = null;
 
-function atomicWrite(file, content, { beforeRename } = {}) {
+function atomicWrite(file, content, { beforeRename, strictPrepare = false, prepareBeforeWrite = false } = {}) {
   const pending = (writes.get(file) || Promise.resolve()).then(async () => {
     const temp = `${file}.tmp`;
     try {
-      await writeFile(temp, content, 'utf8');
       const prepare = async (target) => {
         try { await beforeRename?.(target); }
-        catch (error) { event(`before rename failed ${target}: ${error.message}`); }
+        catch (error) {
+          event(`before rename failed ${target}: ${error.message}`);
+          if (strictPrepare) throw error;
+        }
       };
-      await prepare(temp);
+      if (prepareBeforeWrite) {
+        await writeFile(temp, '', 'utf8');
+        await prepare(temp);
+      }
+      await writeFile(temp, content, 'utf8');
+      if (!prepareBeforeWrite) await prepare(temp);
       let elapsed = 0;
       for (let delay = 10; ; delay *= 2) {
         try {
@@ -209,6 +258,7 @@ function atomicWrite(file, content, { beforeRename } = {}) {
         } catch (error) {
           if (!['EPERM', 'EBUSY', 'EACCES'].includes(error.code)) throw error;
           if (elapsed + delay > 1500) {
+            if (strictPrepare) throw error;
             event(`atomic rename fallback ${file}: ${error.code}`);
             await writeFile(file, content, 'utf8');
             await prepare(file);
@@ -246,6 +296,7 @@ function removeLockDirectory(directory) {
 
 function daemonLock(report = event, directory = path.join(RUN, 'daemon.lock')) {
   let token = null;
+  let identityKey = '', identityAt = 0, identityMismatch = false;
 
   function reclaim() {
     const owner = readLockOwner(directory);
@@ -258,9 +309,20 @@ function daemonLock(report = event, directory = path.join(RUN, 'daemon.lock')) {
       if (age > 600) {
         reason = 'owner age exceeds 600s';
       } else if (age > 5 && /^[1-9]\d*$/.test(owner.pid ?? '') && Number.isSafeInteger(Number(owner.pid))) {
+        let alive = true;
         try { process.kill(Number(owner.pid), 0); } catch (error) {
-          if (error.code === 'ESRCH') reason = `owner pid ${owner.pid} is dead`;
+          if (error.code === 'ESRCH') alive = false;
         }
+        if (alive && owner.pid_start) {
+          const key = `${owner.pid}:${owner.pid_start}`;
+          if (identityKey !== key || now - identityAt >= 60_000) {
+            const actual = processStart(owner.pid);
+            identityKey = key; identityAt = now;
+            identityMismatch = Boolean(actual && actual !== owner.pid_start);
+          }
+          if (identityMismatch) alive = false;
+        }
+        if (!alive) reason = `owner pid ${owner.pid} is dead`;
       }
     } else {
       try {
@@ -324,7 +386,8 @@ function daemonLock(report = event, directory = path.join(RUN, 'daemon.lock')) {
       try {
         const ownerPath = path.join(directory, 'owner');
         writeFileSync(`${ownerPath}.tmp`,
-          `pid=${process.pid}\nkind=luna-daemon\nsince=${Math.floor(Date.now() / 1000)}\ntoken=${token}\n`);
+          `pid=${process.pid}\npid_start=${selfStart()}\n` +
+          `kind=luna-daemon\nsince=${Math.floor(Date.now() / 1000)}\ntoken=${token}\n`);
         renameSync(`${ownerPath}.tmp`, ownerPath);
       } catch (error) {
         token = null;
@@ -566,9 +629,9 @@ async function flushEvents() {
   while (eventWriter) await eventWriter;
 }
 
-function readInfo() {
+function readInfo(directory = RUN) {
   try {
-    const info = JSON.parse(readFileSync(INFO, 'utf8'));
+    const info = JSON.parse(readFileSync(path.join(directory, 'daemon.json'), 'utf8'));
     if (info.version !== 1 || !Number.isInteger(info.pid) || info.pid <= 0) return null;
     if (!Number.isInteger(info.port) || info.port < 1 || info.port > 65535) return null;
     if (!/^[a-f0-9]{32}$/.test(info.token)) return null;
@@ -600,12 +663,14 @@ function httpJson(info, method, route, body, token = info.token, timeoutMs = 300
   });
 }
 
-async function health(info = readInfo(), timeoutMs = 3000) {
+async function health(info = readInfo(), timeoutMs = 3000, allowUnhealthy = false) {
   if (!info) return null;
   try {
     process.kill(info.pid, 0);
     const result = await httpJson(info, 'GET', '/health', undefined, info.token, timeoutMs);
-    return result.status === 200 && result.body.ok && result.body.pid === info.pid ? result.body : null;
+    return result.status === 200 && (result.body.ok || result.body.draining || allowUnhealthy) &&
+      result.body.pid === info.pid
+      ? result.body : null;
   } catch { return null; }
 }
 
@@ -616,7 +681,9 @@ async function discoveryAlive(info = readInfo()) {
   if (process.platform === 'linux') {
     try {
       const command = await readFile(`/proc/${info.pid}/cmdline`, 'utf8');
-      if (!/luna-daemon\.mjs\0--serve(?:\0|$)/.test(command)) return false;
+      const args = command.split('\0');
+      const script = args.findIndex((arg) => /(?:^|[\\/])luna-daemon\.mjs$/.test(arg));
+      if (script < 0 || !args.slice(script + 1).includes('--serve')) return false;
     } catch { return false; }
   }
   return new Promise((resolve) => {
@@ -689,6 +756,7 @@ class AppServer {
     this.stopping = false;
     const config = path.join(process.env.CODEX_HOME || path.join(HOME, '.codex'), 'config.toml');
     const args = [...buildLeanArgs(config), '-c', 'thread_unload_delay_secs=0'];
+    if (PROFILE === 'net') args.push('-c', 'sandbox_workspace_write.network_access=true');
     const shellPath = process.env.LUNA_CODEX_SHELL_PATH;
     this.shell = 'default';
     try {
@@ -872,6 +940,7 @@ async function serve() {
   let app;
   let starting;
   let stopping = false;
+  let draining = false;
   let crashLoop = false;
   let info;
   let idleTimer;
@@ -1026,7 +1095,10 @@ async function serve() {
   }
 
   function marker(job) {
-    const values = { state: job.state, id: job.id, thread: job.thread || '', turn: job.turn || '' };
+    const values = { state: job.state, id: job.id, thread: job.thread || '', turn: job.turn || '',
+      daemon_pid: process.pid, daemon_start: selfStart(),
+      model_retry: job.modelRetryOffset + job.modelRetryCount, retry_waiting: job.retryWaiting ? 1 : 0,
+      retry_delay_ms: job.retryDelayMs || '' };
     if (job.state === 'queued') Object.assign(values, {
       queue_pos: queue.indexOf(job) + 1 || 1, reason: job.reason || 'capacity'
     });
@@ -1073,6 +1145,9 @@ async function serve() {
 
   function finish(job, state, rc, error = '') {
     if (terminal(job)) return;
+    clearTimeout(job.retryTimer);
+    job.retryTimer = null;
+    job.retryWaiting = false;
     job.publishing = true;
     job.shownState = job.state;
     job.state = state;
@@ -1154,10 +1229,13 @@ async function serve() {
   async function cancel(job, error = '', state = 'cancelled', rc = 130) {
     if (terminal(job)) return;
     job.cancelled = true;
+    const waiting = job.retryWaiting && !job.retryStarting;
     // Publish cancellation immediately; keep the slot until interrupt/unload has finished.
     finish(job, state, rc, error);
     if (!job.slot) { void pump(); return; }
-    if (job.turn && job.server && !job.server.dead) {
+    if (waiting) {
+      await unload(job);
+    } else if (job.turn && job.server && !job.server.dead) {
       await interruptAndUnload(job);
     }
     // If thread/start or turn/start is pending, startJob observes cancelled and cleans up.
@@ -1176,6 +1254,8 @@ async function serve() {
     }
     const job = threads.get(p.threadId || p.conversationId);
     if (!job) return;
+    if ((job.retryWaiting && !job.retryStarting) ||
+        (job.retiredTurns && (job.retiredTurns.has(p.turn?.id) || job.retiredTurns.has(p.turnId)))) return;
     job.lastActivity = Date.now();
     if (message.method === 'turn/completed') {
       void refreshLimits('turn');
@@ -1210,12 +1290,92 @@ async function serve() {
       if (typeof final?.text === 'string') job.finalMessage = final.text;
       let error = turn.status === 'completed' ? '' : (turn.error?.message || `turn status ${turn.status}`);
       if (!job.finalMessage?.trim() && !error) error = 'empty final message';
+      if (turn.status === 'failed' && retryableModelError(error) && !job.cancelled && !stopping &&
+          job.server === app && app && !app.dead &&
+          job.modelRetryOffset + job.modelRetryCount < job.modelRetries) {
+        scheduleModelRetry(job, error, turn.id);
+        return;
+      }
       void (async () => {
         if (!await atomicWrite(job.out, job.finalMessage || '')) error = 'final output write failed';
         await unload(job);
         error ||= job.cleanupError || '';
         if (!terminal(job)) finish(job, error ? 'failed' : 'completed', error ? 1 : 0, error);
       })();
+    }
+  }
+
+  function scheduleModelRetry(job, error, turnId) {
+    const server = job.server;
+    const count = ++job.modelRetryCount;
+    const retry = job.modelRetryOffset + count;
+    const delayMs = retryDelayMs(job.modelRetryDelayS, retry);
+    job.retryDelayMs = String(delayMs);
+    const delayS = formatDelay(delayMs);
+    const note = cleanValue(error);
+    appendLog(job, `luna: model error: ${note}; retry ${retry}/${job.modelRetries} on the same session in ${delayS}s\n`,
+      true);
+    event(`job ${job.id} model retry ${retry}/${job.modelRetries} in ${delayS}s after: ${note}`);
+    // Ignore late events from failed turns when the thread is reused.
+    (job.retiredTurns ||= new Set()).add(turnId || job.turn);
+    job.completing = false;
+    job.turnEnded = false;
+    job.ended = null;
+    job.finalMessage = '';
+    job.turn = '';
+    job.retryWaiting = true;
+    job.retryStarting = false;
+    job.lastActivity = job.heartbeatAt = Date.now();
+    void marker(job);
+    if (admissionJob === job) {
+      clearTimeout(admissionTimer);
+      admissionTimer = setTimeout(() => releaseAdmission(job), rampMs);
+    }
+    let remaining = delayMs;
+    const schedule = () => {
+      const delay = Number(remaining > 2_147_483_647n ? 2_147_483_647n : remaining);
+      job.retryTimer = setTimeout(() => {
+        remaining -= BigInt(delay);
+        if (remaining > 0n && !terminal(job) && !job.cancelled && !stopping && job.server === app && !server.dead) {
+          schedule();
+        } else void retryTurn(job, server, error, count);
+      }, delay);
+    };
+    schedule();
+  }
+
+  async function retryTurn(job, server, error, count) {
+    job.retryTimer = null;
+    if (terminal(job) || job.cancelled) return;
+    if (stopping || job.server !== server || app !== server || server.dead) {
+      finish(job, 'failed', 1, error);
+      await unload(job);
+      return;
+    }
+    job.retryStarting = true;
+    job.lastActivity = Date.now();
+    try {
+      const result = await server.rpc('turn/start', {
+        threadId: job.thread, model: job.model, effort: job.effort, serviceTier: job.tier,
+        input: [{
+          type: 'text', text: retryPrompt(job.modelRetryOffset + count, job.modelRetries, error), text_elements: []
+        }]
+      });
+      if (job.modelRetryCount !== count || job.completing) return;
+      job.turn = result?.turn?.id || job.turn;
+      if (!job.turn) throw new Error('turn/start returned no turn id');
+      if (job.cancelled || stopping || terminal(job)) { await interruptAndUnload(job); return; }
+      job.retryStarting = false;
+      job.retryWaiting = false;
+      job.retryDelayMs = '';
+      job.lastActivity = Date.now();
+      void marker(job);
+      progress(job, `turn start thread=${job.thread} turn=${job.turn} model=${job.model} effort=${job.effort}`);
+    } catch (caught) {
+      if (job.modelRetryCount !== count) return;
+      if (!terminal(job)) finish(job, 'failed', 1, caught.message);
+      if (job.turn) await interruptAndUnload(job);
+      else await unload(job);
     }
   }
 
@@ -1275,7 +1435,13 @@ async function serve() {
       if (info && !stopping) {
         info.codexBin = server.codexBin;
         info.shell = server.shell;
-        await atomicWrite(INFO, `${JSON.stringify(info)}\n`, { beforeRename: secureInfo });
+        if (!await atomicWrite(INFO, `${JSON.stringify(info)}\n`, {
+          beforeRename: secureInfo, strictPrepare: true, prepareBeforeWrite: true
+        })) {
+          process.exitCode = 1;
+          void shutdown('discovery ACL failed');
+          throw new Error('cannot secure discovery');
+        }
       }
       return server;
     })();
@@ -1283,6 +1449,7 @@ async function serve() {
   }
 
   async function startJob(job) {
+    const turnGeneration = job.modelRetryCount;
     try {
       const server = await ensureApp();
       job.server = server;
@@ -1304,6 +1471,7 @@ async function serve() {
         threadId: job.thread, model: job.model, effort: job.effort, serviceTier: job.tier,
         input: [{ type: 'text', text: job.prompt, text_elements: [] }]
       });
+      if (job.modelRetryCount !== turnGeneration) return;
       job.turn = result?.turn?.id || job.turn;
       job.prompt = '';
       if (!job.turn) throw new Error('turn/start returned no turn id');
@@ -1317,6 +1485,7 @@ async function serve() {
         if (admissionJob === job) admissionTimer = setTimeout(() => releaseAdmission(job), rampMs);
       }
     } catch (error) {
+      if (job.modelRetryCount !== turnGeneration) return;
       if (error.message === 'thread/start timed out') {
         error = new Error('thread-start-timeout');
         if (++threadTimeouts >= 2 && !degraded) {
@@ -1388,8 +1557,9 @@ async function serve() {
   }
 
   async function secureInfo(file) {
+    if (testHooks && process.env.LUNA_DAEMON_TEST_ACL_FAIL === '1') throw new Error('simulated icacls failure');
     if (process.platform !== 'win32') return;
-    await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
       let child;
       let timer;
       let done = false;
@@ -1397,9 +1567,11 @@ async function serve() {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        if (error) event(`daemon.json ACL failed: ${error.message}`);
-        else event(`daemon.json ACL rc=${code} `);
-        resolve();
+        if (error || code !== 0) {
+          const reason = error?.message || `icacls exited ${code}`;
+          event(`daemon.json ACL failed: ${reason}`);
+          reject(new Error(`daemon.json ACL failed: ${reason}`));
+        } else resolve();
       };
       try {
         child = spawn('icacls', [file, '/inheritance:r', '/grant:r',
@@ -1419,6 +1591,7 @@ async function serve() {
     return [...jobs.values()].map((job) => ({
       id: job.id, state: jobView(job).state, owner: job.owner, model: job.model, effort: job.effort,
       sandbox: job.sandbox, orphaned: Boolean(job.orphanedAt) && !terminal(job),
+      modelRetries: job.modelRetryOffset + job.modelRetryCount, retryWaiting: Boolean(job.retryWaiting),
       cwd: job.cwd, clientPid: job.clientPid || 0, queuedAt: new Date(job.queuedAt).toISOString(),
       startedAt: job.startedAt ? new Date(job.startedAt).toISOString() : null,
       ageS: Math.floor((Date.now() - job.queuedAt) / 1000), logBytes: job.logBytes, reason: job.reason || ''
@@ -1541,9 +1714,13 @@ async function serve() {
     if (body.exclusiveRepo !== undefined && typeof body.exclusiveRepo !== 'boolean') {
       throw new Error('invalid exclusiveRepo');
     }
-    for (const key of ['idleMaxS', 'timeoutS']) {
+    if (body.modelRetries === undefined) body.modelRetries = 2;
+    if (body.modelRetryDelayS === undefined) body.modelRetryDelayS = 60;
+    if (body.modelRetryOffset === undefined) body.modelRetryOffset = 0;
+    for (const key of ['idleMaxS', 'timeoutS', 'modelRetries', 'modelRetryDelayS', 'modelRetryOffset']) {
       if (!Number.isSafeInteger(body[key]) || body[key] < 0) throw new Error(`${key} must be non-negative seconds`);
     }
+    if (body.modelRetryOffset > body.modelRetries) throw new Error('modelRetryOffset exceeds modelRetries');
   }
 
   async function prepareJob(job) {
@@ -1695,7 +1872,10 @@ async function serve() {
           }
         }
         if (req.method === 'GET' && req.url === '/health') {
-          reply(200, { ok: !stopping && !crashLoop, pid: process.pid, appServerPid: app?.child.pid || null,
+          reply(200, { ok: !stopping && !crashLoop && !draining, draining, pid: process.pid,
+            profile: PROFILE, protocol: testHooks && process.env.LUNA_DAEMON_TEST_PROTOCOL === '1' ? 1 : 2,
+            features: ['model-retry', 'profiles'],
+            appServerPid: app?.child.pid || null,
             degraded, loopDelayMs: eventLoopDelayMs(loopDelay, loopSamples),
             appServer: starting ? 'restarting' : app && !app.dead ? 'up' : 'down',
             codexBin: app?.codexBin || info?.codexBin, shell: app?.shell || info?.shell,
@@ -1718,6 +1898,11 @@ async function serve() {
           reply(200, { ok: true });
           return;
         }
+        if (req.method === 'POST' && req.url === '/stop-when-idle') {
+          draining = true;
+          reply(200, { ok: true });
+          return;
+        }
         const match = /^\/jobs\/([a-f0-9]+)(\/cancel)?$/.exec(req.url);
         if (match) {
           const job = jobs.get(match[1]);
@@ -1731,6 +1916,7 @@ async function serve() {
           return;
         }
         if (req.method !== 'POST' || req.url !== '/jobs') { reply(404, { error: 'unknown route' }); return; }
+        if (draining) { reply(503, { error: 'daemon draining' }); return; }
         // With no orphan grace there can be no reattachment; retain early streaming rejection.
         if (!orphanGraceS && queue.length >= queueMax) {
           reply(429, { error: 'daemon queue full', retryAfterS: 2 });
@@ -1798,12 +1984,13 @@ async function serve() {
           }
         }
         const fields = ['prompt', 'cwd', 'sandbox', 'model', 'effort', 'tier', 'out', 'log',
-          'idleMaxS', 'timeoutS', 'ephemeral', 'clientPid', 'exclusiveRepo', 'owner'];
+          'idleMaxS', 'timeoutS', 'modelRetries', 'modelRetryDelayS', 'modelRetryOffset', 'ephemeral', 'clientPid',
+          'exclusiveRepo', 'owner'];
         const job = { ...Object.fromEntries(fields.map((key) => [key, body[key]])),
           identity, outKey,
           id: randomBytes(16).toString('hex'), state: 'queued', rc: null, error: '', queuedAt: Date.now(),
           canonicalCwd: null, logBytes: 0, logWrittenBytes: 0, logPending: [], logPendingBytes: 0,
-          logDropped: 0, logRevision: 0, logInitialized: false, ready: false };
+          logDropped: 0, logRevision: 0, logInitialized: false, ready: false, modelRetryCount: 0 };
         jobs.set(job.id, job);
         queue.push(job); // Reserve queue count/bytes before yielding to any other submission.
         const preparation = prepareJob(job);
@@ -1846,9 +2033,11 @@ async function serve() {
       http.listen(0, '127.0.0.1', resolve);
     });
     if (stopping) throw new Error('daemon stopped');
-    info = { pid: process.pid, port: http.address().port, token, startedAt,
+    info = { pid: process.pid, pid_start: selfStart(), port: http.address().port, token, startedAt,
       codexBin: app.codexBin, shell: app.shell, version: 1 };
-    if (!await atomicWrite(INFO, `${JSON.stringify(info)}\n`, { beforeRename: secureInfo })) {
+    if (!await atomicWrite(INFO, `${JSON.stringify(info)}\n`, {
+      beforeRename: secureInfo, strictPrepare: true, prepareBeforeWrite: true
+    })) {
       throw new Error('cannot write discovery');
     }
     lock.release();
@@ -1895,15 +2084,16 @@ async function serve() {
         }
         const expiry = expiredLimit(job, now);
         if (expiry) void cancel(job, expiry, 'stalled', 124);
-        if (!terminal(job) && job.truncated && now - job.heartbeatAt >= 30_000) {
+        if (!terminal(job) && (job.truncated || job.retryWaiting) && now - job.heartbeatAt >= 30_000) {
           job.heartbeatAt = now;
-          appendLog(job, `[${nowIso()}] heartbeat: job still running\n`, true);
+          const note = job.retryWaiting ? 'waiting for model retry' : 'job still running';
+          appendLog(job, `[${nowIso()}] heartbeat: ${note}\n`, true);
         }
       }
       if (now >= nextClientCheck) nextClientCheck = now + clientCheckMs;
       if (now >= nextPump) void pump();
-      const idleStillTrue = () => !running && !queue.some((job) => !terminal(job)) && idleS &&
-        Date.now() - lastBusy >= idleS * 1000;
+      const idleStillTrue = () => !running && !queue.some((job) => !terminal(job)) &&
+        (draining || (idleS && Date.now() - lastBusy >= idleS * 1000));
       if (idleStillTrue()) shutdownWhenQuiet('idle exit', idleStillTrue);
     }, 500);
     priorityTimer = setInterval(() => { if (running) app?.memoryPriority(); }, 60_000);
@@ -1924,7 +2114,16 @@ function eventLoopDelayMs(current, samples, now = Date.now()) {
 }
 
 async function unitChecks(root, check) {
+  check('model retry jitter stays within 0–30 percent',
+    retryDelayMs(60, 2, 0) === 120000n && retryDelayMs(60, 2, 300) === 156000n &&
+    Array.from({ length: 100 }, () => retryDelayMs(60, 2)).every((ms) => ms >= 120000n && ms <= 156000n));
   testLog = path.join(root, 'unit.log');
+  check('model retry classifier accepts transient errors',
+    ['at capacity', 'overloaded', 'HTTP 501', 'stream disconnected'].every(retryableModelError));
+  check('model retry classifier rejects permanent errors even with transient text',
+    ['usage limit, try again later', 'billing: 503', 'authentication: 503', 'HTTP 429, try again later',
+      'invalid model: 503', 'context window: 503', 'stalled: 503', 'daemon crashed: 503']
+      .every((error) => !retryableModelError(error)));
   const identityServer = createServer();
   await new Promise((resolve) => identityServer.listen(0, '127.0.0.1', resolve));
   const identityInfo = { pid: process.pid, port: identityServer.address().port };
@@ -2023,10 +2222,10 @@ async function unitChecks(root, check) {
   const publishing = { id: 'publishing', state: 'failed', rc: 1, error: 'failed',
     shownState: 'running', publishing: true, expiry: 0 };
   check('job view hides terminal state and result during publication',
-    JSON.stringify(jobView(publishing)) === '{"state":"running","rc":null,"error":""}');
+    JSON.stringify(jobView(publishing)) === '{"state":"running","rc":null,"error":"","modelRetries":0}');
   check('job view exposes terminal state and result after publication',
     JSON.stringify(jobView({ ...publishing, publishing: false })) ===
-      '{"state":"failed","rc":1,"error":"failed"}');
+      '{"state":"failed","rc":1,"error":"failed","modelRetries":0}');
   const publishingRetained = new Map([[publishing.id, publishing], ...Array.from({ length: 501 }, (_, id) =>
     [id, { id, state: 'completed', expiry: Date.now() + 600_000 }])]);
   pruneTerminalJobs(publishingRetained);
@@ -2062,6 +2261,14 @@ async function unitChecks(root, check) {
       prepared = temp === `${fresh}.tmp` && existsSync(temp) && !existsSync(fresh);
     } });
     check('atomicWrite beforeRename runs on the temp file before the target appears', preparedWrite && prepared);
+    const rejected = path.join(root, 'acl-rejected');
+    check('strict discovery preparation failure never publishes a target',
+      !await atomicWrite(rejected, 'secret', {
+        beforeRename: (temp) => {
+          if (readFileSync(temp, 'utf8') !== '') throw new Error('secret written before ACL');
+          throw new Error('simulated ACL failure');
+        }, strictPrepare: true, prepareBeforeWrite: true
+      }) && !existsSync(rejected) && !existsSync(`${rejected}.tmp`));
     for (let i = 0; i < 500; i++) event(`ordered burst ${i}`);
     await flushEvents();
     const burst = readFileSync(testLog, 'utf8').split('\n').filter((line) => line.includes('ordered burst '));
@@ -2250,7 +2457,8 @@ async function selfTest(unitOnly = false) {
       home,
       env: {
         ...process.env, HOME: home, CODEX_HOME: path.join(home, '.codex'),
-        LUNA_DAEMON_HOME: home, LUNA_DAEMON_MAX: '2', LUNA_DAEMON_IDLE_S: String(idleS),
+        LUNA_DAEMON_HOME: home, LUNA_DAEMON_PROFILE: 'default', LUNA_DAEMON_MAX: '2',
+        LUNA_DAEMON_IDLE_S: String(idleS),
         LUNA_KEEP_SESSION: '0', LUNA_ADMIT_LOCK: path.join(home, 'admit.lock'), LUNA_RAM_RESERVE_MB: '0',
         LUNA_DAEMON_TURN_MB: '0', LUNA_DAEMON_RAMP_MS: '10', LUNA_DAEMON_OWNER_MAX: '0',
         LUNA_DAEMON_LIMITS_POLL_S: '300', LUNA_STUB_LIMITS_FAIL_READ: '',
@@ -2351,6 +2559,9 @@ async function selfTest(unitOnly = false) {
       audit().filter((entry) => entry.event === 'spawn').length === 1);
     check('authenticated health', initialHealth.ok && initialHealth.jobs.running === 0 &&
       initialHealth.appServer === 'up');
+    check('health advertises protocol, features and default profile', initialHealth.protocol === 2 &&
+      initialHealth.profile === 'default' &&
+      ['model-retry', 'profiles'].every((feature) => initialHealth.features.includes(feature)));
     if (process.platform === 'win32') {
       check('daemon and app-server keep inherited CPU priority by default',
         os.getPriority(info.pid) === os.getPriority(process.pid) &&
@@ -2375,6 +2586,28 @@ async function selfTest(unitOnly = false) {
       discoveryBefore.equals(readFileSync(path.join(main.home, 'daemon.json'))) &&
       logBefore.equals(readFileSync(path.join(main.home, 'daemon.log'))) &&
       audit().filter((entry) => entry.event === 'spawn').length === spawnsBefore);
+    const net = { home: path.join(main.home, 'daemon-net'),
+      env: { ...main.env, LUNA_DAEMON_PROFILE: 'net' } };
+    mkdirSync(net.home);
+    instances.push(net);
+    launch(net);
+    const netInfo = await ready(net);
+    const netHealth = await health(netInfo);
+    const netSpawn = audit().find((entry) => entry.event === 'spawn' && entry.pid === netHealth.appServerPid);
+    check('network profile uses an isolated daemon and network-enabled app-server',
+      netHealth.profile === 'net' && netInfo.pid !== info.pid &&
+      netSpawn.args.includes('sandbox_workspace_write.network_access=true') &&
+      !defaultSpawn.args.includes('sandbox_workspace_write.network_access=true'));
+    const netJob = await submit(netInfo, 'network profile', { sandbox: 'workspace-write' });
+    check('network profile runs a write thread', (await finished(netInfo, netJob.id)).state === 'completed');
+    await httpJson(netInfo, 'POST', '/stop');
+    await until(() => !existsSync(path.join(net.home, 'daemon.json')));
+    const acl = await instance(0, { LUNA_DAEMON_TEST_HOOKS: '1', LUNA_DAEMON_TEST_ACL_FAIL: '1' });
+    const aclChild = launch(acl);
+    await until(() => aclChild.exitCode !== null);
+    check('failed discovery ACL exits without publishing discovery', aclChild.exitCode !== 0 &&
+      !existsSync(path.join(acl.home, 'daemon.json')) &&
+      readFileSync(path.join(acl.home, 'daemon.log'), 'utf8').includes('simulated icacls failure'));
     const reusedPid = await instance();
     const unusedPortServer = createServer();
     await new Promise((resolve) => unusedPortServer.listen(0, '127.0.0.1', resolve));
@@ -2475,6 +2708,59 @@ async function selfTest(unitOnly = false) {
     const failedJob = await finished(info, failure.id);
     check('turn failure preserves final answer and error', failedJob.rc === 1 && failedJob.error === 'fake failure' &&
       readFileSync(failure.out, 'utf8') === 'answer FAIL');
+    const capacity = 'Selected model is at capacity. Please try a different model.';
+    const retryAudit = audit().length;
+    const retried = await submit(info, `MODEL_FAIL_ONCE:${capacity}`, { modelRetryDelayS: 0 });
+    const retryResult = await finished(info, retried.id);
+    const retryEvents = audit().slice(retryAudit);
+    const retryTurns = retryEvents.filter((entry) => entry.method === 'turn/start');
+    check('model retry resumes once in the same thread and completes with the new answer',
+      retryResult.state === 'completed' && retryResult.modelRetries === 1 &&
+      retryEvents.filter((entry) => entry.method === 'thread/start').length === 1 && retryTurns.length === 2 &&
+      retryTurns[0].params.threadId === retryTurns[1].params.threadId &&
+      retryTurns[1].params.input[0].text.startsWith('LUNA AUTO-RETRY 1/2:') &&
+      retryTurns[1].params.model === retryTurns[0].params.model &&
+      retryTurns[1].params.effort === retryTurns[0].params.effort &&
+      retryTurns[1].params.serviceTier === retryTurns[0].params.serviceTier &&
+      readFileSync(retried.out, 'utf8') === `answer ${retryTurns[1].params.input[0].text}` &&
+      readFileSync(`${retried.out}.daemon`, 'utf8').includes('model_retry=1\n') &&
+      readFileSync(retried.log, 'utf8').includes(`luna: model error: ${capacity}; retry 1/2`) &&
+      !readFileSync(retried.log, 'utf8').includes('late failed-turn output'));
+    const repeatAudit = audit().length;
+    const repeated = await submit(info, `MODEL_FAIL_ALWAYS:${capacity}`, { modelRetries: 2, modelRetryDelayS: 0 });
+    const repeatResult = await finished(info, repeated.id);
+    const repeatEvents = audit().slice(repeatAudit);
+    const repeatTurns = repeatEvents.filter((entry) => entry.method === 'turn/start');
+    check('capacity exhaustion fails with the last error after three starts on one thread',
+      repeatResult.state === 'failed' && repeatResult.error === capacity && repeatResult.modelRetries === 2 &&
+      repeatEvents.filter((entry) => entry.method === 'thread/start').length === 1 &&
+      repeatTurns.length === 3 && new Set(repeatTurns.map((entry) => entry.params.threadId)).size === 1 &&
+      repeatTurns[2].params.input[0].text.startsWith('LUNA AUTO-RETRY 2/2:'));
+    const usageAudit = audit().length;
+    const usageError = "You've hit your usage limit. Try again later.";
+    const usage = await submit(info, `MODEL_FAIL_ALWAYS:${usageError}`, { modelRetryDelayS: 0 });
+    const usageResult = await finished(info, usage.id);
+    check('usage limit overrides retryable text',
+      usageResult.state === 'failed' && usageResult.error === usageError && usageResult.modelRetries === 0 &&
+      audit().slice(usageAudit).filter((entry) => entry.method === 'turn/start').length === 1);
+    const cancelAudit = audit().length;
+    const pending = await submit(info, `MODEL_FAIL_ONCE:${capacity}`, { modelRetryDelayS: 5, idleMaxS: 1 });
+    await until(() => readFileSync(`${pending.out}.daemon`, 'utf8').includes('retry_waiting=1\n'));
+    const delayMs = Number(/^retry_delay_ms=(\d+)$/m.exec(readFileSync(`${pending.out}.daemon`, 'utf8'))?.[1]);
+    await until(() => readFileSync(pending.log, 'utf8').includes(`in ${formatDelay(BigInt(delayMs))}s`));
+    check('daemon retry delay is within jitter bounds and appears in the log', delayMs >= 5000 && delayMs <= 6500);
+    await sleep(1500);
+    check('retry wait remains running beyond the idle limit and exposes its count',
+      (await result(info, pending.id)).state === 'running' && (await result(info, pending.id)).modelRetries === 1);
+    const cancelStarted = Date.now();
+    await cancel(info, pending);
+    const cancelResult = await finished(info, pending.id);
+    await until(async () => (await counts(info)).running === 0);
+    const cancelEvents = audit().slice(cancelAudit);
+    check('cancel during retry pause promptly unloads without starting another turn',
+      cancelResult.state === 'cancelled' && cancelResult.modelRetries === 1 && Date.now() - cancelStarted < 1000 &&
+      cancelEvents.filter((entry) => entry.method === 'turn/start').length === 1 &&
+      cancelEvents.filter((entry) => entry.method === 'thread/unsubscribe').length === 1);
     await until(async () => (await counts(info)).running === 0);
     const one = await submit(info, 'WAIT first');
     check('output conflict is flushed with 409 and connection close',
@@ -3168,7 +3454,8 @@ async function selfTest(unitOnly = false) {
 }
 
 try {
-  const mode = process.argv[2];
+  const modes = ['--serve', '--alive', '--self-test', '--self-test-unit', '--status', '--jobs', '--stop'];
+  const mode = process.argv.slice(2).find((arg) => modes.includes(arg));
   if (mode === '--serve') await serve();
   else if (mode === '--alive') {
     const info = readInfo();
@@ -3178,12 +3465,26 @@ try {
     process.exitCode = await selfTest(mode === '--self-test-unit');
   }
   else if (mode === '--status' || mode === '--jobs') {
-    const info = readInfo();
-    const result = await health(info);
-    process.stdout.write(`${JSON.stringify(result || { ok: false })}\n`);
-    if (!result) process.exitCode = 1;
-    else {
-      const response = await httpJson(info, 'GET', '/jobs');
+    const selected = profileFlag ? [PROFILE] : ['default', 'net'];
+    let found = false;
+    for (const profile of selected) {
+      const info = readInfo(profile === 'net' ? path.join(BASE_RUN, 'daemon-net') : BASE_RUN);
+      const result = await health(info);
+      process.stdout.write(`${JSON.stringify(result ? { ...result, profile } : { ok: false, profile })}\n`);
+      if (!result) continue;
+      found = true;
+      let response;
+      try { response = await httpJson(info, 'GET', '/jobs'); }
+      catch (error) {
+        process.stderr.write(`luna-daemon: ${profile} jobs: ${cleanValue(error.message)}\n`);
+        process.exitCode = 1;
+        continue;
+      }
+      if (response.status !== 200 || !response.body || !Array.isArray(response.body.jobs) || !response.body.owners) {
+        process.stderr.write(`luna-daemon: ${profile} jobs unavailable\n`);
+        process.exitCode = 1;
+        continue;
+      }
       const columns = ['id', 'state', 'model', 'effort', 'sandbox', 'owner', 'clientPid', 'ageS', 'logBytes',
         'queuedAt', 'startedAt', 'reason', 'cwd'];
       process.stdout.write(`${columns.join('\t')}\n`);
@@ -3196,9 +3497,21 @@ try {
         process.stdout.write(`${owner}\t${counts.running}\t${counts.queued}\n`);
       }
     }
+    if (!found) process.exitCode = 1;
   } else if (mode === '--stop') {
-    const info = readInfo();
-    if (info && await health(info)) await httpJson(info, 'POST', '/stop');
+    const selected = profileFlag ? [PROFILE] : ['default', 'net'];
+    for (const profile of selected) {
+      const info = readInfo(profile === 'net' ? path.join(BASE_RUN, 'daemon-net') : BASE_RUN);
+      try {
+        if (info && await health(info, 3000, true)) {
+          const response = await httpJson(info, 'POST', '/stop');
+          if (response.status !== 200 || !response.body?.ok) throw new Error(`stop returned HTTP ${response.status}`);
+        }
+      } catch (error) {
+        process.stderr.write(`luna-daemon: ${profile} stop: ${cleanValue(error.message)}\n`);
+        process.exitCode = 1;
+      }
+    }
   } else throw new Error('usage: node luna-daemon.mjs --serve|--alive|--status|--jobs|--stop|--self-test');
 } catch (error) {
   process.stderr.write(`luna-daemon: ${cleanValue(error.message)}\n`);

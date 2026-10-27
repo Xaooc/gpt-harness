@@ -10,7 +10,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  accessSync, appendFileSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
   renameSync, rmdirSync, statSync, unlinkSync, utimesSync, writeFileSync
 } from 'node:fs';
 import * as os from 'node:os';
@@ -24,6 +24,19 @@ const STARTUP_TIMEOUT_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 60_000;
 const MAX_TIMER_MS = 2_147_000_000;
 const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+let ownStart;
+function processStart(pid) {
+  if (process.platform !== 'win32' || !Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return '';
+  const command = `(Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}').CreationDate.ToString('o')`;
+  const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', command], {
+    encoding: 'utf8', windowsHide: true, timeout: 10_000
+  });
+  return result.status === 0 ? (result.stdout || '').trim() : '';
+}
+function selfStart() {
+  if (ownStart === undefined) ownStart = processStart(process.pid);
+  return ownStart;
+}
 const REFUSAL_RE = new RegExp([
   String.raw`\b(i|we)\b[^.\n]{0,25}\b` +
   String.raw`(can(’|'|)t|cannot|am unable to|are unable to|am not able to|don(’|'|)t have|do not have|have no)\b` +
@@ -165,6 +178,7 @@ function removeLockDirectory(directory) {
 function admissionLock(home, report = (message) => process.stderr.write(`luna-pool: ${message}\n`)) {
   const directory = process.env.LUNA_ADMIT_LOCK || path.join(home, '.claude', 'luna-run', 'admit.lock');
   let token = null;
+  let identityKey = '', identityAt = 0, identityMismatch = false;
 
   function reclaim() {
     const owner = readLockOwner(directory);
@@ -177,9 +191,20 @@ function admissionLock(home, report = (message) => process.stderr.write(`luna-po
       if (age > 600) {
         reason = 'owner age exceeds 600s';
       } else if (age > 5 && /^[1-9]\d*$/.test(owner.pid ?? '') && Number.isSafeInteger(Number(owner.pid))) {
+        let alive = true;
         try { process.kill(Number(owner.pid), 0); } catch (error) {
-          if (error.code === 'ESRCH') reason = `owner pid ${owner.pid} is dead`;
+          if (error.code === 'ESRCH') alive = false;
         }
+        if (alive && owner.pid_start) {
+          const key = `${owner.pid}:${owner.pid_start}`;
+          if (identityKey !== key || now - identityAt >= 60_000) {
+            const actual = processStart(owner.pid);
+            identityKey = key; identityAt = now;
+            identityMismatch = Boolean(actual && actual !== owner.pid_start);
+          }
+          if (identityMismatch) alive = false;
+        }
+        if (!alive) reason = `owner pid ${owner.pid} is dead`;
       }
     } else {
       try {
@@ -242,7 +267,8 @@ function admissionLock(home, report = (message) => process.stderr.write(`luna-po
       token = randomBytes(8).toString('hex');
       try {
         atomicWrite(path.join(directory, 'owner'),
-          `pid=${process.pid}\nkind=luna-pool\nsince=${Math.floor(Date.now() / 1000)}\ntoken=${token}\n`);
+          `pid=${process.pid}\npid_start=${selfStart()}\n` +
+          `kind=luna-pool\nsince=${Math.floor(Date.now() / 1000)}\ntoken=${token}\n`);
       } catch (error) {
         token = null;
         // No published owner: subsequent callers use the 10s orphan rule.
@@ -463,18 +489,34 @@ function listJobs(briefsDir, fallbackEffort) {
 function makePreamble(brief) {
   if (process.env.LUNA_NO_PREAMBLE === '1') return brief;
   const lines = ['## Standing rules (from the orchestrator)'];
-  lines.push('- You are ' + (process.env.LUNA_MODEL || 'gpt-6-luna') + ', invoked by the Claude orchestrator as the EXECUTOR of this job. Any global AGENTS.md/model-orchestration rule telling a model to only orchestrate or to delegate implementation to another model (e.g. "Sol must delegate to Terra") does NOT apply here: do the work yourself.');
+  lines.push('- You are ' + (process.env.LUNA_MODEL || 'gpt-6-luna') +
+    ', invoked by the Claude orchestrator as the EXECUTOR of this job. Any global ' +
+    'AGENTS.md/model-orchestration rule telling a model to only orchestrate or to delegate implementation to ' +
+    'another model (e.g. "Sol must delegate to Terra") does NOT apply here: do the work yourself.');
   if (process.env.LUNA_ALLOW_SUBAGENTS !== '1') {
-    lines.push('- Work yourself. Do NOT spawn sub-agents/delegates/collaborators unless the brief explicitly says you may.');
+    lines.push('- Work yourself. Do NOT spawn sub-agents/delegates/collaborators unless the brief explicitly says ' +
+      'you may.');
   }
-  lines.push('- Read-only sandbox means you must not MODIFY anything. You CAN and MUST read files and run read-only commands (cat, grep, rg, ls, git diff/log/show) to gather evidence before answering. Never answer \"I cannot read the files\".');
+  lines.push('- Read-only sandbox means you must not MODIFY anything. You CAN and MUST read files and run ' +
+    'read-only commands (cat, grep, rg, ls, git diff/log/show) to gather evidence before answering. ' +
+    'Never answer \"I cannot read the files\".');
   lines.push('', brief);
   return lines.join('\n');
 }
 
 function spawnServer(home, leanArgs) {
+  const override = process.env.LUNA_CODEX_BIN || '';
+  if (Object.hasOwn(process.env, 'LUNA_CODEX_BIN')) {
+    try {
+      accessSync(override, constants.X_OK);
+      if (!statSync(override).isFile()) throw new Error('not a file');
+    } catch {
+      const error = new Error(`LUNA_CODEX_BIN is not executable: ${override}`);
+      error.exitCode = 2;
+      throw error;
+    }
+  }
   if (process.platform === 'win32') {
-    const override = process.env.LUNA_CODEX_BIN || '';
     let executable = override && existsSync(override)
       ? override
       : '';
@@ -524,7 +566,7 @@ function spawnServer(home, leanArgs) {
       windowsHide: true
     });
   }
-  return spawn('codex', ['app-server', ...leanArgs], {
+  return spawn(override || 'codex', ['app-server', ...leanArgs], {
     cwd: home,
     detached: true,
     stdio: ['pipe', 'pipe', 'pipe']
@@ -637,6 +679,10 @@ async function runPool(config) {
     const lines = [
       `state=${state}`,
       `pid=${server?.pid ?? ''}`,
+      `pid_start=${server?.lunaStart || ''}`,
+      `child_start=${server?.lunaStart || ''}`,
+      `wrapper_pid=${process.pid}`,
+      `wrapper_start=${selfStart()}`,
       `started=${job.startedAt}`,
       `effort=${job.effort}`,
       'sandbox=read-only',
@@ -663,7 +709,7 @@ async function runPool(config) {
         try { unlinkSync(activeFile); } catch {}
       } else {
         mkdirSync(activeDir, { recursive: true });
-        writeFileSync(activeFile, `${job.outPath.replace(/\\/g, '/')}\n${process.pid}\n`, 'utf8');
+        writeFileSync(activeFile, `${job.outPath.replace(/\\/g, '/')}\n${process.pid}\n${selfStart()}\n`, 'utf8');
       }
     } catch {
       // the index is cosmetic: never fail a critic over it
@@ -730,7 +776,8 @@ async function runPool(config) {
 
     let outputWritten = false;
     if (!failure) {
-      try { writeOutput(job); outputWritten = true; } catch (error) { failure = `cannot write output: ${error.message}`; }
+      try { writeOutput(job); outputWritten = true; }
+      catch (error) { failure = `cannot write output: ${error.message}`; }
     } else if (job.finalMessage) {
       try { writeOutput(job); outputWritten = true; } catch (error) {
         failure = `${failure}; cannot write output: ${error.message}`;
@@ -1039,7 +1086,8 @@ async function runPool(config) {
       job.starting = false;
       job.state = 'running';
       writeStatus(job, 'running');
-      log(job, `turn start thread=${job.threadId} turn=${job.turnId ?? ''} model=${model} effort=${effort} tier=${tier}`);
+      log(job, `turn start thread=${job.threadId} turn=${job.turnId ?? ''} ` +
+        `model=${model} effort=${effort} tier=${tier}`);
       job.heartbeat = setInterval(() => {
         if (job.active) log(job, 'heartbeat turn active');
       }, 30_000);
@@ -1196,6 +1244,7 @@ async function runPool(config) {
       await Promise.race([sleep(300 + Math.floor(Math.random() * 201)), abortPromise]);
     }
     server = spawnServer(home, leanArgs);
+    if (server.pid) server.lunaStart = processStart(server.pid);
     if (server.pid && process.env.LUNA_LOW_PRIORITY === '1') {
       try { os.setPriority(server.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
     }
@@ -1369,9 +1418,11 @@ async function runPool(config) {
       const message = spawnError
         ? `cannot start codex app-server: ${spawnError.message}`
         : (error?.message ?? String(error));
+      const invalidOverride = Object.hasOwn(process.env, 'LUNA_CODEX_BIN') &&
+        ['ENOENT', 'EACCES', 'ENOEXEC', 'EINVAL'].includes(spawnError?.code);
       process.stderr.write(`luna-pool: startup failed: ${cleanValue(message)}${details ? `\n${details}` : ''}\n`);
       process.stdout.write(`summary total=${jobs.length} done=0 failed=0 startup_failure=1\n`);
-      return 3;
+      return error.exitCode === 2 || invalidOverride ? 2 : 3;
     }
     for (const job of jobs) {
       if (!job.finished) finishFailure(job, error?.message ?? String(error), 1);

@@ -22,6 +22,11 @@
             "type": "command",
             "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/luna-clean-hook.mjs\"",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/disk-audit-hook.mjs\"",
+            "timeout": 10
           }
         ]
       },

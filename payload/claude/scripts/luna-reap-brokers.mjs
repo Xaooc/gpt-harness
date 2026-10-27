@@ -153,6 +153,19 @@ function alive(pid) {
 }
 
 function killTree(node) {
+  const command = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${node.ProcessId}';` +
+    `if ($p) {$p | Select-Object ProcessId,CommandLine,` +
+    `@{n='Created';e={$_.CreationDate.ToUniversalTime().ToString('o')}} | ConvertTo-Json -Compress}`;
+  let current;
+  try {
+    const text = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
+      encoding: 'utf8', windowsHide: true, timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe']
+    });
+    current = JSON.parse(text.replace(/^\uFEFF/, ''));
+  } catch { return false; }
+  if (current.ProcessId !== node.ProcessId || current.CommandLine !== node.CommandLine ||
+      !node.Created || current.Created !== node.Created ||
+      !(BROKER.test(current.CommandLine) || APP_SERVER.test(current.CommandLine))) return false;
   try {
     execFileSync('taskkill.exe', ['/PID', String(node.ProcessId), '/T', '/F'], {
       windowsHide: true, stdio: ['ignore', 'pipe', 'pipe']
@@ -212,7 +225,8 @@ function selfTest() {
   const select = (nodes, recorded = [], live = [], options = {}) => selectVictims({
     nodes, brokerPids: new Set(recorded), livePids: new Set(live), now, selfPid: 1, parentPid: 2, ...options
   });
-  const empty = (result) => result.brokers.length === 0 && result.appServers.length === 0 && result.bloated.length === 0;
+  const empty = (result) => result.brokers.length === 0 &&
+    result.appServers.length === 0 && result.bloated.length === 0;
   const treeNodes = [101, 301, 302, 303, 304].map((pid, index, pids) => ({
     ProcessId: pid, ParentProcessId: index ? pids[index - 1] : 202
   }));

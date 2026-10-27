@@ -1,11 +1,11 @@
 ---
 name: luna
-description: Delegate execution to Codex - gpt-6.1-sol at high effort for every moderately complex or complex implementation, gpt-6-luna for simple/mechanical work, research and critics; reasoning effort chosen per task. Use for every clear, well-bounded job instead of doing it inline or spawning a Claude subagent - implementing features, fixes, refactors, tests, migrations, scripts, AND information gathering (codebase exploration, "find where X happens", reading logs/docs, summarising files, research). NOT for visual/UI/UX design work - Opus (the main Claude model) always does design itself, never delegated. Luna CAN generate raster images (imagegen) for sites and other tasks.
+description: Delegate execution to Codex - gpt-6.1-terra at max effort for every moderately complex or complex implementation, gpt-6-luna for simple/mechanical work, research and critics; Luna's reasoning effort chosen per task. Use for every clear, well-bounded job instead of doing it inline or spawning a Claude subagent - implementing features, fixes, refactors, tests, migrations, scripts, AND information gathering (codebase exploration, "find where X happens", reading logs/docs, summarising files, research). NOT for visual/UI/UX design work - Opus (the main Claude model) always does design itself, never delegated. Luna CAN generate raster images (imagegen) for sites and other tasks.
 ---
 
-# Luna & Sol: Codex executors
+# Luna & Terra: Codex executors
 
-**Codex `gpt-6.1-sol`** implements anything non-trivial; **`gpt-6-luna`** handles simple work, research and critics. Claude is the orchestrator: it
+**Codex `gpt-6.1-terra` at max effort** implements anything non-trivial; **`gpt-6-luna`** handles simple work, research and critics. Claude is the orchestrator: it
 understands the request, slices the work, writes the briefs, runs independent slices in
 parallel, verifies the results, and talks to the user.
 
@@ -15,39 +15,49 @@ to every prompt (no sub-agents; in write mode: match neighbouring style, never l
 tests, and use the result contract below):
 
 ```bash
-bash ~/.claude/scripts/luna.sh -w -e <effort> -C "<repo root>" -f <brief.md> -o <result.md>   # write
+bash ~/.claude/scripts/luna.sh -w -m gpt-6.1-terra -e max -C "<repo root>" -f <brief.md> -o <result.md>   # write
 bash ~/.claude/scripts/luna.sh -r -e <effort> -C "<repo root>" -f <brief.md> -o <result.md>   # read-only
 bash ~/.claude/scripts/luna-status.sh <result.md> [...]                                        # state of a job
 ```
 
-## Model routing: Sol 6.1 for anything non-trivial, Luna for simple work
+## Model routing: Terra max for anything non-trivial, Luna for simple work
 
-| Model | When | How |
+**Never `medium`/`high` for implementation** (benchmark 2026-10-26): at those efforts Terra stops long multi-step
+jobs after ~1 min with 8–50 % done, and under a parity test it once faked the result. At `max` it finished the
+same 305-item task completely and exactly in 3.4 min (≈3× faster than Sol 6.1 high). Verify spec adherence, not just green tests.
+
+| Level | When | How |
 |---|---|---|
-| `gpt-6.1-sol` (**default for implementation**) | **Every implementation beyond simple** (user decision, 2026-10-21): features (even single-module), non-trivial bug fixes, refactors, migrations, multi-file changes, new logic or architecture, data/API/auth/money/concurrency/security, debugging and root-cause work, fix rounds that need judgement, anything Luna failed at once. **When in doubt, Sol.** | `luna.sh -w -m gpt-6.1-sol -e high ...`. **Always `high`** (user decision, 2026-09-30): never max or ultra |
-| `gpt-6-luna` | Simple, mechanical work with no decisions: renames, reformatting, boilerplate, trivial one-file edits, copying an existing pattern exactly, fix rounds made of precise one-line findings. Plus information gathering/scouts, critics and images | `luna.sh` as usual, effort from the table below |
+| Terra max | Every implementation beyond simple: features (even single-module), non-trivial bug fixes, refactors, migrations, multi-file changes, new logic or architecture, data/API/auth/money/concurrency/security, debugging and root-cause work, fix rounds that need judgement, and anything Luna failed at once. When in doubt, use max. | `luna.sh -w -m gpt-6.1-terra -e max ...` |
+| `gpt-6-luna` (user, 2026-10-26: simple work stays on Luna) | Simple, mechanical work with no decisions: renames, reformatting, boilerplate, trivial one-file edits, copying an existing pattern exactly, fix rounds made of precise one-line findings. Plus information gathering/scouts, critics and images | `luna.sh` as usual (default model), effort from the table below |
 
 - **Don't use `gpt-6-astra`** (user decision, 2026-09-30).
-- **Best-of-2 for the riskiest pieces**: one implementation on Luna (`max`) and one on Sol 6.1 (`high`),
-  each in its own worktree. Different models fail differently, so this pair beats two runs of one model.
+- **Best-of-2 for the riskiest pieces**: two independent Terra max implementations, each in its own worktree.
 - **Critics stay on Luna** (cheap, parallel, one shared process). For a serious panel you may add ONE
-  extra critic on Sol for a different perspective: `luna.sh -r -m gpt-6.1-sol -e high -f critic.brief.md -o ...`,
+  extra critic on Terra max for a different perspective: `luna.sh -r -m gpt-6.1-terra -e max -f critic.brief.md -o ...`,
   launched in parallel with the panel. `luna-pool.mjs` uses a single model per run (`LUNA_MODEL`).
-- Sol is slower than Luna. Keep Sol slices coherent, but don't make them bigger just because the model is stronger.
-- Sol 6.1 needs Codex CLI ≥ 0.159. Check it with `codex debug models | grep gpt-6.1-sol`.
+- Terra needs Codex CLI ≥ 0.164 (the custom Windows build must be rebuilt on it). Check: `codex debug models | grep gpt-6.1-terra`.
 
-## Effort routing — choose `-e` every time
-
-`max` is slow. Use it only where deeper reasoning changes the outcome.
+## Effort routing for Luna — choose `-e` every time
 
 | Task | `-e` |
 |---|---|
-| New core logic, money/finance, concurrency/locking, security-sensitive code, reproducing tricky formulas/specs exactly, root-cause of a hard bug | `max` |
-| Feature slice following an existing pattern, API/CRUD/services, UI wiring, migrations modelled on existing ones, fix rounds with precise findings | `high` |
+| Scouts whose answers matter, critics, fix rounds with precise findings, pattern-following edits | `high` |
 | Reformatting, renames, mechanical multi-file edits, boilerplate, codebase exploration / "find where X", summarising files/logs | `medium` |
 | Readiness check, trivial single-file edit you still want delegated | `low` |
 
+- Keep implementation slices coherent, but don't make them bigger just because the model is capable.
+
 Critics: `high` by default, `max` only for an attacker on auth/money/secrets (see `luna-critics`).
+
+- **Write jobs can run the project's tests themselves** (owner 2026-10-26). `luna.sh -w` opens the sandbox to
+  network/local sockets (`LUNA_NET=1`, the default for write jobs; `LUNA_NET=0` closes it) and runs those jobs as
+  threads in a second shared daemon (profile `net`, `<run>/daemon-net/`; status `daemon_profile=net`; 2026-10-27:
+  per-job exec cost ~180-300 MB each), so tests that start a local server or app-server subprocess work inside the job. The standing rules
+  tell the executor to give test commands a ≥300 s tool timeout: under load a harness test looked «hung» only
+  because the command timed out. So briefs can say «run these tests and iterate until green» instead of
+  «reviewer runs»; Claude still re-runs the decisive tests before committing. On Windows the restricted-token sandbox
+  may still refuse `spawn` of child processes (`spawn EPERM`); when a job reports that, run those tests yourself.
 
 ## Launch hygiene (a silent failure costs as much as a slow job)
 
@@ -58,10 +68,10 @@ Critics: `high` by default, `max` only for an attacker on auth/money/secrets (se
   A hung job never sends a completion notification, so waiting for one is not enough. Use the Monitor tool:
   `Monitor(command: "bash ~/.claude/scripts/luna-watch.sh -i 300 <out.md> [<out.md> ...]", timeout_ms: 1800000,
   description: "<job>: stall or end")`. One watcher can cover several jobs. It emits `STALL` when a running job's log hasn't
-  grown for `-i` seconds (use 300 normally; 600 for Sol/max jobs that think long between steps), `RESUMED`, `END state=…`,
+  grown for `-i` seconds (use 300 normally; 600 for Terra max jobs that think long between steps), `RESUMED`, `END state=…`,
   and `GONE` when the wrapper died without updating its status. Re-arm it when it expires while jobs still run.
   **On `STALL`, act immediately**: read the tail of `<out>.log` and `luna-status.sh`. If it's really stuck (no new commands,
-  the model isn't thinking), kill it (`taskkill //PID <winpid> //T //F`, or Ctrl-C the wrapper task), tell the user, and
+  the model isn't thinking), stop it (`bash ~/.claude/scripts/luna-stop.sh <out.md>`; last resort `taskkill //PID <winpid> //T //F`), tell the user, and
   re-brief smaller or switch model. Don't wait it out silently. The wrapper also has its own idle and total timeouts
   (`LUNA_IDLE_MAX_S`, `LUNA_TIMEOUT_S`) that end a hung job with `state=stalled`. A job that keeps making progress is
   NOT cut short (user decision, 2026-10-22: a 90-minute cap killed working jobs): stalls are caught by idle time
@@ -83,11 +93,19 @@ Critics: `high` by default, `max` only for an attacker on auth/money/secrets (se
   the SAME brief with the SAME `-o` reattaches to it (same job, no rerun); a changed brief on the same `-o` fails fast
   (rc 1, "output or log already in use"), so give it a fresh `-o`. `luna-stop.sh` also cancels such orphaned jobs; after a
   raw `taskkill` of a wrapper, run it too.
+- **Model-error retry** (user request, 2026-10-27, after 5 jobs died mid-work on `Selected model is at capacity`):
+  a turn that fails with a transient model/server error (capacity, overloaded, 5xx, stream disconnected) is continued
+  automatically up to 2 more times on the SAME model, effort and session — daemon: new turn in the same thread; exec:
+  `codex exec resume <session>` — after a pause of 60 s, then 120 s, each plus 0–30 % random jitter so jobs that failed together don’t retry in one wave. The agent gets a `LUNA AUTO-RETRY k/N` note telling
+  it to check what it already did and carry on. Never retried: usage limit/quota, auth, 4xx/invalid request, stops,
+  stalls, daemon crashes. Status shows `model_retry=<k>`; the log shows `luna: model error: …; retry k/N`. Knobs:
+  `LUNA_MODEL_RETRIES` (default 2, `0` = old behaviour), `LUNA_MODEL_RETRY_DELAY_S` (default 60). With retries on, exec
+  sessions are recorded (not `--ephemeral`) and their rollout file is deleted when the job ends.
 - **Refusal guard**: read-only jobs that answer "I can't read files" without running any command are
   retried once automatically at `high` (status `retry=1`). Low/medium read-only jobs refuse this way quite often.
   The retry fixes it, but it costs time, so prefer `high` for scouts whose answers matter.
 - The wrappers tell the model it is the EXECUTOR and must ignore global AGENTS.md rules about delegating
-  implementation (the user's Codex AGENTS.md says "Sol must delegate to Terra"). Without this, Sol 6.1 refuses to implement.
+  implementation (the user's Codex AGENTS.md says "Sol must delegate to Terra"). This keeps the executor focused on implementation.
 - Exit codes: `2` = wrapper/setup error (see `.status`), `75` = gave up waiting for RAM → run later or inline.
 
 ## Priorities: quality first, then speed through parallelism (quota is not a concern)
@@ -101,7 +119,7 @@ jobs.** Spend them wherever they raise the quality of the final result or cut wa
   puts many read-only jobs in one Codex process. Claude merges their findings into the spec
   and briefs. This is cheaper than one scout that has to hold everything.
 - **Best-of-2 for the riskiest core pieces** (new core logic, money, concurrency, security).
-  Two independent `max` implementations of the same brief, each in its own git worktree.
+  Two independent Terra max implementations of the same brief, each in its own git worktree.
   Claude compares them, picks or merges, and runs critics on the result.
 - **Bigger, sharper critic panels.** Size them by risk (see `luna-critics`). For a large diff,
   give each subsystem its own critic instead of one critic for everything.
@@ -112,6 +130,12 @@ jobs.** Spend them wherever they raise the quality of the final result or cut wa
 
 ## Slicing and parallelism
 
+- **Parallelise as much as possible without losing quality** (owner rule, restated 2026-10-26). The default plan is
+  waves, not a chain: every slice, scout and critic whose inputs are ready starts at once, limited only by the RAM gate
+  and by write sets not overlapping. When a plan looks sequential, look for the cut that makes it a wave — e.g. one
+  small core slice that fixes the API, then one job per family/module in parallel, each in its own worktree and its
+  own files (2026-10-26: 9 tool-registry families ran at once instead of 7 serial slices). Quality limits: never two
+  writers on the same files, never slices smaller than a coherent unit, and every parallel result is still verified.
 - **Keep each Luna slice to ~40 minutes, including acceptance checks.** Split work across slices without reducing requested scope; give each slice its own acceptance commands.
 - **Run independent slices at the same time.** Slices are independent when their write sets (files) don't overlap. Never let two write-mode jobs touch the same files. A slice that only *imports* another slice's API can start once that API's names/types are fixed in the brief.
 - **Don't idle while a job runs.** Launch the next independent slice, do Claude-owned work (design/UI, reviewing the previous slice, drafting the next brief), or run critics on the previous slice.
@@ -150,7 +174,7 @@ jobs.** Spend them wherever they raise the quality of the final result or cut wa
   under extreme machine load (disk saturated + paging) every process, the daemon included, can freeze for 10–25 s, so curl may time
   out. Since 2026-10-22 luna.sh treats such a daemon as busy, not dead, while its process is alive and discovery is unchanged
   (budget `LUNA_DAEMON_BUSY_MAX_S`, default 300 s), so freezes no longer cancel jobs machine-wide.
-- **Custom Codex build (busybox shell)**: `<LUNA_CUSTOM_CODEX_ROOT>/dist/bin/codex.exe` is Codex 0.162.1 + our patch
+- **Custom Codex build (busybox shell)**: `<LUNA_CUSTOM_CODEX_ROOT>/dist/bin/codex.exe` is Codex 0.164.0 + our patch
   (`<LUNA_CUSTOM_CODEX_ROOT>/codex/LUNA-PATCH.md`, `luna-shell.patch`) adding the `default_shell` / `default_shell_path` config keys. luna.sh
   uses it automatically when it and `~/.claude/bin/luna-sh/sh.exe` (busybox-w32) exist: model commands then run in a POSIX `sh` of
   ~5–7 MB instead of PowerShell at ~65 MB (`shell=busybox-sh` in the status). Git Bash can NOT be used: MSYS dies in Codex's
@@ -235,7 +259,7 @@ WebSearch/WebFetch only when the job needs the live web and Luna can't reach it.
 
 ## The executors are literal: diligent, but they don't think beyond the brief
 
-User observation (2026-10-21), true for Sol and Luna alike, and most true of Sol: **they do exactly
+User observation (2026-10-21), true for Terra and Luna alike, and most true of Terra: **they do exactly
 what the brief says, and do it well, but miss things nobody wrote down, or do those things wrong.**
 They don't ask "what else does this touch?" and they don't push back on a bad plan. The judgement
 stays with Claude. Treat every brief as the complete spec: whatever isn't in it gets skipped or guessed.
@@ -266,8 +290,8 @@ stays with Claude. Treat every brief as the complete spec: whatever isn't in it 
 **Fix rounds**: name the exact gap and the general rule ("you changed X but not its 3 callers; whenever a
 signature changes, update every caller"), because it won't generalise from a single example on its own.
 
-**Sol vs Luna under this lens**: Sol executes a long, precise brief over many files very reliably, so the
-more complex the job, the more exhaustive the brief must be. A thin brief to Sol is the most expensive
+**Terra max under this lens**: the executor handles long, precise briefs over many files, so the
+more complex the job, the more exhaustive the brief must be. A thin brief to Terra max is the most expensive
 mistake: it will confidently build the wrong thing at scale.
 
 ## Writing the brief

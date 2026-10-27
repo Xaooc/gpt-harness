@@ -5,11 +5,11 @@
 
 ## Division of labour: Claude orchestrates, Luna executes
 
-**Executor = Codex `gpt-6-luna`, normal service tier, reasoning effort chosen per task**
-(`-e max` for new core logic, money, concurrency, security and exact spec reproduction;
-`high` for pattern-following features, CRUD, fix rounds and critics; `medium` for
-mechanical edits, reformatting and exploration; see the effort table in the `luna` skill).
-The fast tier is OFF because it burns too much quota. Don't pass `-t fast` unless the user asks.
+**Executors = Codex, normal service tier, two levels** (user decisions 2026-10-26): **`-m gpt-6.1-terra -e max`**
+for everything that was Sol (any implementation more than simple; never Terra `medium`/`high`: they stop long jobs
+early), and **`gpt-6-luna`** — the wrapper's default model, unchanged («простое лучше вернуть как было») — for simple/
+mechanical work, scouts, critics and images, with Luna's effort chosen per task (see the `luna` skill). Pass
+`-m gpt-6.1-terra -e max` explicitly for complex jobs. The fast tier is OFF because it burns too much quota. Don't pass `-t fast` unless the user asks.
 It is always called through
 `bash ~/.claude/scripts/luna.sh` (`-w` write / `-r` read-only). The wrapper pins
 model and effort on the command line. Don't rely on `$CODEX_HOME/config.toml`,
@@ -17,7 +17,7 @@ because the Codex desktop app rewrites it. Use it proactively, without waiting t
 asked. Keep slices ≤ ~40 min, run independent slices in parallel, never discard the
 wrapper's output, and check `luna-status.sh` right after launching.
 
-**Any implementation that is more than simple goes to Sol 6.1 at `high`** (user decision, 2026-10-21): `luna.sh -w -m gpt-6.1-sol -e high`. That means every moderately complex or complex job: features (even single-module ones), non-trivial bug fixes, refactors, migrations, multi-file changes, new logic, anything touching data/API/auth/money/concurrency/security, debugging, and anything Luna failed at once. **Luna** keeps only simple, mechanical work (renames, reformatting, boilerplate, one-file trivial edits, pattern copy with no decisions), information gathering/scouts, critics and images. When in doubt, use Sol. Sol is literal (see the `luna` skill, "The executors are literal"), so a Sol brief must be exhaustive. Never use `gpt-6-astra`. See "Model routing" in the `luna` skill.
+**Any implementation that is more than simple goes to Terra at `max`** (user decisions 2026-10-21, 2026-10-26: formerly Sol 6.1 high): `luna.sh -w -m gpt-6.1-terra -e max`. In the rest of this paragraph «Sol» means this level and «Luna» means `gpt-6-luna`. That means every moderately complex or complex job: features (even single-module ones), non-trivial bug fixes, refactors, migrations, multi-file changes, new logic, anything touching data/API/auth/money/concurrency/security, debugging, and anything Luna failed at once. **Luna** keeps only simple, mechanical work (renames, reformatting, boilerplate, one-file trivial edits, pattern copy with no decisions), information gathering/scouts, critics and images. When in doubt, use Sol. Sol is literal (see the `luna` skill, "The executors are literal"), so a Sol brief must be exhaustive. Never use `gpt-6-astra`. See "Model routing" in the `luna` skill.
 
 **Priorities: quality of the final result > speed through parallelism > quota.** Codex
 quota is effectively unlimited (user, 2026-09-29), so never economise on Luna jobs. Fan out
@@ -70,8 +70,8 @@ data/API change, auth/money/secrets, concurrency, infra, or a non-obvious
 decision), run a panel of 3–5 **clean-context role-play critics on Luna** via
 `luna-panel.sh`, which runs the whole panel as threads in ONE shared Codex process (`luna-pool.mjs`, ~16 MB per extra critic) (3–4 for internal code, 5–6 for user-facing, plus one per subsystem on large diffs; `high` effort by default,
 run in parallel with the next independent slice). They review statically, without running tests or scripts. Concurrency
-adapts to free RAM: `luna.sh` admits a job only while a reserve stays free, so launch
-freely and the machine won't hang: рядовой пользователь, взломщик, дизайнер, проджект, мейнтейнер,
+adapts to free RAM: `luna.sh` admits a job only while a reserve stays free; the Luna daemon defaults to max 12 jobs.
+Launch freely and the machine won't hang: рядовой пользователь, взломщик, дизайнер, проджект, мейнтейнер,
 тестировщик, эксплуатация, эксперт предметки. Run them after the plan (before
 implementing) and/or after implementing (before saying "done" or committing).
 Claude verifies every finding, fixes the accepted ones, and reports what was
@@ -90,7 +90,7 @@ line that Luna was skipped and why, and go back to Luna once it recovers.
 
 ### 5. Always clean up after yourself (user rule, 2026-10-21)
 
-A task isn't done until its garbage is gone. This applies to Claude itself AND to everything it launches (Luna/Sol jobs,
+A task isn't done until its garbage is gone. This applies to Claude itself AND to everything it launches (Luna/Terra jobs,
 subagents, other sessions it starts: tell them in their brief). **Clean up as you go**: after each finished step, remove that
 step's leftovers right away, as soon as they've been verified and used. Don't let them pile up until the end. Anything still
 in use (a running job's files, a backup needed for a possible rollback) is cleaned as soon as it's free. Before the final
@@ -107,6 +107,87 @@ report of every task, in every project, make a last pass:
 - Last line of the report: what was cleaned up and what was deliberately kept (and why).
 `~/.claude/scripts/luna-clean.mjs` (`--dry-run` to preview) removes the wrappers' own leftovers (old temp prompt files, stale lock dirs,
 luna-run job dirs older than 7 days, luna-made Codex sessions). It also runs automatically at session start.
+
+**Disk hygiene: worktrees and shared data (user rule, 2026-10-24).** The projects had grown to ~90 GB: 15 full worktrees,
+each with its own node_modules, `.next` and `public/`, nobody removing them, game data copied instead of linked.
+- **Create worktrees only with** `node ~/.claude/scripts/disk/wt-new.mjs --repo <repo> --path <dir> --new-branch <b> --base <ref>
+  --owner <session/task> --purpose "<why>" --until <date ≤ 30 days> --no-public`. It records owner/purpose/until in git's
+  worktree lock and links the shared `node_modules` instead of installing a copy. Never a bare `git worktree add` for work
+  that lives longer than one command. Session briefs say the same.
+- **Remove them with** `node ~/.claude/scripts/disk/wt-done.mjs <dir>` (`--archive` to commit + tag uncommitted work first).
+  It unlinks junctions before deleting, so a shared `node_modules` or data folder is never deleted through a link.
+- **One copy of big data.** Game sources, OCR, downloads live once; worktrees link to them (junction). Raw originals that
+  cannot be re-downloaded go to `%USERPROFILE%\dev\_sources\<game>\` (`DISK_SOURCES_ROOT`) with a README, never into `.tmp`.
+- **`.tmp` is temporary.** `node ~/.claude/scripts/disk/audit.mjs` lists worktrees (verdict: removable / dirty / in-use /
+  expired) and free space; `--apply` deletes only `.next` idle > 24 h, `.tmp` children older than 7 days (a `KEEP` file or a
+  `.tmp/.keep` entry protects one) and old test reports. The SessionStart hook `~/.claude/hooks/disk-audit-hook.mjs` shows a
+  short report when action is needed and runs `--apply` once a day. Act on what it reports before starting heavy work.
+
+### 6. Tests: a budget, not a free-for-all (user rule, 2026-10-24)
+
+Test runs have killed this PC before: about 10 GB of RAM, about 20 GB of temp files on the SSD, and
+1.5–2 hours of waiting. A test run is a resource with a budget, in every project, for Claude and for
+everything it launches (put these rules into executor briefs):
+- **Every pytest run goes through `python ~/.claude/scripts/pytest_gate.py -n K -- <args>`.** The gate
+  does the following:
+  - caps workers per run (default 4) and shares ONE machine-wide worker pool sized to the CPU count
+    (`PYTEST_GATE_POOL`), held by file locks, so all sessions and Codex jobs together never run more workers than
+    cores; 1–3 explicit test ids run without xdist (`-n 0`, 1 slot) (2026-10-27: per-job TMPDIRs had split the pool
+    and 10 workers ran on 4 cores);
+  - waits for free RAM;
+  - refuses to start below 10 GB free disk;
+  - gives each run its own temp dir with `tmp_path_retention_policy=failed`;
+  - deletes that dir after a green run, and prunes old red runs.
+
+  Don't bypass it with a bare `pytest`. Don't pass your own `--basetemp` unless you delete it yourself.
+  Other test runners (vitest, jest, cargo, go) get the same treatment: limit workers and clean their output.
+- **Default to the smallest check that answers the question.** Run the tests of the files you changed
+  and their direct dependents (an affected-tests tool if the project has one). The full suite runs
+  **once per release** on the merged result, never per wave or per fix. Never run it concurrently
+  with another heavy run (another full suite, a build, a load probe). Before a long run, check free
+  RAM and disk and say how long it will take.
+- **Results must survive a stop.** Use `-rf` and a junit report (or verbose names), so a killed run
+  still says what failed. Never pipe through `tail` in a way that loses the exit code.
+- **How many tests (user rule, 2026-10-24: «куда столько тестов? Ты на каждый символ тесты делаешь?»):**
+  write tests only for what could destroy work, lose data, break prod, or touch money/security —
+  usually 1–3 test files per change. Everything else is checked by one real run (report, smoke,
+  screenshot). Executor briefs list the exact few tests and say "No other tests".
+- **Writing tests:** a new test must be cheap by design.
+  - Share heavy setup (session or module fixtures, prebuilt snapshots, hardlinks instead of copying
+    big data).
+  - Don't start a subprocess server per test when one shared server will do.
+  - No real-time waits: use small timeouts or fake clocks.
+  - Every temp dir and process a test (or the code under test) creates is removed in `finally`.
+  - A test slower than about 5 s is marked `slow` and justified.
+  - Before adding a scenario test, check whether an existing one already covers the behaviour, and
+    extend it rather than copy it.
+- **Lessons of the rpg suite that grew to 3 h (2026-10-24), apply in every project:**
+  - **Never key a cache by a per-instance path** (a temp dir, a campaign folder, a room id) when the
+    cached thing is a function of CONTENT. Key it by a content hash, and bound it (`maxsize`). A
+    path-keyed cache never hits in tests (each test has a fresh path) and grew one worker from 150 MB
+    to 1.1 GB and 1.5 million objects in 270 tests; in production it holds one parsed copy of the same
+    data per campaign. When reviewing code, treat `lru_cache`/dict caches keyed by `Path`/`root` as a bug.
+  - **Measure the suite like production:** worker RSS growth over a run, total time, top-20 slowest
+    tests. A worker that keeps growing is a leak to fix, not a reason to run fewer workers.
+  - **Tests switch off background work by default** (post-turn workers, schedulers, ingest, indexers);
+    a test that is about that work opts in explicitly. Production can never run with it off.
+  - **Tiers, not one big run:** a fast release tier (target ≤ 20 min) that gates deploys, and a separate
+    `slow` tier for long replays and load, which must be excluded by default, not just labelled.
+  - **Don't copy what can be read from one place — spare the SSD.** Immutable data (world packs, canon,
+    fixtures, templates, reference corpora) lives once, read-only, under a content hash; each test,
+    campaign or tenant keeps only what it actually changes and reads the rest through one resolver
+    (shared base + per-instance overlay). A test that copies hundreds of unchanged files per case (the rpg
+    suite wrote ~2 million such files per run) is a defect to fix, not a cost of testing. Never hardlink
+    files that can be written.
+  - **Acceptance ≠ everything end-to-end:** one full scenario per invariant; other behaviour is tested
+    through the real write path without the expensive layer (model turn, subprocess server) when that
+    layer is not what is under test.
+- **After any test work:**
+  - no leftover test processes;
+  - no new `pytest-of-*`, `pytest-gate-runs/*` (except kept red runs) or project temp dirs;
+  - no clones, worktrees or venvs created only for the run.
+
+  Report what was removed.
 
 ### Plugin commands (secondary)
 

@@ -2,7 +2,7 @@
 param(
     [string]$BuildRoot = (Join-Path $env:USERPROFILE 'codex-build'),
     [ValidateNotNullOrEmpty()]
-    [string]$Tag = 'rust-v0.162.1'
+    [string]$Tag = 'rust-v0.164.0'
 )
 
 $ErrorActionPreference = 'Stop'

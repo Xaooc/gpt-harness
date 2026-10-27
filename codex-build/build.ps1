@@ -18,12 +18,12 @@ if (-not (Test-Path -LiteralPath (Join-Path $source 'Cargo.toml') -PathType Leaf
 $env:PATH = "$(Join-Path $env:USERPROFILE '.cargo\bin');$env:PATH"
 foreach ($tool in 'cargo', 'rustc') {
     if (-not (Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue)) {
-        throw "$tool is missing from PATH. Install Rustlang.Rustup and Rust 1.95.0; see BUILD.md."
+        throw "$tool is missing from PATH. Install Rustlang.Rustup and Rust 1.99.1; see BUILD.md."
     }
 }
 $rustVersion = & rustc --version
-if ($LASTEXITCODE -ne 0 -or $rustVersion -notmatch '^rustc 1\.95\.') {
-    throw "Rust 1.95.x is required; found '$rustVersion'. Run rustup toolchain install 1.95.0 and rustup default 1.95.0."
+if ($LASTEXITCODE -ne 0 -or $rustVersion -notmatch '^rustc 1\.99\.') {
+    throw "Rust 1.99.x is required; found '$rustVersion'. Run rustup toolchain install 1.99.1 and rustup default 1.99.1."
 }
 $rustDetails = & rustc -vV
 if ($LASTEXITCODE -ne 0 -or -not ($rustDetails -match '^host: x86_64-pc-windows-msvc$')) {
@@ -59,7 +59,7 @@ if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
     throw 'vswhere.exe is missing. Install Visual Studio 2022 Build Tools with the C++ workload; see BUILD.md.'
 }
 $vsArgs = @(
-    '-latest', '-version', '[17.0,18.0)', '-products', 'Microsoft.VisualStudio.Product.BuildTools',
+    '-latest', '-version', '[17.0,18.0)', '-products', '*',
     '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
     'Microsoft.VisualStudio.Component.Windows11SDK.26100', '-property', 'installationPath'
 )

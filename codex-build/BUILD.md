@@ -1,6 +1,6 @@
 # Build the Luna Codex binary on Windows
 
-This kit reproduces Codex `rust-v0.162.1` with `luna-shell.patch` at
+This kit reproduces Codex `rust-v0.164.0` with `luna-shell.patch` at
 `<BuildRoot>\dist\bin\codex.exe`. The patch adds `default_shell` and `default_shell_path` so Luna can run
 commands with busybox `sh` (about 5-7 MB per process) instead of PowerShell (about 65 MB).
 
@@ -21,7 +21,7 @@ Never elevate the source, build, assembly, or harness steps just because prerequ
 | --- | --- | --- |
 | Visual Studio Build Tools + Windows SDK | Yes (UAC/elevated shell) | Yes; large download |
 | Git via winget | Normally yes for a machine install | Yes |
-| Rustup via winget, Rust 1.95.0 toolchain | Normally no for user install | Yes |
+| Rustup via winget, Rust 1.99.1 toolchain | Normally no for user install | Yes |
 | Node.js/npm if absent | Depends on installer/scope | Yes |
 | Pinned global npm Codex | No with a user-owned npm prefix; otherwise depends on prefix | Yes |
 | `setup-source.ps1` first run | No | Yes: shallow Git clone |
@@ -60,20 +60,20 @@ rights for a user installation). Reopen PowerShell after winget so PATH is refre
 ```powershell
 winget install --exact --id Rustlang.Rustup
 # Reopen PowerShell here before continuing.
-rustup toolchain install 1.95.0
-rustup default 1.95.0
+rustup toolchain install 1.99.1
+rustup default 1.99.1
 rustc --version
 rustc -vV
 ```
 
-Expect `rustc 1.95.0 ...` and host `x86_64-pc-windows-msvc`. If the host is GNU or ARM64, explicitly install
-and select `1.95.0-x86_64-pc-windows-msvc` with the same two rustup commands instead.
-`build.ps1` accepts `rustc 1.95.x` and rejects a different host or version family.
+Expect `rustc 1.99.1 ...` and host `x86_64-pc-windows-msvc`. If the host is GNU or ARM64, explicitly install
+and select `1.99.1-x86_64-pc-windows-msvc` with the same two rustup commands instead.
+`build.ps1` accepts `rustc 1.99.x` and rejects a different host or version family.
 
 Install the **same-version** npm package after user approval (download; no elevation with a user-owned npm prefix):
 
 ```powershell
-npm i -g @openai/codex@0.162.1
+npm i -g @openai/codex@0.164.0
 ```
 
 Do not omit optional dependencies: its Windows x64 platform package supplies `codex-path\rg.exe`,
@@ -92,7 +92,7 @@ $BuildRoot = Join-Path $env:USERPROFILE 'codex-build'
 ### 1. Set up source (download on first run; ask first; no admin)
 
 ```powershell
-& .\codex-build\setup-source.ps1 -BuildRoot $BuildRoot -Tag rust-v0.162.1
+& .\codex-build\setup-source.ps1 -BuildRoot $BuildRoot -Tag rust-v0.164.0
 ```
 
 This finds Git on PATH, shallow-clones the tag into `<BuildRoot>\codex` if absent, verifies HEAD equals
@@ -124,7 +124,7 @@ Get-Content -LiteralPath (Join-Path $BuildRoot 'build.log') -Tail 25
 ```
 
 The script finds VS 2022 Build Tools with `vswhere`, initializes its x64 environment, and checks `cl.exe`,
-Rust 1.95.x, the MSVC host, and at least 15 GB free disk. Low free RAM (below 4 GB) warns without blocking.
+Rust 1.99.x, the MSVC host, and at least 15 GB free disk. Low free RAM (below 4 GB) warns without blocking.
 It preserves the current PATH, adds `$env:USERPROFILE\.cargo\bin`, and sets:
 
 ```text
@@ -163,7 +163,7 @@ run `build.ps1` in a visible PowerShell terminal to read the pre-check error bef
 ```
 
 The default npm location is `npm root -g` plus `\@openai\codex`. Override it with
-`-NpmCodexDir '<path to @openai\codex>'` if needed. The script checks npm and vendor metadata for 0.162.1,
+`-NpmCodexDir '<path to @openai\codex>'` if needed. The script checks npm and vendor metadata for 0.164.0,
 copies the entire `vendor\x86_64-pc-windows-msvc` tree into `<BuildRoot>\dist`, then replaces only
 `dist\bin\codex.exe` with `target\release\codex.exe`. It checks the final executable's version.
 It supports both nested and sibling npm platform package locations. Existing distribution files are overwritten;
@@ -201,7 +201,7 @@ In PowerShell, verify the explicit executable rather than a stock Codex found on
 & (Join-Path $BuildRoot 'dist\bin\codex.exe') --version
 ```
 
-Expected: `codex-cli 0.162.1`.
+Expected: `codex-cli 0.164.0`.
 
 In Git Bash, wait until existing Luna jobs have finished, then stop an old daemon so the next job uses
 the newly selected executable. The readiness job requires authentication and a network request; ask first
@@ -235,10 +235,10 @@ Official OpenAI documentation describes the upstream
 - **Git Bash as the Codex shell fails:** MSYS can die inside the sandbox with `CreateFileMapping error 5`.
   Use busybox `sh.exe` for model commands. Git Bash remains suitable for starting the Luna wrapper outside
   the sandbox. Do not point `default_shell_path` to Git's bash/sh. Keep `allow_login_shell=false`.
-- **`rg` missing:** rerun assembly against npm Codex 0.162.1 with its Windows platform dependency installed.
+- **`rg` missing:** rerun assembly against npm Codex 0.164.0 with its Windows platform dependency installed.
   Copying only the Rust `codex.exe` omits `codex-path\rg.exe`; assembly copies that directory and resources.
-- **npm version mismatch:** run `npm i -g @openai/codex@0.162.1` after approval, then assemble again.
-  Missing optional vendor package: use `npm i -g @openai/codex@0.162.1 --include=optional`.
+- **npm version mismatch:** run `npm i -g @openai/codex@0.164.0` after approval, then assemble again.
+  Missing optional vendor package: use `npm i -g @openai/codex@0.164.0 --include=optional`.
 - **`cl.exe` or SDK not found:** modify the VS 2022 Build Tools installation to include all three components
   listed above. The build script discovers it with vswhere; no hard-coded Git or compiler path is needed.
 - **Patch fails:** confirm HEAD is the intended tag and inspect local changes. Do not force-apply or reset
@@ -246,7 +246,7 @@ Official OpenAI documentation describes the upstream
 
 ## Rebuild after a Codex upgrade
 
-This kit and npm assembly are intentionally pinned to 0.162.1. An upgrade requires a reviewed kit change,
+This kit and npm assembly are intentionally pinned to 0.164.0. An upgrade requires a reviewed kit change,
 not just passing a newer `-Tag`: the script must still assemble helpers of the same version as the new binary.
 
 1. After user approval for downloads, use a clean checkout of the new upstream tag (for example, a fresh BuildRoot
