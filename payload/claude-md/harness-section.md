@@ -3,6 +3,16 @@
 > Project-level `CLAUDE.md`, explicit user requests, and any active project
 > workflow (e.g. GSD) take precedence over this file when they conflict.
 
+## Harness source
+
+How this Claude→Codex harness is built (scripts, daemon, skills, hooks, installer, learning loop) lives in the package
+repo `Xaooc/gpt-harness` (private), cloned at `C:/dev/luna-harness`. Read it to understand the design: `README.md`,
+`PACKAGE-SPEC.md`, `INSTALL.md`, `SELF-LEARNING.md`; `payload/` is what this machine runs, `payload-linux/` is the
+other platform's version, `codex-build/` is this PC's custom Codex build (Rust, busybox-shell patch; see `BUILD.md`, `LUNA-PATCH.md`).
+`~/.claude` is the installed copy: when you change a harness script or skill there, make the same change in
+`payload/` (and in `payload-linux/` unless it is platform-specific), update the payload `manifest.json` hashes, and
+commit and push (or tell the user it needs a push when this clone has no GitHub credentials).
+
 ## Division of labour: Claude orchestrates, Luna executes
 
 **Executors = Codex, normal service tier, two levels** (user decisions 2026-10-26): **`-m gpt-6.1-terra -e max`**

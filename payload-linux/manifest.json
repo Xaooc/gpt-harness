@@ -407,5 +407,5 @@
   "settings": "settings/hooks.json",
   "claudeMd": "claude-md/harness-section.md",
   "settingsSha256": "36a63c37e1fa6faa6489dcd8b8db7337f7d320253b13a41c5acc0c4434951468",
-  "claudeMdSha256": "e9d8bde6da0e394576449a2e8d8bb5a0bbe92bdac01f1112b8efa61b4297c698"
+  "claudeMdSha256": "b7089f1ab03490b3fb866c1a6ce36e9bf137e03af0b892e7b5b3400828875082"
 }
