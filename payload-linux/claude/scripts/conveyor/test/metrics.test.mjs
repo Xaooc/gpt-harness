@@ -86,7 +86,61 @@ test('run indexes collect write gate outcomes including handoff and exits 5, 6 a
     { ...runs[0], at: '2026-11-08T00:00:00Z' }]);
   assert.deepEqual(f.collect().executor, {
     writeRuns: 9, round0: 1, afterFix: 2, fixRounds: { 1: 1, 2: 2 }, red: 1,
-    handoffs: 1, noProvider: 1, writeLocked: 1, missingDispatch: 1
+    handoffs: 1, noProvider: 1, writeLocked: 1, unknown: 1
+  });
+});
+
+test('end records retain outcomes after dispatch cleanup without counting starts twice', (t) => {
+  const f = fixture(t);
+  const outcomes = [
+    { code: 0, gate: { status: 'pass', rounds: 0 } },
+    { code: 0, gate: { status: 'pass', rounds: 1 } },
+    { code: 6, gate: { status: 'fail', rounds: 2 } },
+    { code: 7, gate: null }, { code: 4, gate: null }, { code: 5, gate: null },
+    { code: 2, gate: { status: 'pass', rounds: 0 } },
+    { code: null, gate: { status: 'pass', rounds: 0 } },
+    { mode: 'read', code: 0, gate: null }
+  ];
+  const rows = outcomes.flatMap((outcome, i) => {
+    const out = path.join(f.home, `deleted-${i}.md`);
+    const completion = { event: 'end', at, out, mode: 'write', ...outcome };
+    return outcome.code === 7 || outcome.mode === 'read'
+      ? [completion] : [{ at, out, mode: 'block' }, completion];
+  });
+  f.write('conveyor/sessions/a.jsonl', rows);
+  assert.deepEqual(f.collect().executor, {
+    writeRuns: 8, round0: 1, afterFix: 1, fixRounds: { 1: 1, 2: 1 }, red: 1,
+    handoffs: 1, noProvider: 1, writeLocked: 1, unknown: 0
+  });
+});
+
+test('ordered end records take precedence over dispatch files when output paths are reused', (t) => {
+  const f = fixture(t);
+  const out = path.join(f.home, 'reused.md');
+  const row = { at, out, mode: 'block' };
+  f.write('reused.md.dispatch.json', { mode: 'read', code: 6 });
+  f.write('conveyor/sessions/a.jsonl', [
+    row, { ...row, event: 'end', code: 0, gate: { status: 'pass', rounds: 0 } },
+    row, { ...row, event: 'end', code: 0, gate: { status: 'pass', rounds: 2 } },
+    { ...row, at: '2026-11-08T00:00:00Z' }, { ...row, event: 'end', code: 6 }
+  ]);
+  const gate = f.collect().executor;
+  assert.equal(gate.writeRuns, 2);
+  assert.equal(gate.round0, 1);
+  assert.equal(gate.afterFix, 1);
+  assert.equal(gate.fixRounds[2], 1);
+  assert.equal(gate.red, 0);
+  assert.equal(gate.unknown, 0);
+});
+
+test('legacy dispatch runs with a null code and a passing gate count as green', (t) => {
+  const f = fixture(t);
+  const out = path.join(f.home, 'legacy.md');
+  f.write('legacy.md.dispatch.json', { mode: 'write', code: null, gate: { status: 'pass', rounds: 0 } });
+  f.write('conveyor/sessions/a.jsonl', [{ at, out, mode: 'block' }]);
+  assert.deepEqual(f.collect().executor, {
+    writeRuns: 1, round0: 1, afterFix: 0, fixRounds: { 1: 0, 2: 0 }, red: 0,
+    handoffs: 0, noProvider: 0, writeLocked: 0, unknown: 0
   });
 });
 

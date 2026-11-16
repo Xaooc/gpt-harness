@@ -407,12 +407,26 @@ test('a live repository write lock exits 7 with its owner while reads proceed', 
     assert.equal(dispatch.code, 7);
     assert.deepEqual(dispatch.owner, owner);
     assert.deepEqual(dispatch.attempts, []);
-    await assert.rejects(fs.stat(path.join(paths().home, 'sessions')), { code: 'ENOENT' });
+    const index = path.join(paths().home, 'sessions', 'gate-session.jsonl');
+    const blockedRecords = await readLines(index);
+    assert.equal(blockedRecords.length, 1);
+    const [completion] = blockedRecords;
+    assert.deepEqual(completion, {
+      event: 'end', at: completion.at, session: 'gate-session', out: env.out, tier: 'complex', mode: 'write',
+      provider: null, model: null, code: 7, gate: null
+    });
+    assert.ok(Number.isFinite(Date.parse(completion.at)));
     args[3] = '-r';
     const read = await env.command(args, { FAKE_WRAPPER_DELAY_S: '0' });
     assert.equal(read.status, 0, read.stderr);
     assert.match(read.stdout, /codex gpt-6.1-sol max read/);
     assert.deepEqual(await readJson(path.join(lock, 'owner.json')), owner);
+    const records = await readLines(index);
+    assert.equal(records.length, 2);
+    assert.equal(records[1].event, 'end');
+    assert.equal(records[1].mode, 'read');
+    assert.equal(records[1].code, 0);
+    assert.equal(records[1].gate, null);
   } finally {
     const exited = once(child, 'exit');
     child.kill();
@@ -427,7 +441,7 @@ test('stale write locks are taken over and released after successful and failed 
     await env.setup();
     const key = await fs.realpath(env.dir);
     const lock = path.join(paths().home, 'write-locks', createHash('sha256').update(key).digest('hex').slice(0, 16));
-    for (const code of [0, 17]) {
+    for (const code of [0, 2, 17]) {
       await fs.mkdir(lock, { recursive: true });
       await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({
         pid: 2147483647, start: '1', key, out: env.out, brief: env.brief, session: null, at: new Date().toISOString()
@@ -437,6 +451,22 @@ test('stale write locks are taken over and released after successful and failed 
       assert.equal((await readJson(`${env.out}.dispatch.json`)).action, 'run-wrapper');
       await assert.rejects(fs.stat(lock), { code: 'ENOENT' });
       assert.deepEqual(await fs.readdir(path.dirname(lock)), []);
+    }
+    const records = await readLines(path.join(paths().home, 'sessions', 'gate-session.jsonl'));
+    assert.deepEqual(records.filter((record) => record.event === 'end').map((record) => record.code), [0, 2, 17]);
+  } finally { await env.cleanup(); }
+});
+
+test('run index failures log diagnostics without changing executor exits', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    await fs.mkdir(paths().home, { recursive: true });
+    await fs.writeFile(path.join(paths().home, 'sessions'), 'not a directory');
+    for (const code of [0, 17]) {
+      const run = await env.run('complex', '-r', { FAKE_CODEX_RC: String(code), FAKE_WRAPPER_DELAY_S: '0' });
+      assert.equal(run.status, code, run.stderr);
+      assert.match(run.stderr, /conveyor: could not append run index:/);
     }
   } finally { await env.cleanup(); }
 });
@@ -887,11 +917,18 @@ test('a green write gate appends checks and records the owner, excluding pre-exi
     const dispatch = await readJson(`${env.out}.dispatch.json`);
     assert.equal(dispatch.gate.status, 'pass');
     assert.equal(dispatch.gate.rounds, 0);
-    const [owner] = await readLines(path.join(paths().home, 'sessions', 'gate-session.jsonl'));
+    const records = await readLines(path.join(paths().home, 'sessions', 'gate-session.jsonl'));
+    assert.equal(records.length, 2);
+    const [owner, completion] = records;
     assert.deepEqual(owner, {
       at: owner.at, session: 'gate-session', repo: env.dir, base: 'fixture-base', out: env.out, tier: 'complex', mode: 'block'
     });
     assert.ok(Number.isFinite(Date.parse(owner.at)));
+    assert.deepEqual(completion, {
+      event: 'end', at: completion.at, session: 'gate-session', out: env.out, tier: 'complex', mode: 'write',
+      provider: 'codex', model: 'gpt-6.1-sol', code: 0, gate: { status: 'pass', rounds: 0 }
+    });
+    assert.ok(Number.isFinite(Date.parse(completion.at)));
   } finally { await env.cleanup(); }
 });
 

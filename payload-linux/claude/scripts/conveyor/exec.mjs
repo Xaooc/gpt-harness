@@ -278,12 +278,21 @@ async function prepareGate(dir, brief, out, tier, skip) {
   catch (error) { gate.mode = 'block'; gate.configError = error.message; }
   if (gate.base && gate.mode !== 'off') gate.preExisting = await workingFiles(gate.repo);
   gate.brief = await fs.readFile(brief, 'utf8');
-  const session = process.env.CLAUDE_CODE_SESSION_ID || 'unknown', file = gateSessionFile(session);
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.appendFile(file, `${JSON.stringify({
-    at: new Date().toISOString(), session, repo: gate.repo, base: gate.base, out, tier, mode: gate.mode
-  })}\n`, { mode: 0o600 });
+  await appendRunRecord({
+    at: new Date().toISOString(), session: process.env.CLAUDE_CODE_SESSION_ID || 'unknown',
+    repo: gate.repo, base: gate.base, out, tier, mode: gate.mode
+  });
   return gate;
+}
+
+async function appendRunRecord(record) {
+  try {
+    const file = gateSessionFile(record.session);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.appendFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  } catch (error) {
+    process.stderr.write(`conveyor: could not append run index: ${error.message}\n`);
+  }
 }
 
 async function finishGate(gate, dispatch, entry, dir, out) {
@@ -768,16 +777,18 @@ async function runCommand(args) {
   if (opts['--waive']) dispatch.waive = opts['--waive'];
   if (opts['--no-gate']) dispatch.noGate = true;
   const saveDispatch = () => writeJsonAtomic(`${out}.dispatch.json`, dispatch);
-  const lock = mode === 'write' ? await acquireWriteLock(dir, out, brief) : null;
-  if (lock && !lock.release) {
-    Object.assign(dispatch, { action: 'write-locked', owner: lock.owner, code: 7 });
-    await saveDispatch();
-    process.stderr.write(`exec: another write job runs in ${lock.key} ` +
-      `(out: ${lock.owner?.out ?? 'unknown'}, since ${lock.owner?.at ?? 'unknown'}). ` +
-      'Run this slice in its own worktree (node ~/.claude/scripts/disk/wt-new.mjs …) or wait for it.\n');
-    return 7;
-  }
+  const session = process.env.CLAUDE_CODE_SESSION_ID || 'unknown';
+  let lock, code = 1;
   try {
+    lock = mode === 'write' ? await acquireWriteLock(dir, out, brief) : null;
+    if (lock && !lock.release) {
+      Object.assign(dispatch, { action: 'write-locked', owner: lock.owner, code: 7 });
+      await saveDispatch();
+      process.stderr.write(`exec: another write job runs in ${lock.key} ` +
+        `(out: ${lock.owner?.out ?? 'unknown'}, since ${lock.owner?.at ?? 'unknown'}). ` +
+        'Run this slice in its own worktree (node ~/.claude/scripts/disk/wt-new.mjs …) or wait for it.\n');
+      return code = 7;
+    }
     const gate = mode === 'write' ? await prepareGate(dir, brief, out, tier, panel || opts['--no-gate']) : null;
     let cursor = -1, from = null, failedReason = null;
     while (true) {
@@ -793,7 +804,7 @@ async function runCommand(args) {
         dispatch.code = 5;
         await saveDispatch();
         process.stderr.write(`conveyor: ${tier}: no provider available: ${dispatch.reason}\n`);
-        return 5;
+        return code = 5;
       }
       const entry = resolution.chain[index];
       const skipped = resolution.chain.slice(cursor + 1, index);
@@ -810,7 +821,7 @@ async function runCommand(args) {
       if (entry.provider === 'claude') {
         // Exit 4 releases the lock; the caller's hand-off subagent writes outside this lock.
         print(dispatch);
-        return 4;
+        return code = 4;
       }
       const attempt = {
         provider: entry.provider, model: entry.model, effort: entry.effort, at: new Date().toISOString()
@@ -837,7 +848,7 @@ async function runCommand(args) {
           dispatch.code = await finishGate(gate, dispatch, entry, dir, out);
         }
         await saveDispatch();
-        return dispatch.code;
+        return code = dispatch.code;
       }
       attempt.retry = true;
       attempt.reason = `${failure.reason}: ${failure.note}`;
@@ -849,7 +860,16 @@ async function runCommand(args) {
       state = await providerState(config);
       resolution = await resolve();
     }
-  } finally { lock?.release(); }
+  } finally {
+    try { lock?.release?.(); }
+    finally {
+      await appendRunRecord({
+        event: 'end', at: new Date().toISOString(), session, out, tier, mode,
+        provider: dispatch.provider ?? null, model: dispatch.model ?? null, code,
+        gate: dispatch.gate ? { status: dispatch.gate.status, rounds: dispatch.gate.rounds ?? null } : null
+      });
+    }
+  }
 }
 
 export async function main(args = process.argv.slice(2)) {

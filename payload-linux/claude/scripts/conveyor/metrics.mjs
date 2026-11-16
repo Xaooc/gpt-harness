@@ -86,21 +86,37 @@ export function collectMetrics({ start, end, home = process.env.CLAUDE_HOME_DIR 
   const sessions = files(path.join(conveyor, 'sessions'), '.jsonl');
   if (sessions !== null) {
     const gate = { writeRuns: 0, round0: 0, afterFix: 0, fixRounds: { 1: 0, 2: 0 }, red: 0,
-      handoffs: 0, noProvider: 0, writeLocked: 0, missingDispatch: 0 };
+      handoffs: 0, noProvider: 0, writeLocked: 0, unknown: 0 };
     for (const file of sessions) {
+      const runs = [], pending = new Map();
       for (const row of readJsonl(file) || []) {
+        if (row.event === 'end') {
+          const queue = pending.get(row.out);
+          const run = queue?.shift();
+          if (run) run.end = row;
+          else runs.push({ row, end: row });
+        } else {
+          const run = { row, end: null };
+          runs.push(run);
+          if (typeof row.out === 'string') {
+            if (!pending.has(row.out)) pending.set(row.out, []);
+            pending.get(row.out).push(run);
+          }
+        }
+      }
+      for (const { row, end: completion } of runs) {
         if (!within(row.at)) continue;
-        const dispatch = typeof row.out === 'string' ? readJson(`${row.out}.dispatch.json`) : null;
+        const dispatch = completion ?? (typeof row.out === 'string' ? readJson(`${row.out}.dispatch.json`) : null);
         // The current index contains write runs with gate modes block/warn/off; older fixtures may say write/read.
         if (dispatch?.mode === 'read' || row.mode === 'read') continue;
         if (dispatch?.mode !== 'write' && !['write', 'block', 'warn', 'off'].includes(row.mode)) continue;
         gate.writeRuns++;
-        if (!object(dispatch)) { gate.missingDispatch++; continue; }
+        if (!object(dispatch)) { gate.unknown++; continue; }
         const outcome = { 4: 'handoffs', 5: 'noProvider', 6: 'red', 7: 'writeLocked' }[dispatch.code];
         if (outcome) gate[outcome]++;
         const rounds = dispatch.gate?.rounds;
         if (rounds === 1 || rounds === 2) gate.fixRounds[rounds]++;
-        if (dispatch.code === 0 && dispatch.gate?.status === 'pass') {
+        if ((dispatch.code === 0 || (!completion && dispatch.code === null)) && dispatch.gate?.status === 'pass') {
           if (rounds === 0) gate.round0++;
           else if (rounds === 1 || rounds === 2) gate.afterFix++;
         }
