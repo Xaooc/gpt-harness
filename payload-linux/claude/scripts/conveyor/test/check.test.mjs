@@ -1,19 +1,42 @@
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadProfile } from '../lib/profile.mjs';
+import { main as checkMain } from '../check.mjs';
+import { invoke } from './process-fixture.mjs';
 
-const cli = fileURLToPath(new URL('../check.mjs', import.meta.url));
 const timeout = 600_000;
 const quote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
 const command = (source) => `${quote(process.execPath)} -e ${quote(source)}`;
 const counter = { name: 'eslint-disable', pattern: 'eslint-disable', glob: 'src/**/*.{ts,tsx}' };
 const profile = (fast = [], counters = []) => ({ version: 1, fast, hygiene: { counters } });
+let template;
+
+after(async () => { if (template) await fs.rm(template, { recursive: true, force: true }); });
+
+function git(repo, args, env) {
+  const result = spawnSync('git', [
+    '-c', 'user.name=Conveyor test', '-c', 'user.email=conveyor@example.invalid',
+    '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args
+  ], { cwd: repo, env, encoding: 'utf8', timeout });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+}
+
+async function repositoryTemplate(env) {
+  if (!template) {
+    template = await fs.mkdtemp(path.join(tmpdir(), 'conveyor-check-template-'));
+    git(template, ['init', '--quiet'], env);
+    await fs.writeFile(path.join(template, 'README.md'), 'A check fixture.\n');
+    git(template, ['add', '--all'], env);
+    git(template, ['commit', '--quiet', '-m', 'template'], env);
+  }
+  return template;
+}
 
 async function environment(t, config, files = { 'src/example.ts': 'export const value = 1;\n' }) {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'conveyor check test-'));
@@ -40,23 +63,17 @@ async function environment(t, config, files = { 'src/example.ts': 'export const 
       }
     },
     git(args) {
-      const result = spawnSync('git', [
-        '-c', 'user.name=Conveyor test', '-c', 'user.email=conveyor@example.invalid',
-        '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args
-      ], { cwd: repo, env, encoding: 'utf8', timeout });
-      assert.ifError(result.error);
-      assert.equal(result.status, 0, result.stderr);
+      git(repo, args, env);
     },
-    command(args, extraEnv = {}) {
-      const result = spawnSync(process.execPath, [cli, args[0], '--dir', repo, '--json', ...args.slice(1)], {
-        cwd: repo, env: { ...env, ...extraEnv }, encoding: 'utf8', timeout, maxBuffer: 4 * 1024 * 1024
+    async command(args, extraEnv = {}) {
+      const result = await invoke(checkMain, [args[0], '--dir', repo, '--json', ...args.slice(1)], {
+        cwd: repo, env: { ...env, ...extraEnv }, prefix: 'conveyor check', errorCode: 2
       });
       assert.ifError(result.error);
       return { ...result, report: result.stdout ? JSON.parse(result.stdout) : null };
     }
   };
-  fixture.git(['init', '--quiet']);
-  await fixture.write('README.md', 'A check fixture.\n');
+  fixture.git(['clone', '--local', '--quiet', await repositoryTemplate(env), '.']);
   for (const [file, value] of Object.entries(files)) await fixture.write(file, value);
   if (config !== undefined) await fixture.profile(config);
   fixture.git(['add', '--all']);
@@ -111,7 +128,7 @@ test('file placeholders pass literal positional arguments, including legacy quot
   const check = command(`require('node:assert/strict').deepEqual(process.argv.slice(1), ${JSON.stringify(expected)})`);
   for (const placeholder of ['{files}', '"{files}"', "'{files}'"]) {
     await env.profile(profile([{ name: 'argv', run: `${check} -- ${placeholder}` }]));
-    const result = env.command(['run', '--level', 'fast', '--files', files.join(',')]);
+    const result = await env.command(['run', '--level', 'fast', '--files', files.join(',')]);
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.ok(result.report.results[0].cmd.includes('"$@"'));
     await assert.rejects(fs.stat(path.join(env.repo, 'PWNED')), { code: 'ENOENT' });
@@ -133,7 +150,7 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) 
   await env.profile(config, false);
   await env.write('src/example.ts', '// eslint-disable\n');
   for (const level of ['fast', 'turn']) {
-    const result = env.command(['run', '--level', level], fakePath);
+    const result = await env.command(['run', '--level', level], fakePath);
     assert.equal(result.status, 1);
     assert.equal(result.report.profileTrust, 'untrusted');
     assert.equal(result.report.profile, 'untrusted (run check.mjs trust after review)');
@@ -142,27 +159,27 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) 
     await assert.rejects(fs.stat(path.join(env.repo, 'PROFILE_RAN')), { code: 'ENOENT' });
   }
   assert.equal(await fs.readFile(log, 'utf8'), '["run","lint"]\n');
-  const trusted = env.command(['trust']);
+  const trusted = await env.command(['trust']);
   assert.equal(trusted.status, 0, trusted.stderr);
   const raw = await fs.readFile(path.join(env.repo, '.claude/conveyor.json'));
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(env.home, 'trusted-profiles.json'), 'utf8')), {
     [env.repo]: createHash('sha256').update(raw).digest('hex')
   });
   for (const level of ['fast', 'turn']) {
-    const result = env.command(['run', '--level', level]);
+    const result = await env.command(['run', '--level', level]);
     assert.equal(result.report.profileTrust, 'trusted');
     assert.equal(result.report.results[0].status, 'pass');
     await fs.rm(path.join(env.repo, 'PROFILE_RAN'));
   }
   await fs.appendFile(path.join(env.repo, '.claude/conveyor.json'), '\n');
-  assert.equal(env.command(['run', '--level', 'fast']).report.profileTrust, 'untrusted');
+  assert.equal((await env.command(['run', '--level', 'fast'])).report.profileTrust, 'untrusted');
   await assert.rejects(fs.stat(path.join(env.repo, 'PROFILE_RAN')), { code: 'ENOENT' });
 });
 
 test('runner skips entries with no matching changed files and excludes deleted files', { timeout }, async (t) => {
   const env = await environment(t, profile([{ name: 'lint', glob: 'src/**/*.ts', run: command('process.exit(9)') }]));
   await fs.rm(path.join(env.repo, 'src/example.ts'));
-  const { status, stderr, report } = env.command(['run', '--level', 'fast', '--files', 'README.md,src/example.ts']);
+  const { status, stderr, report } = await env.command(['run', '--level', 'fast', '--files', 'README.md,src/example.ts']);
   assert.equal(status, 0, stderr);
   assert.deepEqual(report.changed, ['README.md']);
   assert.equal(report.results[0].status, 'skipped');
@@ -177,7 +194,7 @@ test('runner returns exit 1 and the last 60 ANSI-free output lines on failure', 
     process.exit(7);
   `.trim().replaceAll('\n', ' '));
   const env = await environment(t, profile([{ name: 'failure', glob: 'src/**/*.ts', run }]));
-  const { status, report } = env.command(['run', '--level', 'fast', '--files', 'src/example.ts']);
+  const { status, report } = await env.command(['run', '--level', 'fast', '--files', 'src/example.ts']);
   assert.equal(status, 1);
   assert.equal(report.ok, false);
   assert.equal(report.results[0].status, 'fail');
@@ -200,7 +217,7 @@ test('runner times out and kills the process group including the child', { timeo
   await env.profile({ ...profile([{ name: 'slow', glob: '**/*.ts', run: command(source) }]), budgets: { fast_s: 1 } });
   let pids;
   try {
-    const { status, report } = env.command(['run', '--level', 'fast', '--files', 'src/example.ts']);
+    const { status, report } = await env.command(['run', '--level', 'fast', '--files', 'src/example.ts']);
     pids = JSON.parse(await fs.readFile(pidFile, 'utf8'));
     assert.equal(status, 1);
     assert.equal(report.results[0].status, 'timeout');
@@ -227,7 +244,7 @@ test('runner invokes the heavy-gate wait before a heavy-looking command', { time
   ].join('\n'));
   const source = `require('node:assert/strict').deepEqual(require('node:fs').readFileSync(${JSON.stringify(log)}, 'utf8'), '["wait"]')`;
   await env.profile(profile([{ name: 'types', when: '**/*.ts', run: `${command(source)} tsc` }]));
-  const { status, stderr, report } = env.command(['run', '--level', 'fast', '--files', 'src/example.ts'], {
+  const { status, stderr, report } = await env.command(['run', '--level', 'fast', '--files', 'src/example.ts'], {
     CONVEYOR_HEAVY_GATE: gate
   });
   assert.equal(status, 0, stderr);
@@ -238,7 +255,7 @@ test('runner invokes the heavy-gate wait before a heavy-looking command', { time
 test('hygiene fails when one eslint-disable is added to a changed file', { timeout }, async (t) => {
   const env = await environment(t, profile([], [counter]), { 'src/example.ts': '// eslint-disable\n' });
   await env.write('src/example.ts', '// eslint-disable\n// eslint-disable\n');
-  const { status, report } = env.command(['run', '--level', 'fast']);
+  const { status, report } = await env.command(['run', '--level', 'fast']);
   assert.equal(status, 1);
   assert.equal(report.hygiene.ok, false);
   assert.deepEqual(report.hygiene.grew, [{ file: 'src/example.ts', counter: 'eslint-disable', before: 1, after: 2 }]);
@@ -247,7 +264,7 @@ test('hygiene fails when one eslint-disable is added to a changed file', { timeo
 test('hygiene passes when one eslint-disable is removed', { timeout }, async (t) => {
   const env = await environment(t, profile([], [counter]), { 'src/example.ts': '// eslint-disable\n// eslint-disable\n' });
   await env.write('src/example.ts', '// eslint-disable\n');
-  const { status, report } = env.command(['run', '--level', 'turn']);
+  const { status, report } = await env.command(['run', '--level', 'turn']);
   assert.equal(status, 0);
   assert.equal(report.hygiene.ok, true);
   assert.deepEqual(report.hygiene.grew, []);
@@ -256,7 +273,7 @@ test('hygiene passes when one eslint-disable is removed', { timeout }, async (t)
 test('hygiene counts a new untracked file with a TODO from zero', { timeout }, async (t) => {
   const env = await environment(t);
   await env.write('src/new.ts', '// TODO: finish this module\n');
-  const { status, report } = env.command(['run', '--level', 'fast']);
+  const { status, report } = await env.command(['run', '--level', 'fast']);
   assert.equal(status, 1);
   assert.deepEqual(report.changed, ['src/new.ts']);
   assert.deepEqual(report.hygiene.grew, [{ file: 'src/new.ts', counter: 'TODO/FIXME', before: 0, after: 1 }]);
@@ -266,27 +283,27 @@ test('hygiene fails when a large file crosses the line limit', { timeout }, asyn
   const large = { name: 'large-files', maxLines: 1500, glob: 'src/**/*.ts' };
   const env = await environment(t, profile([], [large]), { 'src/example.ts': 'export {};\n'.repeat(1500) });
   await env.write('src/example.ts', 'export {};\n'.repeat(1501));
-  const { status, report } = env.command(['run', '--level', 'fast']);
+  const { status, report } = await env.command(['run', '--level', 'fast']);
   assert.equal(status, 1);
   assert.deepEqual(report.hygiene.grew, [{ file: 'src/example.ts', counter: 'large-files', before: 1500, after: 1501 }]);
 });
 
 test('hygiene writes a baseline and reports repository totals against it', { timeout }, async (t) => {
   const env = await environment(t, undefined, { 'src/example.ts': '// eslint-disable\n// TODO: finish\n' });
-  const written = env.command(['hygiene', '--write-baseline']);
+  const written = await env.command(['hygiene', '--write-baseline']);
   assert.equal(written.status, 0, written.stderr);
   assert.equal(written.report.totals['eslint-disable'], 1);
   assert.equal(written.report.totals['TODO/FIXME'], 1);
   assert.equal(written.report.totals['large-files'], 0);
   const file = path.join(env.repo, '.conveyor/hygiene-baseline.json');
   assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), { version: 1, totals: written.report.totals });
-  const read = env.command(['hygiene']);
+  const read = await env.command(['hygiene']);
   assert.equal(read.status, 0, read.stderr);
   assert.deepEqual(read.report.totals, written.report.totals);
   assert.deepEqual(read.report.baseline, written.report.totals);
   assert.ok(Object.values(read.report.delta).every((value) => value === 0));
   await env.write('src/example.ts', '// eslint-disable\n// eslint-disable\n// TODO: finish\n');
-  const changed = env.command(['hygiene']);
+  const changed = await env.command(['hygiene']);
   assert.equal(changed.status, 0, changed.stderr);
   assert.equal(changed.report.totals['eslint-disable'], 2);
   assert.equal(changed.report.baseline['eslint-disable'], 1);

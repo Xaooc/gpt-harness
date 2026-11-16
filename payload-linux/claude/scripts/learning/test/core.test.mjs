@@ -6,8 +6,8 @@ import assert from "node:assert/strict";
 import childProcess, { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
+import { editableHeading, targetFixtures } from "./target-fixtures.mjs";
 
-const root = fileURLToPath(new URL("../../../", import.meta.url));
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "learning-core-"));
 process.env.CLAUDE_HOME_DIR = path.join(temporary, "home");
 process.env.CLAUDE_LEARNING_DIR = path.join(temporary, "data");
@@ -17,9 +17,7 @@ const common = await import("../common.mjs");
 const { paths, HOME_CLAUDE } = common;
 const coreFile = fileURLToPath(new URL("../core.mjs", import.meta.url));
 const revertScript = fileURLToPath(new URL("../../learning-revert.sh", import.meta.url));
-const originals = Object.fromEntries(core.TARGETS.map((target) => [
-  target, fs.readFileSync(path.join(root, target)),
-]));
+const originals = targetFixtures(core.TARGETS);
 const quote = "Always preserve the local change when undoing an adopted lesson.";
 const fixtures = [
   { id: "a", type: "luna_job", session: "session-A", source: "a.status", data: { trusted: true } },
@@ -35,7 +33,7 @@ const fixtures = [
   quote: event.id === "b" ? `${quote} A separate job result.` : quote,
   context: "A separate context sentence.",
 }));
-const editable = "## Division of labour: Claude orchestrates, Luna executes";
+const editable = editableHeading;
 const replacement = "## Division of labour and careful execution";
 
 function writeTarget(text, target = "CLAUDE.md") {
@@ -428,7 +426,7 @@ test("protected spans, repeated text and targets outside the allowlist fail", ()
   assertFailure(proposal({ target: "../CLAUDE.md" }), /allowlisted/);
 });
 
-test("real CLAUDE critic panel line and target-specific review policy vocabulary are protected", () => {
+test("fixture critic panel line and target-specific review policy vocabulary are protected", () => {
   const text = originals["CLAUDE.md"].toString("utf8").replace(/\r/g, "");
   const lines = text.split("\n");
   const index = lines.findIndex((line) => /3[–-]5/.test(line) && /critic/i.test(line));
@@ -1001,7 +999,7 @@ test("forced empty report omits empty sections and limits long lists", () => {
   assert.ok(long.short.length <= 1200);
 });
 
-test("real CLAUDE safety, permission and ask lines are protected against replacement", () => {
+test("fixture safety, permission and ask lines are protected against replacement", () => {
   const text = originals["CLAUDE.md"].toString("utf8").replace(/\r/g, "");
   const lines = text.split("\n");
   const indexes = core.protectedLineIndexes(text, "CLAUDE.md");

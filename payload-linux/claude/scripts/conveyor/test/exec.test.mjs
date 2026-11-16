@@ -2,16 +2,17 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { main as execMain } from '../exec.mjs';
+import { gitState, invoke, shellQuote, shellLog } from './process-fixture.mjs';
 import {
   loadConfig, validateConfig, saveConfig, applyPreset, markUnavailable, resolveChain, paths
 } from '../lib/orchestration.mjs';
 
-const cli = fileURLToPath(new URL('../exec.mjs', import.meta.url));
 const fixture = fileURLToPath(new URL('./fixtures/fake-wrapper.sh', import.meta.url));
 const defaultFile = new URL('../../../conveyor/orchestration.default.json', import.meta.url);
 const timeout = 600_000;
@@ -36,30 +37,28 @@ async function environment() {
       await fs.mkdir(changes.LUNA_RUN_DIR);
       await fs.writeFile(brief, 'Inspect the fixture.\n');
       await fs.mkdir(path.join(root, 'bin'));
-      await fs.writeFile(path.join(root, 'bin', 'git'), `#!${process.execPath}
-const fs = require('node:fs');
-const stateFile = ${JSON.stringify(path.join(root, 'git.json'))};
-if (!fs.existsSync(stateFile)) process.exit(128);
-const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-const args = process.argv.slice(4);
-let files;
-if (args[0] === 'rev-parse') {
-  process.stdout.write(args[1] === '--show-toplevel' ? ${JSON.stringify(dir)} : state.head);
-} else {
-  if (args[0] === 'diff') files = state.working;
-  else if (args[0] === 'log') files = state.committed || [];
-  else if (args[0] === 'ls-files') files = args.includes('--cached') ? state.files : state.untracked;
-  else throw new Error('unexpected fake git arguments: ' + JSON.stringify(args));
-  process.stdout.write(files.length ? files.join('\\0') + '\\0' : '');
-}
+      await fs.writeFile(path.join(root, 'bin', 'git'), `#!/bin/bash
+state_file=${shellQuote(path.join(root, 'git.json'))}
+[ -f "$state_file" ] || exit 128
+source "$state_file.sh"
+shift 2
+case "$1" in
+  rev-parse)
+    if [ "$2" = --show-toplevel ]; then printf '%s' ${shellQuote(dir)}; else printf '%s' "$head"; fi
+    exit 0 ;;
+  diff) names=$working ;;
+  log) names=$committed ;;
+  ls-files) if [[ " $* " == *' --cached '* ]]; then names=$files; else names=$untracked; fi ;;
+  *) printf 'unexpected fake git arguments: %s\\n' "$*" >&2; exit 1 ;;
+esac
+eval "set -- $names"
+if [ "$#" -gt 0 ]; then printf '%s\\0' "$@"; fi
 `, { mode: 0o755 });
     },
-    command(args, extraEnv = {}) {
-      const result = spawnSync(process.execPath, [cli, ...args], {
-        env: { ...process.env, ...extraEnv }, encoding: 'utf8', timeout, maxBuffer: 4 * 1024 * 1024
+    async command(args, extraEnv = {}) {
+      return invoke(execMain, args, {
+        env: { ...process.env, ...extraEnv }, prefix: 'conveyor', captureChildren: true
       });
-      assert.ifError(result.error);
-      return result;
     },
     run(tier, mode = '-r', extraEnv = {}, extraArgs = []) {
       return this.command(['run', '--tier', tier, mode, '-C', dir, '-f', brief, '-o', out, ...extraArgs], extraEnv);
@@ -85,74 +84,89 @@ if (args[0] === 'rev-parse') {
 async function gateFixture(env, scenario = 'green', mode = 'block') {
   const stateFile = path.join(env.root, 'git.json'), calls = path.join(env.root, 'launches.jsonl');
   const checks = path.join(env.root, 'checks.jsonl'), wrapper = path.join(env.root, 'gate-wrapper.sh');
-  const runner = path.join(env.root, 'gate-wrapper.mjs'), checker = path.join(env.root, 'check.mjs');
+  const checker = path.join(env.root, 'check.sh');
   await fs.mkdir(path.join(env.dir, '.claude'));
   await fs.writeFile(path.join(env.dir, '.claude', 'conveyor.json'), JSON.stringify({ gate: { mode } }));
   for (const file of ['source.js', 'dirty.txt', 'old.txt', 'source.test.js']) {
     await fs.writeFile(path.join(env.dir, file), 'before\n');
   }
-  await fs.writeFile(stateFile, JSON.stringify({
+  const initial = {
     head: 'fixture-base', working: ['dirty.txt'], untracked: ['old.txt'],
     files: ['source.js', 'dirty.txt', 'old.txt', 'source.test.js', '.claude/conveyor.json']
-  }));
-  await fs.writeFile(wrapper, 'exec "$FAKE_GATE_NODE" "$FAKE_GATE_WRAPPER" "$@"\n');
-  await fs.writeFile(runner, `import * as fs from 'node:fs';
-import path from 'node:path';
-const args = process.argv.slice(2);
-const option = (name) => args[args.indexOf(name) + 1];
-const calls = ${JSON.stringify(calls)}, stateFile = ${JSON.stringify(stateFile)};
-fs.appendFileSync(calls, JSON.stringify(args) + '\\n');
-const round = fs.readFileSync(calls, 'utf8').trim().split('\\n').length;
-const dir = option('-C'), out = option('-o');
-const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-fs.writeFileSync(path.join(dir, 'source.js'), 'change ' + round + '\\n');
-fs.writeFileSync(path.join(dir, 'new.txt'), 'new\\n');
-fs.writeFileSync(path.join(dir, 'committed.js'), 'committed\\n');
-state.head = 'fixture-head';
-state.working = ['dirty.txt', 'source.js'];
-state.untracked = ['old.txt', 'new.txt'];
-state.committed = ['committed.js'];
-state.files = [...new Set([...state.files, 'new.txt', 'committed.js'])];
-if (round > 1 && process.env.FAKE_GATE_SCENARIO === 'weaken') {
-  fs.writeFileSync(path.join(dir, 'eslint.config.js'), 'export default [];\\n');
-  state.files.push('eslint.config.js');
-}
-if (round > 1 && process.env.FAKE_GATE_SCENARIO === 'edit-tests') {
-  fs.writeFileSync(path.join(dir, 'source.test.js'), 'weakened test\\n');
-}
-if (round > 1 && process.env.FAKE_GATE_SCENARIO === 'delete-tests') fs.rmSync(path.join(dir, 'source.test.js'));
-if (round > 1 && process.env.FAKE_GATE_SCENARIO === 'add-tests') {
-  fs.writeFileSync(path.join(dir, 'new.test.js'), 'new test\\n');
-  state.files.push('new.test.js');
-  state.untracked.push('new.test.js');
-}
-fs.writeFileSync(stateFile, JSON.stringify(state));
-fs.writeFileSync(out, 'Requested change done.\\n');
-fs.writeFileSync(out + '.status', 'state=done\\n');
+  };
+  await fs.writeFile(stateFile, JSON.stringify(initial));
+  await fs.writeFile(`${stateFile}.sh`, gitState(initial));
+  await fs.writeFile(wrapper, `#!/bin/bash
+${shellLog}
+calls=${shellQuote(calls)}
+state_file=${shellQuote(stateFile)}
+json_args "$@" >> "$calls"
+printf '\\n' >> "$calls"
+round=$(wc -l < "$calls")
+while [ "$#" -gt 1 ]; do
+  case "$1" in -C) dir=$2;; -o) out=$2;; esac
+  shift
+done
+printf 'change %s\\n' "$round" > "$dir/source.js"
+printf 'new\\n' > "$dir/new.txt"
+printf 'committed\\n' > "$dir/committed.js"
+working=('dirty.txt' 'source.js')
+untracked=('old.txt' 'new.txt')
+committed=('committed.js')
+files=('source.js' 'dirty.txt' 'old.txt' 'source.test.js' '.claude/conveyor.json' 'new.txt' 'committed.js')
+if [ "$round" -gt 1 ]; then
+  case "$FAKE_GATE_SCENARIO" in
+    weaken) printf 'export default [];\\n' > "$dir/eslint.config.js"; files+=('eslint.config.js') ;;
+    edit-tests) printf 'weakened test\\n' > "$dir/source.test.js" ;;
+    delete-tests) rm -- "$dir/source.test.js" ;;
+    add-tests) printf 'new test\\n' > "$dir/new.test.js"; files+=('new.test.js'); untracked+=('new.test.js') ;;
+  esac
+fi
+printf 'head=fixture-head\\n' > "$state_file.sh"
+printf '{"head":"fixture-head"' > "$state_file"
+for key in working untracked committed files; do
+  declare -n names=$key
+  printf -v encoded '%q ' "${'${'}names[@]}"
+  printf '%s=%q\\n' "$key" "$encoded" >> "$state_file.sh"
+  { printf ',"%s":' "$key"; json_args "${'${'}names[@]}"; } >> "$state_file"
+done
+printf '}' >> "$state_file"
+printf 'Requested change done.\\n' > "$out"
+printf 'state=done\\n' > "$out.status"
 `);
-  await fs.writeFile(checker, `import * as fs from 'node:fs';
-const args = process.argv.slice(2), option = (name) => args[args.indexOf(name) + 1];
-fs.appendFileSync(${JSON.stringify(checks)}, JSON.stringify(args) + '\\n');
-const round = fs.readFileSync(${JSON.stringify(calls)}, 'utf8').trim().split('\\n').length;
-const scenario = process.env.FAKE_GATE_SCENARIO;
-const ok = scenario === 'green' || (['repair', 'timeout', 'add-tests'].includes(scenario) && round > 1);
-const timedOut = scenario === 'timeout' && !ok;
-const level = option('--level');
-process.stdout.write(JSON.stringify({
-  ok, level, repo: option('--dir'), base: option('--base'), changed: option('--files').split(','),
-  results: [{ name: level + '-check', cmd: ['fake', level], status: timedOut ? 'timeout' : ok ? 'pass' : 'fail',
-    rc: timedOut ? null : ok ? 0 : 1, durationMs: 12,
-    outputTail: ok ? '' : timedOut ? 'fixture timeout tail' : 'fixture failure tail' }],
-  hygiene: { ok, grew: ok ? [] : [{ file: 'source.js', counter: 'suppression', before: 0, after: 1 }] }
-}));
-process.exitCode = ok ? 0 : 1;
-`);
+  await fs.writeFile(checker, `#!/bin/bash
+${shellLog}
+json_args "$@" >> ${shellQuote(checks)}
+printf '\\n' >> ${shellQuote(checks)}
+round=$(wc -l < ${shellQuote(calls)})
+while [ "$#" -gt 1 ]; do
+  case "$1" in --level) level=$2;; --dir) repo=$2;; --base) base=$2;; --files) files=$2;; esac
+  shift
+done
+ok=false
+if [ "$FAKE_GATE_SCENARIO" = green ]; then ok=true
+elif [ "$round" -gt 1 ]; then
+  case "$FAKE_GATE_SCENARIO" in repair|timeout|add-tests) ok=true;; esac
+fi
+status=fail; rc=1; tail='fixture failure tail'; grew='[{"file":"source.js","counter":"suppression","before":0,"after":1}]'
+if [ "$ok" = true ]; then status=pass; rc=0; tail=; grew='[]'
+elif [ "$FAKE_GATE_SCENARIO" = timeout ]; then status=timeout; rc=null; tail='fixture timeout tail'; fi
+printf '{"ok":%s,"level":' "$ok"; json_string "$level"
+printf ',"repo":'; json_string "$repo"
+printf ',"base":'; json_string "$base"
+printf ',"changed":'; IFS=, read -ra names <<< "$files"; json_args "${'${'}names[@]}"
+printf ',"results":[{"name":'; json_string "$level-check"
+printf ',"cmd":'; json_args fake "$level"
+printf ',"status":'; json_string "$status"
+printf ',"rc":%s,"durationMs":12,"outputTail":' "$rc"; json_string "$tail"
+printf '}],"hygiene":{"ok":%s,"grew":%s}}' "$ok" "$grew"
+if [ "$ok" = true ]; then exit 0; else exit 1; fi
+`, { mode: 0o755 });
   return {
     calls, checks,
     env: {
-      CONVEYOR_LUNA_SH: wrapper, CONVEYOR_GEM_SH: wrapper, FAKE_GATE_NODE: process.execPath,
-      FAKE_GATE_WRAPPER: runner, FAKE_GATE_SCENARIO: scenario,
-      CONVEYOR_CHECK_CMD: JSON.stringify([process.execPath, checker])
+      CONVEYOR_LUNA_SH: wrapper, CONVEYOR_GEM_SH: wrapper, FAKE_GATE_SCENARIO: scenario,
+      CONVEYOR_CHECK_CMD: JSON.stringify([checker])
     }
   };
 }
@@ -223,11 +237,11 @@ test('Codex threshold persists hysteresis, hands off to Sonnet, and ignores stal
     await fs.writeFile(path.join(sessions, 'live.json'), JSON.stringify({
       v: 1, sessionId: 'live', updatedAt: Date.now(), limits: [{ kind: 'five_hour', percentUsed: 96 }]
     }));
-    const first = env.command(['resolve', '--tier', 'complex', '--json']);
+    const first = await env.command(['resolve', '--tier', 'complex', '--json']);
     assert.equal(first.status, 0, first.stderr);
     assert.equal(JSON.parse(first.stdout).selected.model, 'sonnet');
     assert.match(JSON.parse(first.stdout).chain[0].reason, /codex 83% ≥ 80% \(5h window\)/);
-    const handoff = env.run('complex');
+    const handoff = await env.run('complex');
     assert.equal(handoff.status, 4, handoff.stderr);
     const dispatch = await readJson(`${env.out}.dispatch.json`);
     assert.equal(dispatch.action, 'claude-subagent');
@@ -261,7 +275,7 @@ test('Gemini exit 3 falls back, archives artifacts, and journals a cooldown and 
   const env = await environment();
   try {
     await env.setup();
-    const run = env.run('simple', '-w', {
+    const run = await env.run('simple', '-w', {
       FAKE_GEMINI_RC: '3', FAKE_GEMINI_REASON: 'quota', FAKE_GEMINI_STATE: 'starting'
     });
     assert.equal(run.status, 0, run.stderr);
@@ -269,7 +283,7 @@ test('Gemini exit 3 falls back, archives artifacts, and journals a cooldown and 
     const mark = (await readJson(paths().providers)).gemini;
     assert.equal(mark.reason, 'quota');
     assert.equal(Date.parse(mark.until) - Date.parse(mark.at), 1800_000);
-    const resolved = env.command(['resolve', '--tier', 'simple', '--json']);
+    const resolved = await env.command(['resolve', '--tier', 'simple', '--json']);
     const chain = JSON.parse(resolved.stdout);
     assert.equal(chain.chain[0].available, false);
     assert.match(chain.chain[0].reason, /gemini unavailable until .*: quota/);
@@ -305,7 +319,7 @@ test('a write wrapper that runs, edits a file and hits quota is never retried', 
   const env = await environment();
   try {
     await env.setup();
-    const run = env.run('complex', '-w', {
+    const run = await env.run('complex', '-w', {
       FAKE_CODEX_RC: '17', FAKE_CODEX_ERROR: 'Usage limit reached; quota exhausted', FAKE_CODEX_MODIFY: '1'
     });
     assert.equal(run.status, 17, run.stderr);
@@ -328,9 +342,10 @@ test('running write jobs never fall back even without edits; running read-only j
       const env = await environment();
       try {
         await env.setup();
-        const run = env.run('simple', mode, {
+        const run = await env.run('simple', mode, {
           FAKE_GEMINI_RC: '3', FAKE_GEMINI_REASON: 'quota', FAKE_GEMINI_STATE: 'running',
-          FAKE_WRAPPER_DELAY_S: '1.1'
+          // The real status watcher observes the running state; no full polling interval is needed.
+          FAKE_WRAPPER_DELAY_S: '0.1'
         });
         assert.equal(run.status, mode === '-w' ? 3 : 0, run.stderr);
         assert.deepEqual(await fs.readdir(env.dir), [], 'the wrapper did not change the project');
@@ -368,6 +383,7 @@ test('a live repository write lock exits 7 with its owner while reads proceed', 
     await once(child, 'spawn');
     await env.setup();
     await fs.writeFile(path.join(env.root, 'git.json'), JSON.stringify({ head: 'fixture-base' }));
+    await fs.writeFile(path.join(env.root, 'git.json.sh'), gitState({ head: 'fixture-base' }));
     const subdir = path.join(env.dir, 'nested');
     await fs.mkdir(subdir);
     const stat = await fs.readFile(`/proc/${child.pid}/stat`, 'utf8');
@@ -380,7 +396,7 @@ test('a live repository write lock exits 7 with its owner while reads proceed', 
     await fs.mkdir(lock, { recursive: true });
     await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify(owner));
     const args = ['run', '--tier', 'complex', '-w', '-C', subdir, '-f', env.brief, '-o', env.out];
-    const blocked = env.command([...args, '--no-gate', '--waive', 'W-7']);
+    const blocked = await env.command([...args, '--no-gate', '--waive', 'W-7']);
     assert.equal(blocked.status, 7, blocked.stderr);
     assert.equal(blocked.stdout, '');
     assert.equal(blocked.stderr, `exec: another write job runs in ${env.dir} ` +
@@ -393,7 +409,7 @@ test('a live repository write lock exits 7 with its owner while reads proceed', 
     assert.deepEqual(dispatch.attempts, []);
     await assert.rejects(fs.stat(path.join(paths().home, 'sessions')), { code: 'ENOENT' });
     args[3] = '-r';
-    const read = env.command(args, { FAKE_WRAPPER_DELAY_S: '0' });
+    const read = await env.command(args, { FAKE_WRAPPER_DELAY_S: '0' });
     assert.equal(read.status, 0, read.stderr);
     assert.match(read.stdout, /codex gpt-6.1-sol max read/);
     assert.deepEqual(await readJson(path.join(lock, 'owner.json')), owner);
@@ -416,7 +432,7 @@ test('stale write locks are taken over and released after successful and failed 
       await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({
         pid: 2147483647, start: '1', key, out: env.out, brief: env.brief, session: null, at: new Date().toISOString()
       }));
-      const run = env.run('complex', '-w', { FAKE_CODEX_RC: String(code), FAKE_WRAPPER_DELAY_S: '0' });
+      const run = await env.run('complex', '-w', { FAKE_CODEX_RC: String(code), FAKE_WRAPPER_DELAY_S: '0' });
       assert.equal(run.status, code, run.stderr);
       assert.equal((await readJson(`${env.out}.dispatch.json`)).action, 'run-wrapper');
       await assert.rejects(fs.stat(lock), { code: 'ENOENT' });
@@ -430,31 +446,31 @@ test('panel runs keep the chosen seat and unavailable seats return 5 with their 
   try {
     await env.setup();
     const args = ['run', '--panel', 'design', '--seat', '1', '-r', '-C', env.dir, '-f', env.brief, '-o', env.out];
-    const run = env.command(args);
+    const run = await env.command(args);
     assert.equal(run.status, 0, run.stderr);
     assert.match(run.stdout, /gemini gemini-3.8-flash high read/);
     let dispatch = await readJson(`${env.out}.dispatch.json`);
     assert.equal(dispatch.panel, 'design');
     assert.equal(dispatch.seat, 1);
     assert.equal(dispatch.attempts.length, 1);
-    const failed = env.command(args, {
+    const failed = await env.command(args, {
       FAKE_GEMINI_RC: '3', FAKE_GEMINI_REASON: 'quota', FAKE_GEMINI_STATE: 'starting'
     });
     assert.equal(failed.status, 3, failed.stderr);
     dispatch = await readJson(`${env.out}.dispatch.json`);
     assert.equal(dispatch.attempts.length, 1);
     assert.equal(dispatch.attempts[0].retry, false);
-    const unavailable = env.command(args);
+    const unavailable = await env.command(args);
     assert.equal(unavailable.status, 5, unavailable.stderr);
     assert.match(unavailable.stderr, /gemini unavailable until .*: quota/);
     assert.deepEqual((await readJson(`${env.out}.dispatch.json`)).attempts, []);
     await env.limits(83);
     args[4] = '0';
-    const threshold = env.command(args);
+    const threshold = await env.command(args);
     assert.equal(threshold.status, 5, threshold.stderr);
     assert.match(threshold.stderr, /codex 83% ≥ 80%/);
     await assert.rejects(fs.stat(paths().switches), { code: 'ENOENT' });
-    const role = env.command(['run', '--role', 'arena runners', '--seat', '1', '-w',
+    const role = await env.command(['run', '--role', 'arena runners', '--seat', '1', '-w',
       '-C', env.dir, '-f', env.brief, '-o', env.out]);
     assert.equal(role.status, 5, role.stderr);
     assert.equal((await readJson(`${env.out}.dispatch.json`)).panel, 'design');
@@ -466,23 +482,23 @@ test('judge resolution lists seats and first-available selects the earliest avai
   try {
     await env.setup();
     const args = ['resolve', '--panel', 'judge', '--json'];
-    const listed = env.command(args);
+    const listed = await env.command(args);
     assert.equal(listed.status, 0, listed.stderr);
     assert.equal(JSON.parse(listed.stdout).selected, null);
     assert.deepEqual(JSON.parse(listed.stdout).seats.map((entry) => entry.seat), [0, 1]);
     args.push('--first-available');
-    const first = env.command(args);
+    const first = await env.command(args);
     assert.equal(first.status, 0, first.stderr);
     assert.equal(JSON.parse(first.stdout).selected.provider, 'gemini');
     assert.equal(JSON.parse(first.stdout).selected.seat, 0);
     await markUnavailable('gemini', 'quota', 'fixture');
-    const second = env.command(['resolve', '--role', 'arena cross-judge pool', '--first-available', '--json']);
+    const second = await env.command(['resolve', '--role', 'arena cross-judge pool', '--first-available', '--json']);
     assert.equal(second.status, 0, second.stderr);
     assert.equal(JSON.parse(second.stdout).panel, 'judge');
     assert.equal(JSON.parse(second.stdout).selected.provider, 'codex');
     assert.equal(JSON.parse(second.stdout).selected.seat, 1);
     await env.limits(83);
-    const none = env.command(args);
+    const none = await env.command(args);
     assert.equal(none.status, 5, none.stderr);
     assert.equal(JSON.parse(none.stdout).selected, null);
     assert.ok(JSON.parse(none.stdout).seats.every((entry) => !entry.available));
@@ -494,7 +510,7 @@ test('all providers skipped returns exit 5 with reasons and a status snapshot', 
   try {
     await env.setup();
     for (const provider of ['codex', 'gemini', 'claude']) await markUnavailable(provider, 'quota', 'fixture quota');
-    const run = env.run('simple');
+    const run = await env.run('simple');
     assert.equal(run.status, 5, run.stderr);
     for (const provider of ['codex', 'gemini', 'claude']) {
       assert.match(run.stderr, new RegExp(`${provider} unavailable until`));
@@ -503,10 +519,10 @@ test('all providers skipped returns exit 5 with reasons and a status snapshot', 
     assert.equal(dispatch.action, 'unavailable');
     assert.equal(dispatch.selected, null);
     assert.deepEqual(dispatch.attempts, []);
-    const resolve = env.command(['resolve', '--tier', 'simple', '--json']);
+    const resolve = await env.command(['resolve', '--tier', 'simple', '--json']);
     assert.equal(resolve.status, 5, resolve.stderr);
     assert.ok(JSON.parse(resolve.stdout).chain.every((entry) => !entry.available));
-    const status = env.command(['status', '--json']);
+    const status = await env.command(['status', '--json']);
     assert.equal(status.status, 0, status.stderr);
     const result = JSON.parse(status.stdout);
     assert.deepEqual(Object.keys(result.tiers).sort(), ['complex', 'review', 'scout', 'simple']);
@@ -526,17 +542,17 @@ test('roles render and override tiers; labelled presets validate and journal cha
       label: 'Экономия', tiers: { complex: [{ provider: 'claude', model: 'haiku', effort: 'medium' }] }
     };
     await saveConfig(config, { actor: 'panel', note: 'roles and presets' });
-    const run = env.run('simple', '-r', {}, ['--role', 'auditor']);
+    const run = await env.run('simple', '-r', {}, ['--role', 'auditor']);
     assert.equal(run.status, 0, run.stderr);
     const dispatch = await readJson(`${env.out}.dispatch.json`);
     assert.equal(dispatch.tier, 'review');
     assert.equal(dispatch.role, 'auditor');
     assert.equal(dispatch.provider, 'codex');
     assert.equal(dispatch.model, 'gpt-6-luna');
-    const get = env.command(['config', 'get', 'roles.auditor']);
+    const get = await env.command(['config', 'get', 'roles.auditor']);
     assert.equal(get.status, 0, get.stderr);
     assert.equal(JSON.parse(get.stdout), 'tier:review');
-    const render = env.command(['roles', 'render']);
+    const render = await env.command(['roles', 'render']);
     assert.equal(render.status, 0, render.stderr);
     const generated = path.join(process.env.CLAUDE_HOME_DIR, 'rules', 'pstack-models.md');
     const content = await fs.readFile(generated, 'utf8');
@@ -549,21 +565,21 @@ test('roles render and override tiers; labelled presets validate and journal cha
       assert.ok(content.split('\n').includes(`${role}: ${kind} ${name}${seats}`));
     }
     const custom = path.join(env.root, 'custom-models.md');
-    const customRender = env.command(['roles', 'render', '--out', custom]);
+    const customRender = await env.command(['roles', 'render', '--out', custom]);
     assert.equal(customRender.status, 0, customRender.stderr);
     assert.equal(await fs.readFile(custom, 'utf8'), content);
     assert.deepEqual(await fs.readdir(path.dirname(generated)), ['pstack-models.md']);
-    const set = env.command(['config', 'set', 'thresholds.codex.switch_percent', '82']);
+    const set = await env.command(['config', 'set', 'thresholds.codex.switch_percent', '82']);
     assert.equal(set.status, 0, set.stderr);
     const before = await fs.readFile(paths().config, 'utf8');
-    const invalid = env.command(['config', 'set', 'thresholds.codex.switch_percent', '0']);
+    const invalid = await env.command(['config', 'set', 'thresholds.codex.switch_percent', '0']);
     assert.equal(invalid.status, 1);
     assert.match(invalid.stderr, /switch_percent must be between 1 and 100/);
     assert.equal(await fs.readFile(paths().config, 'utf8'), before);
-    const validate = env.command(['config', 'validate']);
+    const validate = await env.command(['config', 'validate']);
     assert.equal(validate.status, 0, validate.stderr);
     assert.equal(validate.stdout, 'valid\n');
-    const preset = env.command(['config', 'preset', 'economy']);
+    const preset = await env.command(['config', 'preset', 'economy']);
     assert.equal(preset.status, 0, preset.stderr);
     assert.deepEqual((await loadConfig()).tiers.complex, config.presets.economy.tiers.complex);
     assert.equal((await loadConfig()).presets.economy.label, 'Экономия');
@@ -577,8 +593,8 @@ test('roles render and override tiers; labelled presets validate and journal cha
   } finally { await env.cleanup(); }
 });
 
-function action(env, args, extraEnv = {}) {
-  const result = env.command(args, extraEnv);
+async function action(env, args, extraEnv = {}) {
+  const result = await env.command(args, extraEnv);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, '');
   assert.equal(result.stdout.trim().split('\n').length, 1);
@@ -597,7 +613,7 @@ test('config set-entry regenerates the roles file with the new model', { timeout
     const roles = path.join(process.env.CLAUDE_HOME_DIR, 'rules', 'pstack-models.md');
     await fs.mkdir(path.dirname(roles), { recursive: true });
     await fs.writeFile(roles, 'stale roles\n');
-    action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '0', '--provider', 'codex',
+    await action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '0', '--provider', 'codex',
       '--model', 'gpt-6-luna', '--effort', 'high', '--actor', 'panel']);
     const rendered = await fs.readFile(roles, 'utf8');
     assert.match(rendered, /^# Generated from orchestration.json\./);
@@ -611,19 +627,19 @@ test('set-entry validates catalog efforts, edits panel seats and journals the pa
   try {
     await env.setup();
     const target = ['--tier', 'complex', '--index', '0', '--provider', 'codex', '--model', 'gpt-6.1-sol'];
-    const edited = action(env, ['config', 'set-entry', ...target, '--effort', 'high', '--actor', 'panel']);
+    const edited = await action(env, ['config', 'set-entry', ...target, '--effort', 'high', '--actor', 'panel']);
     assert.equal(edited.changed, true);
     assert.equal((await loadConfig()).tiers.complex[0].effort, 'high');
     const before = await fs.readFile(paths().config, 'utf8');
     const journalBefore = await fs.readFile(paths().journal, 'utf8');
-    const invalid = env.command(['config', 'set-entry', ...target, '--effort', 'ultra', '--actor', 'panel']);
+    const invalid = await env.command(['config', 'set-entry', ...target, '--effort', 'ultra', '--actor', 'panel']);
     assert.equal(invalid.status, 1);
     assert.equal(invalid.stdout, '');
     assert.match(invalid.stderr, /effort ultra is not in catalog/);
     assert.equal(invalid.stderr.trim().split('\n').length, 1);
     assert.equal(await fs.readFile(paths().config, 'utf8'), before);
     assert.equal(await fs.readFile(paths().journal, 'utf8'), journalBefore);
-    action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
+    await action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
       '--model', 'gemini-3.8-flash', '--effort', 'low', '--actor', 'panel']);
     assert.deepEqual((await loadConfig()).panels.design[1], {
       provider: 'gemini', model: 'gemini-3.8-flash', effort: 'low'
@@ -639,20 +655,20 @@ test('entry actions insert, move and remove; the last chain entry cannot be remo
     await env.setup();
     const initial = (await loadConfig()).tiers.simple;
     const entry = { provider: 'claude', model: 'sonnet', effort: 'low' };
-    action(env, ['config', 'add-entry', '--tier', 'simple', '--provider', entry.provider,
+    await action(env, ['config', 'add-entry', '--tier', 'simple', '--provider', entry.provider,
       '--model', entry.model, '--effort', entry.effort, '--at', '1']);
     assert.deepEqual((await loadConfig()).tiers.simple, [initial[0], entry, ...initial.slice(1)]);
-    action(env, ['config', 'move-entry', '--tier', 'simple', '--index', '1', '--to', '3']);
+    await action(env, ['config', 'move-entry', '--tier', 'simple', '--index', '1', '--to', '3']);
     assert.deepEqual((await loadConfig()).tiers.simple, [...initial, entry]);
-    action(env, ['config', 'remove-entry', '--tier', 'simple', '--index', '3']);
+    await action(env, ['config', 'remove-entry', '--tier', 'simple', '--index', '3']);
     assert.deepEqual((await loadConfig()).tiers.simple, initial);
-    assert.equal(action(env, ['config', 'move-entry', '--tier', 'simple', '--index', '0', '--to', '0']).changed, false);
-    action(env, ['config', 'remove-entry', '--tier', 'complex', '--index', '1']);
+    assert.equal((await action(env, ['config', 'move-entry', '--tier', 'simple', '--index', '0', '--to', '0'])).changed, false);
+    await action(env, ['config', 'remove-entry', '--tier', 'complex', '--index', '1']);
     const before = await fs.readFile(paths().config, 'utf8');
-    const empty = env.command(['config', 'remove-entry', '--tier', 'complex', '--index', '0']);
+    const empty = await env.command(['config', 'remove-entry', '--tier', 'complex', '--index', '0']);
     assert.equal(empty.status, 1);
     assert.match(empty.stderr, /cannot remove the last entry/);
-    const pastEnd = env.command(['config', 'move-entry', '--tier', 'simple', '--index', '0', '--to', '3']);
+    const pastEnd = await env.command(['config', 'move-entry', '--tier', 'simple', '--index', '0', '--to', '3']);
     assert.equal(pastEnd.status, 1);
     assert.match(pastEnd.stderr, /zero-based index/);
     assert.equal(await fs.readFile(paths().config, 'utf8'), before);
@@ -664,15 +680,15 @@ test('threshold edits preserve omitted hysteresis and reject out-of-range values
   const env = await environment();
   try {
     await env.setup();
-    action(env, ['config', 'threshold', '--percent', '85', '--hysteresis', '7', '--actor', 'panel']);
+    await action(env, ['config', 'threshold', '--percent', '85', '--hysteresis', '7', '--actor', 'panel']);
     assert.deepEqual((await loadConfig()).thresholds.codex, {
       switch_percent: 85, hysteresis_percent: 7, windows: ['primary', 'secondary']
     });
-    action(env, ['config', 'threshold', '--percent', '82']);
+    await action(env, ['config', 'threshold', '--percent', '82']);
     assert.equal((await loadConfig()).thresholds.codex.hysteresis_percent, 7);
     const before = await fs.readFile(paths().config, 'utf8');
     for (const args of [['--percent', '0'], ['--percent', '101'], ['--percent', '80', '--hysteresis', '51']]) {
-      const result = env.command(['config', 'threshold', ...args]);
+      const result = await env.command(['config', 'threshold', ...args]);
       assert.equal(result.status, 1);
       assert.match(result.stderr, /must be between/);
       assert.equal(await fs.readFile(paths().config, 'utf8'), before);
@@ -685,17 +701,17 @@ test('save-preset snapshots every tier and preset restores it with its label', {
   try {
     await env.setup();
     const initial = (await loadConfig()).tiers;
-    action(env, ['config', 'save-preset', '--name', 'my-chains', '--label', 'Мои цепочки', '--actor', 'panel']);
-    action(env, ['config', 'set-entry', '--tier', 'complex', '--index', '0', '--provider', 'claude',
+    await action(env, ['config', 'save-preset', '--name', 'my-chains', '--label', 'Мои цепочки', '--actor', 'panel']);
+    await action(env, ['config', 'set-entry', '--tier', 'complex', '--index', '0', '--provider', 'claude',
       '--model', 'haiku', '--effort', 'medium']);
     assert.notDeepEqual((await loadConfig()).tiers, initial);
-    action(env, ['config', 'preset', 'my-chains', '--actor', 'panel']);
+    await action(env, ['config', 'preset', 'my-chains', '--actor', 'panel']);
     const config = await loadConfig();
     assert.deepEqual(config.tiers, initial);
     assert.deepEqual(config.presets['my-chains'], { label: 'Мои цепочки', tiers: initial });
     const before = await fs.readFile(paths().config, 'utf8');
     for (const args of [['preset', 'absent'], ['save-preset', '--name', '../bad', '--label', 'Bad']]) {
-      assert.equal(env.command(['config', ...args]).status, 1);
+      assert.equal((await env.command(['config', ...args])).status, 1);
       assert.equal(await fs.readFile(paths().config, 'utf8'), before);
     }
     assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
@@ -707,17 +723,17 @@ test('undo twice restores successive full configs and never toggles previous und
   try {
     await env.setup();
     const initial = await loadConfig();
-    const empty = env.command(['config', 'undo']);
+    const empty = await env.command(['config', 'undo']);
     assert.equal(empty.status, 1);
     assert.match(empty.stderr, /nothing to undo/);
-    action(env, ['config', 'threshold', '--percent', '82']);
+    await action(env, ['config', 'threshold', '--percent', '82']);
     const first = await loadConfig();
-    action(env, ['config', 'threshold', '--percent', '88', '--hysteresis', '6']);
+    await action(env, ['config', 'threshold', '--percent', '88', '--hysteresis', '6']);
     const second = await loadConfig();
-    action(env, ['config', 'threshold', '--percent', '88', '--hysteresis', '6']);
-    action(env, ['config', 'undo', '--actor', 'panel']);
+    await action(env, ['config', 'threshold', '--percent', '88', '--hysteresis', '6']);
+    await action(env, ['config', 'undo', '--actor', 'panel']);
     assert.deepEqual(await loadConfig(), first);
-    action(env, ['config', 'undo', '--actor', 'panel']);
+    await action(env, ['config', 'undo', '--actor', 'panel']);
     assert.deepEqual(await loadConfig(), initial);
     const journal = await readLines(paths().journal);
     const applying = journal.filter((entry) => entry.status === 'applying');
@@ -727,14 +743,14 @@ test('undo twice restores successive full configs and never toggles previous und
     assert.equal(applying[3].actor, 'panel');
     assert.equal(applying[4].actor, 'panel');
     const before = await fs.readFile(paths().config, 'utf8');
-    const exhausted = env.command(['config', 'undo']);
+    const exhausted = await env.command(['config', 'undo']);
     assert.equal(exhausted.status, 1);
     assert.match(exhausted.stderr, /nothing to undo/);
     assert.equal(await fs.readFile(paths().config, 'utf8'), before);
-    action(env, ['config', 'threshold', '--percent', '90']);
-    action(env, ['config', 'undo']);
+    await action(env, ['config', 'threshold', '--percent', '90']);
+    await action(env, ['config', 'undo']);
     assert.deepEqual(await loadConfig(), initial);
-    assert.equal(env.command(['config', 'undo']).status, 1);
+    assert.equal((await env.command(['config', 'undo'])).status, 1);
   } finally { await env.cleanup(); }
 });
 
@@ -748,16 +764,16 @@ test('catalog refresh adds Gemini families from a fake command and keeps existin
     const command = { CONVEYOR_AGY_MODELS_CMD: JSON.stringify([
       process.execPath, '-e', `process.stdout.write(${JSON.stringify(listing)})`
     ]) };
-    const refreshed = action(env, ['catalog', 'refresh', '--provider', 'gemini', '--actor', 'panel'], command);
+    const refreshed = await action(env, ['catalog', 'refresh', '--provider', 'gemini', '--actor', 'panel'], command);
     assert.equal(refreshed.changed, true);
     assert.equal(refreshed.note, 'added gemini-9-pro');
     const expected = { ...initial, gemini: [...initial.gemini, { model: 'gemini-9-pro', efforts: ['low', 'medium', 'high'] }] };
     assert.deepEqual((await loadConfig()).catalog, expected);
     assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
-    assert.equal(action(env, ['catalog', 'refresh', '--provider', 'gemini'], command).changed, false);
+    assert.equal((await action(env, ['catalog', 'refresh', '--provider', 'gemini'], command)).changed, false);
     assert.deepEqual((await loadConfig()).catalog, expected);
     const before = await fs.readFile(paths().config, 'utf8');
-    const failed = env.command(['catalog', 'refresh', '--provider', 'gemini'], {
+    const failed = await env.command(['catalog', 'refresh', '--provider', 'gemini'], {
       CONVEYOR_AGY_MODELS_CMD: JSON.stringify([process.execPath, '-e', 'process.stderr.write("fake error\\n"); process.exit(1)'])
     });
     assert.equal(failed.status, 1);
@@ -771,25 +787,25 @@ test('catalog add/remove validate efforts and refuse models referenced by tiers 
   const env = await environment();
   try {
     await env.setup();
-    action(env, ['catalog', 'add', '--provider', 'gemini', '--model', 'gemini-9-panel', '--efforts', 'low,medium,high']);
+    await action(env, ['catalog', 'add', '--provider', 'gemini', '--model', 'gemini-9-panel', '--efforts', 'low,medium,high']);
     let before = await fs.readFile(paths().config, 'utf8');
-    const invalid = env.command(['catalog', 'add', '--provider', 'gemini', '--model', 'gemini-bad', '--efforts', 'low,,high']);
+    const invalid = await env.command(['catalog', 'add', '--provider', 'gemini', '--model', 'gemini-bad', '--efforts', 'low,,high']);
     assert.equal(invalid.status, 1);
     assert.match(invalid.stderr, /catalog effort must be a non-empty string/);
-    const tier = env.command(['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-3.8-flash']);
+    const tier = await env.command(['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-3.8-flash']);
     assert.equal(tier.status, 1);
     assert.match(tier.stderr, /is in use by a tier or panel/);
     assert.equal(await fs.readFile(paths().config, 'utf8'), before);
-    action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
+    await action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
       '--model', 'gemini-9-panel', '--effort', 'high']);
     before = await fs.readFile(paths().config, 'utf8');
-    const panel = env.command(['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-9-panel']);
+    const panel = await env.command(['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-9-panel']);
     assert.equal(panel.status, 1);
     assert.match(panel.stderr, /is in use by a tier or panel/);
     assert.equal(await fs.readFile(paths().config, 'utf8'), before);
-    action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
+    await action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
       '--model', 'gemini-3.8-flash', '--effort', 'high']);
-    action(env, ['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-9-panel', '--actor', 'panel']);
+    await action(env, ['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-9-panel', '--actor', 'panel']);
     assert.ok(!(await loadConfig()).catalog.gemini.some((entry) => entry.model === 'gemini-9-panel'));
     assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
   } finally { await env.cleanup(); }
@@ -800,7 +816,7 @@ test('a green write gate appends checks and records the owner, excluding pre-exi
   try {
     await env.setup();
     const gate = await gateFixture(env);
-    const run = env.run('complex', '-w', gate.env);
+    const run = await env.run('complex', '-w', gate.env);
     assert.equal(run.status, 0, run.stderr);
     const output = await fs.readFile(env.out, 'utf8');
     assert.match(output, /Requested change done\.[\s\S]*## Gate[\s\S]*pass/);
@@ -830,7 +846,7 @@ test('a red gate repairs on the same provider and preserves the brief and failur
     const original = 'Implement this exact change.\n\nKeep the original brief verbatim.\n';
     await fs.writeFile(env.brief, original);
     const gate = await gateFixture(env, 'repair');
-    const run = env.run('complex', '-w', gate.env);
+    const run = await env.run('complex', '-w', gate.env);
     assert.equal(run.status, 0, run.stderr);
     const fixBrief = await fs.readFile(`${env.out}.gate-1.brief.md`, 'utf8');
     assert.ok(fixBrief.startsWith(original));
@@ -858,7 +874,7 @@ test('a gate still red after the configured repair budget exits 6 and records it
   try {
     await env.setup();
     const gate = await gateFixture(env, 'red');
-    const run = env.run('complex', '-w', { ...gate.env, CONVEYOR_GATE_ROUNDS: '1' });
+    const run = await env.run('complex', '-w', { ...gate.env, CONVEYOR_GATE_ROUNDS: '1' });
     assert.equal(run.status, 6, run.stderr);
     const dispatch = await readJson(`${env.out}.dispatch.json`);
     assert.equal(dispatch.code, 6);
@@ -877,7 +893,7 @@ test('a repair touching check configuration stops before another check or repair
   try {
     await env.setup();
     const gate = await gateFixture(env, 'weaken');
-    const run = env.run('complex', '-w', gate.env);
+    const run = await env.run('complex', '-w', gate.env);
     assert.equal(run.status, 6, run.stderr);
     assert.match(await fs.readFile(env.out, 'utf8'),
       /## Gate: fail \(fix round touched check configuration: eslint.config.js\)/);
@@ -896,7 +912,7 @@ test('fix rounds reject edits or deletions of existing tests and allow new tests
     try {
       await env.setup();
       const gate = await gateFixture(env, scenario);
-      const run = env.run('complex', '-w', gate.env);
+      const run = await env.run('complex', '-w', gate.env);
       const added = scenario === 'add-tests';
       assert.equal(run.status, added ? 0 : 6, run.stderr);
       const output = await fs.readFile(env.out, 'utf8');
@@ -913,7 +929,7 @@ test('timeout results retain check names and diagnostics in gate output and repa
   try {
     await env.setup();
     const gate = await gateFixture(env, 'timeout');
-    const run = env.run('complex', '-w', gate.env);
+    const run = await env.run('complex', '-w', gate.env);
     assert.equal(run.status, 0, run.stderr);
     for (const file of [env.out, `${env.out}.gate-1.brief.md`]) {
       const text = await fs.readFile(file, 'utf8');
@@ -929,13 +945,13 @@ test('warn mode reports failures without repair and non-git jobs skip the gate',
   try {
     await env.setup();
     const gate = await gateFixture(env, 'red', 'warn');
-    const warn = env.run('complex', '-w', gate.env);
+    const warn = await env.run('complex', '-w', gate.env);
     assert.equal(warn.status, 0, warn.stderr);
     assert.equal((await readLines(gate.calls)).length, 1);
     assert.match(await fs.readFile(env.out, 'utf8'), /## Gate: warn[\s\S]*fixture failure tail/);
     assert.equal((await readJson(`${env.out}.dispatch.json`)).gate.status, 'warn');
     await fs.rm(path.join(env.root, 'git.json'));
-    const nonGit = env.run('complex', '-w', { CONVEYOR_CHECK_CMD: 'invalid JSON; must never be used' });
+    const nonGit = await env.run('complex', '-w', { CONVEYOR_CHECK_CMD: 'invalid JSON; must never be used' });
     assert.equal(nonGit.status, 0, nonGit.stderr);
     assert.equal((await readLines(gate.checks)).length, 2);
     assert.equal((await readJson(`${env.out}.dispatch.json`)).gate.status, 'skipped');

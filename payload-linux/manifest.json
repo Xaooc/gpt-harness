@@ -216,7 +216,7 @@
       "src": "claude/scripts/learning/test/core.test.mjs",
       "dest": "scripts/learning/test/core.test.mjs",
       "kind": "file",
-      "sha256": "07b90ff005e304e5874918ff952cde51c2ac52e80df15c40bacad440ad4a1408"
+      "sha256": "3f69cece16146f63835973058c388cdcbdfaf9f140780605ed8eeafa3b184a53"
     },
     {
       "src": "claude/scripts/learning/test/extract.test.mjs",
@@ -234,7 +234,7 @@
       "src": "claude/scripts/learning/test/loop.test.mjs",
       "dest": "scripts/learning/test/loop.test.mjs",
       "kind": "file",
-      "sha256": "ee886e628c1d4de7ac179f6444ee4a4c85ca81e877e7c34c2d7acc714e1f09fb"
+      "sha256": "a2e2a6c64f1346590ee029d684bea9c83c7b1ef899afc77e2d1b7b2547517e92"
     },
     {
       "src": "claude/scripts/learning-revert.sh",

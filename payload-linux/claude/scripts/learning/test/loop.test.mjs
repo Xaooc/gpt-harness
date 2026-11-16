@@ -7,6 +7,7 @@ import childProcess, { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
 import { fakeLuna } from "./fake-luna.mjs";
+import { editableHeading, targetFixtures } from "./target-fixtures.mjs";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "learning-loop-"));
@@ -27,15 +28,9 @@ const {
 const { paths, HOME_CLAUDE } = common;
 const loop = fileURLToPath(new URL("../loop.mjs", import.meta.url));
 const hook = path.join(root, "hooks", "learning-session-start.mjs");
-const originals = Object.fromEntries(core.TARGETS.map((target) => [
-  target, fs.readFileSync(path.join(root, target)),
-]));
-// The edit target is a real heading of the installed CLAUDE.md, chosen at run time, so rewording that file never
-// breaks this test (it once hard-coded a heading the harness later renamed).
-const claudeText = originals["CLAUDE.md"].toString();
-const editable = claudeText.split(/\r?\n/).find((line) => /^## \S/.test(line) && claudeText.split(line).length === 2);
-if (!editable) throw new Error("CLAUDE.md has no unique level-2 heading for the loop test to edit");
-const replacement = `${editable} (adopted lesson)`;
+const originals = targetFixtures(core.TARGETS);
+const editable = editableHeading;
+const replacement = "## Shared responsibilities and careful execution (adopted lesson)";
 const quote = "Preserve local changes when undoing an adopted lesson.";
 
 function event(index, overrides = {}) {
@@ -216,6 +211,25 @@ test("full cycle applies only real evidence and journals every outcome", () => {
   const saved = common.readJson(paths.loopState);
   assert.equal(saved.lastRunAt, result.startedAt);
   assert.deepEqual(saved.foreignKey, { keep: true });
+});
+
+test("over-budget targets reject growing edits but allow shrinking edits", () => {
+  const file = path.join(HOME_CLAUDE, "CLAUDE.md");
+  const maxBytes = core.loadConfig().targets["CLAUDE.md"].max_bytes;
+  const oversized = target() + "Detailed execution notes.\n".repeat(Math.ceil(maxBytes / 20));
+  assert.ok(Buffer.byteLength(oversized) > maxBytes);
+  fs.writeFileSync(file, oversized);
+  run();
+  assert.equal(target(), oversized);
+  assert.equal(latestResult().gatePassed, 0);
+  assert.match(core.loadCandidates()[0].reason, /over budget: only shrinking edits allowed/);
+
+  const shorter = "## Division of labour";
+  fake([proposal({ new_text: shorter })]);
+  run();
+  assert.equal(latestResult().applied.length, 1);
+  assert.equal(target(), oversized.replace(editable, shorter));
+  assert.ok(Buffer.byteLength(target()) > maxBytes, "shrinking is allowed even while still over budget");
 });
 
 test("approved check is queued, reported and reviewed without changing targets", () => {
