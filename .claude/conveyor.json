@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "fast": [
+    {"name": "node-check", "glob": "**/*.mjs", "run": "for f in {files}; do node --check \"$f\" || exit 1; done"},
+    {"name": "bash-n", "glob": "**/*.sh", "run": "for f in {files}; do bash -n \"$f\" || exit 1; done"}
+  ],
+  "turn": [],
+  "gate": {"mode": "block"},
+  "hygiene": {
+    "counters": [
+      {"name": "TODO/FIXME", "pattern": "\\b(TODO|FIXME)\\b", "glob": "payload-linux/claude/**/*.{mjs,js,sh,py}", "exclude": "payload-linux/claude/local-plugins/pstack/**"},
+      {"name": "large-files", "maxLines": 2000, "glob": "**/*.{mjs,sh,py}", "exclude": "payload-linux/claude/local-plugins/pstack/**"}
+    ],
+    "baseline": ".conveyor/hygiene-baseline.json"
+  }
+}
