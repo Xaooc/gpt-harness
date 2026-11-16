@@ -55,6 +55,10 @@ user in one line.
 
 You own every delegate's work: review the diff and the result yourself; never pass a report through.
 
+Brief size by tier: the `simple` tier starts on Gemini, which explores widely when a brief is open-ended (observed
+2026-11-16: 12–15 min and ~3.4 M tokens for a 60-line change). For `simple` and `scout` briefs, name the exact files
+to read and to change, the commands to run, and say "read nothing else unless a listed file imports it".
+
 ## Roles → tiers
 
 `~/.claude/rules/pstack-models.md` is generated from the `roles` and `panels` of `orchestration.json`; edit them
