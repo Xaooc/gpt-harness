@@ -40,7 +40,7 @@ export async function main(args = process.argv.slice(2)) {
   const arity = (count) => { if (values.length !== count) throw new Error(`${command} requires ${count} arguments`); };
   if (command === 'start') {
     arity(0);
-    const state = startTask(context, flags['--note']);
+    const state = await startTask(context, flags['--note']);
     print(`${state.task.id}: requirements playback\n` + state.messages.map((message) => {
       return `${message.id}: ${message.text}\n${message.clauses.map((clause) => `- ${clause.id}: ${clause.text}`).join('\n')}`;
     }).join('\n') + '\nLink every clause, then include ledger checklist in the final message.');
@@ -63,6 +63,7 @@ export async function main(args = process.argv.slice(2)) {
     arity(1);
     markDone(context, values[0]);
   } else if (command === 'waive') {
+    // `crosscheck` waives only the current unavailable snapshot; `gate` remains limited to checks 5 and 8.
     arity(1);
     if (!flags['--quote']) throw new Error('waive requires --quote');
     const result = waive(context, values[0], flags['--quote']);

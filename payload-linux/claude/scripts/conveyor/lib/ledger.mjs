@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { entryText, isGenuineHumanEntry } from '../../learning/extract.mjs';
 import { readJsonl, sanitizeQuote } from '../../learning/common.mjs';
@@ -48,13 +48,18 @@ function withoutFences(text) {
   }).join('\n');
 }
 
+function humanWords(text) {
+  return withoutFences(withoutPastes(String(text))).replace(/^[ \t]*>[^\n]*/gm, '');
+}
+
 export function extractClauses(text, message = 'M1') {
-  const clean = withoutFences(withoutPastes(String(text))).replace(/^[ \t]*>[^\n]*/gm, '')
+  const clean = humanWords(text)
     .replace(/^[ \t]*(?:[-*+•]|\d+[.)])[ \t]+/gm, '').replace(/•/g, '\n');
   const sentences = clean.match(/[^.!?\r\n]+[.!?]?/gu) || [];
   const clauses = [];
   for (const sentence of sentences) {
     const value = sentence.trim();
+    if (value.endsWith('?')) continue;
     const words = value.match(/[\p{L}]+/gu) || [];
     const imperative = markerPattern.test(value) || words.slice(0, CLAUSE_RULES.firstWords)
       .some((word) => CLAUSE_RULES.russianVerbs.includes(word.toLowerCase()) || /^[а-яё]+$/iu.test(word) && endingPattern.test(word));
@@ -76,7 +81,8 @@ export function ledgerPaths(session) {
   const home = path.resolve(process.env.CONVEYOR_HOME || path.join(claudeHome(), 'conveyor'));
   return {
     home, ledger: path.join(home, 'ledgers', `${session}.jsonl`), runs: path.join(home, 'sessions', `${session}.jsonl`),
-    context: path.join(home, 'sessions', `${session}.ledger.json`), gate: path.join(home, 'gate.json'),
+    context: path.join(home, 'sessions', `${session}.ledger.json`), bases: path.join(home, 'sessions', `${session}.base.json`),
+    calibration: path.join(home, 'gate-calibration-start'),
     stops: path.join(home, 'gate-state', `${session}.json`)
   };
 }
@@ -214,12 +220,13 @@ export function syncMessages(context, rows = transcriptRows(context)) {
   return rows;
 }
 
-export function capturePrompt(event) {
+export async function capturePrompt(event) {
   const context = rememberContext(event);
   if ((event.source && !['user', 'sdk'].includes(event.source)) || !eligiblePrompt(event.prompt)) return null;
   const human = { type: 'user', message: { content: event.prompt } };
   if (event.source === 'user' || event.source === 'sdk') human.origin = { kind: 'human' };
   if (!isGenuineHumanEntry(human)) return null;
+  await recordSessionBases(context);
   const records = readJsonl(ledgerPaths(context.session).ledger);
   const id = nextId(records, 'M');
   const offset = context.transcript && fs.existsSync(context.transcript) ? fs.statSync(context.transcript).size : 0;
@@ -230,7 +237,7 @@ export function capturePrompt(event) {
 
 export function quoteVerified(context, task, quote, rows = transcriptRows(context)) {
   return !!task && typeof quote === 'string' && quote.trim().length >= 12 && rows.some(({ entry, offset }) => {
-    return offset >= task.offset && isGenuineHumanEntry(entry) && entryText(entry).includes(quote);
+    return offset >= task.offset && isGenuineHumanEntry(entry) && humanWords(entryText(entry)).includes(quote);
   });
 }
 
@@ -259,7 +266,8 @@ export function loadLedger(context, rows = transcriptRows(context)) {
   return state;
 }
 
-export function startTask(context, note) {
+export async function startTask(context, note) {
+  await recordSessionBases(context);
   const rows = syncMessages(context);
   const records = readJsonl(ledgerPaths(context.session).ledger);
   const last = rows.findLast(({ entry }) => isGenuineHumanEntry(entry) && eligiblePrompt(entryText(entry)));
@@ -320,7 +328,9 @@ export async function runCommand(command, args = [], cwd = process.cwd()) {
   else argv = ['/bin/sh', '-c', `${command} "$@"`, 'conveyor', ...args];
   if (!argv.length || argv.some((value) => typeof value !== 'string')) throw new Error('invalid command');
   try {
-    const result = await execute(argv[0], argv.slice(1), { cwd, timeout: 600_000, maxBuffer: 32 * 1024 * 1024 });
+    const result = await execute(argv[0], argv.slice(1), {
+      cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, timeout: 600_000, maxBuffer: 32 * 1024 * 1024
+    });
     return { rc: 0, ...result };
   } catch (error) {
     return { rc: typeof error.code === 'number' ? error.code : 2, stdout: error.stdout || '',
@@ -343,8 +353,7 @@ export async function addEvidence(context, id, kind, value, expectedRc = 0) {
     record.value = path.resolve(context.cwd, value);
     record.mtime = fs.statSync(record.value).mtimeMs;
     if (kind === 'check') {
-      const check = readJson(record.value);
-      record.ok = checkPassed(check);
+      record.ok = checkEvidencePassed(record.value);
       rc = record.ok ? 0 : 1;
     }
   }
@@ -360,10 +369,12 @@ export function markDone(context, id) {
 export function waive(context, target, quote) {
   const state = loadLedger(context);
   requireTask(state);
-  if (target !== 'gate') findItem(state, target);
+  if (!['gate', 'crosscheck'].includes(target)) findItem(state, target);
+  if (target === 'crosscheck' && state.crosscheck?.ok !== null) throw new Error('only an unavailable cross-check may be waived');
   const verified = quoteVerified(context, state.task, quote);
   const id = nextId(readJsonl(ledgerPaths(context.session).ledger), 'W');
-  appendRecord(context.session, { type: 'waive', id, target, quote, verified });
+  appendRecord(context.session, { type: 'waive', id, target, quote, verified,
+    ...(target === 'crosscheck' ? { hash: state.crosscheck.hash } : {}) });
   return { id, verified };
 }
 
@@ -376,7 +387,7 @@ export function checklist(state) {
   }).join('\n');
 }
 
-// Code/configuration files trigger the gate; prose and image-only edits do not.
+// Non-git transcript edits use these extensions; git repositories use their actual changes.
 export const CODE_EXTENSIONS = new Set([
   '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.sh', '.bash', '.zsh', '.fish', '.rs', '.go', '.java',
   '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.rb', '.php', '.swift', '.kt', '.kts', '.scala', '.lua', '.pl', '.r',
@@ -387,16 +398,29 @@ export const CODE_EXTENSIONS = new Set([
 
 function codeWrites(rows, cwd) {
   const files = new Set();
+  const add = (file) => {
+    if (typeof file !== 'string') return;
+    if (CODE_EXTENSIONS.has(path.extname(file).toLowerCase())
+      || /^(Dockerfile|Makefile|CMakeLists\.txt|Gemfile)$/i.test(path.basename(file))) files.add(path.resolve(cwd, file));
+  };
   for (const { entry } of rows) {
     if (entry.type !== 'assistant' || !Array.isArray(entry.message?.content)) continue;
     for (const block of entry.message.content) {
-      if (block.type !== 'tool_use' || !['Write', 'Edit', 'MultiEdit'].includes(block.name)) continue;
+      if (block.type !== 'tool_use') continue;
+      if (block.name === 'Bash' && typeof block.input?.command === 'string') {
+        const command = block.input.command;
+        const token = /"([^"\n]*)"|'([^'\n]*)'|([^\s;&|<>]+)/g;
+        for (const match of command.matchAll(/>>?\s*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s;&|<>]+))/g)) {
+          add(match[1] ?? match[2] ?? match[3]);
+        }
+        for (const match of command.matchAll(/(?:^|[;&|\n])\s*(?:sed\s+-[^\s]*i[^\s]*|tee\b)([^;&|\n]*)/g)) {
+          for (const value of match[1].matchAll(token)) add(value[1] ?? value[2] ?? value[3]);
+        }
+      }
+      if (!['Write', 'Edit', 'MultiEdit'].includes(block.name)) continue;
       const inputs = [block.input, ...(block.input?.edits || [])];
       for (const input of inputs) {
-        const file = input?.file_path;
-        if (typeof file !== 'string') continue;
-        if (CODE_EXTENSIONS.has(path.extname(file).toLowerCase())
-          || /^(Dockerfile|Makefile|CMakeLists\.txt|Gemfile)$/i.test(path.basename(file))) files.add(path.resolve(cwd, file));
+        add(input?.file_path);
       }
     }
   }
@@ -410,8 +434,12 @@ async function git(repo, args) {
 }
 
 function checkPassed(check) {
-  return !!check && check.ok !== false && (check.code === undefined || check.code === 0)
-    && (check.ok === true || check.code === 0);
+  return check?.gate?.status === 'pass' && (check.code === undefined || check.code === 0);
+}
+
+function checkEvidencePassed(file) {
+  try { return checkPassed(readJson(file)); }
+  catch { return false; }
 }
 
 function inside(repo, file) {
@@ -419,40 +447,78 @@ function inside(repo, file) {
   return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-function sessionWriteRuns(context) {
+function sessionRuns(context) {
   return readJsonl(ledgerPaths(context.session).runs).filter((run) => run.session === context.session
-    && !['read', '-r', 'r'].includes(run.mode) && typeof run.repo === 'string');
+    && typeof run.repo === 'string');
+}
+
+async function repositoryRoot(directory) {
+  const result = await runCommand(['git', '-C', directory, 'rev-parse', '--show-toplevel']);
+  if (result.rc === 128) return null;
+  if (result.rc !== 0) throw new Error(`git rev-parse: ${result.stderr.trim()}`);
+  return result.stdout.trim() || null;
+}
+
+export async function recordSessionBases(context) {
+  const file = ledgerPaths(context.session).bases, bases = readJson(file, {});
+  const root = await repositoryRoot(context.cwd);
+  const candidates = [...sessionRuns(context), ...(root ? [{ repo: root }] : [])];
+  for (const candidate of candidates) {
+    const directory = path.resolve(context.cwd, candidate.repo);
+    const repo = directory === root ? root : await repositoryRoot(directory);
+    if (!repo) continue;
+    if (bases[repo]) continue;
+    const base = candidate.base || (await git(repo, ['rev-parse', 'HEAD'])).trim();
+    if (base) bases[repo] = base;
+  }
+  writeJson(file, bases);
+}
+
+async function changedNames(repo, base) {
+  const tracked = await git(repo, ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', base, '--']);
+  const staged = await git(repo, ['diff', '--cached', '--name-only', '--no-renames', '-z', base, '--']);
+  const untracked = await git(repo, ['ls-files', '--others', '--exclude-standard', '-z']);
+  const committed = await git(repo, ['log', '--format=', '--name-only', '--no-renames', '-m', '-z', `${base}..HEAD`, '--']);
+  const head = (await git(repo, ['rev-parse', 'HEAD'])).trim();
+  return { files: [...new Set((tracked + staged + untracked + committed).split('\0').filter(Boolean))].sort(),
+    untracked: [...new Set(untracked.split('\0').filter(Boolean))].sort(), head };
 }
 
 export async function sessionRepos(context, rows = transcriptRows(context)) {
-  const runs = sessionWriteRuns(context);
+  const runs = sessionRuns(context), bases = readJson(ledgerPaths(context.session).bases, {});
   const repos = [];
+  const add = async (repo, base) => {
+    if (repos.some((entry) => entry.repo === repo)) return;
+    const revision = bases[repo] || base || (await git(repo, ['rev-parse', 'HEAD'])).trim();
+    const changes = await changedNames(repo, revision);
+    const changed = changes.files.length > 0 || (changes.head !== revision
+      && !!(await git(repo, ['log', '--format=%H', '--max-count=1', `${revision}..HEAD`, '--'])).trim());
+    repos.push({ repo, base: revision, ...changes, changed });
+  };
+  const root = await repositoryRoot(context.cwd);
+  if (root) await add(root, runs.find((run) => path.resolve(context.cwd, run.repo) === root)?.base);
   for (const run of runs) {
-    const repo = path.resolve(context.cwd, run.repo);
-    if (!repos.some((entry) => entry.repo === repo)) repos.push({ repo, base: run.base || 'HEAD' });
+    const repo = await repositoryRoot(path.resolve(context.cwd, run.repo));
+    if (repo) await add(repo, run.base);
   }
   const writes = codeWrites(rows, context.cwd);
-  if (writes.length && !repos.some(({ repo }) => inside(repo, context.cwd))) {
-    const repo = (await git(context.cwd, ['rev-parse', '--show-toplevel'])).trim();
-    if (!repos.some((entry) => entry.repo === repo)) repos.push({ repo, base: 'HEAD' });
-  }
   for (const file of writes) {
     if (repos.some(({ repo }) => inside(repo, file))) continue;
     let directory = path.dirname(file);
     while (!fs.existsSync(directory) && path.dirname(directory) !== directory) directory = path.dirname(directory);
-    const repo = (await git(directory, ['rev-parse', '--show-toplevel'])).trim();
-    if (!repos.some((entry) => entry.repo === repo)) repos.push({ repo, base: 'HEAD' });
+    const repo = await repositoryRoot(directory);
+    if (repo) await add(repo);
   }
-  return { applies: runs.length > 0 || writes.length > 0, repos };
+  const nonGit = !root && writes.length > 0;
+  return { applies: nonGit || repos.some((repo) => repo.changed), repos, nonGit, writes };
 }
 
 async function repoChanges(repos) {
   const changes = new Map();
-  for (const { repo, base } of repos) {
-    const tracked = await git(repo, ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', base, '--']);
-    const untracked = await git(repo, ['ls-files', '--others', '--exclude-standard', '-z']);
+  for (const { repo, base, files } of repos) {
+    const names = files || (await changedNames(repo, base)).files;
     let newest = 0;
-    for (const file of new Set((tracked + untracked).split('\0').filter(Boolean))) {
+    for (const file of names) {
       const absolute = path.resolve(repo, file);
       try { newest = Math.max(newest, fs.statSync(absolute).mtimeMs); }
       catch (error) {
@@ -473,32 +539,111 @@ async function evidenceProblem(state, repos) {
   for (const item of state.items.filter((entry) => entry.status === 'done')) {
     if (!item.evidence.length) return `${item.id}: evidence missing`;
     const newest = new Map(), expected = new Set();
+    let supported = false;
     // A successful rerun supersedes an earlier failed attempt of the same command/check.
     const current = new Map(item.evidence.map((entry) => [`${entry.kind}:${entry.value}`, entry]));
     for (const evidence of current.values()) {
-      if (evidence.kind === 'command' && evidence.rc !== (evidence.expectedRc ?? 0)) return `${item.id}: command failed`;
-      if (evidence.kind === 'check' && !checkPassed(readJson(evidence.value))) return `${item.id}: check evidence is red`;
+      if (evidence.kind === 'command') {
+        if (evidence.rc !== 0) return `${item.id}: command failed`;
+        supported = true;
+      }
+      if (evidence.kind === 'check') {
+        if (!checkEvidencePassed(evidence.value)) return `${item.id}: check evidence is red`;
+        supported = true;
+      }
       if (!['file', 'artifact'].includes(evidence.kind)) continue;
       const owners = repos.filter(({ repo }) => inside(repo, evidence.value));
       const relevant = owners.length ? owners : repos;
       for (const { repo } of relevant) expected.add(repo);
       const stat = fs.statSync(evidence.value, { throwIfNoEntry: false });
-      if (!stat) continue;
+      if (!stat?.isFile()) return `${item.id}: file/artifact evidence missing: ${evidence.value}`;
+      if (evidence.kind === 'artifact') supported = true;
       for (const { repo } of relevant) newest.set(repo, Math.max(newest.get(repo) || 0, stat.mtimeMs));
     }
     for (const repo of expected) if (!newest.has(repo)) return `${item.id}: file/artifact evidence missing in ${repo}`;
     for (const [repo, mtime] of newest) if (mtime < changes.get(repo)) return `${item.id}: stale evidence in ${repo}`;
+    if (!supported) return `${item.id}: runnable command, fresh artifact, or passing dispatch gate evidence required`;
   }
   return null;
+}
+
+function preview(text, lines, bytes) {
+  const parts = text.split('\n');
+  const capped = parts.length > lines || Buffer.byteLength(text) >= bytes;
+  const limited = parts.length > lines ? parts.slice(0, lines).join('\n') : text;
+  return { text: Buffer.from(limited).subarray(0, bytes).toString('utf8'), capped };
+}
+
+// Bound memory and stop git as soon as the preview is complete, even for very large diffs or lines.
+async function gitPreview(repo, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', ['-C', repo, ...args], {
+      stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }
+    });
+    let output = '', stderr = '', capped = false, timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 600_000);
+    child.stdout.setEncoding('utf8').on('data', (chunk) => {
+      if (capped) return;
+      const result = preview(output + chunk, 300, 256 * 1024);
+      output = result.text;
+      capped = result.capped;
+      if (capped) child.kill('SIGKILL');
+    });
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr = (stderr + chunk).slice(-4000); });
+    child.once('error', (error) => { clearTimeout(timer); reject(error); });
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      if (timedOut || (code !== 0 && !capped)) reject(new Error(`git ${args[0]}: ${stderr || 'preview failed'}`));
+      else resolve(output);
+    });
+  });
+}
+
+async function filePreview(file) {
+  const stream = fs.createReadStream(file, { encoding: 'utf8' });
+  let output = '';
+  try {
+    for await (const chunk of stream) {
+      const result = preview(output + chunk, 200, 256 * 1024);
+      output = result.text;
+      if (result.capped) break;
+    }
+    return output.includes('\0') ? '(binary file)' : output;
+  } finally { stream.destroy(); }
+}
+
+async function fileDigest(file) {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat) return null;
+  if (stat.isSymbolicLink()) return { mode: stat.mode, digest: hash(fs.readlinkSync(file)) };
+  if (!stat.isFile()) return { mode: stat.mode };
+  const digest = createHash('sha256');
+  for await (const chunk of fs.createReadStream(file)) digest.update(chunk);
+  return { mode: stat.mode, digest: digest.digest('hex') };
 }
 
 export async function crosscheckSnapshot(context, state = loadLedger(context), repos) {
   repos ??= (await sessionRepos(context)).repos;
   const diffs = [];
-  for (const { repo, base } of repos) {
-    const stat = await git(repo, ['diff', '--no-ext-diff', '--no-textconv', '--stat', base, '--']);
-    const diff = await git(repo, ['diff', '--no-ext-diff', '--no-textconv', base, '--']);
-    diffs.push({ repo, base, stat, digest: hash(diff), diff: diff.split('\n').slice(0, 300).join('\n') });
+  for (const entry of repos) {
+    const { repo, base } = entry;
+    const changes = entry.files ? entry : await changedNames(repo, base);
+    const stat = await gitPreview(repo, ['diff', '--no-ext-diff', '--no-textconv', '--stat', base, '--']);
+    const diff = await gitPreview(repo, ['diff', '--no-ext-diff', '--no-textconv', base, '--']);
+    const files = [];
+    for (const file of changes.files) files.push({ file, ...await fileDigest(path.join(repo, file)) });
+    const untracked = [];
+    for (const file of changes.untracked.slice(0, 20)) {
+      const absolute = path.join(repo, file);
+      if (fs.lstatSync(absolute, { throwIfNoEntry: false })?.isFile()) {
+        untracked.push({ file, content: await filePreview(absolute) });
+      }
+    }
+    // The index and streamed file digests invalidate evidence for changes beyond the displayed 300 lines.
+    const indexPath = (await git(repo, ['rev-parse', '--git-path', 'index'])).trim();
+    const index = indexPath ? await fileDigest(path.resolve(repo, indexPath)) : null;
+    diffs.push({ repo, base, stat, diff, head: changes.head, files, index,
+      untrackedNames: changes.untracked.slice(0, 20), untracked });
   }
   const messages = state.primaryMessages.map(({ id, text }) => ({ id, text }));
   const items = state.items.map(({ id, text, sources, status, evidence }) => ({ id, text, sources, status,
@@ -507,7 +652,11 @@ export async function crosscheckSnapshot(context, state = loadLedger(context), r
         ? fs.statSync(entry.value, { throwIfNoEntry: false })?.mtimeMs ?? null : undefined;
       return { ...entry, mtime: actual };
     }) }));
-  const data = { messages, items, diffs };
+  const nonGitFiles = [];
+  for (const file of codeWrites(transcriptRows(context), context.cwd)) {
+    if (!repos.some(({ repo }) => inside(repo, file))) nonGitFiles.push({ file, ...await fileDigest(file) });
+  }
+  const data = { messages, items, diffs, nonGitFiles };
   return { ...data, hash: hash(JSON.stringify(data)), repos };
 }
 
@@ -529,13 +678,18 @@ export async function crosscheck(context) {
       + 'Report missing or misunderstood requirements. Return only JSON: {"missing": [...], "misread": [...]}.\n\n'
       + snapshot.messages.map((message) => `[user ${message.id}]\n${message.text}\n[/user]`).join('\n\n')
       + '\n\nLedger with evidence:\n' + JSON.stringify(snapshot.items, null, 2)
-      + '\n\nDiff summaries:\n' + snapshot.diffs.map((diff) => `${diff.repo} (${diff.base})\n${diff.stat}\n${diff.diff}`).join('\n');
+      + '\n\nDiff summaries:\n' + snapshot.diffs.map((diff) => `${diff.repo} (${diff.base})\n${diff.stat}\n${diff.diff}\n`
+        + `Untracked names: ${JSON.stringify(diff.untrackedNames)}\n`
+        + diff.untracked.map(({ file, content }) => `[untracked ${file}]\n${content}\n[/untracked]`).join('\n')).join('\n');
     fs.writeFileSync(prompt, text);
-    const command = process.env.CONVEYOR_CROSSCHECK_CMD || [path.join(claudeHome(), 'scripts', 'gem.sh')];
-    const result = await runCommand(command, ['-r', '-e', 'medium', '-C', snapshot.repos[0]?.repo || context.cwd,
+    const command = process.env.CONVEYOR_CROSSCHECK_CMD || [process.execPath, path.join(claudeHome(), 'scripts/conveyor/exec.mjs')];
+    const result = await runCommand(command, ['run', '--tier', 'scout', '-r', '-C', snapshot.repos[0]?.repo || context.cwd,
       '-f', prompt, '-o', out], context.cwd);
     let record = { type: 'crosscheck', at: now(), hash: snapshot.hash, findings: [], ok: null };
-    if (result.rc === 3) record.reason = sanitizeQuote(result.stderr || 'Gemini unavailable (exit 3)', 500);
+    if ([3, 4, 5].includes(result.rc)) {
+      const fallback = result.rc === 4 ? 'Claude hand-off (exit 4)' : `no provider available (exit ${result.rc})`;
+      record.reason = sanitizeQuote(result.stderr || fallback, 500);
+    }
     else if (result.rc !== 0) record = { ...record, ok: false, reason: sanitizeQuote(result.stderr || `exit ${result.rc}`, 500) };
     else {
       const response = parseCrosscheck(fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : result.stdout);
@@ -557,14 +711,18 @@ function linked(state, id) {
   return !!link && (link.item === 'none' ? !!link.reason?.trim() : state.items.some((item) => item.id === link.item));
 }
 
-async function cleanupProblem(context, state, repos) {
+async function ownedJobs(context) {
   const command = process.env.CONVEYOR_OVERVIEW_CMD || [process.execPath, path.join(claudeHome(), 'scripts', 'luna-overview.mjs')];
   const result = await runCommand(command, [], context.cwd);
   if (result.rc !== 0) throw new Error(`executor overview: ${result.stderr}`);
   const overview = JSON.parse(result.stdout);
   if (!Array.isArray(overview.jobs)) throw new Error('executor overview has no jobs array');
-  const running = overview.jobs.filter((job) => job.owner === context.session
+  return overview.jobs.filter((job) => job.owner === context.session
     && /^(?:running|starting|pending|queued|waiting(?:-.*)?)$/.test(job.state));
+}
+
+async function cleanupProblem(context, state, repos) {
+  const running = await ownedJobs(context);
   if (running.length) return `finish executor jobs: ${running.map((job) => job.out || job.state).join(', ')}`;
   const remaining = state.temps.filter((file) => fs.lstatSync(file, { throwIfNoEntry: false }));
   if (remaining.length) return `remove registered temporary paths: ${remaining.join(', ')}`;
@@ -585,18 +743,31 @@ async function cleanupProblem(context, state, repos) {
 
 export async function gateStatus(context) {
   const rows = transcriptRows(context);
-  if (!sessionWriteRuns(context).length && !codeWrites(rows, context.cwd).length) return { applies: false, ok: true };
+  const { applies, repos, nonGit, writes } = await sessionRepos(context, rows);
+  if (!applies) return { applies: false, ok: true };
   const state = loadLedger(context, rows);
-  const block = (check, reason) => ({ applies: true, ok: false, check, reason: sanitizeQuote(`${check}. ${reason}`, 1500) });
+  const checklistLines = /^\s*[-*]\s*(L\d+)\s+(?:[✓✗](?=\s|$)|waived\b)/gm;
+  const lastAssistant = rows.findLast(({ entry }) => entry.type === 'assistant');
+  const final = lastAssistant ? entryText(lastAssistant.entry) : '';
+  const checked = new Set([...final.matchAll(checklistLines)].map((match) => match[1]));
+  const completionChecklist = checked.size > 0 || /^\s*(?:[-*]|\d+[.)])\s+\[[ xX]\](?=\s|$)/m.test(final);
+  if (!completionChecklist) {
+    const running = await ownedJobs(context);
+    if (running.length) return { applies: true, ok: true,
+      systemMessage: `conveyor: work in progress, ${running.length} jobs running` };
+  }
+  const scope = nonGit ? '; non-git code edits: ledger checks only, turn checks unavailable' : '';
+  const block = (check, reason) => ({ applies: true, ok: false, check,
+    reason: sanitizeQuote(`${check}. ${reason}${scope}`, 1500) });
   if (!state.task) return block(1, 'start the ledger and play back the requirements: ledger start');
   const unlinked = state.primaryMessages.flatMap((message) => message.clauses).filter((clause) => !linked(state, clause.id));
   if (unlinked.length) return block(2, `link imperative clauses in the ledger: ${unlinked.map((clause) => clause.id).join(', ')}`);
   const open = state.items.filter((item) => item.status === 'open');
   if (open.length) return block(3, `finish or obtain a user waiver for open items: ${open.map((item) => item.id).join(', ')}`);
-  const { repos } = await sessionRepos(context, rows);
-  const evidence = await evidenceProblem(state, repos);
+  const evidenceRepos = nonGit ? [...repos, { repo: context.cwd, base: null, files: writes }] : repos;
+  const evidence = await evidenceProblem(state, evidenceRepos);
   if (evidence) return block(4, `refresh evidence: ${evidence}`);
-  if (!state.gateWaived) {
+  if (!state.gateWaived && !nonGit) {
     for (const { repo, base } of repos) {
       const command = process.env.CONVEYOR_CHECK_CMD || [process.execPath, path.join(claudeHome(), 'scripts/conveyor/check.mjs')];
       const result = await runCommand(command, ['run', '--dir', repo, '--level', 'turn', '--base', base, '--json'], repo);
@@ -607,15 +778,18 @@ export async function gateStatus(context) {
   }
   const snapshot = await crosscheckSnapshot(context, state, repos);
   const semantic = state.crosscheck;
+  const crosscheckWaived = state.waivers.some((waiver) => waiver.target === 'crosscheck'
+    && waiver.verified && waiver.hash === snapshot.hash);
+  if (semantic?.ok === null && !crosscheckWaived) {
+    return block(6, `cross-check unavailable: ${semantic.reason || 'no provider available'}; run it again or waive`);
+  }
   if (!semantic || semantic.hash !== snapshot.hash || (!semantic.ok && semantic.ok !== null && !semantic.findings?.length)
     || semantic.findings?.some((finding) => !linked(state, finding.id))) {
     return block(6, 'run ledger crosscheck and link any missing or misread requirements');
   }
-  const lastAssistant = rows.findLast(({ entry }) => entry.type === 'assistant');
-  const final = lastAssistant ? entryText(lastAssistant.entry) : '';
-  const absent = state.items.filter((item) => !new RegExp(`(?<![\\w])${item.id}(?![\\w])`).test(final));
+  const absent = state.items.filter((item) => !checked.has(item.id));
   if (absent.length) return block(7, `include the ledger checklist in the final message: ${absent.map((item) => item.id).join(', ')}`);
-  if (!state.gateWaived) {
+  if (!state.gateWaived && !nonGit) {
     const cleanup = await cleanupProblem(context, state, repos);
     if (cleanup) return block(8, cleanup);
   }
@@ -623,22 +797,20 @@ export async function gateStatus(context) {
 }
 
 export function gateMode(session) {
-  const file = ledgerPaths(session).gate;
+  const file = ledgerPaths(session).calibration;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  try { fs.writeFileSync(file, `${now()}\n`, { flag: 'wx' }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
   const override = process.env.CONVEYOR_GATE_MODE;
   if (override) {
     if (!['warn', 'block'].includes(override)) throw new Error('invalid CONVEYOR_GATE_MODE');
     return override;
   }
-  if (!fs.existsSync(file)) {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    try { fs.writeFileSync(file, JSON.stringify({ mode: 'warn', calibration: true }) + '\n', { flag: 'wx' }); }
-    catch (error) { if (error.code !== 'EEXIST') throw error; }
-  }
-  const config = readJson(file);
-  if (!['warn', 'block'].includes(config.mode)) throw new Error('invalid conveyor gate mode');
   const stat = fs.statSync(file);
-  if (config.calibration && Date.now() - (stat.birthtimeMs || stat.mtimeMs) >= 7 * 86400_000) return 'block';
-  return config.mode;
+  const date = Date.parse(fs.readFileSync(file, 'utf8').trim());
+  const start = Math.min(Number.isFinite(date) && date <= stat.mtimeMs ? date : stat.mtimeMs,
+    stat.birthtimeMs || stat.mtimeMs);
+  return Date.now() - start < 7 * 86400_000 ? 'warn' : 'block';
 }
 
 export function logGate(message) {
@@ -652,7 +824,10 @@ export function logGate(message) {
 export function stopOutput(context, status, active) {
   if (!status.applies) return null;
   const file = ledgerPaths(context.session).stops;
-  if (status.ok) { writeJson(file, { reasons: [] }); return null; }
+  if (status.ok) {
+    writeJson(file, { reasons: [] });
+    return status.systemMessage ? { systemMessage: status.systemMessage } : null;
+  }
   const previous = readJson(file, { reasons: [] });
   const repeated = active === true && previous.reasons.length === 3 && previous.reasons.every((reason) => reason === status.reason);
   writeJson(file, { reasons: [...previous.reasons, status.reason].slice(-3) });

@@ -5,7 +5,8 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import {
-  gateRepository, gateChangedFiles, gateMode, gateSessionFile, runGateChecks, gateDetails, gateInstruction
+  gateRepository, gateChangedFiles, gateMode, gateSessionFile, runGateChecks, gateDetails, gateInstruction,
+  failedCheck, protectedFiles, modifiedTests
 } from '../scripts/conveyor/exec.mjs';
 
 const print = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -34,6 +35,19 @@ async function main() {
   if (mode === 'off') return;
   const base = owner?.base || head;
   const files = await gateChangedFiles(repo, base);
+  // Keep the previous red gate's snapshot across the subagent's continuation (the fix round).
+  const identity = [session, repo, base, owner?.at, input.agent_id, input.agent_transcript_path || input.transcript_path];
+  const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+  const stateFile = path.join(path.dirname(gateSessionFile(session)), `${key}.gate.json`);
+  let previous;
+  try { previous = JSON.parse(await fs.readFile(stateFile, 'utf8')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const snapshot = await protectedFiles(repo);
+  const tests = modifiedTests(new Map(previous?.protected || []), snapshot);
+  if (tests.length) {
+    print({ systemMessage: `## Gate: fail (fix round modified tests: ${tests.join(', ')})` });
+    return;
+  }
   if (!files.length) return;
   const last = await runGateChecks(repo, base, files);
   if (last.configError) {
@@ -41,10 +55,6 @@ async function main() {
     print({ systemMessage: `Conveyor gate: config error: ${last.configError}` });
     return;
   }
-  // The documented transcript identifies a particular agent even when it has no agent_id.
-  const identity = [session, repo, base, owner?.at, input.agent_id, input.agent_transcript_path || input.transcript_path];
-  const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
-  const stateFile = path.join(path.dirname(gateSessionFile(session)), `${key}.gate.json`);
   if (last.ok) {
     await fs.rm(stateFile, { force: true });
     return;
@@ -55,15 +65,11 @@ async function main() {
     return;
   }
   // Timing varies on every run. Only failure identities and diagnostics determine a repeated failure.
-  const failures = last.results.filter((result) =>
-    (typeof result.rc === 'number' && result.rc !== 0) || /^(fail|failed|error)$/.test(result.status))
+  const failures = last.results.filter(failedCheck)
     .map(({ name, cmd, status, rc, outputTail }) => ({ name, cmd, status, rc, outputTail }));
   const fingerprint = createHash('sha256').update(JSON.stringify({ failures, hygiene: last.hygiene })).digest('hex');
-  let previous;
-  try { previous = JSON.parse(await fs.readFile(stateFile, 'utf8')); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
   await fs.mkdir(path.dirname(stateFile), { recursive: true });
-  await fs.writeFile(stateFile, JSON.stringify({ fingerprint }), { mode: 0o600 });
+  await fs.writeFile(stateFile, JSON.stringify({ fingerprint, protected: [...snapshot] }), { mode: 0o600 });
   if (input.stop_hook_active === true && previous?.fingerprint === fingerprint) {
     print({ systemMessage: `Conveyor gate failed again; allowing stop to avoid a loop. ${summary}` });
   } else print({ decision: 'block', reason: `${summary} ${gateInstruction}` });

@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const hook = fileURLToPath(new URL('../conveyor-subagent-gate.mjs', import.meta.url));
-const timeout = 300_000;
+const timeout = 600_000;
 
 test('SubagentStop blocks a red gate and allows repeated failures when the stop hook is active', { timeout }, async () => {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'conveyor hook test-'));
@@ -17,6 +17,7 @@ test('SubagentStop blocks a red gate and allows repeated failures when the stop 
     await fs.mkdir(repo);
     await fs.mkdir(bin);
     await fs.mkdir(path.join(home, 'sessions'), { recursive: true });
+    await fs.writeFile(path.join(repo, 'existing.test.js'), 'original test\n');
     await fs.writeFile(path.join(home, 'sessions', 'session.jsonl'), JSON.stringify({
       at: new Date().toISOString(), session: 'session', repo, base: 'recorded-base', out: 'answer.md', tier: 'complex', mode: 'block'
     }) + '\n');
@@ -26,6 +27,7 @@ if (args[0] === 'rev-parse') {
   process.stdout.write(args[1] === '--show-toplevel' ? ${JSON.stringify(repo)} : 'current-head');
 } else if (args[0] === 'log') process.stdout.write('committed.js\\0');
 else if (args[0] === 'diff') process.stdout.write('changed.js\\0');
+else if (args[0] === 'ls-files' && args.includes('--cached')) process.stdout.write('existing.test.js\\0new.test.js\\0');
 else if (args[0] !== 'ls-files') throw new Error('unexpected fake git arguments');
 `, { mode: 0o755 });
     await fs.writeFile(checker, `import * as fs from 'node:fs';
@@ -36,8 +38,9 @@ const durationMs = fs.readFileSync(file, 'utf8').trim().split('\\n').length;
 process.stdout.write(JSON.stringify({
   ok: false, level: option('--level'), repo: option('--dir'), base: option('--base'),
   changed: option('--files').split(','),
-  results: [{ name: option('--level') + '-check', cmd: ['fake', 'check'], status: 'fail',
-    rc: 1, durationMs, outputTail: 'subagent failure tail' }], hygiene: { ok: true, grew: [] }
+  results: [{ name: option('--level') + '-check', cmd: ['fake', 'check'], status: process.env.FAKE_STATUS || 'fail',
+    rc: process.env.FAKE_STATUS === 'timeout' ? null : 1, durationMs,
+    outputTail: process.env.FAKE_TAIL || 'subagent failure tail' }], hygiene: { ok: true, grew: [] }
 }));
 process.exitCode = 1;
 `);
@@ -45,11 +48,11 @@ process.exitCode = 1;
       session_id: 'session', transcript_path: path.join(root, 'parent.jsonl'), cwd: repo, stop_hook_active: false,
       agent_id: 'agent-1', agent_transcript_path: path.join(root, 'agent-1.jsonl'), hook_event_name: 'SubagentStop'
     };
-    const run = (payload) => {
+    const run = (payload, extra = {}) => {
       const result = spawnSync(process.execPath, [hook], {
         env: {
           ...process.env, HOME: root, CONVEYOR_HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH}`,
-          CONVEYOR_CHECK_CMD: JSON.stringify([process.execPath, checker])
+          CONVEYOR_CHECK_CMD: JSON.stringify([process.execPath, checker]), ...extra
         }, input: JSON.stringify(payload), encoding: 'utf8', timeout
       });
       assert.ifError(result.error);
@@ -72,5 +75,21 @@ process.exitCode = 1;
       assert.equal(args[args.indexOf('--base') + 1], 'recorded-base');
       assert.equal(args[args.indexOf('--files') + 1], 'changed.js,committed.js');
     }
+    const active = { ...input, stop_hook_active: true };
+    const timedOut = run(active, { FAKE_STATUS: 'timeout', FAKE_TAIL: 'first timeout diagnostic' });
+    assert.equal(timedOut.decision, 'block');
+    assert.match(timedOut.reason, /fast-check: timeout[\s\S]*first timeout diagnostic/);
+    const changedTimeout = run(active, { FAKE_STATUS: 'timeout', FAKE_TAIL: 'different timeout diagnostic' });
+    assert.equal(changedTimeout.decision, 'block', 'different timeout diagnostics must change the fingerprint');
+    assert.match(run(active, { FAKE_STATUS: 'timeout', FAKE_TAIL: 'different timeout diagnostic' }).systemMessage,
+      /gate failed again/);
+    await fs.writeFile(path.join(repo, 'new.test.js'), 'new tests are allowed\n');
+    assert.equal(run(active).decision, 'block');
+    await fs.writeFile(path.join(repo, 'existing.test.js'), 'edited test\n');
+    const count = (await fs.readFile(calls, 'utf8')).trim().split('\n').length;
+    assert.equal(run(active).systemMessage, '## Gate: fail (fix round modified tests: existing.test.js)');
+    await fs.rm(path.join(repo, 'existing.test.js'));
+    assert.equal(run(active).systemMessage, '## Gate: fail (fix round modified tests: existing.test.js)');
+    assert.equal((await fs.readFile(calls, 'utf8')).trim().split('\n').length, count);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });

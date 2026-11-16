@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { loadProfile, matchesGlob } from './lib/profile.mjs';
+import { loadProfile, matchesGlob, trustProfile } from './lib/profile.mjs';
 import { git, existingFiles, repositoryFiles, ratchet, hygieneReport } from './lib/hygiene.mjs';
 
 function options(args, allowed) {
@@ -22,12 +22,9 @@ function options(args, allowed) {
   return result;
 }
 
-function quote(value) {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function fileArguments(files) {
-  return files.map((file) => quote(file.startsWith('-') ? `./${file}` : file)).join(' ');
+function commandTemplate(command) {
+  // Accept legacy quoted placeholders too. File names never become shell source.
+  return command.replace(/(["'])\{(?:files|tests_for_files)\}\1|\{(?:files|tests_for_files)\}/g, '"$@"');
 }
 
 function heavy(command) {
@@ -107,7 +104,9 @@ async function run(repo, opts, profile) {
   for (const entry of entries) {
     const files = changed.filter((file) => matchesGlob(file, entry.glob ?? entry.when ?? '**/*'));
     const tests = entry.run.includes('{tests_for_files}') && files.length ? await relatedTests(repo, files) : [];
-    const cmd = entry.run.replaceAll('{files}', fileArguments(files)).replaceAll('{tests_for_files}', fileArguments(tests));
+    const cmd = commandTemplate(entry.run);
+    const args = (entry.run.includes('{tests_for_files}') ? tests : files)
+      .map((file) => file.startsWith('-') ? `./${file}` : file);
     if (!files.length || (entry.run.includes('{tests_for_files}') && !tests.length)) {
       results.push({
         name: entry.name, cmd, status: 'skipped', rc: null, durationMs: 0,
@@ -128,13 +127,15 @@ async function run(repo, opts, profile) {
     if (admission && admission.status !== 'pass') result = admission;
     else if (deadline <= Date.now()) {
       result = { status: 'timeout', rc: null, durationMs: 0, outputTail: 'level budget exhausted' };
-    } else result = await processResult(repo, '/bin/sh', ['-c', cmd], deadline - Date.now());
+    } else result = await processResult(repo, '/bin/sh', ['-c', cmd, 'conveyor', ...args], deadline - Date.now());
     results.push({ name: entry.name, cmd, ...result });
   }
   const hygieneFiles = changed.filter((file) => file !== path.normalize(profile.hygiene.baseline));
   const hygiene = await ratchet(repo, hygieneFiles, profile.hygiene.counters, revision);
   const ok = hygiene.ok && results.every((result) => ['pass', 'skipped'].includes(result.status));
-  return { ok, level, repo, base, changed, results, hygiene };
+  const trust = profile.profileTrust;
+  return { ok, level, repo, base, changed, results, hygiene, profileTrust: trust,
+    ...(trust === 'untrusted' ? { profile: 'untrusted (run check.mjs trust after review)' } : {}) };
 }
 
 function print(result, json) {
@@ -143,6 +144,7 @@ function print(result, json) {
     return;
   }
   if (result.level) {
+    if (result.profile) process.stdout.write(`profile: ${result.profile}\n`);
     process.stdout.write(`${result.ok ? 'PASS' : 'FAIL'} ${result.level}: ${result.changed.length} changed files (${result.repo})\n`);
     if (!result.results.some((entry) => entry.status !== 'skipped')) process.stdout.write('nothing to check\n');
     for (const entry of result.results) {
@@ -163,13 +165,19 @@ function print(result, json) {
 
 export async function main(args = process.argv.slice(2)) {
   const [action, ...rest] = args;
-  if (!['run', 'hygiene'].includes(action)) throw new Error('usage: check.mjs run | hygiene --dir <repo> [--json]');
+  if (!['run', 'hygiene', 'trust'].includes(action)) throw new Error('usage: check.mjs run | hygiene | trust --dir <repo> [--json]');
   const allowed = { '--dir': true, '--json': false };
   if (action === 'run') Object.assign(allowed, { '--level': true, '--files': true, '--base': true });
-  else allowed['--write-baseline'] = false;
+  else if (action === 'hygiene') allowed['--write-baseline'] = false;
   const opts = options(rest, allowed);
   if (!opts['--dir']) throw new Error('--dir is required');
-  const repo = path.resolve(opts['--dir']), profile = await loadProfile(repo);
+  const repo = path.resolve(opts['--dir']);
+  if (action === 'trust') {
+    const result = await trustProfile(repo);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return 0;
+  }
+  const profile = await loadProfile(repo);
   const result = action === 'run' ? await run(repo, opts, profile) : await hygieneReport(repo, profile, Boolean(opts['--write-baseline']));
   print(result, opts['--json']);
   return result.ok ? 0 : 1;

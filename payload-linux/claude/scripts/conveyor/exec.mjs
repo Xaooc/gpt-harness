@@ -65,8 +65,8 @@ export function gateSessionFile(session) {
   return path.join(paths().home, 'sessions', `${encodeURIComponent(session)}.jsonl`);
 }
 
-function failedCheck(result) {
-  return (typeof result.rc === 'number' && result.rc !== 0) || /^(fail|failed|error)$/.test(result.status);
+export function failedCheck(result) {
+  return (typeof result.rc === 'number' && result.rc !== 0) || /^(fail|failed|error|timeout)$/.test(result.status);
 }
 
 export function gateDetails(last, failuresOnly = false) {
@@ -119,7 +119,7 @@ export async function runGateChecks(repo, base, files) {
     if (typeof report.ok !== 'boolean' || !Array.isArray(report.results) || typeof report.hygiene?.ok !== 'boolean') {
       throw new Error('check returned invalid JSON report');
     }
-    last.ok &&= code === 0 && report.ok && report.hygiene.ok;
+    last.ok &&= code === 0 && report.ok && report.hygiene.ok && !report.results.some(failedCheck);
     last.results.push(...report.results);
     last.hygiene.ok &&= report.hygiene.ok;
     for (const item of report.hygiene.grew || []) {
@@ -147,26 +147,25 @@ function pythonCheckSections(text) {
   }).join('\n');
 }
 
-async function protectedFiles(repo) {
+export async function protectedFiles(repo) {
   const files = (await git(repo, ['ls-files', '--cached', '--others', '--exclude-standard', '-z'])).split('\0');
   const snapshot = new Map();
   for (const file of new Set(files.filter(Boolean))) {
     const config = checkConfiguration(file), python = path.posix.basename(file) === 'pyproject.toml';
     if (!config && !python && !testFile(file)) continue;
     try {
-      if (config || python) {
-        const content = await fs.readFile(path.join(repo, file));
-        const protectedContent = python ? pythonCheckSections(content.toString()) : content;
-        if (!python || protectedContent) {
-          snapshot.set(file, createHash('sha256').update(protectedContent).digest('hex'));
-        }
-      } else {
-        await fs.lstat(path.join(repo, file));
-        snapshot.set(file, 'test');
+      const content = await fs.readFile(path.join(repo, file));
+      const protectedContent = python && !testFile(file) ? pythonCheckSections(content.toString()) : content;
+      if (!python || protectedContent || testFile(file)) {
+        snapshot.set(file, createHash('sha256').update(protectedContent).digest('hex'));
       }
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   return snapshot;
+}
+
+export function modifiedTests(before, after) {
+  return [...before.keys()].filter((file) => testFile(file) && before.get(file) !== after.get(file)).sort();
 }
 
 async function prepareGate(dir, brief, out, tier, skip) {
@@ -218,6 +217,12 @@ async function finishGate(gate, dispatch, entry, dir, out) {
       const result = await launch(entry, ['-w', '-m', entry.model, '-e', entry.effort,
         '-C', dir, '-f', brief, '-o', fixOut], dir);
       const after = await protectedFiles(gate.repo);
+      const tests = modifiedTests(before, after);
+      if (tests.length) {
+        dispatch.gate = { status: 'fail', rounds, last, touched: tests };
+        await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round modified tests: ${tests.join(', ')})`);
+        return 6;
+      }
       const touched = [...new Set([...before.keys(), ...after.keys()])].filter((file) =>
         before.get(file) !== after.get(file) && (checkConfiguration(file) ||
           path.posix.basename(file) === 'pyproject.toml' || (before.has(file) && !after.has(file)))).sort();

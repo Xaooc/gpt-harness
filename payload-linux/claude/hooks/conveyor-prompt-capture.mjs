@@ -9,7 +9,7 @@ try {
   for await (const chunk of process.stdin) input += chunk;
   const event = JSON.parse(input);
   const { capturePrompt } = await import('../scripts/conveyor/lib/ledger.mjs');
-  const result = capturePrompt(event);
+  const result = await capturePrompt(event);
   if (result?.taskOpen && result.record.clauses.length) {
     const ids = result.record.clauses.map((clause) => clause.id).join(', ');
     process.stdout.write(JSON.stringify({ hookSpecificOutput: {

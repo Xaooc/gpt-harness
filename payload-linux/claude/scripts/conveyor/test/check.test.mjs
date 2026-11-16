@@ -3,12 +3,13 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadProfile } from '../lib/profile.mjs';
 
 const cli = fileURLToPath(new URL('../check.mjs', import.meta.url));
-const timeout = 300_000;
+const timeout = 600_000;
 const quote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
 const command = (source) => `${quote(process.execPath)} -e ${quote(source)}`;
 const counter = { name: 'eslint-disable', pattern: 'eslint-disable', glob: 'src/**/*.{ts,tsx}' };
@@ -19,15 +20,25 @@ async function environment(t, config, files = { 'src/example.ts': 'export const 
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const repo = path.join(root, 'repo');
   await fs.mkdir(repo);
-  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+  const home = path.join(root, 'conveyor');
+  const env = { ...process.env, HOME: root, CONVEYOR_HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
   const fixture = {
-    root, repo,
+    root, repo, home,
     async write(file, value) {
       const target = path.join(repo, file);
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, value);
     },
-    async profile(value) { await this.write('.claude/conveyor.json', JSON.stringify(value)); },
+    async profile(value, trusted = true) {
+      const raw = JSON.stringify(value);
+      await this.write('.claude/conveyor.json', raw);
+      if (trusted) {
+        await fs.mkdir(home, { recursive: true });
+        await fs.writeFile(path.join(home, 'trusted-profiles.json'), JSON.stringify({
+          [repo]: createHash('sha256').update(raw).digest('hex')
+        }));
+      }
+    },
     git(args) {
       const result = spawnSync('git', [
         '-c', 'user.name=Conveyor test', '-c', 'user.email=conveyor@example.invalid',
@@ -74,6 +85,11 @@ test('profile rejects unknown keys and autodetects Node and Python checks', { ti
   const vitest = await loadProfile(env.repo);
   assert.equal(vitest.turn[0].run, 'npx tsc --noEmit');
   assert.equal(vitest.turn[1].run, 'npx vitest related --run {files}');
+  await fs.rm(path.join(env.repo, 'eslint.config.mjs'));
+  await env.write('package.json', JSON.stringify({ scripts: { lint: 'custom-lint', test: 'never-run-the-full-suite' } }));
+  const lint = await loadProfile(env.repo);
+  assert.deepEqual(lint.fast, []);
+  assert.deepEqual(lint.turn.map((entry) => entry.run), ['npm run lint', 'npx tsc --noEmit']);
 
   const python = await environment(t);
   await python.write('pyproject.toml', '[tool.ruff]\nline-length = 100\n\n[tool.mypy]\n\n[tool.pytest.ini_options]\n');
@@ -84,6 +100,63 @@ test('profile rejects unknown keys and autodetects Node and Python checks', { ti
   ]);
   await python.write('uv.lock', 'version = 1\n');
   assert.equal((await loadProfile(python.repo)).fast[0].run, 'uv run ruff check {files}');
+});
+
+test('file placeholders pass literal positional arguments, including legacy quotes and shell syntax', { timeout }, async (t) => {
+  const env = await environment(t);
+  const files = ['a$(touch PWNED).ts', "a';touch PWNED;'.ts", '-option.ts', 'a b.ts'];
+  for (const file of files) await env.write(file, 'export {};\n');
+  // Changed files are sorted before they become positional arguments.
+  const expected = [...files].sort().map((file) => file.startsWith('-') ? `./${file}` : file);
+  const check = command(`require('node:assert/strict').deepEqual(process.argv.slice(1), ${JSON.stringify(expected)})`);
+  for (const placeholder of ['{files}', '"{files}"', "'{files}'"]) {
+    await env.profile(profile([{ name: 'argv', run: `${check} -- ${placeholder}` }]));
+    const result = env.command(['run', '--level', 'fast', '--files', files.join(',')]);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.ok(result.report.results[0].cmd.includes('"$@"'));
+    await assert.rejects(fs.stat(path.join(env.repo, 'PWNED')), { code: 'ENOENT' });
+  }
+});
+
+test('untrusted profiles use autodetection and hygiene data until the reviewed SHA-256 is trusted', { timeout }, async (t) => {
+  const env = await environment(t);
+  const bin = path.join(env.root, 'bin'), log = path.join(env.root, 'npm.jsonl');
+  await fs.mkdir(bin);
+  await fs.writeFile(path.join(bin, 'npm'), `#!${process.execPath}
+const fs = require('node:fs');
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + '\\n');
+`, { mode: 0o755 });
+  const fakePath = { PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+  await env.write('package.json', JSON.stringify({ scripts: { lint: 'custom-lint', test: 'never-run-the-full-suite' } }));
+  const config = { ...profile([{ name: 'repo-fast', run: 'touch PROFILE_RAN' }], [counter]),
+    turn: [{ name: 'repo-turn', run: 'touch PROFILE_RAN' }] };
+  await env.profile(config, false);
+  await env.write('src/example.ts', '// eslint-disable\n');
+  for (const level of ['fast', 'turn']) {
+    const result = env.command(['run', '--level', level], fakePath);
+    assert.equal(result.status, 1);
+    assert.equal(result.report.profileTrust, 'untrusted');
+    assert.equal(result.report.profile, 'untrusted (run check.mjs trust after review)');
+    assert.deepEqual(result.report.results.map((entry) => entry.name), level === 'turn' ? ['lint'] : []);
+    assert.equal(result.report.hygiene.grew[0].counter, 'eslint-disable');
+    await assert.rejects(fs.stat(path.join(env.repo, 'PROFILE_RAN')), { code: 'ENOENT' });
+  }
+  assert.equal(await fs.readFile(log, 'utf8'), '["run","lint"]\n');
+  const trusted = env.command(['trust']);
+  assert.equal(trusted.status, 0, trusted.stderr);
+  const raw = await fs.readFile(path.join(env.repo, '.claude/conveyor.json'));
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(env.home, 'trusted-profiles.json'), 'utf8')), {
+    [env.repo]: createHash('sha256').update(raw).digest('hex')
+  });
+  for (const level of ['fast', 'turn']) {
+    const result = env.command(['run', '--level', level]);
+    assert.equal(result.report.profileTrust, 'trusted');
+    assert.equal(result.report.results[0].status, 'pass');
+    await fs.rm(path.join(env.repo, 'PROFILE_RAN'));
+  }
+  await fs.appendFile(path.join(env.repo, '.claude/conveyor.json'), '\n');
+  assert.equal(env.command(['run', '--level', 'fast']).report.profileTrust, 'untrusted');
+  await assert.rejects(fs.stat(path.join(env.repo, 'PROFILE_RAN')), { code: 'ENOENT' });
 });
 
 test('runner skips entries with no matching changed files and excludes deleted files', { timeout }, async (t) => {

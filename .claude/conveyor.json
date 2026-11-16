@@ -1,15 +1,36 @@
 {
   "version": 1,
   "fast": [
-    {"name": "node-check", "glob": "**/*.mjs", "run": "for f in {files}; do node --check \"$f\" || exit 1; done"},
-    {"name": "bash-n", "glob": "**/*.sh", "run": "for f in {files}; do bash -n \"$f\" || exit 1; done"}
+    {
+      "name": "node-check",
+      "glob": "**/*.mjs",
+      "run": "for f in {files}; do node --check \"$f\" || exit 1; done"
+    },
+    {
+      "name": "bash-n",
+      "glob": "**/*.sh",
+      "run": "for f in {files}; do bash -n \"$f\" || exit 1; done"
+    }
   ],
   "turn": [],
-  "gate": {"mode": "block"},
+  "gate": {
+    "mode": "block"
+  },
   "hygiene": {
     "counters": [
-      {"name": "TODO/FIXME", "pattern": "\\b(TODO|FIXME)\\b", "glob": "payload-linux/claude/**/*.{mjs,js,sh,py}", "exclude": "payload-linux/claude/local-plugins/pstack/**"},
-      {"name": "large-files", "maxLines": 2000, "glob": "**/*.{mjs,sh,py}", "exclude": "payload-linux/claude/local-plugins/pstack/**"}
+      {
+        "name": "TODO/FIXME",
+        "pattern": "\\b(TODO|FIXME)\\b",
+        "glob": "payload-linux/claude/**/*.{mjs,js,sh,py}",
+        "exclude": "payload-linux/claude/local-plugins/pstack/**"
+      },
+      {
+        "name": "large-files",
+        "maxLines": 2000,
+        "glob": "**/*.{mjs,sh,py}",
+        "exclude": "{payload-linux/claude/local-plugins/pstack/**,payload*/claude/scripts/luna-daemon.mjs}",
+        "note": "luna-daemon.mjs is accepted debt (2.9k lines, shared live wrapper): splitting it is its own planned slice, not a side effect of a fix round."
+      }
     ],
     "baseline": ".conveyor/hygiene-baseline.json"
   }

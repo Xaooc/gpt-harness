@@ -8,8 +8,9 @@ try {
   let input = '';
   for await (const chunk of process.stdin) input += chunk;
   const event = JSON.parse(input);
-  const { rememberContext, gateStatus, stopOutput } = await import('../scripts/conveyor/lib/ledger.mjs');
+  const { rememberContext, gateStatus, gateMode, stopOutput } = await import('../scripts/conveyor/lib/ledger.mjs');
   const context = rememberContext(event);
+  gateMode(context.session);
   const output = stopOutput(context, await gateStatus(context), event.stop_hook_active);
   if (output) process.stdout.write(JSON.stringify(output) + '\n');
 } catch (error) {

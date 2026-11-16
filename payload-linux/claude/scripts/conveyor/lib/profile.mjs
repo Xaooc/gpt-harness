@@ -1,5 +1,8 @@
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
+import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { writeJsonAtomic } from './orchestration.mjs';
 
 const jsFiles = '**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}';
 const tsFiles = '**/*.{ts,tsx,mts,cts}';
@@ -38,6 +41,7 @@ export function matchesGlob(file, glob) {
 }
 
 function entries(value, label) {
+  // Write {files} unquoted in run commands; the runner supplies quoted positional arguments.
   if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
   const names = new Set();
   return value.map((entry, index) => {
@@ -151,6 +155,8 @@ async function autodetect(repo) {
     const files = await fs.readdir(repo);
     if (files.some((file) => /^eslint\.config\..+|^\.eslintrc(?:\..*)?$/.test(file))) {
       profile.fast.push({ name: 'eslint', glob: jsFiles, run: 'npx eslint --max-warnings=0 {files}' });
+    } else if (typeof pkg.scripts?.lint === 'string') {
+      profile.turn.push({ name: 'lint', when: jsFiles, run: 'npm run lint' });
     }
     const script = ['typecheck', 'type-check'].find((name) => typeof pkg.scripts?.[name] === 'string');
     if (script || files.includes('tsconfig.json')) {
@@ -184,6 +190,27 @@ async function autodetect(repo) {
 export async function loadProfile(repo) {
   const file = path.join(path.resolve(repo), '.claude', 'conveyor.json');
   const raw = await optionalText(file);
-  try { return raw === null ? await autodetect(repo) : defaults(JSON.parse(raw)); }
+  try {
+    if (raw === null) return { ...await autodetect(repo), profileTrust: 'autodetected' };
+    const profile = defaults(JSON.parse(raw));
+    const trusted = JSON.parse(await optionalText(trustFile()) || '{}');
+    if (trusted[path.resolve(repo)] === digest(raw)) return { ...profile, profileTrust: 'trusted' };
+    return { ...await autodetect(repo), hygiene: profile.hygiene, profileTrust: 'untrusted' };
+  }
   catch (error) { throw new Error(`${file}: ${error.message}`); }
+}
+
+function trustFile() {
+  const home = process.env.CONVEYOR_HOME || path.join(homedir(), '.claude', 'conveyor');
+  return path.join(home, 'trusted-profiles.json');
+}
+
+const digest = (raw) => createHash('sha256').update(raw).digest('hex');
+
+export async function trustProfile(repo) {
+  const raw = await fs.readFile(path.join(repo, '.claude', 'conveyor.json'), 'utf8');
+  defaults(JSON.parse(raw));
+  const file = trustFile(), trusted = JSON.parse(await optionalText(file) || '{}');
+  await writeJsonAtomic(file, { ...trusted, [path.resolve(repo)]: digest(raw) });
+  return { ok: true, repo, profileTrust: 'trusted', sha256: digest(raw) };
 }
