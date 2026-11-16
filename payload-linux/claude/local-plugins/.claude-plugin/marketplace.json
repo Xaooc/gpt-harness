@@ -1,5 +1,16 @@
 {
   "name": "luna-local",
-  "owner": { "name": "local" },
-  "plugins": [{ "name": "luna-panel", "source": "./luna-panel" }]
+  "owner": {
+    "name": "local"
+  },
+  "plugins": [
+    {
+      "name": "luna-panel",
+      "source": "./luna-panel"
+    },
+    {
+      "name": "pstack",
+      "source": "./pstack"
+    }
+  ]
 }

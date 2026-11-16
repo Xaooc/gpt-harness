@@ -3,83 +3,91 @@
 > Project-level `CLAUDE.md`, explicit user requests, and any active project
 > workflow (e.g. GSD) take precedence over this file when they conflict.
 
+## Machines
+
+Claude now runs on **bro-server**: Debian 13, 4 CPU cores, 15 GB RAM. The Windows PC is a backup.
+GTNH (`gtnh-server.service`) and Claude/Codex work are never run at the same time on this box,
+so the full machine is available to Claude; do not start GTNH while Claude work is running unless the user asks.
+This box is bro-server itself: run `gtnh-server` admin commands locally, with no SSH to itself.
+The Windows Docker host **NucBox** is reached over SSH (see `personal-server-connect`).
+LAN IPs drift with DHCP: identify hosts by their SSH host key, not their IP.
+
 ## Harness source
 
-How this Claude→Codex harness is built (scripts, daemon, skills, hooks, installer, learning loop) lives in the package
-repo `Xaooc/gpt-harness` (private), cloned at `~/dev/gpt-harness`. Read it to understand the design: `README.md`,
-`PACKAGE-SPEC.md`, `INSTALL.md`, `SELF-LEARNING.md`; `payload-linux/` is what this machine runs, `payload/` is the
-other platform's version, `codex-build/` is the Windows-only custom Codex build (Rust, busybox-shell patch; not used on Linux).
+How this Claude→Codex harness is built (scripts, daemon, skills, hooks, installer, learning loop) lives in the repo
+`~/dev/gpt-harness` (GitHub `Xaooc/gpt-harness`, private; this clone has no GitHub credentials, so it can be read
+but not pulled or pushed from here). Read it to understand the design: `README.md`, `PACKAGE-SPEC.md`, `INSTALL.md`,
+`SELF-LEARNING.md`; `payload-linux/` is what this machine runs, `payload/` is the Windows PC version,
+`codex-build/` is the Windows-only custom Codex build (Rust, busybox-shell patch; not used on Linux).
 `~/.claude` is the installed copy: when you change a harness script or skill there, make the same change in
-`payload-linux/` (and in `payload/` unless it is platform-specific), update the payload `manifest.json` hashes, and
-commit and push (or tell the user it needs a push when this clone has no GitHub credentials).
+`payload-linux/` (and in `payload/` unless it is Linux-specific), update the payload `manifest.json` hashes, and tell
+the user it needs a commit and push.
 
-## Division of labour: Claude orchestrates, Luna executes
+## Network
 
-**Executors = Codex, normal service tier, two levels** (user decisions 2026-10-26): **`-m gpt-6.1-terra -e max`**
-for everything that was Sol (any implementation more than simple; never Terra `medium`/`high`: they stop long jobs
-early), and **`gpt-6-luna`** — the wrapper's default model, unchanged («простое лучше вернуть как было») — for simple/
-mechanical work, scouts, critics and images, with Luna's effort chosen per task (see the `luna` skill). Pass
-`-m gpt-6.1-terra -e max` explicitly for complex jobs. The fast tier is OFF because it burns too much quota. Don't pass
-`-t fast` unless the user asks.
-It is always called through
-`bash ~/.claude/scripts/luna.sh` (`-w` write / `-r` read-only). The wrapper pins
-model and effort on the command line. Don't rely on `$CODEX_HOME/config.toml`,
-because the Codex desktop app rewrites it. Use it proactively, without waiting to be
-asked. Keep slices ≤ ~40 min, run independent slices in parallel, never discard the
-wrapper's output, and check `luna-status.sh` right after launching.
+Anthropic/OpenAI are reachable only via the local xray proxy: `HTTPS_PROXY` comes from
+`~/.config/bro-env.sh`. `xray.service` exposes SOCKS on 10808 and HTTP on 10809, with
+automatic failover across EU servers and daily subscription refresh by `xray-sub-update.timer`.
+If Codex or Claude calls fail with 403/timeouts, recover in this order:
+1. `systemctl status xray` and `journalctl -u xray -n 30` (each request line shows which server `p-NN` it used).
+2. `ss -tln | grep 1080` should list 127.0.0.1:10808 and :10809; if not, `sudo systemctl restart xray`.
+3. Empty or stale server list: `sudo systemctl start xray-sub-update.service` (re-downloads the subscription,
+   keeps the old config if the new one fails `xray run -test`), then `sudo systemctl restart xray`.
+4. Verify: `curl -s -m 10 -x http://127.0.0.1:10809 https://ipinfo.io/country` must not print `RU`, and
+   `echo $HTTPS_PROXY` must be `http://127.0.0.1:10809` (else `. ~/.config/bro-env.sh`).
 
-**Any implementation that is more than simple goes to Terra at `max`** (user decisions 2026-10-21, 2026-10-26: formerly
-Sol 6.1 high): `luna.sh -w -m gpt-6.1-terra -e max`. In the rest of this paragraph «Sol» means this level and «Luna»
-means `gpt-6-luna`. That means every moderately complex or complex job: features (even single-module ones), non-trivial
-bug fixes, refactors, migrations, multi-file changes, new logic, anything touching
-data/API/auth/money/concurrency/security, debugging, and anything Luna failed at once. **Luna** keeps only simple,
-mechanical work (renames, reformatting, boilerplate, one-file trivial edits, pattern copy with no decisions),
-information gathering/scouts, critics and images. When in doubt, use Sol. Sol is literal (see the `luna` skill, "The
-executors are literal"), so a Sol brief must be exhaustive. Never use `gpt-6-astra`. See "Model routing" in the `luna`
-skill.
+## Process: Lauren Tan's pstack is the default (user decision 2026-11-16)
 
-**Priorities: quality of the final result > speed through parallelism > quota.** Codex
-quota is effectively unlimited (user, 2026-09-29), so never economise on Luna jobs. Fan out
-research scouts, use best-of-2 for the riskiest core pieces, use bigger critic panels, and
-run independent slices in parallel. Decompose by independence, never into pieces smaller
-than a coherent unit.
+Every session works in **poteto-mode** from pstack (MIT, vendored as the local plugin `pstack@luna-local`). The
+session-start hook prints the pstack path. Before the first task, read `<pstack>/docs/harness/claude-code.md`,
+then `<pstack>/docs/harness/bro-harness.md` (this harness's adapter; it wins over pstack), then follow
+`<pstack>/skills/poteto-mode/SKILL.md`: playbooks per task type, named principles read from their leaf skills,
+verification against the real artifact, lessons encoded as checks rather than prose. The adapter overrides
+pstack's "Autonomy": anything external (messages, tickets, PRs, push, merge, deploy) needs the user's yes.
+superpowers and GSD skills stay installed but are not the default process: use them only when the user asks for
+one by name or the project is a GSD project. The `luna` skill keeps the executor infrastructure details.
 
-### The loop (default for every non-trivial task)
+## Executors: Claude orchestrates, executors do the work (user decisions 2026-11-16)
 
-1. **Execute**: Claude briefs Luna, Luna does the work (skill `luna`).
-2. **Critique**: Luna critics with clean context and personas review the result (skill `luna-critics`).
-3. **Close the gaps**: Claude verifies the findings. Luna fixes the accepted ones. Re-run the
-   critics once if critical/high findings were fixed (at most 2 rounds).
-4. **Done**: Claude runs the checks, commits, and reports what the critics caught.
+Claude (Opus) orchestrates, designs and decides; implementation, research and review run on executors through one
+dispatcher, by **tier**, never by naming a tool:
 
-### 1. Clear tasks go to Luna (skill: `luna`)
+```
+node ~/.claude/scripts/conveyor/exec.mjs run --tier <complex|simple|review|scout> (-w|-r) -C <dir> -f <brief.md> -o <out.md>
+```
 
-Every clear, well-bounded job goes to Luna instead of being done inline or by a
-Claude/Sonnet subagent:
-- **Implementation**: features, fixes, refactors, tests, scripts, migrations.
-- **Information gathering**: exploring a codebase, tracing flows, finding usages,
-  reading logs/docs, summarising. Use Luna read-only (`-r`) instead of the
-  `Explore`/`general-purpose` subagents.
+| Tier | Chain (first available wins) |
+| --- | --- |
+| `complex` — any implementation beyond simple: features, non-trivial fixes, refactors, migrations, multi-file, data/API/auth/money/concurrency/security, debugging | Codex Sol 6.1 → Claude Sonnet |
+| `simple` — mechanical edits, scouts, summaries | Gemini (`gem.sh`, full agent, sandboxed) → Codex Luna → Claude Haiku |
+| `review` / `scout` | as configured |
 
-Claude writes a self-contained brief, verifies the result (diff, gates, spot-checks),
-and commits itself. Luna never commits.
+- The chains, models, efforts, panels and pstack roles live in `~/.claude/conveyor/orchestration.json`; the user
+  edits them in the **Luna panel** (model and effort per task kind, presets). Do not hand-edit it.
+- Codex is skipped automatically at **80 %** usage (configurable in the panel; hysteresis), a provider that hit a
+  quota/region/auth error is skipped for its TTL, and a write job that already started is never re-run on
+  another provider. Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`.
+- Never `gpt-6-astra`. Never the fast tier (`-t fast`) unless the user asks.
+- Briefs are self-contained and exhaustive: executors are literal and see only the brief (see the `luna` skill,
+  "The executors are literal"). Every write brief ends with "Edit files only. Do NOT run git add / commit / push".
+  Claude verifies every result (diff, gates, spot-checks) and commits itself.
+- After each launch check `luna-status.sh <out>` and arm `luna-watch.sh` with the Monitor tool; stop jobs with
+  `luna-stop.sh`. Keep slices ≤ ~40 min and run independent slices in parallel.
 
-**Design is done by Opus itself, NEVER delegated.** Opus is the main Claude model in this session, and it is far better
-than GPT with the visual side of websites and apps. Design means visual/UI/UX, layout, styling/CSS, look & feel,
-typography, colour, design tokens, component markup and artifact pages. Don't hand any of it to Luna, and don't hand it
-to Sonnet or other subagents either. Luna may do only the non-visual wiring (data, logic, API) around it, and may
-generate raster images on request (see the `luna` skill, "Image generation").
-Claude also keeps talking to the user and includes requested text directly in the reply when asked. Claude owns final
-decisions, synthesis of Luna/critic output, and trivial one-liners that are faster to do than to brief. For mixed tasks,
-split them: Luna does the
-logic/wiring, Claude does the visuals.
+**Priorities: quality of the final result > speed through parallelism > quota.** Fan out scouts, use best-of-2
+(pstack `arena`) for the riskiest core pieces, run independent slices in parallel; decompose by independence,
+never into pieces smaller than a coherent unit.
 
-This also applies to inline paths such as `/gsd-fast` or direct edits: the code is
-written through `luna.sh -w`, and Claude verifies and commits.
+**Design is done by Opus itself, NEVER delegated.** Opus is the main Claude model in this session, and it is far
+better than GPT with the visual side of websites and apps. Design means visual/UI/UX, layout, styling/CSS, look &
+feel, typography, colour, design tokens, component markup and artifact pages. Don't hand any of it to executors or
+subagents. Executors may do only the non-visual wiring (data, logic, API) around it, and generate raster images on
+request (see the `luna` skill, "Image generation"). Claude also keeps talking to the user and includes requested
+text directly in the reply when asked. Claude owns final decisions, synthesis of executor and review output, and
+trivial one-liners that are faster to do than to brief.
 
-**Images: Luna can generate raster images** (Codex imagegen) for sites and any other task: hero art, illustrations,
-icons, backgrounds, assets. Opus writes the prompt and judges the result, which is art direction and therefore design.
-Luna runs it as a `luna.sh -w` job and saves the file into the project. See the `luna` skill, "Image generation".
+**Images: executors can generate raster images** (Codex imagegen) for sites and any other task. Opus writes the
+prompt and judges the result (art direction is design); the executor saves the file into the project.
 
 **Generate images proactively, without asking** (user rule, 2026-10-21). Whenever a deliverable would look or work
 better with real imagery, generate it as part of the work. That covers websites and landing pages (hero, section art,
@@ -90,33 +98,24 @@ ask permission first: the cost isn't a concern. Generate 2–4 variants for impo
 report what was generated. Limits: no text inside images (put it in HTML/CSS), no real people's likenesses or trademarked
 logos/brands, and optimise the files (size/format) before they ship.
 
-### 2. Critics for anything moderately complex (skill: `luna-critics`)
+### Review: pstack `interrogate` on diverse executors
 
-For any task that isn't trivial (multi-file, new feature/flow, user-facing,
-data/API change, auth/money/secrets, concurrency, infra, or a non-obvious
-decision), run a panel of 3–5 **clean-context role-play critics on Luna** via
-`luna-panel.sh`, which runs the whole panel as threads in ONE shared Codex process (`luna-pool.mjs`, ~16 MB per extra
-critic) (3–4 for internal code, 5–6 for user-facing, plus one per subsystem on large diffs; `high` effort by default,
-run in parallel with the next independent slice). They review statically, without running tests or scripts. Concurrency
-adapts to free RAM: `luna.sh` admits a job only while a reserve stays free; the Luna daemon defaults to max 12 jobs.
-Launch freely and the machine won't hang: рядовой пользователь, взломщик, дизайнер, проджект, мейнтейнер,
-тестировщик, эксплуатация, эксперт предметки. Run them after the plan (before
-implementing) and/or after implementing (before saying "done" or committing).
-Claude verifies every finding, fixes the accepted ones, and reports what was
-accepted and what was rejected.
+Review every non-trivial change before calling it done with pstack `interrogate`: its reviewers are the seats of
+the `review` panel (Codex Sol, Gemini, Codex Luna), each in a throwaway worktree, and a finding counts only with
+the command and output that prove it. For user-facing work add the `luna-critics` persona briefs that pstack does not
+cover (Рядовой пользователь on screenshots and flows, Дизайнер for visuals), and for Terra/Sol implementations a
+gap reviewer that reads the user's goal and the diff. Claude verifies every finding and reports accepted and
+rejected ones. Trivial edits and pure questions skip review.
 
-### 3. Stuck or uncertain
+### Stuck, or an executor is down
 
-If you're looping or unsure, hand a fresh root-cause investigation to Luna (`-r`)
-with a clean brief instead of retrying the same approach.
+Looping or unsure: follow pstack "Attack the Premise" and hand a fresh root-cause investigation to the `scout` tier
+with a clean brief. If a whole chain is unavailable (`exec.mjs` exit 5), do the work inline, say in one line which
+providers were down, and return to the dispatcher once they recover.
 
-### 4. Fallback: never stall
+## Infrastructure rules
 
-If Luna/Codex is unavailable (quota or rate limit, auth, CLI errors, repeated
-timeouts), do the work inline or via a Sonnet subagent (critics included), say in one
-line that Luna was skipped and why, and go back to Luna once it recovers.
-
-### 5. Always clean up after yourself (user rule, 2026-10-21)
+### Always clean up after yourself (user rule, 2026-10-21)
 
 A task isn't done until its garbage is gone. This applies to Claude itself AND to everything it launches (Luna/Sol jobs,
 subagents, other sessions it starts: tell them in their brief). **Clean up as you go**: after each finished step, remove that
@@ -159,13 +158,13 @@ each with its own node_modules, `.next` and `public/`, nobody removing them, gam
   shows a
   short report when action is needed and runs `--apply` once a day. Act on what it reports before starting heavy work.
 
-### 6. Tests: a budget, not a free-for-all (user rule, 2026-10-24)
+### Tests: a budget, not a free-for-all (user rule, 2026-10-24)
 
 Test runs have killed this PC before: about 10 GB of RAM, about 20 GB of temp files on the SSD, and
-1.5–2 hours of waiting. These limits apply on Linux as well.
+1.5–2 hours of waiting. That is Windows PC history; the limits below apply to bro-server now.
 A test run is a resource with a budget, in every project, for Claude and for
 everything it launches (put these rules into executor briefs). The shared heavy-gate defaults
-to 2 slots (`Bash` hooks):
+to 3 slots (`Bash` hooks; `HEAVY_GATE_MAX`):
 - **Every pytest run goes through `python3 ~/.claude/scripts/pytest_gate.py -n K -- <args>`.** The gate
   does the following:
   - caps workers per run (default 4) and shares ONE machine-wide worker pool sized to the CPU count
@@ -199,7 +198,7 @@ to 2 slots (`Bash` hooks):
   - A test slower than about 5 s is marked `slow` and justified.
   - Before adding a scenario test, check whether an existing one already covers the behaviour, and
     extend it rather than copy it.
-- **Lessons of a test suite that grew to 3 h (2026-10-24), apply in every project:**
+- **Lessons of the rpg suite that grew to 3 h (2026-10-24), apply in every project:**
   - **Never key a cache by a per-instance path** (a temp dir, a campaign folder, a room id) when the
     cached thing is a function of CONTENT. Key it by a content hash, and bound it (`maxsize`). A
     path-keyed cache never hits in tests (each test has a fresh path) and grew one worker from 150 MB
@@ -214,7 +213,7 @@ to 2 slots (`Bash` hooks):
   - **Don't copy what can be read from one place — spare the SSD.** Immutable data (world packs, canon,
     fixtures, templates, reference corpora) lives once, read-only, under a content hash; each test,
     campaign or tenant keeps only what it actually changes and reads the rest through one resolver
-    (shared base + per-instance overlay). A test that copies hundreds of unchanged files per case (the
+    (shared base + per-instance overlay). A test that copies hundreds of unchanged files per case (the rpg
     suite wrote ~2 million such files per run) is a defect to fix, not a cost of testing. Never hardlink
     files that can be written.
   - **Acceptance ≠ everything end-to-end:** one full scenario per invariant; other behaviour is tested
