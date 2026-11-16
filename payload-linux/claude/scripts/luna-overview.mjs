@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import {
   loadConfig, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
 } from './conveyor/lib/orchestration.mjs';
+import { summarizeUsage, usagePaths } from './conveyor/usage.mjs';
 
 const DEADLINE_MS = 1750;
 const TAIL_BYTES = 64 * 1024;
@@ -50,7 +51,8 @@ function empty(now = Date.now()) {
     daemon: { running: false, appServer: null, healthy: false }, jobs: [], codexLimits: null, build: null,
     sessions: [],
     orchestration: { chains: {}, panels: {}, threshold: null, marks: {}, presets: [], catalog: {}, configError: null },
-    switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null }
+    switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null },
+    usage: { ...summarizeUsage(null, now), stale: true }
   };
 }
 
@@ -72,6 +74,25 @@ async function readJson(file) {
     const value = JSON.parse(await readText(file));
     return object(value) ? value : null;
   } catch { return null; }
+}
+
+async function usageStatus(now) {
+  const paths = usagePaths(), cache = await readJson(paths.cache);
+  const usage = summarizeUsage(cache?.v === 1 ? cache : null, now);
+  usage.stale = !Number.isFinite(Date.parse(usage.at)) || now - Date.parse(usage.at) > 60_000;
+  if (usage.stale) {
+    const owner = await readJson(path.join(paths.lock, 'owner.json'));
+    if (!owner || !matchingProcess(owner.pid, owner.start)) {
+      try {
+        // Override supports an isolated fake collector; real collectors serialize on usage-state.json.lock.
+        const collector = process.env.LUNA_USAGE_COLLECTOR || fileURLToPath(new URL('./conveyor/usage.mjs', import.meta.url));
+        const child = spawn(process.execPath, [collector, 'collect'], { detached: true, stdio: 'ignore', windowsHide: true });
+        child.on('error', () => {});
+        child.unref();
+      } catch {}
+    }
+  }
+  return usage;
 }
 
 async function readTail(file, limit = TAIL_BYTES) {
@@ -488,7 +509,8 @@ async function collect(config, snapshot, now) {
     orchestrationStatus(snapshot, now),
     switches().then((events) => { snapshot.switches = events; }),
     geminiUsage(config, now, gemini).then((usage) => { Object.assign(snapshot.gemini, usage); }),
-    geminiMcp(config).then((mcp) => { snapshot.gemini.mcp = mcp; })
+    geminiMcp(config).then((mcp) => { snapshot.gemini.mcp = mcp; }),
+    usageStatus(now).then((usage) => { snapshot.usage = usage; })
   ]);
   return snapshot;
 }
@@ -508,7 +530,7 @@ function human(snapshot) {
 
 async function selfTest() {
   const envKeys = ['LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME', 'LUNA_RUN_DIR', 'CONVEYOR_HOME',
-    'CONVEYOR_LUNA_SH', 'CONVEYOR_GEM_SH'];
+    'CONVEYOR_LUNA_SH', 'CONVEYOR_GEM_SH', 'LUNA_USAGE_COLLECTOR'];
   const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   const directory = await fs.mkdtemp(path.join(tmpdir(), 'luna-overview-test-'));
   const now = Date.now();
@@ -524,12 +546,15 @@ async function selfTest() {
     process.env.CONVEYOR_HOME = path.join(directory, 'conveyor');
     process.env.CONVEYOR_LUNA_SH = fileURLToPath(import.meta.url);
     process.env.CONVEYOR_GEM_SH = fileURLToPath(import.meta.url);
+    process.env.LUNA_USAGE_COLLECTOR = path.join(directory, 'missing-collector.mjs');
     const config = configuration();
     config.registry = path.join(directory, 'jobs.jsonl');
     config.codexConfig = path.join(directory, 'config.toml');
     config.geminiStatus = path.join(directory, 'gateway-status.json');
     const orchestration = await loadConfig();
     await fs.mkdir(orchestrationPaths().home);
+    const usageCache = { v: 1, at: new Date(now).toISOString(), days: {}, topJobs: [] };
+    await fs.writeFile(usagePaths().cache, JSON.stringify(usageCache));
     await fs.writeFile(orchestrationPaths().config, JSON.stringify(orchestration));
     await fs.mkdir(path.join(directory, 'active'));
     await fs.mkdir(config.daemon);
@@ -560,7 +585,7 @@ async function selfTest() {
     });
     check('JSON shape', () => {
       assert.deepEqual(Object.keys(snapshot), [
-        'v', 'at', 'ram', 'daemon', 'jobs', 'codexLimits', 'build', 'sessions', 'orchestration', 'switches', 'gemini'
+        'v', 'at', 'ram', 'daemon', 'jobs', 'codexLimits', 'build', 'sessions', 'orchestration', 'switches', 'gemini', 'usage'
       ]);
       assert.equal(snapshot.v, 1);
       assert.equal(snapshot.at, new Date(now).toISOString());
@@ -573,6 +598,10 @@ async function selfTest() {
       ]);
       assert.ok(snapshot.jobs.every((job) => job.provider === 'codex'));
       assert.equal(snapshot.build, null);
+    });
+    check('usage summary comes from the cache', () => {
+      assert.deepEqual(snapshot.usage, { ...summarizeUsage(usageCache, now), stale: false });
+      assert.equal(snapshot.usage.days.length, 7);
     });
     check('terminal filtering and newest first', () => {
       assert.deepEqual(snapshot.jobs.map((job) => job.state), states.slice(0, 3));
