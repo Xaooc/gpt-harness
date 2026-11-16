@@ -67,7 +67,8 @@ node ~/.claude/scripts/conveyor/exec.mjs run --tier <complex|simple|review|scout
 - Codex is skipped automatically at **80 %** usage (configurable in the panel; hysteresis), a provider that hit a
   quota/region/auth error is skipped for its TTL, and a write job that already started is never re-run on
   another provider. Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`; exit 5: no provider
-  available; exit 6: the project's checks stayed red after the fix rounds.
+  available; exit 6: the project's checks stayed red after the fix rounds; exit 7: another write job already runs in
+  that repository, so start the slice in its own worktree (`wt-new.mjs`) or wait for it.
 - Never `gpt-6-astra`. Never the fast tier (`-t fast`) unless the user asks.
 - Briefs are self-contained and exhaustive: executors are literal and see only the brief (see the `luna` skill,
   "The executors are literal"). Every write brief ends with "Edit files only. Do NOT run git add / commit / push".
@@ -106,15 +107,21 @@ On every non-trivial task that changes code:
    (pstack trigger 1) and record them: `ledger.mjs add "<requirement>" --from <M3.c1,…>`. Every imperative sentence
    of the user (`M<n>.c<k>`, captured automatically) must be linked to an item or `ledger.mjs link <clause> none
    --reason "<why it is not a requirement>"`.
-2. Prove each item: `ledger.mjs evidence <L1> --cmd "<check command>"` (the command is run and its exit code
-   recorded), `--artifact <screenshot>`, `--check <out>.dispatch.json`; then `ledger.mjs done <L1>`.
-3. Before claiming done: `ledger.mjs crosscheck` (Gemini compares the user's messages, the items and the diff), and
-   end the final message with the block printed by `ledger.mjs checklist`.
-The stop hook blocks a code-changing turn until this holds and the session left no running jobs, registered temp
+2. Prove each item: `ledger.mjs evidence <L1> --cmd "<check command>"` (the command is run and must exit 0),
+   `--artifact <screenshot>` (a fresh file), `--check <out>.dispatch.json` (a passing gate); then
+   `ledger.mjs done <L1>`. Notes are context only and never prove an item.
+3. Before claiming done: `ledger.mjs crosscheck` (the scout tier compares the user's messages, the items and the diff;
+   if no scout is available, run it again later or `ledger.mjs waive crosscheck --quote "<the user's words>"`), and
+   end the final message with the block printed by `ledger.mjs checklist` (one `- L<n> ✓|✗|waived` line per item).
+The stop hook applies when the session's repositories really changed (git diff, staged, untracked or new commits
+since the session base) and blocks the turn until this holds and the session left no running jobs, registered temp
 paths or expired worktrees (warn-only during the first 7 days). Exceptions only in the user's own words:
 `ledger.mjs waive <item|gate> --quote "<the user's words>"` (verified against the transcript). Executor writes are
 gated by the dispatcher: project checks run after every write job, failures go back to the same executor (≤ 2
-rounds); exit 6 means the gate stayed red and the decision is yours.
+rounds); exit 6 means the gate stayed red and the decision is yours. While your own executor jobs still run, the stop
+hook lets the turn end without a checklist (work in progress). A repository's own `.claude/conveyor.json` commands run
+only after you review it and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>`; until then checks
+use the autodetected profile.
 
 ### Review: pstack `interrogate` on diverse executors
 

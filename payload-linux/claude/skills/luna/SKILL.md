@@ -33,7 +33,11 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   (tell the user). A write job that already started is never re-run on another provider.
 - **Exit codes of `exec.mjs run`:** 0 done; 4 hand-off: read `<out>.dispatch.json` and spawn the `Agent` tool
   with its `model` and the same brief; 5 no provider available; 6 the executor gate stayed red (project checks or
-  hygiene ratchet failed after 2 fix rounds; read `## Gate` in the result); others come from the executor.
+  hygiene ratchet failed after 2 fix rounds; read `## Gate` in the result); 7 another write job already runs in the
+  same repository (parallel write slices need their own worktrees via `wt-new.mjs`); others come from the executor.
+- **Repo profiles must be trusted:** a repository's `.claude/conveyor.json` runs its commands only after you review it
+  and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>` (re-run after every change to the file);
+  until then the gate uses the autodetected profile and reports `profileTrust: "untrusted"`.
 - **Executor gate:** every write job is followed by `check.mjs` fast+turn on the job's own changes (profile
   `.claude/conveyor.json`, autodetected when absent); failures go back to the same executor as fix rounds.
 - **Direct wrappers** remain for special cases: `luna.sh` (Codex; `-m gpt-6.1-sol -e max` for complex work) and
