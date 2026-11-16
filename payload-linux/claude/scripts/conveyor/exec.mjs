@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // Local tier dispatcher. Claude entries are returned to the orchestrator as exit-code-4 handoffs.
 import * as fs from 'node:fs/promises';
-import { readFileSync, statSync, watch, constants } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync, statSync, watch, constants } from 'node:fs';
 import path from 'node:path';
 import { constants as osConstants } from 'node:os';
 import { execFile, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
@@ -27,6 +27,110 @@ export const gateInstruction = 'Fix the root cause in the code. Do not weaken, s
 async function git(repo, args) {
   const { stdout } = await execute('git', ['-C', repo, ...args], gitOptions);
   return stdout;
+}
+
+function processStart(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    return { start: fields[19], zombie: fields[0] === 'Z' };
+  } catch { return { start: null, zombie: false }; }
+}
+
+function writeOwnerAlive(owner) {
+  if (!Number.isSafeInteger(owner?.pid) || owner.pid <= 0) return false;
+  try { process.kill(owner.pid, 0); }
+  catch (error) { if (error.code !== 'EPERM') return false; }
+  const current = processStart(owner.pid);
+  return !current.zombie && (current.start === null || owner.start === null || current.start === String(owner.start));
+}
+
+async function writeLockState(lock) {
+  let stat;
+  try { stat = await fs.stat(lock); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  let owner = null;
+  try { owner = JSON.parse(await fs.readFile(path.join(lock, 'owner.json'), 'utf8')); }
+  catch {}
+  const valid = Number.isSafeInteger(owner?.pid) && owner.pid > 0;
+  return { stat, owner, stale: valid ? !writeOwnerAlive(owner) : Date.now() - stat.mtimeMs > 60_000 };
+}
+
+async function reclaimWriteLock(lock, state, owner) {
+  // Live reclaimers advertise themselves before inspecting each other. Only one may remove the old directory.
+  const marker = path.join(lock, `.reclaim-${randomUUID()}`), stale = `${lock}.${randomUUID()}.stale`;
+  try {
+    try { await fs.writeFile(marker, JSON.stringify(owner), { flag: 'wx', mode: 0o600 }); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    const current = await writeLockState(lock);
+    if (!current || current.stat.ino !== state.stat.ino || current.stat.dev !== state.stat.dev) return;
+    if (current.owner?.pid ? writeOwnerAlive(current.owner) : !state.stale) return;
+    for (const name of await fs.readdir(lock)) {
+      if (!name.startsWith('.reclaim-') || name === path.basename(marker)) continue;
+      let other;
+      try { other = JSON.parse(await fs.readFile(path.join(lock, name), 'utf8')); }
+      catch (error) {
+        if (error.code === 'ENOENT') continue;
+        try { if (Date.now() - (await fs.stat(path.join(lock, name))).mtimeMs > 60_000) continue; }
+        catch (missing) { if (missing.code === 'ENOENT') continue; throw missing; }
+        return;
+      }
+      if (writeOwnerAlive(other)) return;
+    }
+    const checked = await writeLockState(lock);
+    if (!checked || checked.stat.ino !== state.stat.ino || checked.stat.dev !== state.stat.dev) return;
+    if (writeOwnerAlive(checked.owner)) return;
+    await fs.rename(lock, stale);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  } finally {
+    await fs.rm(marker, { force: true });
+    await fs.rm(stale, { recursive: true, force: true });
+  }
+}
+
+async function acquireWriteLock(dir, out, brief) {
+  let key;
+  try { key = (await git(dir, ['rev-parse', '--show-toplevel'])).trim(); }
+  catch (error) { if (error.code !== 128) throw error; key = await fs.realpath(dir); }
+  const lock = path.join(paths().home, 'write-locks', createHash('sha256').update(key).digest('hex').slice(0, 16));
+  const owner = {
+    pid: process.pid, start: processStart(process.pid).start, key, out, brief,
+    session: process.env.CLAUDE_CODE_SESSION_ID || null, at: new Date().toISOString()
+  };
+  await fs.mkdir(path.dirname(lock), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { await fs.mkdir(lock); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const state = await writeLockState(lock);
+      if (attempt === 0 && (!state || state.stale)) {
+        if (state) await reclaimWriteLock(lock, state, owner);
+        continue;
+      }
+      return { key, owner: state?.owner ?? null };
+    }
+    const file = path.join(lock, 'owner.json');
+    try { writeFileSync(file, `${JSON.stringify(owner)}\n`, { flag: 'wx', mode: 0o600 }); }
+    catch (error) { await fs.rm(lock, { recursive: true, force: true }); throw error; }
+    const release = () => {
+      let current;
+      try { current = JSON.parse(readFileSync(file, 'utf8')); }
+      catch { return; }
+      if (current.pid === owner.pid && current.start === owner.start && current.at === owner.at) {
+        rmSync(lock, { recursive: true, force: true });
+      }
+    };
+    const handlers = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((signal) => {
+      const handler = () => { release(); process.exit(128 + osConstants.signals[signal]); };
+      process.on(signal, handler);
+      return [signal, handler];
+    });
+    return { release() {
+      for (const [signal, handler] of handlers) process.off(signal, handler);
+      release();
+    } };
+  }
 }
 
 export async function gateRepository(dir) {
@@ -554,13 +658,17 @@ async function launch(entry, args, dir) {
     const forward = (signal) => child.kill(signal);
     const onInt = () => forward('SIGINT');
     const onTerm = () => forward('SIGTERM');
-    process.on('SIGINT', onInt);
-    process.on('SIGTERM', onTerm);
+    const onHup = () => forward('SIGHUP');
+    // Forward to the wrapper before the write-lock signal handler exits the dispatcher.
+    process.prependListener('SIGINT', onInt);
+    process.prependListener('SIGTERM', onTerm);
+    process.prependListener('SIGHUP', onHup);
     let launchError;
     child.once('error', (error) => { launchError = error.message; });
     child.once('close', (code, signal) => {
       process.off('SIGINT', onInt);
       process.off('SIGTERM', onTerm);
+      process.off('SIGHUP', onHup);
       resolve({ code: code ?? (signal ? 128 + (osConstants.signals[signal] || 1) : 127), signal, launchError });
     });
   });
@@ -654,77 +762,89 @@ async function runCommand(args) {
   };
   if (opts['--waive']) dispatch.waive = opts['--waive'];
   if (opts['--no-gate']) dispatch.noGate = true;
-  const gate = mode === 'write' ? await prepareGate(dir, brief, out, tier, panel || opts['--no-gate']) : null;
   const saveDispatch = () => writeJsonAtomic(`${out}.dispatch.json`, dispatch);
-  let cursor = -1, from = null, failedReason = null;
-  while (true) {
-    const index = resolution.chain.findIndex((entry, position) => position > cursor && entry.available);
-    dispatch.chain = resolution.chain;
-    if (index < 0) {
-      dispatch.action = 'unavailable';
-      dispatch.selected = null;
-      dispatch.provider = null;
-      dispatch.model = null;
-      dispatch.effort = null;
-      dispatch.reason = [failedReason, ...resolution.chain.map((entry) => entry.reason)].filter(Boolean).join('; ');
-      dispatch.code = 5;
-      await saveDispatch();
-      process.stderr.write(`conveyor: ${tier}: no provider available: ${dispatch.reason}\n`);
-      return 5;
-    }
-    const entry = resolution.chain[index];
-    const skipped = resolution.chain.slice(cursor + 1, index);
-    const reason = [failedReason, ...skipped.map((candidate) => candidate.reason)]
-      .filter(Boolean).join('; ') || entry.reason;
-    Object.assign(dispatch, {
-      selected: entry, provider: entry.provider, model: entry.model, effort: entry.effort, reason
-    });
-    dispatch.action = entry.provider === 'claude' ? 'claude-subagent' : 'run-wrapper';
-    dispatch.code = entry.provider === 'claude' ? 4 : null;
-    if (entry.provider === 'claude' && state.usage.claude.nearLimit) dispatch.warning = 'claude near limit';
+  const lock = mode === 'write' ? await acquireWriteLock(dir, out, brief) : null;
+  if (lock && !lock.release) {
+    Object.assign(dispatch, { action: 'write-locked', owner: lock.owner, code: 7 });
     await saveDispatch();
-    if (from || skipped.length) await switchProvider(tier, from || skipped[0].provider, entry.provider, reason, out);
-    if (entry.provider === 'claude') {
-      print(dispatch);
-      return 4;
-    }
-    const attempt = {
-      provider: entry.provider, model: entry.model, effort: entry.effort, at: new Date().toISOString()
-    };
-    dispatch.attempts.push(attempt);
-    await saveDispatch();
-    const tracker = trackStatus(`${out}.status`);
-    let result, observed;
-    try {
-      result = await launch(entry, [mode === 'write' ? '-w' : '-r', '-m', entry.model, '-e', entry.effort,
-        '-C', dir, '-f', brief, '-o', out], dir);
-    } finally { observed = tracker.finish(); }
-    const failure = failureReason(result, observed.values);
-    Object.assign(attempt, {
-      code: result.code, state: observed.values?.state ?? null, error: observed.values?.error ?? null,
-      reached_running: observed.reachedRunning
-    });
-    dispatch.code = result.code;
-    if (failure) await markUnavailable(entry.provider, failure.reason, failure.note, { config });
-    const retryable = result.code === 3 || (result.code !== 0 && quotaError.test(observed.values?.error || ''));
-    if (panel || !retryable || (mode === 'write' && observed.reachedRunning) || result.signal) {
-      attempt.retry = false;
-      if (result.code === 0 && ['done', 'incomplete'].includes(observed.values?.state)) {
-        dispatch.code = await finishGate(gate, dispatch, entry, dir, out);
-      }
-      await saveDispatch();
-      return dispatch.code;
-    }
-    attempt.retry = true;
-    attempt.reason = `${failure.reason}: ${failure.note}`;
-    attempt.archive = await archiveAttempt(out, entry.provider);
-    await saveDispatch();
-    cursor = index;
-    from = entry.provider;
-    failedReason = attempt.reason;
-    state = await providerState(config);
-    resolution = await resolve();
+    process.stderr.write(`exec: another write job runs in ${lock.key} ` +
+      `(out: ${lock.owner?.out ?? 'unknown'}, since ${lock.owner?.at ?? 'unknown'}). ` +
+      'Run this slice in its own worktree (node ~/.claude/scripts/disk/wt-new.mjs …) or wait for it.\n');
+    return 7;
   }
+  try {
+    const gate = mode === 'write' ? await prepareGate(dir, brief, out, tier, panel || opts['--no-gate']) : null;
+    let cursor = -1, from = null, failedReason = null;
+    while (true) {
+      const index = resolution.chain.findIndex((entry, position) => position > cursor && entry.available);
+      dispatch.chain = resolution.chain;
+      if (index < 0) {
+        dispatch.action = 'unavailable';
+        dispatch.selected = null;
+        dispatch.provider = null;
+        dispatch.model = null;
+        dispatch.effort = null;
+        dispatch.reason = [failedReason, ...resolution.chain.map((entry) => entry.reason)].filter(Boolean).join('; ');
+        dispatch.code = 5;
+        await saveDispatch();
+        process.stderr.write(`conveyor: ${tier}: no provider available: ${dispatch.reason}\n`);
+        return 5;
+      }
+      const entry = resolution.chain[index];
+      const skipped = resolution.chain.slice(cursor + 1, index);
+      const reason = [failedReason, ...skipped.map((candidate) => candidate.reason)]
+        .filter(Boolean).join('; ') || entry.reason;
+      Object.assign(dispatch, {
+        selected: entry, provider: entry.provider, model: entry.model, effort: entry.effort, reason
+      });
+      dispatch.action = entry.provider === 'claude' ? 'claude-subagent' : 'run-wrapper';
+      dispatch.code = entry.provider === 'claude' ? 4 : null;
+      if (entry.provider === 'claude' && state.usage.claude.nearLimit) dispatch.warning = 'claude near limit';
+      await saveDispatch();
+      if (from || skipped.length) await switchProvider(tier, from || skipped[0].provider, entry.provider, reason, out);
+      if (entry.provider === 'claude') {
+        // Exit 4 releases the lock; the caller's hand-off subagent writes outside this lock.
+        print(dispatch);
+        return 4;
+      }
+      const attempt = {
+        provider: entry.provider, model: entry.model, effort: entry.effort, at: new Date().toISOString()
+      };
+      dispatch.attempts.push(attempt);
+      await saveDispatch();
+      const tracker = trackStatus(`${out}.status`);
+      let result, observed;
+      try {
+        result = await launch(entry, [mode === 'write' ? '-w' : '-r', '-m', entry.model, '-e', entry.effort,
+          '-C', dir, '-f', brief, '-o', out], dir);
+      } finally { observed = tracker.finish(); }
+      const failure = failureReason(result, observed.values);
+      Object.assign(attempt, {
+        code: result.code, state: observed.values?.state ?? null, error: observed.values?.error ?? null,
+        reached_running: observed.reachedRunning
+      });
+      dispatch.code = result.code;
+      if (failure) await markUnavailable(entry.provider, failure.reason, failure.note, { config });
+      const retryable = result.code === 3 || (result.code !== 0 && quotaError.test(observed.values?.error || ''));
+      if (panel || !retryable || (mode === 'write' && observed.reachedRunning) || result.signal) {
+        attempt.retry = false;
+        if (result.code === 0 && ['done', 'incomplete'].includes(observed.values?.state)) {
+          dispatch.code = await finishGate(gate, dispatch, entry, dir, out);
+        }
+        await saveDispatch();
+        return dispatch.code;
+      }
+      attempt.retry = true;
+      attempt.reason = `${failure.reason}: ${failure.note}`;
+      attempt.archive = await archiveAttempt(out, entry.provider);
+      await saveDispatch();
+      cursor = index;
+      from = entry.provider;
+      failedReason = attempt.reason;
+      state = await providerState(config);
+      resolution = await resolve();
+    }
+  } finally { lock?.release(); }
 }
 
 export async function main(args = process.argv.slice(2)) {
@@ -789,7 +909,8 @@ export async function main(args = process.argv.slice(2)) {
   throw new Error('usage: exec.mjs resolve (--tier <tier>|--panel <name>|--role <name>) [--json] ' +
     '[--first-available] | run (--tier <tier>|--panel <name> --seat <n>|--role <name>) ' +
     '(-w|-r) -C <dir> -f <brief> -o <out> [--no-gate --waive W-<digits>] | ' +
-    'roles render [--out <path>] | status [--json] | config … | catalog …');
+    'roles render [--out <path>] | status [--json] | config … | catalog …; ' +
+    'exit codes: 4 Claude hand-off, 5 no provider available, 6 gate failed, 7 repository write-locked');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

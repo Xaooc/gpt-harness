@@ -261,6 +261,10 @@ async function saveUnlocked(config, { actor, note }) {
     try { await journal('failed', { error: error.message }); } catch {}
     throw error;
   }
+  try { await renderRoles(); }
+  catch (error) {
+    try { await journal('roles-failed', { error: error.message }); } catch {}
+  }
   return config;
 }
 

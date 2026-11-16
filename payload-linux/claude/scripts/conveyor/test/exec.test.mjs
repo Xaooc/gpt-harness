@@ -2,7 +2,9 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -359,6 +361,70 @@ test('stale config and provider locks are reclaimed for dead and reused process 
   } finally { await env.cleanup(); }
 });
 
+test('a live repository write lock exits 7 with its owner while reads proceed', { timeout }, async () => {
+  const env = await environment();
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60_000)'], { stdio: 'ignore' });
+  try {
+    await once(child, 'spawn');
+    await env.setup();
+    await fs.writeFile(path.join(env.root, 'git.json'), JSON.stringify({ head: 'fixture-base' }));
+    const subdir = path.join(env.dir, 'nested');
+    await fs.mkdir(subdir);
+    const stat = await fs.readFile(`/proc/${child.pid}/stat`, 'utf8');
+    const start = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+    const owner = {
+      pid: child.pid, start, key: env.dir, out: path.join(env.root, 'owner.md'), brief: env.brief,
+      session: 'other-session', at: new Date().toISOString()
+    };
+    const lock = path.join(paths().home, 'write-locks', createHash('sha256').update(env.dir).digest('hex').slice(0, 16));
+    await fs.mkdir(lock, { recursive: true });
+    await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify(owner));
+    const args = ['run', '--tier', 'complex', '-w', '-C', subdir, '-f', env.brief, '-o', env.out];
+    const blocked = env.command([...args, '--no-gate', '--waive', 'W-7']);
+    assert.equal(blocked.status, 7, blocked.stderr);
+    assert.equal(blocked.stdout, '');
+    assert.equal(blocked.stderr, `exec: another write job runs in ${env.dir} ` +
+      `(out: ${owner.out}, since ${owner.at}). Run this slice in its own worktree ` +
+      '(node ~/.claude/scripts/disk/wt-new.mjs …) or wait for it.\n');
+    const dispatch = await readJson(`${env.out}.dispatch.json`);
+    assert.equal(dispatch.action, 'write-locked');
+    assert.equal(dispatch.code, 7);
+    assert.deepEqual(dispatch.owner, owner);
+    assert.deepEqual(dispatch.attempts, []);
+    await assert.rejects(fs.stat(path.join(paths().home, 'sessions')), { code: 'ENOENT' });
+    args[3] = '-r';
+    const read = env.command(args, { FAKE_WRAPPER_DELAY_S: '0' });
+    assert.equal(read.status, 0, read.stderr);
+    assert.match(read.stdout, /codex gpt-6.1-sol max read/);
+    assert.deepEqual(await readJson(path.join(lock, 'owner.json')), owner);
+  } finally {
+    const exited = once(child, 'exit');
+    child.kill();
+    await exited;
+    await env.cleanup();
+  }
+});
+
+test('stale write locks are taken over and released after successful and failed executors', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const key = await fs.realpath(env.dir);
+    const lock = path.join(paths().home, 'write-locks', createHash('sha256').update(key).digest('hex').slice(0, 16));
+    for (const code of [0, 17]) {
+      await fs.mkdir(lock, { recursive: true });
+      await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({
+        pid: 2147483647, start: '1', key, out: env.out, brief: env.brief, session: null, at: new Date().toISOString()
+      }));
+      const run = env.run('complex', '-w', { FAKE_CODEX_RC: String(code), FAKE_WRAPPER_DELAY_S: '0' });
+      assert.equal(run.status, code, run.stderr);
+      assert.equal((await readJson(`${env.out}.dispatch.json`)).action, 'run-wrapper');
+      await assert.rejects(fs.stat(lock), { code: 'ENOENT' });
+      assert.deepEqual(await fs.readdir(path.dirname(lock)), []);
+    }
+  } finally { await env.cleanup(); }
+});
+
 test('panel runs keep the chosen seat and unavailable seats return 5 with their reason', { timeout }, async () => {
   const env = await environment();
   try {
@@ -523,6 +589,22 @@ function action(env, args, extraEnv = {}) {
   assert.equal(typeof value.note, 'string');
   return value;
 }
+
+test('config set-entry regenerates the roles file with the new model', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const roles = path.join(process.env.CLAUDE_HOME_DIR, 'rules', 'pstack-models.md');
+    await fs.mkdir(path.dirname(roles), { recursive: true });
+    await fs.writeFile(roles, 'stale roles\n');
+    action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '0', '--provider', 'codex',
+      '--model', 'gpt-6-luna', '--effort', 'high', '--actor', 'panel']);
+    const rendered = await fs.readFile(roles, 'utf8');
+    assert.match(rendered, /^# Generated from orchestration.json\./);
+    assert.match(rendered, /^arena runners: panel design = codex\/gpt-6-luna\/high,/m);
+    assert.doesNotMatch(rendered, /stale roles/);
+  } finally { await env.cleanup(); }
+});
 
 test('set-entry validates catalog efforts, edits panel seats and journals the panel actor', { timeout }, async () => {
   const env = await environment();

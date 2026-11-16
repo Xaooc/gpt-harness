@@ -28,8 +28,7 @@
         "name": "large-files",
         "maxLines": 2000,
         "glob": "**/*.{mjs,sh,py}",
-        "exclude": "{payload-linux/claude/local-plugins/pstack/**,payload*/claude/scripts/luna-daemon.mjs}",
-        "note": "luna-daemon.mjs is accepted debt (2.9k lines, shared live wrapper): splitting it is its own planned slice, not a side effect of a fix round."
+        "exclude": "{payload-linux/claude/local-plugins/pstack/**,payload*/claude/scripts/luna-daemon.mjs}"
       }
     ],
     "baseline": ".conveyor/hygiene-baseline.json"
