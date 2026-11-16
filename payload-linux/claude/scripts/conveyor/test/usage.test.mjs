@@ -28,6 +28,7 @@ function fixture(t, now = Date.parse('2026-11-03T16:00:00Z')) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const env = { ...process.env, HOME: root, TZ: 'America/New_York', CLAUDE_HOME_DIR: path.join(root, '.claude'),
     CODEX_HOME: path.join(root, '.codex'), CONVEYOR_HOME: path.join(root, 'conveyor'),
+    GEMINI_GATEWAY_USAGE_LOG: path.join(root, 'gateway', 'usage.jsonl'),
     LUNA_RUN_DIR: path.join(root, '.claude', 'luna-run'), LUNA_DAEMON_HOME: path.join(root, 'daemon') };
   env.LUNA_OVERVIEW_HOME = env.LUNA_RUN_DIR;
   env.LUNA_GEMINI_QUOTA_CMD = path.join(root, 'missing-quota.mjs');
@@ -146,7 +147,7 @@ test('Incremental collection reads appended bytes, rescans truncations and repla
   assert.equal(f.cache().days[localDay(f.now)].claude.byModel['claude-opus'].total, 58);
 });
 
-test('Codex cumulative rollouts and surviving log footers aggregate alongside Gemini statuses', { timeout }, (t) => {
+test('Codex cumulative rollouts and surviving log footers aggregate alongside Gemini statuses and gateway requests', { timeout }, (t) => {
   const f = fixture(t), at = new Date(f.now).toISOString();
   const retained = path.join(f.root, 'jobs', 'retained'), deleted = path.join(f.root, 'jobs', 'deleted');
   const gem = path.join(f.root, 'jobs', 'gem'), active = path.join(f.root, 'jobs', 'active');
@@ -180,7 +181,15 @@ test('Codex cumulative rollouts and surviving log footers aggregate alongside Ge
   const orphan = path.join(f.paths.run, 'archived', 'orphan.log');
   write(orphan, 'tokens used\n77\n');
   fs.utimesSync(orphan, new Date(f.now), new Date(f.now));
-  f.collect();
+  const gateway = [
+    { v: 1, at: '2026-11-03T02:30:00Z', source: 'mcp-gateway', model: 'gemini-3.8-pro', status: 'completed',
+      input: 20, output: 5, cached: 4, total: 25, cwd: '/srv/docker/compose/antigravity-parallel/data/workspace' },
+    { v: 1, at, source: 'mcp-gateway', model: 'gemini-3.8-flash-high', status: 'completed',
+      input: 100, output: 20, cached: 30, total: 120, cwd: '/home/fake/gateway/.claude/worktrees/branch' }
+  ];
+  jsonl(f.paths.gateway, gateway);
+  fs.appendFileSync(f.paths.gateway, '{malformed\n');
+  assert.equal(f.collect().skippedLines, 1);
   const cache = f.cache(), day = cache.days[localDay(f.now)];
   assert.equal(day.codex.byModel['gpt-6.1-sol'].total, 200);
   assert.equal(day.codex.byModel['gpt-6.1-sol'].cacheRead, 40);
@@ -189,11 +198,39 @@ test('Codex cumulative rollouts and surviving log footers aggregate alongside Ge
   assert.equal(day.codex.byProject.repo, 1434);
   assert.equal(day.codex.byModel.unknown.total, 77);
   assert.equal(day.codex.jobs, 3);
-  assert.equal(day.gemini.byModel['gemini-3.8-flash-high'].total, 50);
+  assert.deepEqual(day.gemini.byModel['gemini-3.8-flash-high'], {
+    input: 130, output: 32, cacheRead: 30, cacheWrite: 0, total: 170, messages: 2
+  });
   assert.equal(day.gemini.byProject['gem-project'], 58);
+  assert.equal(day.gemini.byProject.gateway, 120);
   assert.equal(day.gemini.jobs, 2);
+  assert.equal(day.gemini.requests, 1);
+  const before = cache.days['2026-11-02'].gemini;
+  assert.deepEqual(before.byModel['gemini-3.8-pro'], {
+    input: 20, output: 5, cacheRead: 4, cacheWrite: 0, total: 25, messages: 1
+  });
+  assert.equal(before.byProject['MCP-шлюз'], 25);
+  assert.equal(before.jobs, 0);
+  assert.equal(before.requests, 1);
   assert.equal(cache.topJobs.filter((job) => job.provider === 'codex').length, 3);
-  assert.equal(f.collect().bytesRead, 0);
+  assert.equal(cache.topJobs.filter((job) => job.provider === 'gemini').length, 2);
+  const append = JSON.stringify({ ...gateway[1], input: 7, output: 3, cached: 2, total: 10 }) + '\n';
+  fs.appendFileSync(f.paths.gateway, append);
+  const appended = f.collect();
+  assert.equal(appended.bytesRead, Buffer.byteLength(append));
+  assert.equal(appended.changedFiles, 1);
+  assert.equal(appended.skippedLines, 0);
+  const gatewayDay = f.cache().days[localDay(f.now)].gemini;
+  assert.deepEqual(gatewayDay.byModel['gemini-3.8-flash-high'], {
+    input: 137, output: 35, cacheRead: 32, cacheWrite: 0, total: 180, messages: 3
+  });
+  assert.equal(gatewayDay.byProject.gateway, 130);
+  assert.equal(gatewayDay.requests, 2);
+  assert.equal(gatewayDay.jobs, 2);
+  assert.deepEqual(f.cache().days['2026-11-02'].gemini, before);
+  const idle = f.collect();
+  assert.equal(idle.bytesRead, 0);
+  assert.equal(idle.skippedLines, 0);
   status(gem, { provider: 'gemini', acp_model: 'gemini-3.8-flash-high', dir: '/home/fake/gem-project',
     finished: at, usage_input: 40, usage_output: 20, usage_total: 60 });
   fs.appendFileSync(`${deleted}.log`, 'tokens used\n2,000\n');
@@ -236,6 +273,27 @@ test('Codex cumulative rollouts and surviving log footers aggregate alongside Ge
   f.collect();
   assert.equal(f.cache().days[localDay(f.now)].gemini.byProject['gem-project'], 168);
   assert.equal(f.cache().days[localDay(f.now)].gemini.jobs, 4);
+  // Gateway truncation and replacement rebuild that file's counters without adding its old totals again.
+  jsonl(f.paths.gateway, [gateway[1]]);
+  assert.equal(f.collect().bytesRead, fs.statSync(f.paths.gateway).size);
+  assert.equal(f.cache().days[localDay(f.now)].gemini.byProject.gateway, 120);
+  assert.equal(f.cache().days[localDay(f.now)].gemini.requests, 1);
+  assert.ok(!f.cache().days['2026-11-02']);
+  const replacement = `${f.paths.gateway}.replacement`;
+  jsonl(replacement, gateway);
+  fs.renameSync(replacement, f.paths.gateway);
+  assert.equal(f.collect().bytesRead, fs.statSync(f.paths.gateway).size);
+  assert.equal(f.cache().days[localDay(f.now)].gemini.byProject.gateway, 120);
+  assert.equal(f.cache().days[localDay(f.now)].gemini.requests, 1);
+  assert.equal(f.cache().days['2026-11-02'].gemini.byProject['MCP-шлюз'], 25);
+  const partial = JSON.stringify({ ...gateway[1], input: 7, output: 3, cached: 2, total: 10 });
+  fs.appendFileSync(f.paths.gateway, partial);
+  f.collect();
+  assert.equal(f.cache().days[localDay(f.now)].gemini.requests, 1);
+  fs.appendFileSync(f.paths.gateway, '\n');
+  f.collect();
+  assert.equal(f.cache().days[localDay(f.now)].gemini.byProject.gateway, 130);
+  assert.equal(f.cache().days[localDay(f.now)].gemini.requests, 2);
 });
 
 test('Summary has seven ordered days, today/week totals, model/project rankings, and ten top jobs', { timeout }, (t) => {

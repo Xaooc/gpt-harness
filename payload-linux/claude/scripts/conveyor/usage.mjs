@@ -30,6 +30,7 @@ export function usagePaths(env = process.env) {
     lock: path.join(cacheHome, 'usage-state.json.lock'), projects: path.join(claude, 'projects'),
     sessions: path.join(env.CODEX_HOME || path.join(home, '.codex'), 'sessions'),
     registry: path.join(claude, 'learning', 'jobs.jsonl'),
+    gateway: path.resolve(env.GEMINI_GATEWAY_USAGE_LOG || '/srv/docker/compose/antigravity-parallel/data/usage.jsonl'),
     run: path.resolve(env.LUNA_RUN_DIR || path.join(claude, 'luna-run'))
   };
 }
@@ -225,6 +226,24 @@ function codexLine(record, line) {
   }
 }
 
+function gatewayLine(record, line, since, stats) {
+  const entry = parseLine(line);
+  if (typeof entry?.at !== 'string' || !Number.isFinite(Date.parse(entry.at)) ||
+      typeof entry.model !== 'string' || !entry.model ||
+      !['input', 'output', 'cached', 'total'].every((key) => Number.isInteger(entry[key]) && entry[key] >= 0) ||
+      entry.cwd !== undefined && typeof entry.cwd !== 'string') {
+    stats.skippedLines++;
+    return;
+  }
+  const day = localDay(entry.at);
+  if (day < since) return;
+  const repo = entry.cwd && path.resolve(entry.cwd) === '/srv/docker/compose/antigravity-parallel/data/workspace'
+    ? 'MCP-шлюз' : project(entry.cwd, true);
+  const key = JSON.stringify([day, entry.model, repo]);
+  const usage = record.records[key] ||= { day, model: entry.model, project: repo, ...counters() };
+  addCounters(usage, { input: entry.input, output: entry.output, cacheRead: entry.cached, total: entry.total, messages: 1 });
+}
+
 function logLine(record, line) {
   // Exec's human log footer is a total only; no input/output split can be recovered from it.
   if (record.footer && /^[\d,]+\s*$/.test(line)) record.total = numeric(line.replaceAll(',', '').trim());
@@ -262,6 +281,7 @@ function scanFile(state, file, kind, stats, since, knownStat) {
       record.offset = scanLines(fd, record.offset, stat.size, (line) => {
         if (kind === 'claude') claudeLine(record, line, since);
         else if (kind === 'codex') codexLine(record, line);
+        else if (kind === 'gateway') gatewayLine(record, line, since, stats);
         else if (kind === 'log') logLine(record, line);
         else if (kind === 'registry') {
           const value = parseLine(line);
@@ -300,12 +320,14 @@ function aggregate(state, paths, now, since, allJobs = false) {
     day ||= localDay(at);
     if (day < since || day > today) return;
     const bucket = days[day] ||= Object.fromEntries(providers.map((name) => [name, {
-      byModel: dictionary(), byProject: dictionary(), ...(name === 'claude' ? {} : { jobs: 0 })
+      byModel: dictionary(), byProject: dictionary(), ...(name === 'claude' ? {} : { jobs: 0 }),
+      ...(name === 'gemini' ? { requests: 0 } : {})
     }]));
     const providerDay = bucket[provider];
     addCounters(providerDay.byModel[model] ||= counters(), usage);
     providerDay.byProject[repo] = (providerDay.byProject[repo] || 0) + usage.total;
     if (countJob) providerDay.jobs++;
+    return providerDay;
   };
   for (const [file, record] of Object.entries(state.files)) {
     if (record.kind === 'claude') {
@@ -322,6 +344,11 @@ function aggregate(state, paths, now, since, allJobs = false) {
     } else if (record.kind === 'codex' && record.usage) {
       const session = record.session || path.basename(file, '.jsonl');
       if (!codex.has(session) || Date.parse(codex.get(session).usage.at) <= Date.parse(record.usage.at)) codex.set(session, record);
+    } else if (record.kind === 'gateway') {
+      for (const usage of Object.values(record.records)) {
+        const day = add('gemini', usage.model, usage.project, usage, null, false, usage.day);
+        if (day) day.requests = numeric(day.requests) + usage.messages;
+      }
     } else if (record.kind === 'registry') {
       for (const values of Object.values(record.records)) {
         const key = jobKey(values.out, values);
@@ -489,7 +516,7 @@ export function collectUsage({ env = process.env, now = Date.now() } = {}) {
         record.ino !== stat.ino || record.dev !== stat.dev);
     })) restoreArchive(state, paths);
 
-    const stats = { locked: false, files: 0, changedFiles: 0, bytesRead: 0, scannedBytes: 0 };
+    const stats = { locked: false, files: 0, changedFiles: 0, bytesRead: 0, scannedBytes: 0, skippedLines: 0 };
     const since = daysBefore(now, 34);
     const scanned = new Set(), changed = new Set(), present = new Set(inspected?.sources.keys()), activeOutputs = new Set();
     const scan = (file, kind) => {
@@ -504,6 +531,7 @@ export function collectUsage({ env = process.env, now = Date.now() } = {}) {
       for (const [file, { kind }] of inspected.sources) scan(file, kind);
     } else {
       scan(paths.registry, 'registry');
+      scan(paths.gateway, 'gateway');
       walk(paths.projects, (file) => { if (file.endsWith('.jsonl')) scan(file, 'claude'); });
       walk(paths.sessions, (file) => { if (/^rollout-.*\.jsonl$/.test(path.basename(file))) scan(file, 'codex'); });
       walk(paths.run, (file) => {
@@ -519,6 +547,10 @@ export function collectUsage({ env = process.env, now = Date.now() } = {}) {
         for (const [key, values] of Object.entries(record.records)) {
           if (values.finished && localDay(values.finished) < since) delete record.records[key];
           else if (!inspected || changed.has(file)) outputs.add(values.out);
+        }
+      } else if (record.kind === 'gateway') {
+        for (const [key, usage] of Object.entries(record.records)) {
+          if (usage.day < since) delete record.records[key];
         }
       } else if (record.kind === 'pointer' || record.kind === 'active') {
         if (localPath(record.values?.out) && present.has(file)) {
@@ -587,7 +619,7 @@ function readStateIndex(file) {
 }
 
 function inspectSources(index, paths) {
-  const stats = { locked: false, files: 0, changedFiles: 0, bytesRead: 0, scannedBytes: 0 }, seen = new Set();
+  const stats = { locked: false, files: 0, changedFiles: 0, bytesRead: 0, scannedBytes: 0, skippedLines: 0 }, seen = new Set();
   const outputs = new Set(index.outputs), sources = new Map(), missing = new Set();
   Object.defineProperties(stats, { sources: { value: sources }, outputs: { value: outputs }, missing: { value: missing } });
   const inspect = (file, kind) => {
@@ -610,6 +642,7 @@ function inspectSources(index, paths) {
     }
   };
   inspect(paths.registry, 'registry');
+  inspect(paths.gateway, 'gateway');
   walk(paths.projects, (file) => { if (file.endsWith('.jsonl')) inspect(file, 'claude'); });
   walk(paths.sessions, (file) => { if (/^rollout-.*\.jsonl$/.test(path.basename(file))) inspect(file, 'codex'); });
   walk(paths.run, (file) => {
