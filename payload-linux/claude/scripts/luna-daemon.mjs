@@ -45,6 +45,7 @@ import {
   availableMemory, codexEnvironment, formatRetryDelay, loadProxyEnv, modelRetryDelayMs, ownedProcess, readProcess,
   resolveCodex, stopGroup, stopGroupSync
 } from './lib/luna-runtime.mjs';
+import { bindLeaseChild, heartbeat as leaseHeartbeat, releaseLease, tryShared } from './account-lease.mjs';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
@@ -62,6 +63,7 @@ const INFO = path.join(RUN, 'daemon.json');
 const LIMITS = path.join(RUN, 'codex-limits.json');
 const LOG = path.join(RUN, 'daemon.log');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const monotonic = () => Number(process.hrtime.bigint() / 1_000_000n);
 const cleanValue = (value) => String(value ?? '').replace(/[\r\n\0]+/g, ' ').trim();
 const MODEL_RETRY = new RegExp(
   'at capacity|overloaded|server_error|internal server error|service unavailable|bad gateway|' +
@@ -134,7 +136,7 @@ function jobView(job) {
     : { ...(job.usage ? { usage: job.usage } : {}), state: job.state, rc: job.rc, error: job.error, modelRetries };
 }
 
-function pruneTerminalJobs(jobs, now = Date.now()) {
+function pruneTerminalJobs(jobs, now = monotonic()) {
   const ended = [...jobs.values()].filter(terminal);
   let excess = ended.length - 500;
   for (const job of ended) {
@@ -148,7 +150,7 @@ function pruneTerminalJobs(jobs, now = Date.now()) {
 
 function expiredLimit(job, now) {
   if (job.state !== 'running') return '';
-  if (job.timeoutS && now - job.startedAt >= job.timeoutS * 1000) {
+  if (job.timeoutS && now - (job.startedMono ?? job.startedAt) >= job.timeoutS * 1000) {
     return `exceeded total timeout ${job.timeoutS}s`;
   }
   if (!job.retryWaiting && job.idleMaxS && now - job.lastActivity >= job.idleMaxS * 1000) {
@@ -167,7 +169,7 @@ function limitWindow(window) {
   };
 }
 
-function limitsTurnDue(last, now = Date.now()) {
+function limitsTurnDue(last, now = monotonic()) {
   return last === null || now - last >= 60_000;
 }
 
@@ -428,7 +430,10 @@ function spawnServer(home, leanArgs) {
 }
 
 function childIdentity(child) {
-  if (child.lunaIdentity) return child.lunaIdentity;
+  if (child.lunaIdentity) {
+    const current = readProcess(child.pid);
+    return current?.started === child.lunaIdentity.started ? current : child.lunaIdentity;
+  }
   if (typeof child.kill === 'function' && child.exitCode === null && child.signalCode === null) {
     return readProcess(child.pid);
   }
@@ -702,7 +707,7 @@ class AppServer {
     this.pending.clear();
     // A broken pipe can leave the native process and its children alive.
     if (!this.stopping) {
-      void killTree(this.child);
+      this.crashCleanup = killTree(this.child).catch((error) => event(`app-server cleanup: ${error.message}`));
       this.onCrash(error, this);
     }
   }
@@ -740,9 +745,9 @@ async function serve() {
   privateDirectory(path.join(HOME, '.claude', 'luna-run'));
   privateDirectory(RUN);
   const lock = daemonLock();
-  const deadline = Date.now() + 30_000;
+  const deadline = monotonic() + 30_000;
   while (!lock.acquire()) {
-    if (Date.now() >= deadline) throw new Error('daemon start lock timed out');
+    if (monotonic() >= deadline) throw new Error('daemon start lock timed out');
     await sleep(100);
   }
   let http;
@@ -759,8 +764,8 @@ async function serve() {
   let mainLimitId = null;
   let lastTurnLimits = null;
   let shutdownPromise;
-  let lastBusy = Date.now();
-  let lastHttpActivity = Date.now();
+  let lastBusy = monotonic();
+  let lastHttpActivity = monotonic();
   const connections = new Set();
   const quietShutdowns = new Set();
   const startedAt = nowIso();
@@ -777,7 +782,7 @@ async function serve() {
   let admissionJob;
   let admissionTimer;
   let nextPump = 0;
-  let nextClientCheck = Date.now() + clientCheckMs;
+  let nextClientCheck = monotonic() + clientCheckMs;
 
   async function saveLimits(data, reason, sparse = false, updates = []) {
     try {
@@ -796,14 +801,18 @@ async function serve() {
     if (stopping || !app || app.dead) return;
     if (reason === 'turn') {
       if (!limitsTurnDue(lastTurnLimits)) return;
-      lastTurnLimits = Date.now(); // Throttle failed and coalesced attempts too.
+      lastTurnLimits = monotonic(); // Throttle failed and coalesced attempts too.
     }
     if (limitsRead) return limitsRead;
+    const account = tryShared({ purpose: `luna daemon limits ${reason}` });
+    if (!account.lease) return;
+    const stopHeartbeat = leaseHeartbeat(account.lease);
     const server = app;
     const updates = [];
     limitsUpdates = updates;
     const pending = (async () => {
       try {
+        if (!await bindLeaseChild(account.lease, server.child.pid)) throw new Error('account lease was lost');
         const data = await server.rpc('account/rateLimits/read', { excludeResetCreditDetails: true }, 15_000);
         if (stopping || app !== server || server.dead) return;
         await saveLimits(data, reason, false, updates);
@@ -812,6 +821,8 @@ async function serve() {
     limitsRead = pending;
     try { await pending; } finally {
       if (limitsRead === pending) { limitsRead = null; limitsUpdates = null; }
+      stopHeartbeat();
+      await releaseLease(account.lease.id);
     }
   }
 
@@ -865,7 +876,7 @@ async function serve() {
   }
 
   function appendLog(job, text, control = false) {
-    if (!control) job.lastActivity = Date.now(); // Activity is from app-server, even if its log is capped.
+    if (!control) job.lastActivity = monotonic(); // Activity is from app-server, even if its log is capped.
     if (!control && job.truncated) return;
     const bytes = Buffer.byteLength(text);
     const truncating = !control && !job.logStalled && job.logBytes + bytes > logMax;
@@ -877,7 +888,7 @@ async function serve() {
     }
     if (truncating) {
       job.truncated = true;
-      job.heartbeatAt = Date.now();
+      job.heartbeatAt = monotonic();
       text = `... log truncated at ${logMax} bytes; job still running ...\n`;
     }
     if (control) noteLogDrops(job);
@@ -901,6 +912,9 @@ async function serve() {
     if (job.state === 'queued') Object.assign(values, {
       queue_pos: queue.indexOf(job) + 1 || 1, reason: job.reason || 'capacity'
     });
+    if ((job.state === 'queued' || job.retryWaiting) && job.reason?.startsWith('waiting: exclusive account lease')) {
+      values.last_note = job.reason;
+    }
     if (job.startedAt) values.started = new Date(job.startedAt).toISOString();
     if (terminal(job)) Object.assign(values, { rc: job.rc, error: job.error, finished: nowIso() });
     return atomicWrite(`${job.out}.daemon`,
@@ -916,12 +930,49 @@ async function serve() {
     void pump();
   }
 
-  function releaseSlot(job) {
-    if (!job.slot) return;
-    job.slot = false;
-    running--;
-    lastBusy = Date.now();
-    void pump();
+  function releaseAccount(job) {
+    if (job.leaseRelease) return job.leaseRelease;
+    if (!job.accountLease) return Promise.resolve();
+    job.stopLeaseHeartbeat?.();
+    const id = job.accountLease.id;
+    const pending = (async () => {
+      while (true) {
+        try { await releaseLease(id); break; }
+        catch (error) { event(`lease release: ${error.message}`); await sleep(250); }
+      }
+      if (job.accountLease?.id === id) job.accountLease = null;
+    })().finally(() => {
+      if (job.leaseRelease === pending) job.leaseRelease = null;
+    });
+    job.leaseRelease = pending;
+    return pending;
+  }
+
+  function takeAccount(job) {
+    if (job.leaseRelease || job.accountLease) return { busy: true };
+    const account = tryShared({ purpose: `luna daemon ${job.id}`, owner: job.owner });
+    if (account.lease) {
+      job.accountLease = account.lease;
+      job.stopLeaseHeartbeat = leaseHeartbeat(account.lease, 7200, (error) => {
+        event(`job ${job.id} account lease heartbeat lost: ${error.message}`);
+        void cancel(job, 'account lease heartbeat lost', 'failed', 1);
+      });
+    }
+    return account;
+  }
+
+  async function releaseSlot(job) {
+    if (job.releasingSlot) return job.releasingSlot;
+    job.releasingSlot = (async () => {
+      if (job.server?.crashCleanup) await job.server.crashCleanup;
+      await releaseAccount(job);
+      if (!job.slot) return;
+      job.slot = false;
+      running--;
+      lastBusy = monotonic();
+      void pump();
+    })();
+    try { await job.releasingSlot; } finally { job.releasingSlot = null; }
   }
 
   function finish(job, state, rc, error = '') {
@@ -932,11 +983,12 @@ async function serve() {
     job.publishing = true;
     job.shownState = job.state;
     job.state = state;
+    job.stopLeaseHeartbeat?.();
     job.rc = rc;
     job.error = cleanValue(error);
     job.prompt = ''; // Do not retain prompts in the long-lived job registry.
     job.finalMessage = '';
-    lastBusy = Date.now();
+    lastBusy = monotonic();
     try { progress(job, `completion state=${state} rc=${rc} error=${job.error}`, true); } catch {}
     const publication = settleWithin(logIdle(job), 5000).then(() => marker(job)).finally(() => {
       job.publishing = false;
@@ -947,12 +999,12 @@ async function serve() {
     // A client that died before its job completed never saw the result: keep it reattachable.
     if (state === 'completed' && orphanGraceS && job.clientPid > 0 && !job.orphanedAt &&
         !clientAlive(job)) {
-      job.orphanedAt = Date.now();
+      job.orphanedAt = monotonic();
       event(`job ${job.id} completed after its client was gone; kept for reattachment`);
     }
     event(`job end id=${job.id} state=${state} rc=${rc} error=${job.error}`);
     // Retain only small terminal metadata for GET /jobs; expire it after ten minutes.
-    job.expiry = Date.now() + 600_000;
+    job.expiry = monotonic() + 600_000;
     const index = queue.indexOf(job);
     if (index >= 0) queue.splice(index, 1);
     pruneTerminalJobs(jobs);
@@ -979,8 +1031,8 @@ async function serve() {
       }
       if (job.thread && threads.get(job.thread) === job) threads.delete(job.thread);
       job.finalMessage = '';
+      await releaseSlot(job);
       job.server = null;
-      releaseSlot(job);
     })();
     return job.unloading;
   }
@@ -1047,7 +1099,7 @@ async function serve() {
     }
     if ((job.retryWaiting && !job.retryStarting) ||
         (job.retiredTurns && (job.retiredTurns.has(p.turn?.id) || job.retiredTurns.has(p.turnId)))) return;
-    job.lastActivity = Date.now();
+    job.lastActivity = monotonic();
     if (message.method === 'turn/completed') {
       void refreshLimits('turn');
       job.turnEnded = true;
@@ -1115,7 +1167,8 @@ async function serve() {
     job.turn = '';
     job.retryWaiting = true;
     job.retryStarting = false;
-    job.lastActivity = job.heartbeatAt = Date.now();
+    void releaseAccount(job);
+    job.lastActivity = job.heartbeatAt = monotonic();
     void marker(job);
     if (admissionJob === job) {
       clearTimeout(admissionTimer);
@@ -1142,9 +1195,20 @@ async function serve() {
       await unload(job);
       return;
     }
-    job.retryStarting = true;
-    job.lastActivity = Date.now();
     try {
+      const account = takeAccount(job);
+      if (!account.lease) {
+        job.reason = account.blocking
+          ? `waiting: exclusive account lease ${account.blocking.purpose}` : 'waiting: account lease lock';
+        void marker(job);
+        job.retryTimer = setTimeout(() => { void retryTurn(job, server, error, count); }, 500);
+        return;
+      }
+      job.retryStarting = true;
+      job.reason = '';
+      job.lastActivity = monotonic();
+      if (!await bindLeaseChild(job.accountLease, server.child.pid)) throw new Error('account lease was lost');
+      if (terminal(job) || job.cancelled || stopping) { await unload(job); return; }
       const result = await server.rpc('turn/start', {
         threadId: job.thread, model: job.model, effort: job.effort, serviceTier: job.tier,
         input: [{
@@ -1157,7 +1221,7 @@ async function serve() {
       if (job.cancelled || stopping || terminal(job)) { await interruptAndUnload(job); return; }
       job.retryStarting = false;
       job.retryWaiting = false;
-      job.lastActivity = Date.now();
+      job.lastActivity = monotonic();
       void marker(job);
       progress(job, `turn start thread=${job.thread} turn=${job.turn} model=${job.model} effort=${job.effort}`);
     } catch (caught) {
@@ -1175,17 +1239,16 @@ async function serve() {
     limitsUpdates = null;
     app = null;
     event(`crash ${error}`);
-    crashes.push(Date.now());
-    while (crashes.length && crashes[0] < Date.now() - 600_000) crashes.shift();
+    crashes.push(monotonic());
+    while (crashes.length && crashes[0] < monotonic() - 600_000) crashes.shift();
     crashLoop = crashes.length >= 3;
     queue.length = 0;
     for (const job of jobs.values()) {
       if (!terminal(job)) finish(job, 'failed', 1, error);
-      if (job.slot) { job.slot = false; running--; }
-      job.server = null;
+      void releaseSlot(job).then(() => { if (job.server === server) job.server = null; });
     }
     threads.clear();
-    lastBusy = Date.now();
+    lastBusy = monotonic();
     if (crashLoop) {
       event('app-server crash loop');
       // A short drain window gives clients a definite crash-loop failure before exit.
@@ -1194,10 +1257,10 @@ async function serve() {
   }
 
   function scheduleLimitsPoll(server) {
-    const due = Date.now() + limitsPollS * 1000;
+    const due = monotonic() + limitsPollS * 1000;
     const poll = async () => {
       if (stopping || app !== server || server.dead) return;
-      const remaining = due - Date.now();
+      const remaining = due - monotonic();
       if (remaining > 0) { limitsTimer = setTimeout(poll, remaining); return; }
       await refreshLimits('poll');
       if (!stopping && app === server && !server.dead) scheduleLimitsPoll(server);
@@ -1212,6 +1275,7 @@ async function serve() {
       const server = new AppServer(notification, crashed);
       app = server;
       await server.initialize();
+      server.child.lunaIdentity ||= readProcess(server.child.pid);
       clearTimeout(limitsTimer);
       void refreshLimits('start').then(() => {
         if (!stopping && app === server && !server.dead) scheduleLimitsPoll(server);
@@ -1219,6 +1283,8 @@ async function serve() {
       if (info && !stopping) {
         info.codexBin = server.codexBin;
         info.shell = server.shell;
+        info.appServerPid = server.child.pid;
+        info.appServerStart = server.child.lunaIdentity?.started;
         await atomicWrite(INFO, `${JSON.stringify(info)}\n`, { privateFile: true });
       }
       return server;
@@ -1231,7 +1297,9 @@ async function serve() {
     try {
       const server = await ensureApp();
       job.server = server;
-      if (terminal(job) || stopping) { job.server = null; releaseSlot(job); return; }
+      if (terminal(job) || stopping) { await releaseSlot(job); job.server = null; return; }
+      if (!await bindLeaseChild(job.accountLease, server.child.pid)) throw new Error('account lease was lost');
+      if (terminal(job) || stopping) { await releaseSlot(job); job.server = null; return; }
       const response = await server.rpc('thread/start', {
         cwd: job.cwd, sandbox: job.sandbox, approvalPolicy: 'never',
         ephemeral: job.ephemeral ?? (process.env.LUNA_KEEP_SESSION !== '1'),
@@ -1270,7 +1338,7 @@ async function serve() {
 
   async function pump() {
     if (stopping || crashLoop || admissionJob) return;
-    nextPump = Date.now() + 2000;
+    nextPump = monotonic() + 2000;
     const activeWrites = [...jobs.values()].filter((job) => job.slot && job.sandbox === 'workspace-write');
     const owners = ownerCounts(jobs.values());
     for (const job of fairQueue(queue, owners)) {
@@ -1302,13 +1370,30 @@ async function serve() {
         finish(job, 'failed', 1, 'admission failed');
         continue;
       }
+      try {
+        const account = takeAccount(job);
+        if (!account.lease) {
+          admission.release();
+          job.reason = account.blocking
+            ? `waiting: exclusive account lease ${account.blocking.purpose}` : 'waiting: account lease lock';
+          nextPump = monotonic() + 250;
+          void marker(job);
+          return;
+        }
+      } catch (error) {
+        admission.release();
+        event(`job ${job.id} account lease failed: ${error.message}`);
+        finish(job, 'failed', 1, 'account lease admission failed');
+        continue;
+      }
       admissionJob = job;
       queue.splice(queue.indexOf(job), 1);
       job.slot = true;
       running++;
       job.state = 'running';
       job.reason = '';
-      job.startedAt = job.lastActivity = Date.now();
+      job.startedAt = Date.now();
+      job.startedMono = job.lastActivity = monotonic();
       void marker(job);
       progress(job, `job start model=${job.model} sandbox=${job.sandbox}`);
       event(`job start id=${job.id} model=${job.model}`);
@@ -1330,14 +1415,14 @@ async function serve() {
   function shutdownWhenQuiet(reason, stillWanted = () => true) {
     if (quietShutdowns.has(reason)) return;
     quietShutdowns.add(reason);
-    const started = Date.now();
+    const started = monotonic();
     const check = () => {
       // Timers can run before I/O after a blocked loop; poll accepted connections before deciding.
       setImmediate(() => {
         if (stopping || !stillWanted()) { quietShutdowns.delete(reason); return; }
         // A crash loop must exit even under non-stop polling; idle exit just waits for a quiet moment.
-        const forced = reason !== 'idle exit' && Date.now() - started >= 5000;
-        if ((!connections.size && Date.now() - lastHttpActivity >= 250) || forced) {
+        const forced = reason !== 'idle exit' && monotonic() - started >= 5000;
+        if ((!connections.size && monotonic() - lastHttpActivity >= 250) || forced) {
           quietShutdowns.delete(reason);
           if (reason === 'idle exit') event('idle exit');
           void shutdown(reason);
@@ -1370,6 +1455,7 @@ async function serve() {
       }
       await Promise.allSettled(interrupts);
       await app?.stop();
+      await Promise.all([...jobs.values()].map((job) => releaseSlot(job)));
       if (!await settleWithin(Promise.allSettled([starting, ...preparations]), 5000)) {
         event('shutdown: startup and preparations did not settle within 5000 ms');
       }
@@ -1377,9 +1463,9 @@ async function serve() {
         event('shutdown: INFO write did not settle within 5000 ms');
       }
       if (!await settleWithin(removeOwnDiscovery(), 3000)) event('shutdown: discovery cleanup did not settle');
-      const drainDeadline = Date.now() + 10_000;
+      const drainDeadline = monotonic() + 10_000;
       while (writes.size || logWriters.size || publications.size) {
-        const remaining = drainDeadline - Date.now();
+        const remaining = drainDeadline - monotonic();
         const pending = Promise.allSettled([...writes.values(), ...logWriters, ...publications]);
         if (remaining <= 0 || !await settleWithin(pending, remaining)) {
           event('shutdown: writes and logs did not settle within 10000 ms');
@@ -1396,8 +1482,8 @@ async function serve() {
       // A connection completing between this I/O yield and listener close can still reset on process exit.
       http?.close();
       // In-flight requests get up to 5 s (POST /jobs answers 503); lingering rejected sockets have their own 5 s cap.
-      const deadline = Date.now() + 5000;
-      while (connections.size && Date.now() < deadline) await sleep(20);
+      const deadline = monotonic() + 5000;
+      while (connections.size && monotonic() < deadline) await sleep(20);
       http?.closeAllConnections();
       if (!await settleWithin(flushEvents(), 3000)) {
         event('shutdown: final event flush did not settle within 3000 ms');
@@ -1491,10 +1577,24 @@ async function serve() {
     } catch (error) { event(`daemon log trim failed: ${error.message}`); }
     event(`start pid=${process.pid}`);
     try { os.setPriority(os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
-    await ensureApp();
+    let startupLease;
+    do {
+      startupLease = tryShared({ purpose: 'luna daemon startup' });
+      if (startupLease.busy) await sleep(25);
+    } while (startupLease.busy && !stopping);
+    if (startupLease.lease) {
+      const stopHeartbeat = leaseHeartbeat(startupLease.lease);
+      try {
+        const server = await ensureApp();
+        if (!await bindLeaseChild(startupLease.lease, server.child.pid)) throw new Error('account lease was lost');
+      } finally {
+        stopHeartbeat();
+        await releaseLease(startupLease.lease.id);
+      }
+    }
     if (stopping) throw new Error('daemon stopped');
     http = createServer(async (req, res) => {
-      lastHttpActivity = Date.now();
+      lastHttpActivity = monotonic();
       req.on('error', (error) => event(`HTTP request: ${error.code || error.message}`));
       res.on('error', (error) => event(`HTTP response: ${error.code || error.message}`));
       const reply = (code, body) => {
@@ -1570,6 +1670,11 @@ async function serve() {
             return;
           }
         }
+        if (req.method === 'GET' && req.url === '/account-idle') {
+          const idle = ![...jobs.values()].some((job) => job.slot && !job.retryWaiting);
+          reply(200, { pid: process.pid, idle });
+          return;
+        }
         if (req.method === 'GET' && req.url === '/health') {
           reply(200, { ok: !stopping && !crashLoop, pid: process.pid, profile: PROFILE, protocol: 2,
             features: ['model-retry', 'profiles'], appServerPid: app?.child.pid || null,
@@ -1634,12 +1739,12 @@ async function serve() {
           if (orphanGraceS > 0 && !terminal(previous) && !previous.orphanedAt &&
               previous.clientPid > 0 && previous.clientPid !== body.clientPid) {
             if (!clientAlive(previous)) {
-              previous.orphanedAt = Date.now();
+              previous.orphanedAt = monotonic();
               event(`job ${previous.id} client gone; orphaned at resubmission`);
             }
           }
           if (!previous.orphanedAt || (terminal(previous) && previous.state !== 'completed')) continue;
-          if (!terminal(previous) && Date.now() - previous.orphanedAt >= orphanGraceS * 1000) {
+          if (!terminal(previous) && monotonic() - previous.orphanedAt >= orphanGraceS * 1000) {
             await cancel(previous, 'client gone');
             // Its terminal marker is published asynchronously; let it land before a new job reuses the paths.
             await previous.publication;
@@ -1697,7 +1802,7 @@ async function serve() {
           return;
         }
         job.ready = true;
-        lastBusy = Date.now();
+        lastBusy = monotonic();
         if (crashLoop) finish(job, 'failed', 1, 'app-server crash loop');
         reply(200, { id: job.id });
         void pump();
@@ -1708,10 +1813,10 @@ async function serve() {
     });
     http.on('connection', (socket) => {
       connections.add(socket);
-      lastHttpActivity = Date.now();
+      lastHttpActivity = monotonic();
       socket.once('close', () => {
         connections.delete(socket);
-        lastHttpActivity = Date.now();
+        lastHttpActivity = monotonic();
       });
     });
     http.requestTimeout = 30_000;
@@ -1722,7 +1827,8 @@ async function serve() {
     });
     if (stopping) throw new Error('daemon stopped');
     info = { pid: process.pid, pid_start: readProcess(process.pid).started, port: http.address().port, token, startedAt,
-      codexBin: app.codexBin, shell: app.shell, profile: PROFILE, version: 1 };
+      codexBin: app?.codexBin, shell: app?.shell, appServerPid: app?.child.pid,
+      appServerStart: app?.child.lunaIdentity?.started, profile: PROFILE, version: 1 };
     if (!await atomicWrite(INFO, `${JSON.stringify(info)}\n`, { privateFile: true })) {
       throw new Error('cannot write discovery');
     }
@@ -1734,7 +1840,7 @@ async function serve() {
     process.on('uncaughtException', fatal);
     process.on('unhandledRejection', fatal);
     idleTimer = setInterval(() => {
-      const now = Date.now();
+      const now = monotonic();
       pruneTerminalJobs(jobs);
       for (const job of jobs.values()) {
         if (terminal(job)) continue;
@@ -1759,7 +1865,7 @@ async function serve() {
                 job.logRevision !== revision) return;
             if (size !== job.logWrittenBytes) {
               job.logBytes = job.logWrittenBytes = size;
-              job.lastActivity = Date.now();
+              job.lastActivity = monotonic();
             }
           }).catch((error) => {
             if (!job.logStatFailed) event(`job ${job.id} log stat failed: ${error.message}`);
@@ -1777,7 +1883,7 @@ async function serve() {
       if (now >= nextClientCheck) nextClientCheck = now + clientCheckMs;
       if (now >= nextPump) void pump();
       const idleStillTrue = () => !running && !queue.some((job) => !terminal(job)) && idleS &&
-        Date.now() - lastBusy >= idleS * 1000;
+        monotonic() - lastBusy >= idleS * 1000;
       if (idleStillTrue()) shutdownWhenQuiet('idle exit', idleStillTrue);
     }, 500);
 
@@ -1855,7 +1961,7 @@ async function unitChecks(root, check) {
     expiredLimit(clockJob, 15000) === 'exceeded total timeout 5s');
   check('idle timeout uses thread activity independently', expiredLimit(clockJob, 13000) === 'no events for 3s');
   const retained = new Map(Array.from({ length: 502 }, (_, id) => [id,
-    { id, state: 'completed', expiry: Date.now() + 600_000 }]));
+    { id, state: 'completed', expiry: monotonic() + 600_000 }]));
   retained.set('active', { id: 'active', state: 'running' });
   retained.set('expired', { id: 'expired', state: 'failed', expiry: 0 });
   pruneTerminalJobs(retained);
@@ -1869,7 +1975,7 @@ async function unitChecks(root, check) {
     JSON.stringify(jobView({ ...publishing, publishing: false })) ===
       '{"state":"failed","rc":1,"error":"failed","modelRetries":0}');
   const publishingRetained = new Map([[publishing.id, publishing], ...Array.from({ length: 501 }, (_, id) =>
-    [id, { id, state: 'completed', expiry: Date.now() + 600_000 }])]);
+    [id, { id, state: 'completed', expiry: monotonic() + 600_000 }])]);
   pruneTerminalJobs(publishingRetained);
   check('publishing job survives expiry and terminal metadata cap pruning',
     publishingRetained.has(publishing.id) && publishingRetained.size === 500);
