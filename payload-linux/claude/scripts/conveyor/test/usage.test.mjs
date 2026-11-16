@@ -30,6 +30,7 @@ function fixture(t, now = Date.parse('2026-11-03T16:00:00Z')) {
     CODEX_HOME: path.join(root, '.codex'), CONVEYOR_HOME: path.join(root, 'conveyor'),
     LUNA_RUN_DIR: path.join(root, '.claude', 'luna-run'), LUNA_DAEMON_HOME: path.join(root, 'daemon') };
   env.LUNA_OVERVIEW_HOME = env.LUNA_RUN_DIR;
+  env.LUNA_GEMINI_QUOTA_CMD = path.join(root, 'missing-quota.mjs');
   const paths = usagePaths(env);
   return { root, env, paths, now, collect: () => collectUsage({ env, now }),
     cache: () => JSON.parse(fs.readFileSync(paths.cache, 'utf8')) };
@@ -121,6 +122,28 @@ test('Incremental collection reads appended bytes, rescans truncations and repla
   fs.rmSync(file);
   f.collect();
   assert.equal(f.cache().days[localDay(f.now)].claude.byModel['claude-opus'].total, 5);
+  const cold = path.join(f.paths.projects, '-home-fake-project', 'cold.jsonl');
+  jsonl(cold, [assistant('cold-id', at, 'claude-opus', 30, 10)]);
+  fs.utimesSync(cold, new Date(f.now - 3 * 86_400_000), new Date(f.now - 3 * 86_400_000));
+  f.collect();
+  let state = JSON.parse(fs.readFileSync(f.paths.state, 'utf8'));
+  assert.equal(typeof state.archive.ids.bits, 'string');
+  assert.equal(state.files[cold].archived, true);
+  assert.deepEqual(state.files[cold].messages, {});
+  const firstArchive = state.archive.file;
+  const warm = path.join(path.dirname(cold), 'warm.jsonl');
+  jsonl(warm, [assistant('warm-id', at, 'claude-opus', 2, 1)]);
+  f.collect();
+  assert.equal(f.cache().days[localDay(f.now)].claude.byModel['claude-opus'].total, 48);
+  assert.equal(JSON.parse(fs.readFileSync(f.paths.state, 'utf8')).archive.file, firstArchive);
+  // A cold message copied to a live transcript must still deduplicate and merge its larger counters.
+  fs.appendFileSync(warm, JSON.stringify(assistant('cold-id', at, 'claude-opus', 30, 15)) + '\n');
+  f.collect();
+  assert.equal(f.cache().days[localDay(f.now)].claude.byModel['claude-opus'].total, 53);
+  assert.equal(fs.existsSync(firstArchive), false);
+  fs.appendFileSync(cold, JSON.stringify(assistant('resumed', at, 'claude-opus', 4, 1)) + '\n');
+  f.collect();
+  assert.equal(f.cache().days[localDay(f.now)].claude.byModel['claude-opus'].total, 58);
 });
 
 test('Codex cumulative rollouts and surviving log footers aggregate alongside Gemini statuses', { timeout }, (t) => {
@@ -183,6 +206,36 @@ test('Codex cumulative rollouts and surviving log footers aggregate alongside Ge
   f.collect();
   assert.equal(f.cache().days[localDay(f.now)].codex.byProject.repo, 2200);
   assert.equal(f.cache().days[localDay(f.now)].gemini.byProject['gem-project'], 68);
+  const durable = path.join(f.root, 'jobs', 'durable');
+  const records = [
+    { out: retained, provider: 'codex', model: 'gpt-6.1-sol', thread: 'session-retained', dir: '/home/fake/repo',
+      finished: at, usage_input: 170, usage_cached: 45, usage_output: 40, usage_total: 210 },
+    { out: gem, provider: 'gemini', model: 'gemini-3.8-flash-high', dir: '/home/fake/gem-project',
+      finished: at, usage_input: 45, usage_output: 20, usage_total: 65 },
+    { out: active, provider: 'gemini', model: 'gemini-3.8-flash-medium', dir: '/home/fake/gem-project',
+      started: at, finished: at, usage_input: 6, usage_cached: 2, usage_output: 3, usage_total: 9 },
+    { out: durable, provider: 'gemini', model: 'gemini-durable', dir: '/home/fake/gem-project',
+      started: at, finished: at, usage_input: 80, usage_output: 10, usage_total: 90 }
+  ];
+  status(durable, { ...records.at(-1), state: 'done' });
+  fs.rmSync(`${durable}.status`); // Deleted before this collector ever sees the job.
+  fs.appendFileSync(f.paths.registry, records.concat(records).map(JSON.stringify).join('\n') + '\n');
+  f.collect();
+  const durableDay = f.cache().days[localDay(f.now)];
+  assert.equal(durableDay.codex.byProject.repo, 2210);
+  assert.equal(durableDay.codex.byModel['gpt-6.1-sol'].cacheRead, 45);
+  assert.equal(durableDay.gemini.byProject['gem-project'], 164);
+  assert.equal(durableDay.gemini.byModel['gemini-3.8-flash-medium'].total, 9);
+  assert.equal(durableDay.gemini.jobs, 3);
+  fs.rmSync(`${active}.status`);
+  f.collect();
+  assert.deepEqual(f.cache().days[localDay(f.now)], durableDay);
+  // Reusing an output path for another invocation must preserve both (out, started) identities.
+  fs.appendFileSync(f.paths.registry, JSON.stringify({ ...records.at(-1), usage_total: 4,
+    started: new Date(f.now - 1000).toISOString() }) + '\n');
+  f.collect();
+  assert.equal(f.cache().days[localDay(f.now)].gemini.byProject['gem-project'], 168);
+  assert.equal(f.cache().days[localDay(f.now)].gemini.jobs, 4);
 });
 
 test('Summary has seven ordered days, today/week totals, model/project rankings, and ten top jobs', { timeout }, (t) => {
@@ -253,6 +306,10 @@ test('Luna overview reads only cache and refreshes stale usage in one detached c
   assert.deepEqual(fresh.usage, { ...summarizeUsage(cache, f.now), stale: false });
   assert.ok(!fs.existsSync(marker));
   cache.at = new Date(f.now - 61_000).toISOString();
+  write(f.paths.cache, JSON.stringify(cache));
+  assert.equal(run(overview, [], f.env).usage.stale, false);
+  assert.ok(!fs.existsSync(marker));
+  cache.at = new Date(f.now - 121_000).toISOString();
   write(f.paths.cache, JSON.stringify(cache));
   let pid;
   const waitFor = async (file) => {

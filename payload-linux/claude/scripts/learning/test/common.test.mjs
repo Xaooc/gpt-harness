@@ -338,3 +338,31 @@ test("home expansion falls back to os.homedir when HOME is unset", () => {
   ], { env, encoding: "utf8" });
   assert.equal(output, "");
 });
+
+
+test("registry preserves terminal provider usage after scratch status deletion", async () => {
+  const { recordJob } = await import("../registry.mjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-usage-test-"));
+  try {
+    const registry = path.join(root, "jobs.jsonl");
+    for (const [name, provider, extra, model] of [
+      ["gem", "gemini", "acp_model=gemini-resolved\n", "gemini-resolved"],
+      ["explicit-gem", "gemini", "provider=gemini\n", "alias"],
+      ["codex", "codex", "thread=thread-1\n", "alias"]
+    ]) {
+      const out = path.join(root, name);
+      fs.writeFileSync(`${out}.status`, "state=done\nmodel=alias\neffort=high\ndir=/tmp/repo\n" + extra +
+        "usage_input=100\nusage_cached=20\nusage_output=10\nusage_total=110\n");
+      assert.equal(recordJob(out, { registry }), true);
+      fs.rmSync(`${out}.status`);
+      const record = JSON.parse(fs.readFileSync(registry, "utf8").trim().split("\n").at(-1));
+      assert.equal(record.provider, provider);
+      assert.equal(record.model, model);
+      assert.equal(record.effort, "high");
+      assert.equal(record.dir, "/tmp/repo");
+      for (const [key, value] of Object.entries({ usage_input: 100, usage_cached: 20, usage_output: 10, usage_total: 110 })) {
+        assert.equal(record[key], value);
+      }
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

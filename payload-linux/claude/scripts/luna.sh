@@ -255,6 +255,13 @@ status() { # status <state> [extra key=value lines...]
     echo "codex_bin=$CODEX_BIN"
     echo "shell=bash"
     echo "engine=$ENGINE"
+    if [ -n "${USAGE_TOTAL:-}" ]; then
+      echo "usage_input=${USAGE_INPUT:-0}"
+      echo "usage_cached=${USAGE_CACHED:-0}"
+      echo "usage_output=${USAGE_OUTPUT:-0}"
+      echo "usage_total=$USAGE_TOTAL"
+    fi
+    if [ -n "${USAGE_THREAD:-}" ]; then echo "thread=$USAGE_THREAD"; fi
     echo "daemon_profile=$DAEMON_PROFILE"
     if [ "$ENGINE" = daemon ] && [ -n "$DAEMON_JOB" ]; then echo "daemon_job=$DAEMON_JOB"; fi
     if [ -n "$RETRY_EFFORT" ]; then
@@ -793,6 +800,16 @@ daemon_marker() {
       state) DAEMON_STATE="$value" ;; rc) DAEMON_RC="$value" ;; error) DAEMON_ERROR="$value" ;;
       queue_pos) DAEMON_QUEUE_POS="$value" ;; reason) DAEMON_QUEUE_REASON="$value" ;;
       started) DAEMON_STARTED="$value" ;;
+      thread) USAGE_THREAD="$value" ;;
+      usage_input|usage_cached|usage_output|usage_total)
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+          case "$key" in
+            usage_input) USAGE_INPUT=$(( ${USAGE_BASE_INPUT:-0} + value )) ;;
+            usage_cached) USAGE_CACHED=$(( ${USAGE_BASE_CACHED:-0} + value )) ;;
+            usage_output) USAGE_OUTPUT=$(( ${USAGE_BASE_OUTPUT:-0} + value )) ;;
+            usage_total) USAGE_TOTAL=$(( ${USAGE_BASE_TOTAL:-0} + value )) ;;
+          esac
+        fi ;;
       retry_waiting) [ "$value" != 1 ] || DAEMON_RETRY_WAITING=1 ;;
       model_retry_delay_s) MODEL_RETRY_DELAY_ACTUAL="$value" ;;
       model_retry)
@@ -1070,6 +1087,8 @@ run_attempt() {
   if [ "$rc" != 0 ] && [ "$MODEL_RETRY_COUNT" -gt 0 ] && [ -z "$STALL_REASON" ]; then
     EXEC_LAST_ERROR=$(last_exec_error)
   fi
+  capture_session
+  if [ -n "$EXEC_SESSION_ID" ]; then USAGE_THREAD="$EXEC_SESSION_ID"; fi
   cleanup_session
 }
 
@@ -1080,7 +1099,19 @@ STALL_REASON=""
 while :; do
   commands_before=$(command_count)
   if [ "$ENGINE" = daemon ]; then DAEMON_WAIT_STARTED=$(date +%s); fi
+  USAGE_BASE_INPUT=${USAGE_INPUT:-0}; USAGE_BASE_CACHED=${USAGE_CACHED:-0}
+  USAGE_BASE_OUTPUT=${USAGE_OUTPUT:-0}; USAGE_BASE_TOTAL=${USAGE_TOTAL:-0}
   run_attempt
+  if [ "$ENGINE" = exec ]; then
+    exec_total=$(awk '
+      footer && /^[0-9,]+[[:space:]]*$/ { gsub(/,/, ""); total=$0; found=1 }
+      { footer=($0 == "tokens used") }
+      END { if (found) print total+0 }
+    ' "$OUT.log")
+    if [ -n "$exec_total" ]; then
+      USAGE_TOTAL=$exec_total; USAGE_INPUT=0; USAGE_CACHED=0; USAGE_OUTPUT=0
+    fi
+  fi
   if [ "$DAEMON_DIED" = 1 ]; then
     if [ "$SANDBOX" = read-only ] && [ "$DAEMON_FALLBACK_USED" = 0 ]; then
       DAEMON_FALLBACK_USED=1

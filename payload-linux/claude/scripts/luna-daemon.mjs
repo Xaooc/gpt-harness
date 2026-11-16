@@ -130,8 +130,8 @@ function fairQueue(queue, owners) {
 
 function jobView(job) {
   const modelRetries = (job.modelRetryOffset || 0) + (job.modelRetryCount || 0);
-  return job.publishing ? { state: job.shownState, rc: null, error: '', modelRetries }
-    : { state: job.state, rc: job.rc, error: job.error, modelRetries };
+  return job.publishing ? { ...(job.usage ? { usage: job.usage } : {}), state: job.shownState, rc: null, error: '', modelRetries }
+    : { ...(job.usage ? { usage: job.usage } : {}), state: job.state, rc: job.rc, error: job.error, modelRetries };
 }
 
 function pruneTerminalJobs(jobs, now = Date.now()) {
@@ -893,6 +893,10 @@ async function serve() {
     const values = { state: job.state, id: job.id, thread: job.thread || '', turn: job.turn || '',
       daemon_pid: process.pid, daemon_start: readProcess(process.pid).started, daemon_profile: PROFILE,
       model_retry: job.modelRetryOffset + job.modelRetryCount, retry_waiting: job.retryWaiting ? 1 : 0 };
+    if (job.usage) Object.assign(values, {
+      usage_input: job.usage.input, usage_cached: job.usage.cachedInput,
+      usage_output: job.usage.output, usage_total: job.usage.total
+    });
     if (job.modelRetryDelayActual !== undefined) values.model_retry_delay_s = job.modelRetryDelayActual;
     if (job.state === 'queued') Object.assign(values, {
       queue_pos: queue.indexOf(job) + 1 || 1, reason: job.reason || 'capacity'
@@ -1028,6 +1032,19 @@ async function serve() {
     }
     const job = threads.get(p.threadId || p.conversationId);
     if (!job) return;
+    if (message.method === 'thread/tokenUsage/updated') {
+      // total is cumulative for the thread, including failed and auto-retry turns; last is per request.
+      const total = p.tokenUsage?.total;
+      if (total && !terminal(job)) {
+        job.lastActivity = Date.now();
+        const keys = { input: 'inputTokens', cachedInput: 'cachedInputTokens', output: 'outputTokens',
+          reasoningOutput: 'reasoningOutputTokens', total: 'totalTokens' };
+        job.usage = Object.fromEntries(Object.entries(keys).map(([key, field]) =>
+          [key, Math.max(job.usage?.[key] || 0, Number.isFinite(total[field]) ? Math.max(0, total[field]) : 0)]));
+        void marker(job);
+      }
+      return;
+    }
     if ((job.retryWaiting && !job.retryStarting) ||
         (job.retiredTurns && (job.retiredTurns.has(p.turn?.id) || job.retiredTurns.has(p.turnId)))) return;
     job.lastActivity = Date.now();
@@ -1302,7 +1319,7 @@ async function serve() {
 
   function jobList() {
     return [...jobs.values()].map((job) => ({
-      id: job.id, state: jobView(job).state, owner: job.owner, model: job.model, effort: job.effort,
+      id: job.id, state: jobView(job).state, usage: job.usage, owner: job.owner, model: job.model, effort: job.effort,
       sandbox: job.sandbox, orphaned: Boolean(job.orphanedAt) && !terminal(job),
       cwd: job.cwd, clientPid: job.clientPid || 0, queuedAt: new Date(job.queuedAt).toISOString(),
       startedAt: job.startedAt ? new Date(job.startedAt).toISOString() : null,
@@ -2049,7 +2066,7 @@ async function selfTest(unitOnly = false) {
     const current = {
       home,
       env: {
-        ...process.env, LUNA_DAEMON_HOME: home, LUNA_DAEMON_PROFILE: 'default',
+        ...process.env, HOME: root, LUNA_DAEMON_HOME: home, LUNA_DAEMON_PROFILE: 'default',
         LUNA_DAEMON_MAX: '2', LUNA_DAEMON_IDLE_S: String(idleS),
         LUNA_KEEP_SESSION: '0', LUNA_ADMIT_LOCK: path.join(home, 'admit.lock'), LUNA_RAM_RESERVE_MB: '0',
         LUNA_DAEMON_TURN_MB: '0', LUNA_DAEMON_RAMP_MS: '10', LUNA_DAEMON_OWNER_MAX: '0',
@@ -2206,11 +2223,21 @@ async function selfTest(unitOnly = false) {
     check('turn failure preserves final answer and error', failedJob.rc === 1 && failedJob.error === 'fake failure' &&
       readFileSync(failure.out, 'utf8') === 'answer FAIL');
     const capacity = 'Selected model is at capacity. Please try a different model.';
+    const metered = await submit(info, 'TOKEN_USAGE');
+    const meteredResult = await finished(info, metered.id);
+    const meteredList = (await httpJson(info, 'GET', '/jobs')).body.jobs.find((job) => job.id === metered.id);
+    check('token usage notification is reported by both job endpoints and the marker',
+      JSON.stringify(meteredResult.usage) ===
+        '{"input":160,"cachedInput":40,"output":40,"reasoningOutput":10,"total":200}' &&
+      JSON.stringify(meteredList.usage) === JSON.stringify(meteredResult.usage) &&
+      readFileSync(`${metered.out}.daemon`, 'utf8').includes('usage_total=200\n'));
     const retryAudit = audit().length;
     const retried = await submit(info, `MODEL_FAIL_ONCE:${capacity}`, { modelRetryDelayS: 0 });
     const retryResult = await finished(info, retried.id);
     const retryEvents = audit().slice(retryAudit);
     const retryTurns = retryEvents.filter((entry) => entry.method === 'turn/start');
+    check('retry usage is cumulative across turns without counting repeated updates twice',
+      (await result(info, retried.id)).usage?.total === 400);
     check('model retry resumes once in the same thread and completes with the new answer',
       retryResult.state === 'completed' && retryResult.modelRetries === 1 &&
       retryEvents.filter((entry) => entry.method === 'thread/start').length === 1 && retryTurns.length === 2 &&

@@ -2,7 +2,11 @@
 // agy supplies quota to its documented statusLine hook, even when print mode is region-blocked.
 // https://antigravity.google/docs/cli/statusline/ — no model prompt or credential access is needed.
 import * as fs from 'node:fs/promises';
-import { constants, readFileSync, readdirSync } from 'node:fs';
+import {
+  constants, readFileSync, readdirSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, statSync
+} from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { matchingProcess, readProcess } from '../lib/luna-runtime.mjs';
 import { spawn } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
@@ -19,6 +23,64 @@ const object = (value) => value !== null && typeof value === 'object' && !Array.
 const quote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
 const iso = (value) => typeof value === 'string' && Number.isFinite(Date.parse(value))
   ? new Date(value).toISOString() : null;
+
+export function quotaPaths(env = process.env) {
+  const home = path.resolve(env.CONVEYOR_HOME || path.join(env.HOME || homedir(), '.claude', 'conveyor'));
+  return { home, cache: path.join(home, 'gemini-quota.json'), lock: path.join(home, 'gemini-quota.lock') };
+}
+
+function lockOwners(lock) {
+  try {
+    return readdirSync(lock).filter((name) => /^owner(?:\..+)?\.json$/.test(name)).map((name) => {
+      try { return { name, ...JSON.parse(readFileSync(path.join(lock, name), 'utf8')) }; }
+      catch { return { name }; }
+    });
+  } catch { return []; }
+}
+
+export function quotaRefreshLocked(env = process.env) {
+  const { lock } = quotaPaths(env), owners = lockOwners(lock);
+  if (owners.some((owner) => matchingProcess(owner.pid, owner.start))) return true;
+  // Cover the mkdir -> owner publication gap without permanently retaining an abandoned lock.
+  try { return (!owners.length || owners.some((owner) => !owner.pid || !owner.start)) &&
+    Date.now() - statSync(lock).mtimeMs < 60_000; }
+  catch { return false; }
+}
+
+export function acquireQuotaRefreshLock(env = process.env) {
+  const { home, lock } = quotaPaths(env);
+  mkdirSync(home, { recursive: true });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { mkdirSync(lock); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (quotaRefreshLocked(env)) return null;
+      // A unique owner marker prevents concurrent stale reapers from deleting a new live lock.
+      // Never recursively remove this directory: rmdir must fail while any live marker exists.
+      for (const owner of lockOwners(lock)) {
+        if (matchingProcess(owner.pid, owner.start)) return null;
+        try { unlinkSync(path.join(lock, owner.name)); } catch {}
+      }
+      try { rmdirSync(lock); } catch { return null; }
+      continue;
+    }
+    const owner = { pid: process.pid, start: readProcess(process.pid)?.started, nonce: randomUUID() };
+    const marker = path.join(lock, `owner.${owner.nonce}.json`);
+    try {
+      writeFileSync(marker, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
+      writeFileSync(path.join(lock, 'owner.json'), JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
+    } catch {
+      try { unlinkSync(marker); } catch {}
+      continue;
+    }
+    return () => {
+      try { unlinkSync(path.join(lock, 'owner.json')); } catch {}
+      try { unlinkSync(marker); } catch {}
+      try { rmdirSync(lock); } catch {}
+    };
+  }
+  return null;
+}
 
 // Only quota fractions are usage limits. context_window and ACP used/size are deliberately ignored.
 export function parseStatuslineQuota(data, now = Date.now()) {
@@ -248,8 +310,7 @@ async function queryAgy(env, timeoutMs, overallDeadline) {
 export async function getGeminiQuota({ refresh = false, env = process.env, timeoutMs = TIMEOUT_MS } = {}) {
   const budget = Number.isFinite(timeoutMs) ? Math.max(1, Math.min(TIMEOUT_MS, timeoutMs)) : TIMEOUT_MS;
   const deadline = performance.now() + budget;
-  const home = path.resolve(env.CONVEYOR_HOME || path.join(env.HOME || homedir(), '.claude', 'conveyor'));
-  const cache = path.join(home, 'gemini-quota.json');
+  const { home, cache } = quotaPaths(env);
   const cached = await readJson(cache);
   const age = Date.now() - Date.parse(cached?.at);
   if (!refresh && age >= 0 && age < CACHE_MS) {
@@ -290,8 +351,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === cli) {
       if (args.some((arg) => !['--json', '--refresh'].includes(arg))) {
         throw new Error('usage: gemini-quota.mjs [--json] [--refresh]');
       }
-      const result = await getGeminiQuota({ refresh: args.includes('--refresh') });
-      process.stdout.write(`${JSON.stringify(result, null, args.includes('--json') ? 0 : 2)}\n`);
+      const release = acquireQuotaRefreshLock();
+      try {
+        const result = release ? await getGeminiQuota({ refresh: args.includes('--refresh') })
+          : await readJson(quotaPaths().cache) || { available: false, buckets: [], at: null, reason: 'refresh in progress' };
+        process.stdout.write(`${JSON.stringify(result, null, args.includes('--json') ? 0 : 2)}\n`);
+      } finally { release?.(); }
     }
   } catch (error) {
     process.stderr.write(`gemini-quota: ${error.message}\n`);

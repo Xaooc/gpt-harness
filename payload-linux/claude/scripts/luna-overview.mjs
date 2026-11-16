@@ -14,6 +14,7 @@ import {
   loadConfig, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
 } from './conveyor/lib/orchestration.mjs';
 import { summarizeUsage, usagePaths } from './conveyor/usage.mjs';
+import { quotaPaths, quotaRefreshLocked } from './conveyor/gemini-quota.mjs';
 
 const DEADLINE_MS = 1750;
 const TAIL_BYTES = 64 * 1024;
@@ -51,7 +52,8 @@ function empty(now = Date.now()) {
     daemon: { running: false, appServer: null, healthy: false }, jobs: [], codexLimits: null, build: null,
     sessions: [],
     orchestration: { chains: {}, panels: {}, threshold: null, marks: {}, presets: [], catalog: {}, configError: null },
-    switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null },
+    switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null,
+      quota: { available: false, buckets: [], at: null } },
     usage: { ...summarizeUsage(null, now), stale: true }
   };
 }
@@ -79,7 +81,7 @@ async function readJson(file) {
 async function usageStatus(now) {
   const paths = usagePaths(), cache = await readJson(paths.cache);
   const usage = summarizeUsage(cache?.v === 1 ? cache : null, now);
-  usage.stale = !Number.isFinite(Date.parse(usage.at)) || now - Date.parse(usage.at) > 60_000;
+  usage.stale = !Number.isFinite(Date.parse(usage.at)) || now - Date.parse(usage.at) > 120_000;
   if (usage.stale) {
     const owner = await readJson(path.join(paths.lock, 'owner.json'));
     if (!owner || !matchingProcess(owner.pid, owner.start)) {
@@ -93,6 +95,34 @@ async function usageStatus(now) {
     }
   }
   return usage;
+}
+
+async function geminiQuotaStatus(now) {
+  const cache = await readJson(quotaPaths().cache);
+  const age = now - Date.parse(cache?.at);
+  const quota = {
+    available: cache?.available === true, buckets: Array.isArray(cache?.buckets) ? cache.buckets.map((bucket) => ({
+      name: string(bucket.name),
+      ...(number(bucket.remainingFraction) !== null ? { remainingFraction: bucket.remainingFraction } : {}),
+      ...(number(bucket.usedPercent) !== null ? { usedPercent: bucket.usedPercent } : {}),
+      ...(string(bucket.resetAt) ? { resetAt: bucket.resetAt } : {})
+    })) : [], at: string(cache?.at) || null,
+    ...(string(cache?.reason) ? { reason: cache.reason } : {}),
+    ...(string(cache?.lastExhaustedAt || cache?.proxy?.lastExhaustedAt)
+      ? { lastExhaustedAt: cache.lastExhaustedAt || cache.proxy.lastExhaustedAt } : {})
+  };
+  if ((!Number.isFinite(age) || age < 0 || age > 600_000) && !quotaRefreshLocked()) {
+    try {
+      const refresher = process.env.LUNA_GEMINI_QUOTA_CMD ||
+        fileURLToPath(new URL('./conveyor/gemini-quota.mjs', import.meta.url));
+      const child = spawn(process.execPath, [refresher, '--json', '--refresh'], {
+        detached: true, stdio: 'ignore', windowsHide: true
+      });
+      child.on('error', () => {});
+      child.unref();
+    } catch {}
+  }
+  return quota;
 }
 
 async function readTail(file, limit = TAIL_BYTES) {
@@ -510,6 +540,7 @@ async function collect(config, snapshot, now) {
     switches().then((events) => { snapshot.switches = events; }),
     geminiUsage(config, now, gemini).then((usage) => { Object.assign(snapshot.gemini, usage); }),
     geminiMcp(config).then((mcp) => { snapshot.gemini.mcp = mcp; }),
+    geminiQuotaStatus(now).then((quota) => { snapshot.gemini.quota = quota; }),
     usageStatus(now).then((usage) => { snapshot.usage = usage; })
   ]);
   return snapshot;
@@ -530,7 +561,7 @@ function human(snapshot) {
 
 async function selfTest() {
   const envKeys = ['LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME', 'LUNA_RUN_DIR', 'CONVEYOR_HOME',
-    'CONVEYOR_LUNA_SH', 'CONVEYOR_GEM_SH', 'LUNA_USAGE_COLLECTOR'];
+    'CONVEYOR_LUNA_SH', 'CONVEYOR_GEM_SH', 'LUNA_USAGE_COLLECTOR', 'LUNA_GEMINI_QUOTA_CMD'];
   const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   const directory = await fs.mkdtemp(path.join(tmpdir(), 'luna-overview-test-'));
   const now = Date.now();
@@ -547,6 +578,7 @@ async function selfTest() {
     process.env.CONVEYOR_LUNA_SH = fileURLToPath(import.meta.url);
     process.env.CONVEYOR_GEM_SH = fileURLToPath(import.meta.url);
     process.env.LUNA_USAGE_COLLECTOR = path.join(directory, 'missing-collector.mjs');
+    process.env.LUNA_GEMINI_QUOTA_CMD = path.join(directory, 'missing-quota.mjs');
     const config = configuration();
     config.registry = path.join(directory, 'jobs.jsonl');
     config.codexConfig = path.join(directory, 'config.toml');
@@ -555,6 +587,26 @@ async function selfTest() {
     await fs.mkdir(orchestrationPaths().home);
     const usageCache = { v: 1, at: new Date(now).toISOString(), days: {}, topJobs: [] };
     await fs.writeFile(usagePaths().cache, JSON.stringify(usageCache));
+    const quotaCache = { available: true, source: 'agy-statusline', at: new Date(now).toISOString(),
+      buckets: [{ name: 'gemini-5h', remainingFraction: 0.75, resetAt: new Date(now + 60_000).toISOString() }] };
+    const quotaMarker = path.join(directory, 'quota-refresh.jsonl'), quotaStop = path.join(directory, 'quota-stop');
+    const quotaDone = path.join(directory, 'quota-done'), quotaFake = path.join(directory, 'fake-quota.mjs');
+    await fs.writeFile(quotaFake, [
+      "import fs from 'node:fs';",
+      `import { acquireQuotaRefreshLock } from ${JSON.stringify(new URL('./conveyor/gemini-quota.mjs', import.meta.url).href)};`,
+      'const release = acquireQuotaRefreshLock();',
+      'if (release) {',
+      `  fs.appendFileSync(${JSON.stringify(quotaMarker)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+      '  const timer = setInterval(() => {',
+      `    if (!fs.existsSync(${JSON.stringify(quotaStop)})) return;`,
+      `    release(); fs.writeFileSync(${JSON.stringify(quotaDone)}, 'done'); clearInterval(timer);`,
+      '  }, 20);',
+      '  setTimeout(() => { release(); process.exit(1); }, 60_000).unref();',
+      '}'
+    ].join('\n'));
+    process.env.LUNA_GEMINI_QUOTA_CMD = quotaFake;
+    await fs.writeFile(quotaPaths().cache, JSON.stringify(quotaCache));
+
     await fs.writeFile(orchestrationPaths().config, JSON.stringify(orchestration));
     await fs.mkdir(path.join(directory, 'active'));
     await fs.mkdir(config.daemon);
@@ -603,6 +655,37 @@ async function selfTest() {
       assert.deepEqual(snapshot.usage, { ...summarizeUsage(usageCache, now), stale: false });
       assert.equal(snapshot.usage.days.length, 7);
     });
+    check('fresh Gemini quota appears in the snapshot without spawning a refresh', () => {
+      assert.deepEqual(snapshot.gemini.quota, {
+        available: true, buckets: quotaCache.buckets, at: quotaCache.at
+      });
+      assert.equal(statSync(quotaMarker, { throwIfNoEntry: false }), undefined);
+    });
+    const waitForQuota = async (file) => {
+      const deadline = Date.now() + 15_000;
+      while (!statSync(file, { throwIfNoEntry: false }) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(statSync(file, { throwIfNoEntry: false }), `missing ${path.basename(file)}`);
+    };
+    try {
+      await fs.writeFile(quotaPaths().cache, JSON.stringify({ ...quotaCache,
+        at: new Date(now - 600_001).toISOString() }));
+      await geminiQuotaStatus(now);
+      await waitForQuota(quotaMarker);
+      await Promise.all(Array.from({ length: 5 }, () => geminiQuotaStatus(now)));
+      check('stale Gemini quota spawns exactly one detached refresh while the lock is held', () => {
+        assert.equal(quotaRefreshLocked(), true);
+      });
+      const calls = (await fs.readFile(quotaMarker, 'utf8')).trim().split('\n').map(JSON.parse);
+      check('quota refresher receives the CLI refresh flags once', () => {
+        assert.deepEqual(calls, [['--json', '--refresh']]);
+      });
+    } finally {
+      await fs.writeFile(quotaStop, '');
+      await waitForQuota(quotaDone);
+      await fs.writeFile(quotaPaths().cache, JSON.stringify(quotaCache));
+    }
     check('terminal filtering and newest first', () => {
       assert.deepEqual(snapshot.jobs.map((job) => job.state), states.slice(0, 3));
       assert.deepEqual(snapshot.jobs.map((job) => job.ageS), [1, 2, 3]);

@@ -366,11 +366,11 @@ test("recordJob appends exact ordered records with hashes of the final status by
   assert.equal(lines.length, 1);
   const record = JSON.parse(lines[0]);
   assert.deepEqual(Object.keys(record), [
-    "v", "out", "status_sha256", "started", "finished", "state", "model", "pid",
+    "v", "out", "status_sha256", "started", "finished", "state", "provider", "model", "effort", "dir", "pid",
   ]);
   assert.deepEqual(record, {
     v: 1, out: toWinPath(path.resolve(out)), status_sha256: sha, started: timestamp,
-    finished: "2026-10-20T10:01:00.000Z", state: "done", model: "custom=model", pid: "1234",
+    finished: "2026-10-20T10:01:00.000Z", state: "done", provider: "codex", model: "custom=model", effort: "high", dir: "", pid: "1234",
   });
   assert.equal(record.out.includes("\\"), false);
   if (process.platform === "win32") assert.match(record.out, /^[A-Z]:\//);

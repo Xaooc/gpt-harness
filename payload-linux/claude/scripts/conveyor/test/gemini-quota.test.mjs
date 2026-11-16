@@ -7,7 +7,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getGeminiQuota, parseStatuslineQuota } from '../gemini-quota.mjs';
+import {
+  acquireQuotaRefreshLock, getGeminiQuota, parseStatuslineQuota, quotaPaths, quotaRefreshLocked
+} from '../gemini-quota.mjs';
 
 const cli = fileURLToPath(new URL('../gemini-quota.mjs', import.meta.url));
 const timeout = 600_000;
@@ -56,6 +58,7 @@ async function fixture(t) {
     '  http: process.env.HTTP_PROXY, https: process.env.HTTPS_PROXY, noProxy: process.env.NO_PROXY',
     '}));',
     "if (config.mode === 'exit') process.exit(7);",
+    'if (config.waitFile) while (!fs.existsSync(config.waitFile)) await new Promise((resolve) => setTimeout(resolve, 20));',
     "if (config.mode === 'hang') {",
     "  process.on('SIGTERM', () => {});",
     "  spawn(process.execPath, ['-e', [",
@@ -208,4 +211,40 @@ test('times out and kills agy plus a detached descendant that ignores SIGTERM', 
     const pid = Number(await fs.readFile(path.join(f.root, name), 'utf8'));
     assert.equal(alive(pid), false, `${name} survived quota reader cleanup`);
   }
+});
+
+
+test('refresh lock excludes CLI races, reclaims dead owners, and releases after completion', { timeout }, async (t) => {
+  const f = await fixture(t), paths = quotaPaths(f.env);
+  const release = acquireQuotaRefreshLock(f.env);
+  try {
+    assert.equal(quotaRefreshLocked(f.env), true);
+    assert.equal(acquireQuotaRefreshLock(f.env), null);
+    const owner = JSON.parse(await fs.readFile(path.join(paths.lock, 'owner.json'), 'utf8'));
+    assert.equal(owner.pid, process.pid);
+    assert.ok(owner.start);
+  } finally { release(); }
+  assert.equal(quotaRefreshLocked(f.env), false);
+  await fs.mkdir(paths.lock);
+  await fs.writeFile(path.join(paths.lock, 'owner.json'), JSON.stringify({ pid: 2147483647, start: 'gone' }));
+  const reclaimed = acquireQuotaRefreshLock(f.env);
+  assert.equal(typeof reclaimed, 'function');
+  reclaimed();
+  const waitFile = path.join(f.root, 'release-agy');
+  await f.configure({ waitFile });
+  const first = run(process.execPath, [cli, '--json', '--refresh'], { env: f.env, timeout });
+  const deadline = Date.now() + timeout;
+  while (!await fs.stat(path.join(f.root, 'calls.jsonl')).catch(() => null) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  let peers;
+  try {
+    peers = await Promise.all(Array.from({ length: 3 }, () =>
+      run(process.execPath, [cli, '--json', '--refresh'], { env: f.env, timeout })));
+  } finally { await fs.writeFile(waitFile, ''); }
+  const results = [await first, ...peers];
+  assert.ok(results.every(({ stdout, stderr }) => stderr === '' && typeof JSON.parse(stdout).available === 'boolean'));
+  assert.equal((await f.calls()).length, 1, 'concurrent CLI refreshes must launch only one agy');
+  assert.equal(quotaRefreshLocked(f.env), false);
+  assert.equal(await fs.stat(paths.lock).catch(() => null), null);
 });

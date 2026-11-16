@@ -85,6 +85,10 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       if (prompt.startsWith('WAIT') || prompt.startsWith('SLOW_START') ||
           prompt.startsWith('FLOOD_WAIT') || thread.model === 'hang') return;
       thread.timer = setTimeout(() => {
+        const total = { inputTokens: 160 * thread.turns, cachedInputTokens: 40 * thread.turns,
+          outputTokens: 40 * thread.turns, reasoningOutputTokens: 10 * thread.turns, totalTokens: 200 * thread.turns };
+        notify('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: { total, last: total } });
+        notify('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: { total, last: total } });
         if (thread.failure && (thread.failure.mode === 'ALWAYS' || thread.turns === 1)) {
           notify('turn/completed', { threadId, turn: {
             id: turnId, status: 'failed', items: [], error: { message: thread.failure.error }

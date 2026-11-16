@@ -16,6 +16,8 @@ const totals = () => ({ total: 0, input: 0, output: 0, cached: 0 });
 const dictionary = () => Object.create(null);
 const localPath = (value) => typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0');
 const cacheDigest = (cache) => createHash('sha256').update(JSON.stringify([cache.days, cache.topJobs])).digest('hex');
+const jobKey = (out, values) => JSON.stringify([out, values.started || '']);
+const hasUsage = (values) => ['usage_input', 'usage_output', 'usage_total'].some((key) => values[key] !== undefined);
 const jobLog = (file) => file.endsWith('.log') && !['daemon.log', 'clean.log'].includes(path.basename(file));
 
 export function usagePaths(env = process.env) {
@@ -24,6 +26,7 @@ export function usagePaths(env = process.env) {
   const cacheHome = path.resolve(env.CONVEYOR_HOME || path.join(claude, 'conveyor'));
   return {
     home: cacheHome, state: path.join(cacheHome, 'usage-state.json'), cache: path.join(cacheHome, 'usage-cache.json'),
+    archive: path.join(cacheHome, 'usage-archive.json'),
     lock: path.join(cacheHome, 'usage-state.json.lock'), projects: path.join(claude, 'projects'),
     sessions: path.join(env.CODEX_HOME || path.join(home, '.codex'), 'sessions'),
     registry: path.join(claude, 'learning', 'jobs.jsonl'),
@@ -56,6 +59,30 @@ function readJson(file, fallback = null) {
     if (error.code === 'ENOENT' || error instanceof SyntaxError) return fallback;
     throw error;
   }
+}
+
+const messageKeys = ['input', 'output', 'cacheRead', 'cacheWrite', 'total', 'messages', 'at', 'model'];
+const unpackMessage = (value) => Array.isArray(value) ? {
+  input: value[0], output: value[1], cacheRead: value[2], cacheWrite: value[3], total: value[4],
+  messages: value[5], at: value[6], model: value[7]
+} : value;
+const packMessage = (value) => Array.isArray(value) ? value : messageKeys.map((key) => value[key]);
+
+// A Bloom filter is only a restore hint. False positives reopen the exact ledger; they never change counts.
+function archiveFilter(ids) {
+  const size = 2 ** Math.ceil(Math.log2(Math.max(64, ids.length * 64))), bits = Buffer.alloc(size / 8);
+  for (const id of ids) filterContains({ bits, mask: size - 1 }, id, true);
+  return { bits: bits.toString('base64'), mask: size - 1 };
+}
+
+function filterContains(filter, id, insert = false) {
+  const hash = createHash('sha256').update(id).digest(), first = hash.readUInt32LE(0), step = hash.readUInt32LE(4) | 1;
+  for (let index = 0; index < 8; index++) {
+    const bit = (first + index * step) & filter.mask, byte = bit >>> 3, mask = 1 << (bit & 7);
+    if (insert) filter.bits[byte] |= mask;
+    else if (!(filter.bits[byte] & mask)) return false;
+  }
+  return true;
 }
 
 function writeJson(file, value, header = null) {
@@ -120,7 +147,7 @@ function fields(text) {
   return values;
 }
 
-const metadataKeys = ['out', 'model', 'acp_model', 'provider', 'dir', 'started', 'finished', 'state', 'thread',
+const metadataKeys = ['out', 'effort', 'model', 'acp_model', 'provider', 'dir', 'started', 'finished', 'state', 'thread',
   'usage_input', 'usage_output', 'usage_total', 'usage_cached', 'name'];
 function metadata(value) {
   return Object.fromEntries(metadataKeys.filter((key) => ['string', 'number'].includes(typeof value[key]))
@@ -176,7 +203,7 @@ function claudeLine(record, line, since) {
   if (entry?.type !== 'assistant' || !message?.id || !message.usage || !Number.isFinite(Date.parse(entry.timestamp))) return;
   if (localDay(entry.timestamp) < since) return;
   const next = { ...metrics(message.usage, true), at: entry.timestamp, model: message.model || 'unknown' };
-  record.messages[message.id] = mergeMessage(record.messages[message.id], next);
+  record.messages[message.id] = packMessage(mergeMessage(unpackMessage(record.messages[message.id]), next));
 }
 
 function codexLine(record, line) {
@@ -208,17 +235,17 @@ function logLine(record, line) {
   if (thread) { record.session = thread[1]; record.model = thread[2]; }
 }
 
-function scanFile(state, file, kind, stats, since) {
+function scanFile(state, file, kind, stats, since, knownStat) {
   let fd;
   try {
-    fd = fs.openSync(file, 'r');
-    const stat = fs.fstatSync(fd);
+    const stat = knownStat || fs.statSync(file);
     if (!stat.isFile()) return;
     stats.files++;
     stats.scannedBytes += stat.size;
     let record = state.files[file];
     if (record && record.size === stat.size && record.mtimeMs === stat.mtimeMs &&
-        record.ino === stat.ino && record.dev === stat.dev) return;
+        record.ino === stat.ino && record.dev === stat.dev) return true;
+    fd = fs.openSync(file, 'r');
     const snapshot = ['status', 'daemon', 'pointer', 'active'].includes(kind);
     const reset = snapshot || !record || record.ino !== stat.ino || record.dev !== stat.dev ||
       stat.size < record.size || stat.size === record.size;
@@ -238,12 +265,16 @@ function scanFile(state, file, kind, stats, since) {
         else if (kind === 'log') logLine(record, line);
         else if (kind === 'registry') {
           const value = parseLine(line);
-          if (localPath(value?.out)) record.records[value.out] = metadata(value);
+          if (localPath(value?.out)) {
+            const key = jobKey(value.out, value), previous = record.records[key];
+            record.records[key] = { ...previous, ...metadata(value) };
+          }
         }
       }, stats);
     }
     Object.assign(record, { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino, dev: stat.dev });
     state.files[file] = record;
+    return true;
   } catch (error) {
     if (!['ENOENT', 'ENOTDIR'].includes(error.code)) throw error;
   } finally { if (fd !== undefined) fs.closeSync(fd); }
@@ -259,12 +290,14 @@ function addCounters(target, source) {
   for (const key of tokenKeys) target[key] += numeric(source[key]);
 }
 
-function aggregate(state, paths, now, since) {
-  const days = dictionary(), messages = new Map(), claudeJobs = new Map(), codex = new Map(), jobs = new Map();
+function aggregate(state, paths, now, since, allJobs = false) {
+  const days = state.archive ? structuredClone(state.archive.days) : dictionary();
+  const messages = new Map(), claudeJobs = new Map(), codex = new Map(), jobs = new Map();
   const candidates = [], today = localDay(now), weekStart = daysBefore(now, 6);
-  const add = (provider, model, repo, usage, at, countJob = false) => {
-    if (!Number.isFinite(Date.parse(at))) return;
-    const day = localDay(at);
+  for (const job of state.archive?.jobs || []) claudeJobs.set(`${job.project}/${job.name}`, { ...job });
+  const add = (provider, model, repo, usage, at, countJob = false, day = null) => {
+    if (!day && !Number.isFinite(Date.parse(at))) return;
+    day ||= localDay(at);
     if (day < since || day > today) return;
     const bucket = days[day] ||= Object.fromEntries(providers.map((name) => [name, {
       byModel: dictionary(), byProject: dictionary(), ...(name === 'claude' ? {} : { jobs: 0 })
@@ -279,52 +312,83 @@ function aggregate(state, paths, now, since) {
       const parts = path.relative(paths.projects, file).split(path.sep);
       const session = parts[1]?.replace(/\.jsonl$/, '') || path.basename(file, '.jsonl');
       const repo = project(parts[0]);
-      for (const [id, message] of Object.entries(record.messages)) {
-        const value = { ...message, project: repo, session };
-        messages.set(id, mergeMessage(messages.get(id), value));
+      for (const [id, packed] of Object.entries(record.messages)) {
+        const message = unpackMessage(packed);
+        const previous = messages.get(id);
+        // Most messages are unique. Copy counters only when a duplicate actually needs merging.
+        messages.set(id, previous ? [mergeMessage({ ...previous[0] }, message), previous[1], previous[2]]
+          : [message, repo, session]);
       }
     } else if (record.kind === 'codex' && record.usage) {
       const session = record.session || path.basename(file, '.jsonl');
       if (!codex.has(session) || Date.parse(codex.get(session).usage.at) <= Date.parse(record.usage.at)) codex.set(session, record);
     } else if (record.kind === 'registry') {
-      for (const [out, values] of Object.entries(record.records)) jobs.set(out, { ...jobs.get(out), ...values });
+      for (const values of Object.values(record.records)) {
+        const key = jobKey(values.out, values);
+        jobs.set(key, { ...jobs.get(key), ...values });
+      }
     }
   }
   for (const [file, record] of Object.entries(state.files)) {
-    if (record.kind === 'status' || record.kind === 'daemon') {
-      const out = file.replace(/\.(?:status|daemon)$/, '');
-      jobs.set(out, { ...jobs.get(out), ...record.values });
+    if (record.kind !== 'status') continue;
+    const out = file.slice(0, -7), values = record.values, key = jobKey(out, values);
+    const legacy = jobs.get(jobKey(out, {}));
+    if (values.started && legacy && !hasUsage(legacy)) {
+      jobs.delete(jobKey(out, {}));
+      jobs.set(key, { ...legacy, ...jobs.get(key) });
+    }
+    const previous = jobs.get(key);
+    jobs.set(key, hasUsage(previous || {}) ? { ...values, ...previous } : { ...previous, out, ...values });
+  }
+  const byOutput = new Map();
+  for (const [key, values] of jobs) byOutput.set(values.out, key);
+  for (const [file, record] of Object.entries(state.files)) {
+    if (record.kind === 'daemon') {
+      const out = file.slice(0, -7), status = state.files[`${out}.status`]?.values;
+      const key = status ? jobKey(out, status) : byOutput.get(out) || jobKey(out, record.values);
+      const previous = jobs.get(key);
+      jobs.set(key, { out, ...record.values, ...previous });
+      byOutput.set(out, key);
     } else if (record.kind === 'log' && record.total !== undefined) {
       const out = file.slice(0, -4);
-      if (!jobs.has(out)) jobs.set(out, {});
+      if (!byOutput.has(out)) {
+        const key = jobKey(out, {});
+        jobs.set(key, { out });
+        byOutput.set(out, key);
+      }
     }
   }
-  for (const message of messages.values()) {
-    add('claude', message.model, message.project, message, message.at);
-    const key = `${message.project}/${message.session}`;
-    const job = claudeJobs.get(key) || { provider: 'claude', model: message.model, name: message.session,
-      project: message.project, total: 0, at: message.at };
+  for (const [message, repo, session] of messages.values()) {
+    const day = localDay(message.at);
+    add('claude', message.model, repo, message, message.at, false, day);
+    const key = `${repo}/${session}`;
+    const job = claudeJobs.get(key) || { provider: 'claude', model: message.model, name: session,
+      project: repo, total: 0, at: message.at };
     if (Date.parse(message.at) > Date.parse(job.at)) { job.at = message.at; job.model = message.model; }
     // Rank sessions by their usage within the seven-day window, including subagents.
-    const day = localDay(message.at);
     if (day >= weekStart && day <= today) job.total += message.total;
     claudeJobs.set(key, job);
   }
   candidates.push(...claudeJobs.values());
   const claimed = new Set();
-  for (const [out, values] of jobs) {
+  const metered = new Set([...jobs.values()].filter(hasUsage)
+    .map((values) => values.thread || state.files[`${values.out}.log`]?.session).filter(Boolean));
+  for (const values of jobs.values()) {
+    const out = values.out;
     const log = state.files[`${out}.log`];
     const at = values.finished || values.started || (log?.total !== undefined ? new Date(log.mtimeMs).toISOString() : null);
     const session = values.thread || log?.session;
     const rollout = session && codex.get(session);
-    const provider = values.provider === 'gemini' || values.acp_model ? 'gemini' : 'codex';
+    const provider = values.provider === 'gemini' || Object.hasOwn(values, 'acp_model') ? 'gemini' : 'codex';
     let usage;
-    if (provider === 'gemini') {
-      if (values.usage_total === undefined && values.usage_input === undefined && values.usage_output === undefined) continue;
+    if (hasUsage(values)) {
       usage = { ...counters(), input: numeric(values.usage_input), output: numeric(values.usage_output),
+        cacheRead: numeric(values.usage_cached),
         total: numeric(values.usage_total ?? numeric(values.usage_input) + numeric(values.usage_output)), messages: 1 };
-    } else if (rollout) {
-      if (claimed.has(session)) continue;
+      if (session) claimed.add(session);
+    } else if (provider === 'gemini') continue;
+    else if (rollout) {
+      if (claimed.has(session) || metered.has(session)) continue;
       claimed.add(session);
       usage = rollout.usage;
     } else if (log?.total !== undefined) usage = { ...counters(), total: log.total, messages: 1 };
@@ -342,8 +406,57 @@ function aggregate(state, paths, now, since) {
     candidates.push({ provider: 'codex', model, name: session, project: repo, total: record.usage.total, at: record.usage.at });
   }
   const topJobs = candidates.filter((job) => job.total > 0 && localDay(job.at) >= weekStart &&
-    localDay(job.at) <= today).sort((a, b) => b.total - a.total || b.at.localeCompare(a.at)).slice(0, 10);
-  return { v: 1, at: new Date(now).toISOString(), days, topJobs };
+    localDay(job.at) <= today).sort((a, b) => b.total - a.total || b.at.localeCompare(a.at)).slice(0, allJobs ? undefined : 10);
+  return { v: 1, at: new Date(now).toISOString(), days, topJobs: allJobs ? [...claudeJobs.values()] : topJobs };
+}
+
+// Cold transcripts retain offsets and compact daily/session totals in the hot state. Their message IDs live
+// in a separate ledger, opened only on day rollover, resumption, or a cross-file duplicate with an active file.
+function restoreArchive(state, paths) {
+  if (!state.archive) return;
+  const archive = readJson(state.archive.file || paths.archive);
+  if (!archive?.files) throw new Error('usage archive is missing or corrupt');
+  for (const [file, messages] of Object.entries(archive.files)) {
+    if (state.files[file]) {
+      for (const [id, message] of Object.entries(messages)) state.files[file].messages[id] = packMessage(message);
+      delete state.files[file].archived;
+    }
+  }
+  delete state.archive;
+}
+
+function compactArchive(state, paths, now, since) {
+  if (state.archive) return;
+  const active = new Set(), cold = [];
+  for (const [file, record] of Object.entries(state.files)) {
+    if (record.kind !== 'claude') continue;
+    if (now - record.mtimeMs > 2 * 86_400_000) cold.push([file, record]);
+    else for (const id of Object.keys(record.messages)) active.add(id);
+  }
+  const files = dictionary(), ids = dictionary(), archiveState = { files: dictionary() };
+  for (const [file, record] of cold) {
+    const messages = dictionary();
+    for (const [id, message] of Object.entries(record.messages)) {
+      // A message duplicated into a live file stays in the hot ledger on both sides for max-counter merging.
+      if (active.has(id)) continue;
+      messages[id] = message;
+      ids[id] = true;
+    }
+    if (!Object.keys(messages).length) continue;
+    files[file] = messages;
+    archiveState.files[file] = { kind: 'claude', messages };
+  }
+  if (!Object.keys(files).length) return;
+  const summary = aggregate(archiveState, paths, now, since, true);
+  // Publish the ledger before its reference. An interrupted compaction leaves the original hot state recoverable.
+  const file = `${paths.archive}.${randomUUID()}`;
+  writeJson(file, { files });
+  state.archive = { file, day: localDay(now), days: summary.days, jobs: summary.topJobs, ids: archiveFilter(Object.keys(ids)) };
+  for (const [file, messages] of Object.entries(files)) {
+    const record = state.files[file];
+    for (const id of Object.keys(messages)) delete record.messages[id];
+    record.archived = true;
+  }
 }
 
 export function collectUsage({ env = process.env, now = Date.now() } = {}) {
@@ -351,8 +464,9 @@ export function collectUsage({ env = process.env, now = Date.now() } = {}) {
   if (!release) return { locked: true, bytesRead: 0 };
   try {
     const index = readStateIndex(paths.state);
+    let inspected;
     if (index && localDay(index.at) === localDay(now)) {
-      const stats = inspectSources(index, paths);
+      const stats = inspected = inspectSources(index, paths);
       const cache = stats.changedFiles ? null : readJson(paths.cache);
       if (cache?.v === 1 && cacheDigest(cache) === index.digest) {
         cache.at = new Date(now).toISOString();
@@ -362,31 +476,59 @@ export function collectUsage({ env = process.env, now = Date.now() } = {}) {
     }
     let state = readJson(paths.state);
     if (state?.v !== 1 || !state.files) state = { v: 1, files: dictionary() };
+    const previousArchive = state.archive ? state.archive.file || paths.archive : null;
+    if (!state.packed) {
+      for (const record of Object.values(state.files)) {
+        for (const [id, message] of Object.entries(record.messages || {})) record.messages[id] = packMessage(message);
+      }
+    }
+    if (state.archive && (!inspected || state.archive.day !== localDay(now))) restoreArchive(state, paths);
+    if (state.archive && [...inspected.sources].some(([file, { stat }]) => {
+      const record = state.files[file];
+      return record?.archived && (record.size !== stat.size || record.mtimeMs !== stat.mtimeMs ||
+        record.ino !== stat.ino || record.dev !== stat.dev);
+    })) restoreArchive(state, paths);
+
     const stats = { locked: false, files: 0, changedFiles: 0, bytesRead: 0, scannedBytes: 0 };
     const since = daysBefore(now, 34);
-    const scan = (file, kind) => scanFile(state, file, kind, stats, since);
-    scan(paths.registry, 'registry');
-    walk(paths.projects, (file) => { if (file.endsWith('.jsonl')) scan(file, 'claude'); });
-    walk(paths.sessions, (file) => { if (/^rollout-.*\.jsonl$/.test(path.basename(file))) scan(file, 'codex'); });
-    const outputs = new Set();
-    walk(paths.run, (file) => {
-      if (file.endsWith('.status') || file.endsWith('.daemon')) outputs.add(file.replace(/\.(?:status|daemon)$/, ''));
-      else if (jobLog(file)) outputs.add(file.slice(0, -4));
-      else if (path.basename(path.dirname(file)) === 'gem-active' && file.endsWith('.json')) scan(file, 'pointer');
-      else if (path.basename(path.dirname(file)) === 'active') scan(file, 'active');
-    });
+    const scanned = new Set(), changed = new Set(), present = new Set(inspected?.sources.keys()), activeOutputs = new Set();
+    const scan = (file, kind) => {
+      if (scanned.has(file) || inspected?.missing.has(file)) return;
+      scanned.add(file);
+      const count = stats.changedFiles;
+      if (scanFile(state, file, kind, stats, since, inspected?.sources.get(file)?.stat)) present.add(file);
+      if (stats.changedFiles !== count) changed.add(file);
+    };
+    const outputs = new Set(inspected?.outputs);
+    if (inspected) {
+      for (const [file, { kind }] of inspected.sources) scan(file, kind);
+    } else {
+      scan(paths.registry, 'registry');
+      walk(paths.projects, (file) => { if (file.endsWith('.jsonl')) scan(file, 'claude'); });
+      walk(paths.sessions, (file) => { if (/^rollout-.*\.jsonl$/.test(path.basename(file))) scan(file, 'codex'); });
+      walk(paths.run, (file) => {
+        if (file.endsWith('.status') || file.endsWith('.daemon')) outputs.add(file.replace(/\.(?:status|daemon)$/, ''));
+        else if (jobLog(file)) outputs.add(file.slice(0, -4));
+        else if (path.basename(path.dirname(file)) === 'gem-active' && file.endsWith('.json')) scan(file, 'pointer');
+        else if (path.basename(path.dirname(file)) === 'active') scan(file, 'active');
+      });
+    }
+    const sinceTime = Date.parse(`${since}T00:00:00`);
     for (const [file, record] of Object.entries(state.files)) {
       if (record.kind === 'registry') {
-        for (const [out, values] of Object.entries(record.records)) {
-          if (values.finished && localDay(values.finished) < since) delete record.records[out];
-          else outputs.add(out);
+        for (const [key, values] of Object.entries(record.records)) {
+          if (values.finished && localDay(values.finished) < since) delete record.records[key];
+          else if (!inspected || changed.has(file)) outputs.add(values.out);
         }
       } else if (record.kind === 'pointer' || record.kind === 'active') {
-        if (localPath(record.values?.out)) outputs.add(record.values.out);
-      } else if (record.kind === 'status') outputs.add(file.slice(0, -7));
-      if (record.kind === 'claude') {
+        if (localPath(record.values?.out) && present.has(file)) {
+          outputs.add(record.values.out);
+          activeOutputs.add(record.values.out);
+        }
+      } else if (record.kind === 'status' && (!inspected || present.has(file))) outputs.add(file.slice(0, -7));
+      if (record.kind === 'claude' && !inspected) {
         for (const [id, message] of Object.entries(record.messages)) {
-          if (localDay(message.at) < since) delete record.messages[id];
+          if (Date.parse(Array.isArray(message) ? message[6] : message.at) < sinceTime) delete record.messages[id];
         }
       } else if (record.kind === 'codex' && record.usage && localDay(record.usage.at) < since) delete record.usage;
     }
@@ -396,14 +538,28 @@ export function collectUsage({ env = process.env, now = Date.now() } = {}) {
       scan(`${out}.daemon`, 'daemon');
       scan(`${out}.log`, 'log');
     }
+    if (state.archive) {
+      const ids = state.archive.ids;
+      const filter = ids.bits ? { bits: Buffer.from(ids.bits, 'base64'), mask: ids.mask } : null;
+      if ([...changed].some((file) => state.files[file]?.kind === 'claude' &&
+          Object.keys(state.files[file].messages).some((id) => filter ? filterContains(filter, id) : ids[id]))) {
+        restoreArchive(state, paths);
+      }
+    }
     const cache = aggregate(state, paths, now, since);
+    compactArchive(state, paths, now, since);
     // State is authoritative; a crash between renames is repaired by the next collect.
     const files = Object.fromEntries(Object.entries(state.files).map(([file, record]) =>
       [file, [record.size, record.mtimeMs, record.dev, record.ino]]));
-    writeJson(paths.state, { files: state.files }, {
-      v: 1, at: cache.at, index: files, outputs: [...outputs], digest: cacheDigest(cache)
+    // Deleted scratch files are historical counters, not permanent filesystem poll targets. A new registry
+    // record, run-directory file, or live pointer rediscovers an output if its path is reused later.
+    const retainedOutputs = [...outputs].filter((out) => activeOutputs.has(out) ||
+      ['status', 'daemon', 'log'].some((extension) => present.has(`${out}.${extension}`)));
+    writeJson(paths.state, { files: state.files, ...(state.archive ? { archive: state.archive } : {}) }, {
+      v: 1, packed: true, at: cache.at, index: files, outputs: retainedOutputs, digest: cacheDigest(cache)
     });
     writeJson(paths.cache, cache);
+    if (previousArchive && previousArchive !== state.archive?.file) fs.rmSync(previousArchive, { force: true });
     return { ...stats, elapsedMs: Math.round(performance.now() - started) };
   } finally { release(); }
 }
@@ -432,14 +588,20 @@ function readStateIndex(file) {
 
 function inspectSources(index, paths) {
   const stats = { locked: false, files: 0, changedFiles: 0, bytesRead: 0, scannedBytes: 0 }, seen = new Set();
-  const outputs = new Set(index.outputs);
-  const inspect = (file) => {
+  const outputs = new Set(index.outputs), sources = new Map(), missing = new Set();
+  Object.defineProperties(stats, { sources: { value: sources }, outputs: { value: outputs }, missing: { value: missing } });
+  const inspect = (file, kind) => {
     if (seen.has(file)) return;
     seen.add(file);
     let stat;
     try { stat = fs.statSync(file); }
-    catch (error) { if (['ENOENT', 'ENOTDIR'].includes(error.code)) return; throw error; }
+    catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes(error.code)) throw error;
+      missing.add(file);
+      return;
+    }
     if (!stat.isFile()) return;
+    sources.set(file, { stat, kind });
     stats.files++;
     stats.scannedBytes += stat.size;
     const saved = index.index[file];
@@ -447,18 +609,18 @@ function inspectSources(index, paths) {
       stats.changedFiles++;
     }
   };
-  inspect(paths.registry);
-  walk(paths.projects, (file) => { if (file.endsWith('.jsonl')) inspect(file); });
-  walk(paths.sessions, (file) => { if (/^rollout-.*\.jsonl$/.test(path.basename(file))) inspect(file); });
+  inspect(paths.registry, 'registry');
+  walk(paths.projects, (file) => { if (file.endsWith('.jsonl')) inspect(file, 'claude'); });
+  walk(paths.sessions, (file) => { if (/^rollout-.*\.jsonl$/.test(path.basename(file))) inspect(file, 'codex'); });
   walk(paths.run, (file) => {
     if (file.endsWith('.status') || file.endsWith('.daemon')) outputs.add(file.replace(/\.(?:status|daemon)$/, ''));
     else if (jobLog(file)) outputs.add(file.slice(0, -4));
-    else if (path.basename(path.dirname(file)) === 'gem-active' && file.endsWith('.json')) inspect(file);
-    else if (path.basename(path.dirname(file)) === 'active') inspect(file);
+    else if (path.basename(path.dirname(file)) === 'gem-active' && file.endsWith('.json')) inspect(file, 'pointer');
+    else if (path.basename(path.dirname(file)) === 'active') inspect(file, 'active');
   });
   for (const out of outputs) {
     if (!localPath(out)) continue;
-    for (const extension of ['status', 'daemon', 'log']) inspect(`${out}.${extension}`);
+    for (const extension of ['status', 'daemon', 'log']) inspect(`${out}.${extension}`, extension);
   }
   return stats;
 }
