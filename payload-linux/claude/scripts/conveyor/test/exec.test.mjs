@@ -20,7 +20,9 @@ async function environment() {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'conveyor exec test-'));
   const changes = {
     CONVEYOR_HOME: path.join(root, 'home'), LUNA_RUN_DIR: path.join(root, 'luna-run'),
-    CONVEYOR_LUNA_SH: fixture, CONVEYOR_GEM_SH: fixture, CLAUDE_HOME_DIR: path.join(root, 'claude')
+    CONVEYOR_LUNA_SH: fixture, CONVEYOR_GEM_SH: fixture, CLAUDE_HOME_DIR: path.join(root, 'claude'),
+    PATH: `${path.join(root, 'bin')}${path.delimiter}${process.env.PATH}`,
+    CLAUDE_CODE_SESSION_ID: 'gate-session', CONVEYOR_GATE_ROUNDS: '2'
   };
   const previous = Object.fromEntries(Object.keys(changes).map((key) => [key, process.env[key]]));
   Object.assign(process.env, changes);
@@ -31,6 +33,24 @@ async function environment() {
       await fs.mkdir(dir);
       await fs.mkdir(changes.LUNA_RUN_DIR);
       await fs.writeFile(brief, 'Inspect the fixture.\n');
+      await fs.mkdir(path.join(root, 'bin'));
+      await fs.writeFile(path.join(root, 'bin', 'git'), `#!${process.execPath}
+const fs = require('node:fs');
+const stateFile = ${JSON.stringify(path.join(root, 'git.json'))};
+if (!fs.existsSync(stateFile)) process.exit(128);
+const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+const args = process.argv.slice(4);
+let files;
+if (args[0] === 'rev-parse') {
+  process.stdout.write(args[1] === '--show-toplevel' ? ${JSON.stringify(dir)} : state.head);
+} else {
+  if (args[0] === 'diff') files = state.working;
+  else if (args[0] === 'log') files = state.committed || [];
+  else if (args[0] === 'ls-files') files = args.includes('--cached') ? state.files : state.untracked;
+  else throw new Error('unexpected fake git arguments: ' + JSON.stringify(args));
+  process.stdout.write(files.length ? files.join('\\0') + '\\0' : '');
+}
+`, { mode: 0o755 });
     },
     command(args, extraEnv = {}) {
       const result = spawnSync(process.execPath, [cli, ...args], {
@@ -56,6 +76,68 @@ async function environment() {
         else process.env[key] = value;
       }
       await fs.rm(root, { recursive: true, force: true });
+    }
+  };
+}
+
+async function gateFixture(env, scenario = 'green', mode = 'block') {
+  const stateFile = path.join(env.root, 'git.json'), calls = path.join(env.root, 'launches.jsonl');
+  const checks = path.join(env.root, 'checks.jsonl'), wrapper = path.join(env.root, 'gate-wrapper.sh');
+  const runner = path.join(env.root, 'gate-wrapper.mjs'), checker = path.join(env.root, 'check.mjs');
+  await fs.mkdir(path.join(env.dir, '.claude'));
+  await fs.writeFile(path.join(env.dir, '.claude', 'conveyor.json'), JSON.stringify({ gate: { mode } }));
+  for (const file of ['source.js', 'dirty.txt', 'old.txt']) await fs.writeFile(path.join(env.dir, file), 'before\n');
+  await fs.writeFile(stateFile, JSON.stringify({
+    head: 'fixture-base', working: ['dirty.txt'], untracked: ['old.txt'],
+    files: ['source.js', 'dirty.txt', 'old.txt', '.claude/conveyor.json']
+  }));
+  await fs.writeFile(wrapper, 'exec "$FAKE_GATE_NODE" "$FAKE_GATE_WRAPPER" "$@"\n');
+  await fs.writeFile(runner, `import * as fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+const option = (name) => args[args.indexOf(name) + 1];
+const calls = ${JSON.stringify(calls)}, stateFile = ${JSON.stringify(stateFile)};
+fs.appendFileSync(calls, JSON.stringify(args) + '\\n');
+const round = fs.readFileSync(calls, 'utf8').trim().split('\\n').length;
+const dir = option('-C'), out = option('-o');
+const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+fs.writeFileSync(path.join(dir, 'source.js'), 'change ' + round + '\\n');
+fs.writeFileSync(path.join(dir, 'new.txt'), 'new\\n');
+fs.writeFileSync(path.join(dir, 'committed.js'), 'committed\\n');
+state.head = 'fixture-head';
+state.working = ['dirty.txt', 'source.js'];
+state.untracked = ['old.txt', 'new.txt'];
+state.committed = ['committed.js'];
+state.files = [...new Set([...state.files, 'new.txt', 'committed.js'])];
+if (round > 1 && process.env.FAKE_GATE_SCENARIO === 'weaken') {
+  fs.writeFileSync(path.join(dir, 'eslint.config.js'), 'export default [];\\n');
+  state.files.push('eslint.config.js');
+}
+fs.writeFileSync(stateFile, JSON.stringify(state));
+fs.writeFileSync(out, 'Requested change done.\\n');
+fs.writeFileSync(out + '.status', 'state=done\\n');
+`);
+  await fs.writeFile(checker, `import * as fs from 'node:fs';
+const args = process.argv.slice(2), option = (name) => args[args.indexOf(name) + 1];
+fs.appendFileSync(${JSON.stringify(checks)}, JSON.stringify(args) + '\\n');
+const round = fs.readFileSync(${JSON.stringify(calls)}, 'utf8').trim().split('\\n').length;
+const scenario = process.env.FAKE_GATE_SCENARIO;
+const ok = scenario === 'green' || (scenario === 'repair' && round > 1);
+const level = option('--level');
+process.stdout.write(JSON.stringify({
+  ok, level, repo: option('--dir'), base: option('--base'), changed: option('--files').split(','),
+  results: [{ name: level + '-check', cmd: ['fake', level], status: ok ? 'pass' : 'fail',
+    rc: ok ? 0 : 1, durationMs: 12, outputTail: ok ? '' : 'fixture failure tail' }],
+  hygiene: { ok, grew: ok ? [] : [{ file: 'source.js', counter: 'suppression', before: 0, after: 1 }] }
+}));
+process.exitCode = ok ? 0 : 1;
+`);
+  return {
+    calls, checks,
+    env: {
+      CONVEYOR_LUNA_SH: wrapper, CONVEYOR_GEM_SH: wrapper, FAKE_GATE_NODE: process.execPath,
+      FAKE_GATE_WRAPPER: runner, FAKE_GATE_SCENARIO: scenario,
+      CONVEYOR_CHECK_CMD: JSON.stringify([process.execPath, checker])
     }
   };
 }
@@ -615,5 +697,119 @@ test('catalog add/remove validate efforts and refuse models referenced by tiers 
     action(env, ['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-9-panel', '--actor', 'panel']);
     assert.ok(!(await loadConfig()).catalog.gemini.some((entry) => entry.model === 'gemini-9-panel'));
     assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
+  } finally { await env.cleanup(); }
+});
+
+test('a green write gate appends checks and records the owner, excluding pre-existing dirt', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const gate = await gateFixture(env);
+    const run = env.run('complex', '-w', gate.env);
+    assert.equal(run.status, 0, run.stderr);
+    const output = await fs.readFile(env.out, 'utf8');
+    assert.match(output, /Requested change done\.[\s\S]*## Gate[\s\S]*pass/);
+    assert.match(output, /fast-check: pass \(12 ms\)/);
+    assert.match(output, /turn-check: pass \(12 ms\)/);
+    const checks = await readLines(gate.checks);
+    assert.deepEqual(checks.map((args) => args[args.indexOf('--level') + 1]), ['fast', 'turn']);
+    for (const args of checks) {
+      assert.equal(args[args.indexOf('--base') + 1], 'fixture-base');
+      assert.equal(args[args.indexOf('--files') + 1], 'committed.js,new.txt,source.js');
+    }
+    const dispatch = await readJson(`${env.out}.dispatch.json`);
+    assert.equal(dispatch.gate.status, 'pass');
+    assert.equal(dispatch.gate.rounds, 0);
+    const [owner] = await readLines(path.join(paths().home, 'sessions', 'gate-session.jsonl'));
+    assert.deepEqual(owner, {
+      at: owner.at, session: 'gate-session', repo: env.dir, base: 'fixture-base', out: env.out, tier: 'complex', mode: 'block'
+    });
+    assert.ok(Number.isFinite(Date.parse(owner.at)));
+  } finally { await env.cleanup(); }
+});
+
+test('a red gate repairs on the same provider and preserves the brief and failure details', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const original = 'Implement this exact change.\n\nKeep the original brief verbatim.\n';
+    await fs.writeFile(env.brief, original);
+    const gate = await gateFixture(env, 'repair');
+    const run = env.run('complex', '-w', gate.env);
+    assert.equal(run.status, 0, run.stderr);
+    const fixBrief = await fs.readFile(`${env.out}.gate-1.brief.md`, 'utf8');
+    assert.ok(fixBrief.startsWith(original));
+    assert.match(fixBrief, /The work above is done but failed the project's checks/);
+    assert.match(fixBrief, /fixture failure tail/);
+    assert.match(fixBrief, /hygiene: source.js suppression: 0 → 1/);
+    assert.match(fixBrief, /Do not weaken, skip or delete checks, tests, lint rules or hygiene counters/);
+    assert.match(fixBrief, /Do not revert the requested change/);
+    const launches = await readLines(gate.calls);
+    assert.equal(launches.length, 2);
+    for (const args of launches) {
+      assert.deepEqual(args.slice(0, 5), ['-w', '-m', 'gpt-6.1-sol', '-e', 'max']);
+    }
+    assert.equal(launches[1][launches[1].indexOf('-f') + 1], `${env.out}.gate-1.brief.md`);
+    assert.equal(launches[1][launches[1].indexOf('-o') + 1], `${env.out}.gate-1.out.md`);
+    const output = await fs.readFile(env.out, 'utf8');
+    assert.match(output, /Round 0: fail[\s\S]*Round 1: pass[\s\S]*## Gate: pass/);
+    assert.equal((await readLines(gate.checks)).length, 4);
+    assert.equal((await readJson(`${env.out}.dispatch.json`)).gate.rounds, 1);
+  } finally { await env.cleanup(); }
+});
+
+test('a gate still red after the configured repair budget exits 6 and records its last results', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const gate = await gateFixture(env, 'red');
+    const run = env.run('complex', '-w', { ...gate.env, CONVEYOR_GATE_ROUNDS: '1' });
+    assert.equal(run.status, 6, run.stderr);
+    const dispatch = await readJson(`${env.out}.dispatch.json`);
+    assert.equal(dispatch.code, 6);
+    assert.equal(dispatch.gate.status, 'fail');
+    assert.equal(dispatch.gate.rounds, 1);
+    assert.equal(dispatch.gate.last.ok, false);
+    assert.deepEqual(dispatch.gate.last.results.map((result) => result.name), ['fast-check', 'turn-check']);
+    assert.equal((await readLines(gate.calls)).length, 2);
+    assert.equal((await readLines(gate.checks)).length, 4);
+    assert.match(await fs.readFile(env.out, 'utf8'), /Round 0: fail[\s\S]*Round 1: fail[\s\S]*## Gate: fail/);
+  } finally { await env.cleanup(); }
+});
+
+test('a repair touching check configuration stops before another check or repair', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const gate = await gateFixture(env, 'weaken');
+    const run = env.run('complex', '-w', gate.env);
+    assert.equal(run.status, 6, run.stderr);
+    assert.match(await fs.readFile(env.out, 'utf8'),
+      /## Gate: fail \(fix round touched check configuration: eslint.config.js\)/);
+    assert.equal((await readLines(gate.calls)).length, 2);
+    assert.equal((await readLines(gate.checks)).length, 2);
+    const dispatch = await readJson(`${env.out}.dispatch.json`);
+    assert.equal(dispatch.gate.status, 'fail');
+    assert.equal(dispatch.gate.rounds, 1);
+    assert.deepEqual(dispatch.gate.touched, ['eslint.config.js']);
+  } finally { await env.cleanup(); }
+});
+
+test('warn mode reports failures without repair and non-git jobs skip the gate', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const gate = await gateFixture(env, 'red', 'warn');
+    const warn = env.run('complex', '-w', gate.env);
+    assert.equal(warn.status, 0, warn.stderr);
+    assert.equal((await readLines(gate.calls)).length, 1);
+    assert.match(await fs.readFile(env.out, 'utf8'), /## Gate: warn[\s\S]*fixture failure tail/);
+    assert.equal((await readJson(`${env.out}.dispatch.json`)).gate.status, 'warn');
+    await fs.rm(path.join(env.root, 'git.json'));
+    const nonGit = env.run('complex', '-w', { CONVEYOR_CHECK_CMD: 'invalid JSON; must never be used' });
+    assert.equal(nonGit.status, 0, nonGit.stderr);
+    assert.equal((await readLines(gate.checks)).length, 2);
+    assert.equal((await readJson(`${env.out}.dispatch.json`)).gate.status, 'skipped');
+    assert.match(await fs.readFile(env.out, 'utf8'), /skipped: not a git repository/);
   } finally { await env.cleanup(); }
 });

@@ -5,7 +5,8 @@ import { readFileSync, statSync, watch, constants } from 'node:fs';
 import path from 'node:path';
 import { constants as osConstants } from 'node:os';
 import { execFile, spawn } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
   loadConfig, saveConfig, providerState, resolveChain, resolvePanel, markUnavailable,
@@ -19,6 +20,231 @@ const quotaError = new RegExp([
 ].join('|'), 'i');
 const unavailableReasons = ['quota', 'region', 'auth', 'start'];
 const execute = promisify(execFile);
+const gitOptions = { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 };
+export const gateInstruction = 'Fix the root cause in the code. Do not weaken, skip or delete checks, ' +
+  'tests, lint rules or hygiene counters. Do not revert the requested change.';
+
+async function git(repo, args) {
+  const { stdout } = await execute('git', ['-C', repo, ...args], gitOptions);
+  return stdout;
+}
+
+export async function gateRepository(dir) {
+  try {
+    const repo = (await git(dir, ['rev-parse', '--show-toplevel'])).trim();
+    return { repo, base: (await git(repo, ['rev-parse', 'HEAD'])).trim() };
+  } catch (error) {
+    if (error.code !== 128) throw error;
+    return { repo: dir, base: null };
+  }
+}
+
+async function workingFiles(repo) {
+  const tracked = await git(repo, ['diff', '--name-only', '--no-renames', '-z', 'HEAD', '--']);
+  const untracked = await git(repo, ['ls-files', '--others', '--exclude-standard', '-z']);
+  return [...new Set(`${tracked}${untracked}`.split('\0').filter(Boolean))];
+}
+
+export async function gateChangedFiles(repo, base, preExisting = []) {
+  const previous = new Set(preExisting);
+  const working = (await workingFiles(repo)).filter((file) => !previous.has(file));
+  const committed = await git(repo, ['log', '--format=', '--name-only', '--no-renames', '-m', '-z', `${base}..HEAD`, '--']);
+  return [...new Set([...working, ...committed.split('\0').filter(Boolean)])].sort();
+}
+
+export async function gateMode(repo) {
+  let profile;
+  try { profile = JSON.parse(await fs.readFile(path.join(repo, '.claude', 'conveyor.json'), 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return 'block'; throw error; }
+  const mode = profile.gate?.mode ?? 'block';
+  if (!['block', 'warn', 'off'].includes(mode)) throw new Error('gate.mode must be block, warn or off');
+  return mode;
+}
+
+export function gateSessionFile(session) {
+  return path.join(paths().home, 'sessions', `${encodeURIComponent(session)}.jsonl`);
+}
+
+function failedCheck(result) {
+  return (typeof result.rc === 'number' && result.rc !== 0) || /^(fail|failed|error)$/.test(result.status);
+}
+
+export function gateDetails(last, failuresOnly = false) {
+  const lines = [];
+  for (const result of last.results || []) {
+    if (failuresOnly && !failedCheck(result)) continue;
+    lines.push(`- ${result.name}: ${result.status} (${result.durationMs ?? 0} ms)`);
+    if (failedCheck(result)) lines.push(`  cmd: ${JSON.stringify(result.cmd)}\n\n${result.outputTail || ''}`);
+  }
+  for (const item of last.hygiene?.grew || []) {
+    lines.push(`- hygiene: ${item.file} ${item.counter}: ${item.before} → ${item.after}`);
+  }
+  return lines.join('\n') || (last.ok ? 'No checks selected.' : 'Checks failed; no failure details were returned.');
+}
+
+export async function runGateChecks(repo, base, files) {
+  const last = { ok: true, repo, base, changed: files, results: [], hygiene: { ok: true, grew: [] } };
+  if (!files.length) return last;
+  let command;
+  try {
+    command = process.env.CONVEYOR_CHECK_CMD === undefined
+      ? [process.execPath, fileURLToPath(new URL('./check.mjs', import.meta.url))]
+      : JSON.parse(process.env.CONVEYOR_CHECK_CMD);
+    if (!Array.isArray(command) || !command.length || command.some((item) => typeof item !== 'string' || !item)) {
+      throw new Error('CONVEYOR_CHECK_CMD must be non-empty JSON argv');
+    }
+  } catch (error) {
+    last.ok = false;
+    last.configError = error.message;
+    return last;
+  }
+  for (const level of ['fast', 'turn']) {
+    const args = [...command.slice(1), 'run', '--dir', repo, '--level', level, '--base', base,
+      '--files', files.join(','), '--json'];
+    let stdout, stderr = '', code = 0;
+    try {
+      ({ stdout, stderr } = await execute(command[0], args, {
+        encoding: 'utf8', cwd: repo, timeout: 300_000, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024
+      }));
+    } catch (error) {
+      if (![1, 2].includes(error.code)) throw error;
+      ({ stdout, stderr, code } = error);
+    }
+    if (code === 2) {
+      last.configError = (stdout || stderr || 'check exited 2').trim();
+      last.ok = false;
+      return last;
+    }
+    const report = JSON.parse(stdout);
+    if (typeof report.ok !== 'boolean' || !Array.isArray(report.results) || typeof report.hygiene?.ok !== 'boolean') {
+      throw new Error('check returned invalid JSON report');
+    }
+    last.ok &&= code === 0 && report.ok && report.hygiene.ok;
+    last.results.push(...report.results);
+    last.hygiene.ok &&= report.hygiene.ok;
+    for (const item of report.hygiene.grew || []) {
+      if (!last.hygiene.grew.some((previous) => isDeepStrictEqual(previous, item))) last.hygiene.grew.push(item);
+    }
+  }
+  return last;
+}
+
+function checkConfiguration(file) {
+  const name = path.posix.basename(file);
+  return /^(\.eslintrc.*|eslint\.config\..*|tsconfig.*\.json|vitest\.config\..*|jest\.config\..*|pytest\.ini)$/.test(name) ||
+    /(^|\/)(\.claude\/conveyor\.json|\.conveyor\/hygiene-baseline\.json)$/.test(file);
+}
+
+function testFile(file) {
+  return /(^|\/)(tests?|__tests__)\//.test(file) || /(^|\/)(test[._-]|.*(?:_test|\.test|\.spec)\.)/.test(file);
+}
+
+function pythonCheckSections(text) {
+  let selected = false;
+  return text.split(/\r?\n/).filter((line) => {
+    if (/^\s*\[/.test(line)) selected = /^\s*\[\[?tool\.(ruff|mypy)(\.|\])/.test(line);
+    return selected;
+  }).join('\n');
+}
+
+async function protectedFiles(repo) {
+  const files = (await git(repo, ['ls-files', '--cached', '--others', '--exclude-standard', '-z'])).split('\0');
+  const snapshot = new Map();
+  for (const file of new Set(files.filter(Boolean))) {
+    const config = checkConfiguration(file), python = path.posix.basename(file) === 'pyproject.toml';
+    if (!config && !python && !testFile(file)) continue;
+    try {
+      if (config || python) {
+        const content = await fs.readFile(path.join(repo, file));
+        const protectedContent = python ? pythonCheckSections(content.toString()) : content;
+        if (!python || protectedContent) {
+          snapshot.set(file, createHash('sha256').update(protectedContent).digest('hex'));
+        }
+      } else {
+        await fs.lstat(path.join(repo, file));
+        snapshot.set(file, 'test');
+      }
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  return snapshot;
+}
+
+async function prepareGate(dir, brief, out, tier, skip) {
+  const gate = { ...await gateRepository(dir), mode: 'off', preExisting: [] };
+  try { gate.mode = skip ? 'off' : await gateMode(gate.repo); }
+  catch (error) { gate.mode = 'block'; gate.configError = error.message; }
+  if (gate.base && gate.mode !== 'off') gate.preExisting = await workingFiles(gate.repo);
+  gate.brief = await fs.readFile(brief, 'utf8');
+  const session = process.env.CLAUDE_CODE_SESSION_ID || 'unknown', file = gateSessionFile(session);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.appendFile(file, `${JSON.stringify({
+    at: new Date().toISOString(), session, repo: gate.repo, base: gate.base, out, tier, mode: gate.mode
+  })}\n`, { mode: 0o600 });
+  return gate;
+}
+
+async function finishGate(gate, dispatch, entry, dir, out) {
+  if (!gate || gate.mode === 'off') return 0;
+  const append = (text) => fs.appendFile(out, `${text}\n`);
+  if (!gate.base) {
+    dispatch.gate = { status: 'skipped', reason: 'not a git repository with HEAD' };
+    await append(`\n## Gate\n\nskipped: ${dispatch.gate.reason}`);
+    return 0;
+  }
+  let rounds = 0, last;
+  const configError = async (message) => {
+    dispatch.gate = { status: 'config error', rounds, last, message };
+    await append(`\n## Gate: config error\n\n${message}`);
+    return 0;
+  };
+  try {
+    if (gate.configError) return await configError(gate.configError);
+    const raw = process.env.CONVEYOR_GATE_ROUNDS ?? '2';
+    if (!/^[0-2]$/.test(raw)) return await configError('CONVEYOR_GATE_ROUNDS must be 0, 1 or 2');
+    const limit = Number(raw);
+    let files = await gateChangedFiles(gate.repo, gate.base, gate.preExisting);
+    if (!files.length) return 0;
+    await append('\n## Gate\n');
+    last = await runGateChecks(gate.repo, gate.base, files);
+    while (true) {
+      if (last.configError) return await configError(last.configError);
+      await append(`Round ${rounds}: ${last.ok ? 'pass' : 'fail'}\n\n${gateDetails(last)}`);
+      if (last.ok || gate.mode === 'warn' || rounds === limit) break;
+      const before = await protectedFiles(gate.repo);
+      rounds++;
+      const brief = `${out}.gate-${rounds}.brief.md`, fixOut = `${out}.gate-${rounds}.out.md`;
+      await fs.writeFile(brief, gate.brief + '\n\n## The work above is done but failed the project\'s checks\n\n' +
+        `${gateDetails(last, true)}\n\n${gateInstruction}\n`);
+      const result = await launch(entry, ['-w', '-m', entry.model, '-e', entry.effort,
+        '-C', dir, '-f', brief, '-o', fixOut], dir);
+      const after = await protectedFiles(gate.repo);
+      const touched = [...new Set([...before.keys(), ...after.keys()])].filter((file) =>
+        before.get(file) !== after.get(file) && (checkConfiguration(file) ||
+          path.posix.basename(file) === 'pyproject.toml' || (before.has(file) && !after.has(file)))).sort();
+      if (touched.length) {
+        dispatch.gate = { status: 'fail', rounds, last, touched };
+        await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round touched check configuration: ${touched.join(', ')})`);
+        return 6;
+      }
+      if (result.code !== 0) {
+        dispatch.gate = { status: 'fail', rounds, last, fixCode: result.code };
+        await append(`Round ${rounds}: wrapper exited ${result.code}\n\n## Gate: fail\n\n${gateDetails(last)}`);
+        return 6;
+      }
+      files = await gateChangedFiles(gate.repo, gate.base, gate.preExisting);
+      last = await runGateChecks(gate.repo, gate.base, files);
+    }
+    const status = last.ok ? 'pass' : gate.mode === 'warn' ? 'warn' : 'fail';
+    dispatch.gate = { status, rounds, last };
+    await append(`\n## Gate: ${status}\n\n${gateDetails(last)}`);
+    return status === 'fail' ? 6 : 0;
+  } catch (error) {
+    const status = gate.mode === 'warn' ? 'warn' : 'fail';
+    dispatch.gate = { status, rounds, last, message: error.message };
+    await append(`\n## Gate: ${status}\n\n${error.message}`);
+    return status === 'fail' ? 6 : 0;
+  }
+}
 
 function options(args, allowed) {
   const result = Object.create(null);
@@ -385,10 +611,14 @@ function targetFor(opts, config) {
 async function runCommand(args) {
   const opts = options(args, {
     '--tier': true, '--panel': true, '--seat': true, '--role': true,
+    '--no-gate': false, '--waive': true,
     '-w': false, '-r': false, '-C': true, '-f': true, '-o': true
   });
   required(opts, ['-C', '-f', '-o']);
   if (Boolean(opts['-w']) === Boolean(opts['-r'])) throw new Error('exactly one of -w or -r is required');
+  if ((opts['--no-gate'] && !opts['--waive']) || (opts['--waive'] && !/^W-\d+$/.test(opts['--waive']))) {
+    throw new Error('--no-gate requires --waive <id> with format W-<digits>');
+  }
   const config = await loadConfig();
   const role = opts['--role'];
   const target = targetFor(opts, config);
@@ -417,6 +647,9 @@ async function runCommand(args) {
     ...(role ? { role } : {}), brief, out, mode, dir,
     action: 'resolve', selected: null, chain: resolution.chain, attempts: []
   };
+  if (opts['--waive']) dispatch.waive = opts['--waive'];
+  if (opts['--no-gate']) dispatch.noGate = true;
+  const gate = mode === 'write' ? await prepareGate(dir, brief, out, tier, panel || opts['--no-gate']) : null;
   const saveDispatch = () => writeJsonAtomic(`${out}.dispatch.json`, dispatch);
   let cursor = -1, from = null, failedReason = null;
   while (true) {
@@ -471,8 +704,11 @@ async function runCommand(args) {
     const retryable = result.code === 3 || (result.code !== 0 && quotaError.test(observed.values?.error || ''));
     if (panel || !retryable || (mode === 'write' && observed.reachedRunning) || result.signal) {
       attempt.retry = false;
+      if (result.code === 0 && ['done', 'incomplete'].includes(observed.values?.state)) {
+        dispatch.code = await finishGate(gate, dispatch, entry, dir, out);
+      }
       await saveDispatch();
-      return result.code;
+      return dispatch.code;
     }
     attempt.retry = true;
     attempt.reason = `${failure.reason}: ${failure.note}`;
@@ -547,7 +783,8 @@ export async function main(args = process.argv.slice(2)) {
   }
   throw new Error('usage: exec.mjs resolve (--tier <tier>|--panel <name>|--role <name>) [--json] ' +
     '[--first-available] | run (--tier <tier>|--panel <name> --seat <n>|--role <name>) ' +
-    '(-w|-r) -C <dir> -f <brief> -o <out> | roles render [--out <path>] | status [--json] | config … | catalog …');
+    '(-w|-r) -C <dir> -f <brief> -o <out> [--no-gate --waive W-<digits>] | ' +
+    'roles render [--out <path>] | status [--json] | config … | catalog …');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
