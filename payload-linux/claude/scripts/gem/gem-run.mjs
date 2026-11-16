@@ -480,6 +480,13 @@ class Job {
     this.values.elapsed_s = ((performance.now() - this.started) / 1000).toFixed(3);
     atomicWrite(`${this.options.out}.status`, Object.entries(this.values)
       .map(([key, value]) => `${key}=${oneLine(value)}\n`).join(''));
+    if (this.activeFile) {
+      atomicWrite(this.activeFile, JSON.stringify({
+        v: 1, id: path.basename(this.activeFile, '.json'), out: this.options.out,
+        owner: oneLine(this.values.owner), started: this.values.started,
+        pid: this.values.pid || null, wrapper_pid: process.pid
+      }) + '\n');
+    }
     this.statusWritten = true;
   }
 
@@ -545,6 +552,10 @@ class Job {
     const flags = constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_APPEND | constants.O_NOFOLLOW;
     this.outputFd = openSync(options.out, flags, 0o600);
     this.logFd = openSync(`${options.out}.log`, flags, 0o600);
+    const active = path.join(process.env.LUNA_RUN_DIR || path.join(this.home, '.claude/luna-run'), 'gem-active');
+    mkdirSync(active, { recursive: true, mode: 0o700 });
+    const id = createHash('sha1').update(options.out).digest('hex').slice(0, 16);
+    this.activeFile = path.join(active, `${id}.json`);
     this.status();
   }
 
@@ -785,6 +796,7 @@ class Job {
         catch (error) { result = { state: 'failed', rc: 1, error: `cleanup failed: ${oneLine(error.message)}` }; }
         if (this.ownsOutput) result = this.finalize(result);
       } finally {
+        if (this.activeFile) { try { unlinkSync(this.activeFile); } catch {} }
         try { this.outputLock?.release(); }
         catch (error) { result = { state: 'failed', rc: 1, error: `cleanup failed: ${oneLine(error.message)}` }; }
         for (const fd of [this.outputFd, this.logFd]) {

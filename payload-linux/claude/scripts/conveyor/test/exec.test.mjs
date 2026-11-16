@@ -104,6 +104,7 @@ test('validation rejects invalid schema; atomic saves journal a diff', { timeout
     assert.equal(applied.id, journal.id);
     assert.equal(journal.actor, 'panel');
     assert.equal(journal.note, 'threshold control');
+    assert.deepEqual(journal.before, await readJson(defaultFile));
     assert.ok(Number.isFinite(Date.parse(journal.at)));
     assert.deepEqual(journal.diff, { 'thresholds.codex.switch_percent': [80, 81] });
     const before = await fs.readFile(paths().config, 'utf8');
@@ -412,5 +413,207 @@ test('roles render and override tiers; labelled presets validate and journal cha
     assert.deepEqual(journal.at(-1).diff['tiers.complex.0.model'], ['gpt-6.1-sol', 'haiku']);
     assert.deepEqual((await applyPreset('economy')).tiers.complex, config.presets.economy.tiers.complex);
     assert.deepEqual((await readLines(paths().journal)).at(-1).diff, {});
+  } finally { await env.cleanup(); }
+});
+
+function action(env, args, extraEnv = {}) {
+  const result = env.command(args, extraEnv);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  assert.equal(result.stdout.trim().split('\n').length, 1);
+  const value = JSON.parse(result.stdout);
+  assert.deepEqual(Object.keys(value), ['ok', 'changed', 'note']);
+  assert.equal(value.ok, true);
+  assert.equal(typeof value.changed, 'boolean');
+  assert.equal(typeof value.note, 'string');
+  return value;
+}
+
+test('set-entry validates catalog efforts, edits panel seats and journals the panel actor', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const target = ['--tier', 'complex', '--index', '0', '--provider', 'codex', '--model', 'gpt-6.1-sol'];
+    const edited = action(env, ['config', 'set-entry', ...target, '--effort', 'high', '--actor', 'panel']);
+    assert.equal(edited.changed, true);
+    assert.equal((await loadConfig()).tiers.complex[0].effort, 'high');
+    const before = await fs.readFile(paths().config, 'utf8');
+    const journalBefore = await fs.readFile(paths().journal, 'utf8');
+    const invalid = env.command(['config', 'set-entry', ...target, '--effort', 'ultra', '--actor', 'panel']);
+    assert.equal(invalid.status, 1);
+    assert.equal(invalid.stdout, '');
+    assert.match(invalid.stderr, /effort ultra is not in catalog/);
+    assert.equal(invalid.stderr.trim().split('\n').length, 1);
+    assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+    assert.equal(await fs.readFile(paths().journal, 'utf8'), journalBefore);
+    action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
+      '--model', 'gemini-3.8-flash', '--effort', 'low', '--actor', 'panel']);
+    assert.deepEqual((await loadConfig()).panels.design[1], {
+      provider: 'gemini', model: 'gemini-3.8-flash', effort: 'low'
+    });
+    const journal = (await readLines(paths().journal)).filter((entry) => entry.status === 'applied');
+    assert.deepEqual(journal.map((entry) => entry.actor), ['panel', 'panel']);
+  } finally { await env.cleanup(); }
+});
+
+test('entry actions insert, move and remove; the last chain entry cannot be removed', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const initial = (await loadConfig()).tiers.simple;
+    const entry = { provider: 'claude', model: 'sonnet', effort: 'low' };
+    action(env, ['config', 'add-entry', '--tier', 'simple', '--provider', entry.provider,
+      '--model', entry.model, '--effort', entry.effort, '--at', '1']);
+    assert.deepEqual((await loadConfig()).tiers.simple, [initial[0], entry, ...initial.slice(1)]);
+    action(env, ['config', 'move-entry', '--tier', 'simple', '--index', '1', '--to', '3']);
+    assert.deepEqual((await loadConfig()).tiers.simple, [...initial, entry]);
+    action(env, ['config', 'remove-entry', '--tier', 'simple', '--index', '3']);
+    assert.deepEqual((await loadConfig()).tiers.simple, initial);
+    assert.equal(action(env, ['config', 'move-entry', '--tier', 'simple', '--index', '0', '--to', '0']).changed, false);
+    action(env, ['config', 'remove-entry', '--tier', 'complex', '--index', '1']);
+    const before = await fs.readFile(paths().config, 'utf8');
+    const empty = env.command(['config', 'remove-entry', '--tier', 'complex', '--index', '0']);
+    assert.equal(empty.status, 1);
+    assert.match(empty.stderr, /cannot remove the last entry/);
+    const pastEnd = env.command(['config', 'move-entry', '--tier', 'simple', '--index', '0', '--to', '3']);
+    assert.equal(pastEnd.status, 1);
+    assert.match(pastEnd.stderr, /zero-based index/);
+    assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+    assert.ok((await readLines(paths().journal)).every((entry) => entry.actor === 'cli'));
+  } finally { await env.cleanup(); }
+});
+
+test('threshold edits preserve omitted hysteresis and reject out-of-range values', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    action(env, ['config', 'threshold', '--percent', '85', '--hysteresis', '7', '--actor', 'panel']);
+    assert.deepEqual((await loadConfig()).thresholds.codex, {
+      switch_percent: 85, hysteresis_percent: 7, windows: ['primary', 'secondary']
+    });
+    action(env, ['config', 'threshold', '--percent', '82']);
+    assert.equal((await loadConfig()).thresholds.codex.hysteresis_percent, 7);
+    const before = await fs.readFile(paths().config, 'utf8');
+    for (const args of [['--percent', '0'], ['--percent', '101'], ['--percent', '80', '--hysteresis', '51']]) {
+      const result = env.command(['config', 'threshold', ...args]);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /must be between/);
+      assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+    }
+  } finally { await env.cleanup(); }
+});
+
+test('save-preset snapshots every tier and preset restores it with its label', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const initial = (await loadConfig()).tiers;
+    action(env, ['config', 'save-preset', '--name', 'my-chains', '--label', 'Мои цепочки', '--actor', 'panel']);
+    action(env, ['config', 'set-entry', '--tier', 'complex', '--index', '0', '--provider', 'claude',
+      '--model', 'haiku', '--effort', 'medium']);
+    assert.notDeepEqual((await loadConfig()).tiers, initial);
+    action(env, ['config', 'preset', 'my-chains', '--actor', 'panel']);
+    const config = await loadConfig();
+    assert.deepEqual(config.tiers, initial);
+    assert.deepEqual(config.presets['my-chains'], { label: 'Мои цепочки', tiers: initial });
+    const before = await fs.readFile(paths().config, 'utf8');
+    for (const args of [['preset', 'absent'], ['save-preset', '--name', '../bad', '--label', 'Bad']]) {
+      assert.equal(env.command(['config', ...args]).status, 1);
+      assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+    }
+    assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
+  } finally { await env.cleanup(); }
+});
+
+test('undo twice restores successive full configs and never toggles previous undos', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const initial = await loadConfig();
+    const empty = env.command(['config', 'undo']);
+    assert.equal(empty.status, 1);
+    assert.match(empty.stderr, /nothing to undo/);
+    action(env, ['config', 'threshold', '--percent', '82']);
+    const first = await loadConfig();
+    action(env, ['config', 'threshold', '--percent', '88', '--hysteresis', '6']);
+    const second = await loadConfig();
+    action(env, ['config', 'threshold', '--percent', '88', '--hysteresis', '6']);
+    action(env, ['config', 'undo', '--actor', 'panel']);
+    assert.deepEqual(await loadConfig(), first);
+    action(env, ['config', 'undo', '--actor', 'panel']);
+    assert.deepEqual(await loadConfig(), initial);
+    const journal = await readLines(paths().journal);
+    const applying = journal.filter((entry) => entry.status === 'applying');
+    assert.deepEqual(applying.map((entry) => entry.before), [initial, first, second, second, first]);
+    assert.equal(applying[3].note, `undo ${applying[1].id}`);
+    assert.equal(applying[4].note, `undo ${applying[0].id}`);
+    assert.equal(applying[3].actor, 'panel');
+    assert.equal(applying[4].actor, 'panel');
+    const before = await fs.readFile(paths().config, 'utf8');
+    const exhausted = env.command(['config', 'undo']);
+    assert.equal(exhausted.status, 1);
+    assert.match(exhausted.stderr, /nothing to undo/);
+    assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+    action(env, ['config', 'threshold', '--percent', '90']);
+    action(env, ['config', 'undo']);
+    assert.deepEqual(await loadConfig(), initial);
+    assert.equal(env.command(['config', 'undo']).status, 1);
+  } finally { await env.cleanup(); }
+});
+
+test('catalog refresh adds Gemini families from a fake command and keeps existing models', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const initial = structuredClone((await loadConfig()).catalog);
+    const listing = ['gemini-9-pro-low\tPro low', 'gemini-9-pro-medium\tPro medium', 'gemini-9-pro-high\tPro high',
+      'gemini-3.8-flash-high\tFlash high', 'claude-sonnet-4-6\tSonnet', 'invalid line'].join('\n') + '\n';
+    const command = { CONVEYOR_AGY_MODELS_CMD: JSON.stringify([
+      process.execPath, '-e', `process.stdout.write(${JSON.stringify(listing)})`
+    ]) };
+    const refreshed = action(env, ['catalog', 'refresh', '--provider', 'gemini', '--actor', 'panel'], command);
+    assert.equal(refreshed.changed, true);
+    assert.equal(refreshed.note, 'added gemini-9-pro');
+    const expected = { ...initial, gemini: [...initial.gemini, { model: 'gemini-9-pro', efforts: ['low', 'medium', 'high'] }] };
+    assert.deepEqual((await loadConfig()).catalog, expected);
+    assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
+    assert.equal(action(env, ['catalog', 'refresh', '--provider', 'gemini'], command).changed, false);
+    assert.deepEqual((await loadConfig()).catalog, expected);
+    const before = await fs.readFile(paths().config, 'utf8');
+    const failed = env.command(['catalog', 'refresh', '--provider', 'gemini'], {
+      CONVEYOR_AGY_MODELS_CMD: JSON.stringify([process.execPath, '-e', 'process.stderr.write("fake error\\n"); process.exit(1)'])
+    });
+    assert.equal(failed.status, 1);
+    assert.equal(failed.stdout, '');
+    assert.equal(failed.stderr.trim().split('\n').length, 1);
+    assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+  } finally { await env.cleanup(); }
+});
+
+test('catalog add/remove validate efforts and refuse models referenced by tiers or panels', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    action(env, ['catalog', 'add', '--provider', 'gemini', '--model', 'gemini-9-panel', '--efforts', 'low,medium,high']);
+    let before = await fs.readFile(paths().config, 'utf8');
+    const invalid = env.command(['catalog', 'add', '--provider', 'gemini', '--model', 'gemini-bad', '--efforts', 'low,,high']);
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /catalog effort must be a non-empty string/);
+    const tier = env.command(['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-3.8-flash']);
+    assert.equal(tier.status, 1);
+    assert.match(tier.stderr, /is in use by a tier or panel/);
+    assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+    action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
+      '--model', 'gemini-9-panel', '--effort', 'high']);
+    before = await fs.readFile(paths().config, 'utf8');
+    const panel = env.command(['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-9-panel']);
+    assert.equal(panel.status, 1);
+    assert.match(panel.stderr, /is in use by a tier or panel/);
+    assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+    action(env, ['config', 'set-entry', '--panel', 'design', '--seat', '1', '--provider', 'gemini',
+      '--model', 'gemini-3.8-flash', '--effort', 'high']);
+    action(env, ['catalog', 'remove', '--provider', 'gemini', '--model', 'gemini-9-panel', '--actor', 'panel']);
+    assert.ok(!(await loadConfig()).catalog.gemini.some((entry) => entry.model === 'gemini-9-panel'));
+    assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
   } finally { await env.cleanup(); }
 });

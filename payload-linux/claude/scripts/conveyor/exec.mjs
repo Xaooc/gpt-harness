@@ -4,11 +4,12 @@ import * as fs from 'node:fs/promises';
 import { readFileSync, statSync, watch, constants } from 'node:fs';
 import path from 'node:path';
 import { constants as osConstants } from 'node:os';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import {
-  loadConfig, saveConfig, applyPreset, providerState, resolveChain, resolvePanel, markUnavailable,
-  recordSwitch, renderRoles, wrapperPath, writeJsonAtomic
+  loadConfig, saveConfig, providerState, resolveChain, resolvePanel, markUnavailable,
+  recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
 } from './lib/orchestration.mjs';
 
 // Matches luna.sh's retryable_model_error deny pattern, including usage, auth and invalid-model failures.
@@ -17,6 +18,7 @@ const quotaError = new RegExp([
   'model_not_found|not supported|invalid|context window|context_length|too long'
 ].join('|'), 'i');
 const unavailableReasons = ['quota', 'region', 'auth', 'start'];
+const execute = promisify(execFile);
 
 function options(args, allowed) {
   const result = Object.create(null);
@@ -59,13 +61,85 @@ function valueAt(config, parts) {
   return value;
 }
 
+function actorArguments(args) {
+  const rest = [...args];
+  let actor = 'cli';
+  const index = rest.indexOf('--actor');
+  if (index >= 0) {
+    actor = rest[index + 1];
+    rest.splice(index, 2);
+    if (!['cli', 'panel'].includes(actor)) throw new Error('--actor must be cli or panel');
+    if (rest.includes('--actor')) throw new Error('duplicate option: --actor');
+  }
+  return { actor, args: rest };
+}
+
+async function saveResult(config, previous, actor, note) {
+  const changed = !isDeepStrictEqual(previous, config);
+  await saveConfig(config, { actor, note });
+  process.stdout.write(`${JSON.stringify({ ok: true, changed, note })}\n`);
+  return 0;
+}
+
+function entryOptions(opts) {
+  required(opts, ['--provider', '--model', '--effort']);
+  return { provider: opts['--provider'], model: opts['--model'], effort: opts['--effort'] };
+}
+
+function chainFor(config, opts, allowPanel = false) {
+  if (opts['--tier'] && opts['--panel']) throw new Error('choose one of --tier or --panel');
+  const panel = allowPanel && opts['--panel'];
+  const name = panel || opts['--tier'];
+  if (!name) throw new Error(allowPanel ? '--tier or --panel is required' : '--tier is required');
+  const chains = panel ? config.panels : config.tiers;
+  if (!Object.hasOwn(chains, name)) throw new Error(`unknown ${panel ? 'panel' : 'tier'}: ${name}`);
+  return chains[name];
+}
+
+function entryIndex(value, max, label) {
+  if (!/^(0|[1-9]\d*)$/.test(value || '') || !Number.isSafeInteger(Number(value)) || Number(value) > max) {
+    throw new Error(`${label} must be a zero-based index between 0 and ${max}`);
+  }
+  return Number(value);
+}
+
+async function undoTarget() {
+  let journal;
+  try { journal = await fs.readFile(paths().journal, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') throw new Error('nothing to undo'); throw error; }
+  const applying = new Map(), history = [];
+  for (const line of journal.split(/\r?\n/).filter((value) => value.trim())) {
+    const entry = JSON.parse(line);
+    if (!entry || typeof entry.id !== 'string') continue;
+    if (entry.status === 'applying') applying.set(entry.id, entry);
+    if (entry.status !== 'applied') continue;
+    const change = applying.get(entry.id);
+    if (!change) continue;
+    const undone = typeof change.note === 'string' && /^undo (.+)$/.exec(change.note);
+    if (undone) {
+      const index = history.findIndex((candidate) => candidate.id === undone[1]);
+      if (index >= 0) history.splice(index, 1);
+    } else if (change.before && change.diff && Object.keys(change.diff).length) history.push(change);
+  }
+  if (!history.length) throw new Error('nothing to undo');
+  return history.at(-1);
+}
+
 async function configCommand(args) {
-  const [action, key, raw, ...extra] = args;
-  if (extra.length) throw new Error('too many config arguments');
-  const config = await loadConfig();
-  if (action === 'get' && raw === undefined) {
-    print(key === undefined ? config : valueAt(config, jsonPath(key)));
-  } else if (action === 'set' && key !== undefined && raw !== undefined) {
+  const parsed = actorArguments(args), actor = parsed.actor;
+  const [action, ...rest] = parsed.args;
+  const config = await loadConfig(), previous = structuredClone(config);
+  if (action === 'get' && rest.length <= 1) {
+    print(rest.length ? valueAt(config, jsonPath(rest[0])) : config);
+    return 0;
+  }
+  if (action === 'validate' && !rest.length) {
+    process.stdout.write('valid\n');
+    return 0;
+  }
+  let note;
+  if (action === 'set' && rest.length === 2) {
+    const [key, raw] = rest;
     const parts = jsonPath(key);
     const parent = parts.length === 1 ? config : valueAt(config, parts.slice(0, -1));
     if (!parent || typeof parent !== 'object') throw new Error('json-path parent must be an object or array');
@@ -77,15 +151,121 @@ async function configCommand(args) {
     try { value = JSON.parse(raw); }
     catch { throw new Error('config set value must be valid JSON (quote string values)'); }
     Object.defineProperty(parent, last, { value, enumerable: true, configurable: true, writable: true });
-    await saveConfig(config, { actor: 'cli', note: `set ${key}` });
+    await saveConfig(config, { actor, note: `set ${key}` });
     print(config);
-  } else if (action === 'preset' && key !== undefined && raw === undefined) {
-    print(await applyPreset(key));
-  } else if (action === 'validate' && key === undefined) {
-    process.stdout.write('valid\n');
-  } else throw new Error('usage: exec.mjs config get [json-path] | set <json-path> <JSON-value> | ' +
-    'preset <name> | validate');
-  return 0;
+    return 0;
+  } else if (action === 'preset' && rest.length === 1) {
+    const [name] = rest;
+    if (!Object.hasOwn(config.presets, name)) throw new Error(`unknown preset: ${name}`);
+    for (const [tier, chain] of Object.entries(config.presets[name].tiers)) {
+      config.tiers[tier] = structuredClone(chain);
+    }
+    note = `preset ${name}`;
+  } else if (action === 'save-preset') {
+    const opts = options(rest, { '--name': true, '--label': true });
+    required(opts, ['--name', '--label']);
+    const name = opts['--name'];
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new Error('--name must be a lowercase slug');
+    config.presets[name] = { label: opts['--label'], tiers: structuredClone(config.tiers) };
+    note = `save-preset ${name}`;
+  } else if (action === 'threshold') {
+    const opts = options(rest, { '--percent': true, '--hysteresis': true });
+    required(opts, ['--percent']);
+    for (const [flag, key] of [['--percent', 'switch_percent'], ['--hysteresis', 'hysteresis_percent']]) {
+      if (opts[flag] !== undefined) {
+        if (!/^\d+(?:\.\d+)?$/.test(opts[flag])) throw new Error(`${flag} must be a decimal number`);
+        config.thresholds.codex[key] = Number(opts[flag]);
+      }
+    }
+    note = 'threshold';
+  } else if (action === 'undo' && !rest.length) {
+    const target = await undoTarget();
+    return saveResult(target.before, previous, actor, `undo ${target.id}`);
+  } else if (['set-entry', 'add-entry', 'remove-entry', 'move-entry'].includes(action)) {
+    const allowed = { '--tier': true };
+    if (action === 'set-entry') Object.assign(allowed, { '--panel': true, '--seat': true });
+    if (action !== 'add-entry') allowed['--index'] = true;
+    if (action === 'set-entry' || action === 'add-entry') {
+      Object.assign(allowed, { '--provider': true, '--model': true, '--effort': true });
+    }
+    if (action === 'add-entry') allowed['--at'] = true;
+    if (action === 'move-entry') allowed['--to'] = true;
+    const opts = options(rest, allowed), chain = chainFor(config, opts, action === 'set-entry');
+    const panel = Boolean(opts['--panel']);
+    const flag = panel ? '--seat' : '--index';
+    if (opts[panel ? '--index' : '--seat'] !== undefined) throw new Error(`use ${flag} for this target`);
+    if (action === 'add-entry') {
+      const at = opts['--at'] === undefined ? chain.length : entryIndex(opts['--at'], chain.length, '--at');
+      chain.splice(at, 0, entryOptions(opts));
+    } else {
+      const index = entryIndex(opts[flag], chain.length - 1, flag);
+      if (action === 'set-entry') chain[index] = entryOptions(opts);
+      else if (action === 'remove-entry') {
+        if (chain.length === 1) throw new Error('cannot remove the last entry in a chain');
+        chain.splice(index, 1);
+      } else {
+        const to = entryIndex(opts['--to'], chain.length - 1, '--to');
+        chain.splice(to, 0, chain.splice(index, 1)[0]);
+      }
+    }
+    note = `${action} ${panel ? 'panel' : 'tier'} ${opts['--panel'] || opts['--tier']}`;
+  } else throw new Error('usage: exec.mjs config get | set | set-entry | add-entry | remove-entry | move-entry | ' +
+    'threshold | preset | save-preset | undo | validate');
+  return saveResult(config, previous, actor, note);
+}
+
+async function catalogCommand(args) {
+  const parsed = actorArguments(args), actor = parsed.actor;
+  const [action, ...rest] = parsed.args;
+  const allowed = { '--provider': true };
+  if (action === 'add' || action === 'remove') allowed['--model'] = true;
+  if (action === 'add') allowed['--efforts'] = true;
+  if (!['add', 'remove', 'refresh'].includes(action)) throw new Error('usage: exec.mjs catalog add | remove | refresh');
+  const opts = options(rest, allowed);
+  required(opts, ['--provider']);
+  const provider = opts['--provider'];
+  const config = await loadConfig(), previous = structuredClone(config);
+  if (!Object.hasOwn(config.catalog, provider)) throw new Error(`unknown provider: ${provider}`);
+  const catalog = config.catalog[provider];
+  let note;
+  if (action === 'refresh') {
+    if (provider !== 'gemini') throw new Error('catalog refresh requires --provider gemini');
+    let command = ['/srv/docker/compose/antigravity-parallel/run-agy', 'models'];
+    if (process.env.CONVEYOR_AGY_MODELS_CMD !== undefined) {
+      try { command = JSON.parse(process.env.CONVEYOR_AGY_MODELS_CMD); }
+      catch { throw new Error('CONVEYOR_AGY_MODELS_CMD must be JSON argv'); }
+    }
+    if (!Array.isArray(command) || !command.length || command.some((item) => typeof item !== 'string' || !item)) {
+      throw new Error('CONVEYOR_AGY_MODELS_CMD must be non-empty JSON argv');
+    }
+    const { stdout } = await execute(command[0], command.slice(1), {
+      encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024
+    });
+    const added = [];
+    for (const line of stdout.split(/\r?\n/)) {
+      const match = /^(gemini-[^\s]+)\t[^\t]+$/.exec(line);
+      if (!match) continue;
+      const model = match[1].replace(/-(low|medium|high)$/, '');
+      if (catalog.some((entry) => entry.model === model)) continue;
+      catalog.push({ model, efforts: ['low', 'medium', 'high'] });
+      added.push(model);
+    }
+    note = added.length ? `added ${added.join(', ')}` : 'no models added';
+  } else {
+    required(opts, action === 'add' ? ['--model', '--efforts'] : ['--model']);
+    const model = opts['--model'];
+    if (action === 'add') catalog.push({ model, efforts: opts['--efforts'].split(',') });
+    else {
+      const inUse = [...Object.values(config.tiers), ...Object.values(config.panels)]
+        .some((chain) => chain.some((entry) => entry.provider === provider && entry.model === model));
+      if (inUse) throw new Error(`model ${provider}/${model} is in use by a tier or panel`);
+      const index = catalog.findIndex((entry) => entry.model === model);
+      if (index < 0) throw new Error(`unknown model: ${provider}/${model}`);
+      catalog.splice(index, 1);
+    }
+    note = `${action} ${provider}/${model}`;
+  }
+  return saveResult(config, previous, actor, note);
 }
 
 function statusValues(text) {
@@ -309,6 +489,7 @@ async function runCommand(args) {
 export async function main(args = process.argv.slice(2)) {
   const [command, ...rest] = args;
   if (command === 'config') return configCommand(rest);
+  if (command === 'catalog') return catalogCommand(rest);
   if (command === 'run') return runCommand(rest);
   if (command === 'roles') {
     if (rest[0] !== 'render') throw new Error('usage: exec.mjs roles render [--out <path>]');
@@ -366,12 +547,12 @@ export async function main(args = process.argv.slice(2)) {
   }
   throw new Error('usage: exec.mjs resolve (--tier <tier>|--panel <name>|--role <name>) [--json] ' +
     '[--first-available] | run (--tier <tier>|--panel <name> --seat <n>|--role <name>) ' +
-    '(-w|-r) -C <dir> -f <brief> -o <out> | roles render [--out <path>] | status [--json] | config …');
+    '(-w|-r) -C <dir> -f <brief> -o <out> | roles render [--out <path>] | status [--json] | config … | catalog …');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
-    process.stderr.write(`conveyor: ${error.message}\n`);
+    process.stderr.write(`conveyor: ${error.message.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')}\n`);
     process.exitCode = 1;
   });
 }

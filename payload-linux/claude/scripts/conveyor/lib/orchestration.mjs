@@ -254,7 +254,7 @@ async function saveUnlocked(config, { actor, note }) {
     ...entry, at: new Date().toISOString(), status, ...extra
   })}\n`, { mode: 0o600 });
   try {
-    await journal('applying');
+    await journal('applying', { before: previous });
     await writeJsonAtomic(paths().config, config);
     await journal('applied');
   } catch (error) {
@@ -364,18 +364,19 @@ function thresholdState(config, usage, previous) {
   return { switched: true, skip: true, reason };
 }
 
-export async function providerState(config, { now = Date.now() } = {}) {
+export async function providerState(config, { now = Date.now(), persist = true } = {}) {
   config ??= await loadConfig();
   const [codex, claude] = await Promise.all([codexUsage(now), claudeUsage(now)]);
-  const state = await withLock(paths().providers, async () => {
+  const resolve = async () => {
     const marks = await readProviders();
     const threshold = thresholdState(config, codex, marks.codex?.switched);
     if (threshold.switched !== (marks.codex?.switched === true)) {
       marks.codex = { ...marks.codex, switched: threshold.switched };
-      await writeJsonAtomic(paths().providers, marks);
+      if (persist) await writeJsonAtomic(paths().providers, marks);
     }
     return { providers: marks, threshold };
-  });
+  };
+  const state = await (persist ? withLock(paths().providers, resolve) : resolve());
   const wrappers = Object.create(null);
   for (const provider of ['codex', 'gemini']) {
     try {

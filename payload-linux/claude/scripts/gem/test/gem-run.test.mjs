@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -30,13 +31,17 @@ async function fixture(fn) {
   mkdirSync(home);
   const trace = () => readFileSync(traceFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   async function run({
-    args = [], prompt = 'Read Привет.txt and report 世界.', scenario = 'success-with-headings', env = {}, output = out
+    args = [], prompt = 'Read Привет.txt and report 世界.', scenario = 'success-with-headings', env = {}, output = out,
+    onActive
   } = {}) {
     writeFileSync(traceFile, '');
+    const command = onActive ? [process.execPath, '--input-type=module', '-e',
+      'await new Promise((resolve) => setTimeout(resolve, 200)); await import(process.argv[1]);',
+      fake, scenario, traceFile, pidFile] : [process.execPath, fake, scenario, traceFile, pidFile];
     const child = spawn('bash', [entry, '-C', dir, '-o', output, ...args, ...(prompt === null ? [] : [prompt])], {
       env: {
         ...process.env, HOME: home, CLAUDE_CODE_SESSION_ID: 'gem-test-owner', SSH_FAKE_TEST: 'must be removed',
-        GEM_AGENT_CMD: JSON.stringify([process.execPath, fake, scenario, traceFile, pidFile]),
+        GEM_AGENT_CMD: JSON.stringify(command), LUNA_RUN_DIR: path.join(root, 'run'),
         GEM_NO_SANDBOX: '1', GEM_SKIP_CHECKSUM: '1', GEM_SHARED_HOME: '0',
         GEM_JOB_MB: '0', GEM_RAM_WAIT_S: '5', LUNA_RAM_RESERVE_MB: '0', LUNA_RAMP_S: '0',
         LUNA_ADMIT_LOCK: path.join(root, 'admit.lock'), LUNA_IDLE_MAX_S: '30', LUNA_TIMEOUT_S: '30',
@@ -49,10 +54,29 @@ async function fixture(fn) {
     let stdout = '', stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
     child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
-    const rc = await new Promise((resolve, reject) => {
-      child.on('error', reject);
-      child.on('close', (code) => { children.delete(child); resolve(code); });
-    });
+    const id = createHash('sha1').update(path.resolve(output)).digest('hex').slice(0, 16);
+    const activeFile = path.join(root, 'run', 'gem-active', `${id}.json`);
+    let observed = false, observationError;
+    const observer = onActive ? setInterval(() => {
+      if (observed || !existsSync(activeFile)) return;
+      try {
+        const pointer = JSON.parse(readFileSync(activeFile, 'utf8'));
+        observed = true;
+        onActive(pointer, id);
+      } catch (error) { if (error.code !== 'ENOENT') observationError = error; }
+    }, 10) : undefined;
+    let rc;
+    try {
+      rc = await new Promise((resolve, reject) => {
+        child.on('error', reject);
+        child.on('close', (code) => { children.delete(child); resolve(code); });
+      });
+    } finally { clearInterval(observer); }
+    if (onActive) {
+      assert.ifError(observationError);
+      assert.equal(observed, true, 'active pointer was visible while the wrapper was running');
+    }
+    assert.equal(existsSync(activeFile), false, 'active pointer is removed after every terminal path');
     assert.equal(existsSync(`${output}.gem-lock`), false, 'output claim is cleaned up');
     assert.equal(existsSync(path.join(root, 'admit.lock')), false, 'admission lock is released');
     return {
@@ -131,6 +155,25 @@ test('write-mode success writes the final message and all status fields', { time
     assert.ok(!environment.keys.some((key) => key.startsWith('SSH_')));
   });
 });
+
+test('active pointers are published during runs and removed after done and provider-unavailable',
+  { timeout: 300_000 }, async () => {
+    await fixture(async ({ out, run }) => {
+      for (const [scenario, state, rc] of [['success-with-headings', 'done', 0], ['provider-exhausted', 'unavailable', 3]]) {
+        const result = await run({ scenario, onActive(pointer, id) {
+          assert.deepEqual(Object.keys(pointer), ['v', 'id', 'out', 'owner', 'started', 'pid', 'wrapper_pid']);
+          assert.equal(pointer.v, 1);
+          assert.equal(pointer.id, id);
+          assert.equal(pointer.out, path.resolve(out));
+          assert.equal(pointer.owner, 'gem-test-owner');
+          assert.ok(Number.isFinite(Date.parse(pointer.started)));
+          assert.equal(running(pointer.wrapper_pid), true);
+        } });
+        assert.equal(result.rc, rc, result.stderr);
+        assert.equal(result.status.state, state);
+      }
+    });
+  });
 
 test('output, status, log and parent symlinks are refused without touching their targets',
   { timeout: 300_000 }, async () => {
