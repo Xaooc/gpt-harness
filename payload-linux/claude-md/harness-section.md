@@ -66,7 +66,8 @@ node ~/.claude/scripts/conveyor/exec.mjs run --tier <complex|simple|review|scout
   edits them in the **Luna panel** (model and effort per task kind, presets). Do not hand-edit it.
 - Codex is skipped automatically at **80 %** usage (configurable in the panel; hysteresis), a provider that hit a
   quota/region/auth error is skipped for its TTL, and a write job that already started is never re-run on
-  another provider. Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`.
+  another provider. Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`; exit 5: no provider
+  available; exit 6: the project's checks stayed red after the fix rounds.
 - Never `gpt-6-astra`. Never the fast tier (`-t fast`) unless the user asks.
 - Briefs are self-contained and exhaustive: executors are literal and see only the brief (see the `luna` skill,
   "The executors are literal"). Every write brief ends with "Edit files only. Do NOT run git add / commit / push".
@@ -97,6 +98,23 @@ fall back to grey boxes, stock-photo URLs, emoji or "add an image here" notes wh
 ask permission first: the cost isn't a concern. Generate 2–4 variants for important visuals and pick the best. Mention in the
 report what was generated. Limits: no text inside images (put it in HTML/CSS), no real people's likenesses or trademarked
 logos/brands, and optimise the files (size/format) before they ship.
+
+### Acceptance ledger and gates (enforced by hooks)
+
+On every non-trivial task that changes code:
+1. `node ~/.claude/scripts/conveyor/ledger.mjs start`, then play back the user's requirements in your first message
+   (pstack trigger 1) and record them: `ledger.mjs add "<requirement>" --from <M3.c1,…>`. Every imperative sentence
+   of the user (`M<n>.c<k>`, captured automatically) must be linked to an item or `ledger.mjs link <clause> none
+   --reason "<why it is not a requirement>"`.
+2. Prove each item: `ledger.mjs evidence <L1> --cmd "<check command>"` (the command is run and its exit code
+   recorded), `--artifact <screenshot>`, `--check <out>.dispatch.json`; then `ledger.mjs done <L1>`.
+3. Before claiming done: `ledger.mjs crosscheck` (Gemini compares the user's messages, the items and the diff), and
+   end the final message with the block printed by `ledger.mjs checklist`.
+The stop hook blocks a code-changing turn until this holds and the session left no running jobs, registered temp
+paths or expired worktrees (warn-only during the first 7 days). Exceptions only in the user's own words:
+`ledger.mjs waive <item|gate> --quote "<the user's words>"` (verified against the transcript). Executor writes are
+gated by the dispatcher: project checks run after every write job, failures go back to the same executor (≤ 2
+rounds); exit 6 means the gate stayed red and the decision is yours.
 
 ### Review: pstack `interrogate` on diverse executors
 

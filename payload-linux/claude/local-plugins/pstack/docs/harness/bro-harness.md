@@ -95,7 +95,9 @@ of the same vendor.
 ## Harness gates that pstack meets
 
 - **First message** (poteto-mode trigger 1) is also the acceptance-ledger playback: list the user's requirements
-  in your own words before work starts, and record them with `conveyor ledger` when that tool exists.
+  in your own words before work starts, and record them: `node ~/.claude/scripts/conveyor/ledger.mjs start`, then
+  `ledger.mjs add … --from <clause ids>`; every captured imperative clause is linked or marked `none` with a reason.
+- **Final reply** of a code-changing task ends with the `ledger.mjs checklist` block, after `ledger.mjs crosscheck`.
 - **Prove It Works** is enforced: on a turn that changed code, the stop gate checks the acceptance ledger, the
   evidence and the final checklist. Do not claim done without evidence; the gate will block it.
 - **Encode Lessons in Structure** has a queue: open checks are in `~/.claude/learning/checks.md`; build them with

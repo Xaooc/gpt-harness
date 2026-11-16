@@ -32,7 +32,10 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   quota/region/auth/checksum error is skipped for its TTL; the dispatcher prints one `conveyor:` line per switch
   (tell the user). A write job that already started is never re-run on another provider.
 - **Exit codes of `exec.mjs run`:** 0 done; 4 hand-off: read `<out>.dispatch.json` and spawn the `Agent` tool
-  with its `model` and the same brief; 5 no provider available; others come from the executor.
+  with its `model` and the same brief; 5 no provider available; 6 the executor gate stayed red (project checks or
+  hygiene ratchet failed after 2 fix rounds; read `## Gate` in the result); others come from the executor.
+- **Executor gate:** every write job is followed by `check.mjs` fast+turn on the job's own changes (profile
+  `.claude/conveyor.json`, autodetected when absent); failures go back to the same executor as fix rounds.
 - **Direct wrappers** remain for special cases: `luna.sh` (Codex; `-m gpt-6.1-sol -e max` for complex work) and
   `gem.sh` (Gemini; same flags; exit 3 = provider unavailable). Prefer the dispatcher.
 - **Don't use `gpt-6-astra`** (user decision, 2026-09-30). Never the fast tier unless the user asks.
