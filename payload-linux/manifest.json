@@ -168,7 +168,7 @@
       "src": "claude/scripts/learning/core.mjs",
       "dest": "scripts/learning/core.mjs",
       "kind": "file",
-      "sha256": "18824eb9a16f77dfc80a53fa9a86f72a1b1a5fdf4f0c2e7bc3f922a2b6ec8df5"
+      "sha256": "d9454bea2bcd55990840c31fb06a3c7ee6aea7dc25b3d9bb95be9f74001ddfe9"
     },
     {
       "src": "claude/scripts/learning/DESIGN.md",

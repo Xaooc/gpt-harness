@@ -1012,7 +1012,7 @@ function conveyorReport(start, end) {
     let line = `Гейт исполнителя: ${runs} · сразу зелёные ${gate.round0}`
       + ` · после доработки ${gate.afterFix} · красные ${gate.red}`;
     const extra = [[gate.handoffs, "передано Claude"], [gate.noProvider, "нет провайдера"],
-      [gate.writeLocked, "запись занята"], [gate.missingDispatch, "нет результата"]];
+      [gate.writeLocked, "запись занята"], [gate.unknown ?? gate.missingDispatch, "нет результата"]];
     for (const [count, label] of extra) if (count) line += ` · ${label} ${count}`;
     entries.push(line);
   }
