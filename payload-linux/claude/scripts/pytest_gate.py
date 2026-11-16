@@ -5,11 +5,12 @@ Usage (from the repo or worktree root, any shell):
 
 It waits until `n` worker slots are free in a shared pool (POOL_SIZE total across
 all runs on this machine) and until free RAM is above MIN_FREE_GB, then runs
-`python -m uv run pytest -n <n> <args>` in the current directory, releases the
+`uv run pytest -n <n> <args>` in the current directory (falling back to the uv module
+or pytest module when needed), releases the
 slots and exits with pytest's own exit code. The OS releases locks when their owner exits.
 
 Disk and garbage (owner rule 2026-10-24: test runs must not kill the SSD or leave files):
-- a run does not start while the temp drive has less than MIN_FREE_DISK_GB free (exit 75);
+- a run does not start while the run storage has less than MIN_FREE_DISK_GB free (exit 75);
 - `-n`/`--numprocesses` given after `--` count too: the cap and the slots are what pytest
   really starts;
 - every run gets its own --basetemp under RUNS_DIR (unless the caller passed one) and
@@ -34,6 +35,8 @@ which shows a read-only snapshot if it cannot acquire the lock.
 from __future__ import annotations
 
 import errno
+import importlib.util
+import json
 import os
 import secrets
 import signal
@@ -69,9 +72,33 @@ def default_slot_dir() -> Path:
     return Path("/tmp") / f"pytest-gate-{uid}"
 
 
+def _writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".probe-{os.getpid()}"
+        probe.touch()
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def default_runs_dir() -> Path:
+    """A disk-backed home for per-run temp dirs (/tmp is a small RAM tmpfs on this machine).
+
+    The user cache comes first; an executor sandbox can mount it read-only, so the project's own ignored `.tmp/`
+    (the harness convention) is the fallback, and the system temp dir the last resort.
+    """
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "pytest-gate-runs"
+    for candidate in (cache, Path.cwd() / ".tmp" / "pytest-gate-runs"):
+        if _writable_dir(candidate):
+            return candidate
+    return Path(tempfile.gettempdir()) / "pytest-gate-runs"
+
+
 SLOT_DIR = Path(os.environ.get("PYTEST_GATE_DIR") or default_slot_dir())
 POOL_IS_PRIVATE = False
-RUNS_DIR = Path(os.environ.get("PYTEST_GATE_RUNS", Path(tempfile.gettempdir()) / "pytest-gate-runs"))
+RUNS_DIR = Path(os.environ.get("PYTEST_GATE_RUNS", default_runs_dir()))
 POLL_SECONDS = float(os.environ.get("PYTEST_GATE_POLL_S", "5"))
 BACKFILL_SECONDS = float(os.environ.get("PYTEST_GATE_BACKFILL_S", "600"))
 FROZEN_SECONDS = float(os.environ.get("PYTEST_GATE_FROZEN_S", "120"))
@@ -79,6 +106,22 @@ REFUSED_DISK = 75  # not a pytest exit code (pytest uses 0-5)
 GREEN = {0, 5}  # passed, or nothing collected: no failing test dir worth keeping
 RUN_SLOTS = ""
 RUN_PYTEST_WORKERS = ""
+
+
+def pytest_launcher() -> list[str]:
+    override = os.environ.get("PYTEST_GATE_LAUNCHER")
+    if override is not None:
+        prefix = json.loads(override)
+        if not isinstance(prefix, list) or not prefix or not all(isinstance(arg, str) and arg for arg in prefix):
+            raise ValueError("PYTEST_GATE_LAUNCHER must be a nonempty JSON array of argv strings")
+        return prefix
+    uv = shutil.which("uv")
+    if uv is not None:
+        return [uv, "run", "pytest"]
+    if importlib.util.find_spec("uv") is not None:
+        return [sys.executable, "-m", "uv", "run", "pytest"]
+    print("[pytest_gate] uv unavailable; using python -m pytest", flush=True)
+    return [sys.executable, "-m", "pytest"]
 
 
 def free_ram_gb() -> float:
@@ -178,8 +221,9 @@ def _owner_pids(run: Path) -> list[int]:
         live = []
         for index, pid in enumerate(pids):
             start = starts.get(f"start_{pid}", "")
-            pattern = "pytest_gate.py" if index == 0 else "-m uv"
-            if same_process(pid, start, pattern) or (index > 0 and same_process(pid, start, "pytest")):
+            # All launchers carry pytest; retain recognition of legacy uv module owners.
+            patterns = ("pytest_gate.py",) if index == 0 else ("pytest", "-m uv")
+            if any(same_process(pid, start, pattern) for pattern in patterns):
                 live.append(pid)
         return live
     except (OSError, ValueError, IndexError):
@@ -826,7 +870,7 @@ def main() -> int:
     prune_runs()
     disk = free_disk_gb(RUNS_DIR)
     if disk < MIN_FREE_DISK_GB:
-        print(f"[pytest_gate] refused: {disk:.1f} GB free on the temp drive, need "
+        print(f"[pytest_gate] refused: {disk:.1f} GB free on the run storage, need "
               f"{MIN_FREE_DISK_GB:.0f} GB. Clean up before testing.", flush=True)
         return REFUSED_DISK
     slots = wait_for_slots(workers, pytest_workers, ticket_args)
@@ -848,7 +892,7 @@ def main() -> int:
     try:
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             previous[sig] = signal.signal(sig, forward)
-        command = [sys.executable, "-m", "uv", "run", "pytest", "-n", str(pytest_workers), *argv]
+        command = [*pytest_launcher(), "-n", str(pytest_workers), *argv]
         # Block termination until the child's identity and slot reservations are durable.
         signals = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)

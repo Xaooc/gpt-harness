@@ -299,7 +299,7 @@
       "src": "claude/scripts/lib/pytest-gate-test.py",
       "dest": "scripts/lib/pytest-gate-test.py",
       "kind": "file",
-      "sha256": "78b50b55bb585d27075612a53da222f948612a1d644234a9eccc80c4f6d1f308",
+      "sha256": "228126fd1a78c7ab133ba57cdb000a2bb8c0b09a7cb81bf2a9f9685ddd760260",
       "executable": true
     },
     {
@@ -390,7 +390,7 @@
       "src": "claude/scripts/pytest_gate.py",
       "dest": "scripts/pytest_gate.py",
       "kind": "file",
-      "sha256": "87eec4d461a00dd3412d06b417449428b0fd1b32f9d2cf902c41b8c3652a0b80"
+      "sha256": "76a311defc1c6d31649c0c763f48266a16dd206bc2de46afd6e6d81bb8f039bd"
     },
     {
       "src": "claude/skills/luna/SKILL.md",

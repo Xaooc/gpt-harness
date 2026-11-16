@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Offline lifecycle and PID identity regressions; no pytest/uv installation needed."""
+"""Offline lifecycle and PID identity regressions; no pytest/uv installation needed.
+
+Run: python3 payload-linux/claude/scripts/pytest_gate.py --self-test
+"""
 from contextlib import redirect_stdout
 from io import StringIO
 import fcntl
@@ -7,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import runpy
 import signal
 import subprocess
 import sys
@@ -80,6 +84,7 @@ class Lifecycle(unittest.TestCase):
         env = {**os.environ, "HOME": str(self.root), "PYTHONPATH": str(self.root),
                "PYTEST_GATE_DIR": str(gate.SLOT_DIR), "PYTEST_GATE_RUNS": str(self.root / "runs"),
                "PYTEST_GATE_MIN_FREE_DISK_GB": "0", "PYTEST_GATE_MIN_FREE_GB": "0",
+               "PYTEST_GATE_LAUNCHER": json.dumps([sys.executable, "-m", "uv", "run", "pytest"]),
                "FIXTURE_INFO": str(self.root / "info"), "PYTHONDONTWRITEBYTECODE": "1"}
         self.child = subprocess.Popen([sys.executable, str(SCRIPT), "-n", "1", "--", "-q"],
                                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -142,11 +147,86 @@ class Lifecycle(unittest.TestCase):
         env = {**os.environ, "PYTHONPATH": str(self.root), "PYTEST_GATE_DIR": str(gate.SLOT_DIR),
                "PYTEST_GATE_POOL": "2", "PYTEST_GATE_MAX_WORKERS": "2", "PYTEST_GATE_MIN_FREE_GB": "0",
                "PYTEST_GATE_MIN_FREE_DISK_GB": "0", "TMPDIR": str(temp), "TEMP": str(temp),
+               "PYTEST_GATE_LAUNCHER": json.dumps([sys.executable, "-m", "uv", "run", "pytest"]),
+               "PYTEST_GATE_RUNS": str(self.root / "runs"),
                "TMP": str(temp), "PYTHONDONTWRITEBYTECODE": "1", "FIXTURE_READY": str(self.root / label),
                "FIXTURE_RELEASE": str(self.root / (label + ".release"))}
-        env.pop("PYTEST_GATE_RUNS", None)
         env.pop("PYTEST_GATE_SERIAL_MAX", None)
         return env
+
+    def test_launcher_resolution(self):
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(gate.shutil, "which", return_value="/fake/bin/uv") as which, \
+                patch.object(gate.importlib.util, "find_spec") as find_spec:
+            self.assertEqual(gate.pytest_launcher(), ["/fake/bin/uv", "run", "pytest"])
+            which.assert_called_once_with("uv")
+            find_spec.assert_not_called()
+            which.return_value = None
+            find_spec.return_value = object()
+            self.assertEqual(gate.pytest_launcher(), [sys.executable, "-m", "uv", "run", "pytest"])
+            find_spec.assert_called_once_with("uv")
+            find_spec.return_value = None
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(gate.pytest_launcher(), [sys.executable, "-m", "pytest"])
+            self.assertIn("uv unavailable; using python -m pytest", output.getvalue())
+
+    def test_launcher_override(self):
+        prefix = [sys.executable, str(self.root / "fake launcher.py")]
+        with patch.dict(os.environ, {"PYTEST_GATE_LAUNCHER": json.dumps(prefix)}), \
+                patch.object(gate.shutil, "which") as which, \
+                patch.object(gate.importlib.util, "find_spec") as find_spec:
+            self.assertEqual(gate.pytest_launcher(), prefix)
+            which.assert_not_called()
+            find_spec.assert_not_called()
+            for invalid in ("[]", '"uv"', '["uv", 1]', '[""]'):
+                with self.subTest(override=invalid):
+                    os.environ["PYTEST_GATE_LAUNCHER"] = invalid
+                    with self.assertRaisesRegex(ValueError, "nonempty JSON array"):
+                        gate.pytest_launcher()
+
+    def test_runs_default_to_cache_and_disk_check_uses_it(self):
+        cache = self.root / "cache"
+        env = {"HOME": str(self.root), "XDG_CACHE_HOME": str(cache), "TMPDIR": str(self.root / "temp")}
+        with patch.dict(os.environ, env, clear=True):
+            runs = runpy.run_path(str(SCRIPT))["RUNS_DIR"]
+            self.assertEqual(runs, cache / "pytest-gate-runs")
+            self.assertFalse(runs.is_relative_to(Path(env["TMPDIR"])))
+            del os.environ["XDG_CACHE_HOME"]
+            self.assertEqual(runpy.run_path(str(SCRIPT))["RUNS_DIR"], self.root / ".cache" / "pytest-gate-runs")
+            os.environ["PYTEST_GATE_RUNS"] = str(self.root / "explicit-runs")
+            self.assertEqual(runpy.run_path(str(SCRIPT))["RUNS_DIR"], self.root / "explicit-runs")
+        with patch.object(gate, "RUNS_DIR", runs), patch.object(gate, "prepare_pool"), \
+                patch.object(gate, "prune_runs"), patch.object(gate.shutil, "disk_usage") as disk_usage, \
+                patch.object(gate, "MIN_FREE_DISK_GB", 10), patch.object(gate, "wait_for_slots") as wait, \
+                patch.object(sys, "argv", [str(SCRIPT)]), redirect_stdout(StringIO()):
+            disk_usage.return_value.free = 9 * 1024**3
+            self.assertEqual(gate.main(), gate.REFUSED_DISK)
+            disk_usage.assert_called_once_with(runs)
+            wait.assert_not_called()
+
+    def test_cleanup_recognises_all_launchers(self):
+        run = self.root / "runs" / "run-10-1"
+        run.mkdir(parents=True)
+        owner = run.with_name(run.name + ".owner")
+        owner.write_text("10 20\nstart_10=100\nstart_20=200\n")
+        commands = ("/fake/bin/uv run pytest -n 2", "/python -m uv run pytest -n 2", "/python -m pytest -n 2")
+        for command in commands:
+            with self.subTest(command=command):
+                row = {"pid": 20, "start": "200", "state": "S", "command": command}
+                with patch.object(gate, "process_identity", side_effect=lambda pid: row if pid == 20 else None), \
+                        patch.object(gate, "RUNS_DIR", run.parent), patch.object(gate, "KEEP_FAILED", 0), \
+                        patch.object(gate, "pid_alive", return_value=True), patch.object(gate, "_processes", return_value=[]):
+                    self.assertEqual(gate._owner_pids(run), [20])
+                    gate.prune_runs()
+                    self.assertTrue(run.is_dir())
+                    row["start"] = "201"  # A reused child pid cannot protect a finished run.
+                    self.assertEqual(gate._owner_pids(run), [])
+        with patch.object(gate, "process_identity", return_value=None), patch.object(gate, "RUNS_DIR", run.parent), \
+                patch.object(gate, "KEEP_FAILED", 0), patch.object(gate, "_processes", return_value=[]):
+            gate.prune_runs()
+        self.assertFalse(run.exists())
+        self.assertFalse(owner.exists())
 
     def fixture_launch(self, label, temp, workers, args, extra=None):
         env = self.fixture_env(label, temp)
