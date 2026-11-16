@@ -66,6 +66,8 @@ test('overview: every limit window, the active executor per tier, on every surfa
     expect(await ui.find({ type: 'Text', text: /^5 ч/ })).toBeTruthy()
     // Groups inside a section card are separated by a drawn rule (text, so every surface shows it).
     expect(await ui.find({ type: 'Text', text: /^┈{20,}$/ })).toBeTruthy()
+    // Panels run all their seats at once; they are listed in the overview so they are never mistaken for chains.
+    expect(await ui.find({ type: 'Text', text: /все места работают одновременно/ })).toBeTruthy()
     await ui.unmount()
   }
 })

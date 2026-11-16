@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -9,6 +9,7 @@ import { resolvePanel } from './lib/orchestration.mjs';
 
 const scripts = path.join(homedir(), '.claude', 'scripts');
 const here = path.dirname(fileURLToPath(import.meta.url));
+const REPRO_LIMIT = 2 * 1024 * 1024;
 
 function parse(args) {
   const opts = { '--panel': 'review', '--timeout-min': '60' };
@@ -90,6 +91,34 @@ async function checked(argv, options) {
 
 const git = (repo, args, options) => checked(['git', '-C', repo, ...args], options);
 
+async function baselineTree(worktree, index) {
+  const options = { env: { ...process.env, GIT_INDEX_FILE: index } };
+  try {
+    await git(worktree, ['read-tree', 'HEAD'], options);
+    await git(worktree, ['add', '-A', '.'], options);
+    return (await git(worktree, ['write-tree'], options)).trim();
+  } finally {
+    await fs.rm(index, { force: true });
+    await fs.rm(`${index}.lock`, { force: true });
+  }
+}
+
+async function saveRepro(worktree, baseline, out, seat) {
+  await git(worktree, ['add', '-A', '-N', '.']);
+  // The baseline tree is HEAD plus the copied scope, so this excludes that scope even in files the seat also edits.
+  // No commit is needed; intent-to-add includes the adversary's new files in the working-tree diff.
+  const patch = await git(worktree, ['diff', baseline ?? 'HEAD', '--'], { maxOutput: REPRO_LIMIT + 1 });
+  let bytes = Buffer.from(patch);
+  const note = '\n# Repro patch truncated at 2 MB; remaining changes were omitted.\n';
+  if (bytes.length > REPRO_LIMIT) {
+    seat.reproNote = note.trim().slice(2);
+    bytes = Buffer.concat([bytes.subarray(0, REPRO_LIMIT - Buffer.byteLength(note)), Buffer.from(note)]);
+  }
+  const file = path.join(out, `seat-${seat.seat}.repro.patch`);
+  await fs.writeFile(file, bytes);
+  seat.repro = file;
+}
+
 async function scopeFor(repo, requestedBase) {
   const head = (await git(repo, ['rev-parse', '--verify', 'HEAD'])).trim();
   let base = requestedBase;
@@ -155,6 +184,7 @@ function report(result) {
     lines.push(`- Seat ${seat.seat} (${seat.provider}/${seat.model}): ${dropped.length} dropped; ${seat.status}. ${seat.reason}`);
     for (const item of dropped) lines.push(`  - ${item.title}: ${item.reason}`);
     if (seat.dispatch) lines.push(`  - Claude hand-off: ${seat.dispatch}; brief: ${seat.brief}`);
+    if (seat.repro) lines.push(`  - Repro patch: ${seat.repro}${seat.reproNote ? ` (${seat.reproNote})` : ''}`);
   }
   return `${lines.join('\n')}\n`;
 }
@@ -178,7 +208,12 @@ export async function main(args = process.argv.slice(2)) {
   const wtDone = commandOverride('CONVEYOR_WT_DONE', [process.execPath, path.join(scripts, 'disk/wt-done.mjs')]);
   const exec = commandOverride('CONVEYOR_EXEC_CMD', [process.execPath, path.join(here, 'exec.mjs')]);
   await fs.mkdir(opts.out, { recursive: true });
-  const root = await fs.mkdtemp(path.join(tmpdir(), 'interrogate-'));
+  // Seat worktrees live on disk next to the repository: /tmp is a small RAM-backed tmpfs here, and wt-new refuses
+  // to create worktrees there once it holds less than 10 GB free.
+  const rootBase = process.env.CONVEYOR_INTERROGATE_ROOT
+    || path.join(path.dirname(opts.repo), `${path.basename(opts.repo)}-interrogate`);
+  await fs.mkdir(rootBase, { recursive: true });
+  const root = await fs.mkdtemp(path.join(rootBase, 'run-'));
   const result = { intent, scope, seats: seats.map(({ seat, provider, model, available, reason }) => ({
     seat, provider, model, status: available ? 'pending' : 'unavailable', reason
   })), findings: [], dropped: [] };
@@ -189,11 +224,13 @@ export async function main(args = process.argv.slice(2)) {
       const seat = result.seats[entry.seat], worktree = path.join(root, `seat-${entry.seat}`);
       const branch = `interrogate/${runid}-${entry.seat}`;
       const output = path.join(opts.out, `seat-${entry.seat}.out.md`), brief = path.join(opts.out, `seat-${entry.seat}.brief.md`);
-      created.push({ worktree, branch, seat });
+      const cleanup = { worktree, branch, seat };
+      created.push(cleanup);
       try {
         // Reusing an output directory must never replay findings or dispatches from an earlier run.
         await fs.rm(output, { force: true });
         await fs.rm(`${output}.dispatch.json`, { force: true });
+        await fs.rm(path.join(opts.out, `seat-${entry.seat}.repro.patch`), { force: true });
         await checked([...wtNew, '--repo', opts.repo, '--path', worktree, '--new-branch', branch, '--base', scope.head,
           '--owner', owner, '--purpose', `interrogate seat ${entry.seat}`, '--until', expiry, '--no-public']);
         if (patch) await git(worktree, ['apply', '--binary', '-'], { input: patch });
@@ -202,6 +239,7 @@ export async function main(args = process.argv.slice(2)) {
           await fs.mkdir(path.dirname(target), { recursive: true });
           await fs.cp(path.join(opts.repo, file), target, { recursive: true, dereference: false, verbatimSymlinks: true });
         }
+        cleanup.baseline = await baselineTree(worktree, path.join(root, `seat-${entry.seat}.baseline.index`));
         await fs.writeFile(brief, `# Scope\n\n${JSON.stringify(scope, null, 2)}\n\n# Intent\n\n${intent}\n\n`
           + `# Adversary brief\n\n${adversary}\n\n# Mandatory output\n\n`
           + 'Include a fenced JSON block (an empty findings list is allowed):\n\n```json\n'
@@ -232,11 +270,12 @@ export async function main(args = process.argv.slice(2)) {
       }
     }
   } finally {
-    for (const { worktree, branch, seat } of created) {
+    for (const { worktree, branch, seat, baseline } of created) {
       try {
         // These are this run's disposable worktrees. Avoid wt-done --archive, which commits repros.
         const exists = await fs.stat(worktree).then(() => true, () => false);
         if (exists) {
+          await saveRepro(worktree, baseline, opts.out, seat);
           await git(worktree, ['reset', '--hard', scope.head]);
           await git(worktree, ['clean', '-ffdx']);
           await checked([...wtDone, worktree]);
@@ -248,14 +287,19 @@ export async function main(args = process.argv.slice(2)) {
         seat.reason += `; cleanup failed (${worktree}): ${error.message}`;
       }
     }
-    if (!cleanupFailed) await fs.rm(root, { recursive: true, force: true });
+    if (!cleanupFailed) {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rmdir(rootBase).catch(() => {});
+    }
     result.findings.sort((a, b) => a.seat - b.seat);
     result.dropped.sort((a, b) => a.seat - b.seat);
     await fs.writeFile(path.join(opts.out, 'findings.json'), `${JSON.stringify(result, null, 2)}\n`);
     await fs.writeFile(path.join(opts.out, 'report.md'), report(result));
   }
   if (cleanupFailed) return 1;
-  return result.seats.every((seat) => seat.status === 'unavailable') ? 5 : 0;
+  if (result.seats.every((seat) => seat.status === 'unavailable')) return 5;
+  // A run in which no seat got to work (every seat unavailable or failed to start) proves nothing: report failure.
+  return result.seats.some((seat) => !['unavailable', 'failed'].includes(seat.status)) ? 0 : 1;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

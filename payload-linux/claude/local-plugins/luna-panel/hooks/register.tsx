@@ -36,7 +36,8 @@ const TIER_HINT: Record<string, string> = {
   review: 'критики и ревью',
   scout: 'поиск и чтение',
 }
-const PANEL_RU: Record<string, string> = { design: 'Проектирование', review: 'Ревью', judge: 'Судья' }
+const PANEL_RU: Record<string, string> = { design: 'Арена (проектирование)', review: 'Ревью (interrogate)', judge: 'Судьи' }
+const PANEL_SHORT: Record<string, string> = { design: 'Арена', review: 'Ревью', judge: 'Судьи' }
 const EFFORTS_ALL = ['low', 'medium', 'high', 'xhigh', 'max']
 const STATE_RU: Record<string, string> = {
   running: 'работает', queued: 'в очереди', starting: 'старт', 'waiting-daemon': 'ждёт место',
@@ -895,6 +896,23 @@ export const register: Register = on => {
           {Object.entries(o.chains).map(([tier, chain], i) => (
             <Box flexDirection="column" key={`tl-${tier}`}>{i > 0 ? <Rule /> : null}<TierLine tier={tier} chain={chain} /></Box>
           ))}
+          {Object.keys(o.panels ?? {}).length ? (
+            <Box flexDirection="column" marginTop={1}>
+              <Text size="caption" color="subtle">Панели · все места работают одновременно</Text>
+              {Object.entries(o.panels ?? {}).map(([name, seats]) => (
+                <Box flexDirection="row" gap={1} key={`pl-${name}`}>
+                  <Box width={11} flexShrink={0}><Text size="footnote" color="subtle">{PANEL_SHORT[name] ?? name}</Text></Box>
+                  <Box flexGrow={1} flexShrink={1}>
+                    <Text size="footnote" wrap="truncate-end">
+                      {seats.map((seat, i) => (
+                        <Text color={seat.available ? undefined : 'warning'}>{`${i ? ' · ' : ''}${modelName(seat.provider, seat.model)}`}</Text>
+                      ))}
+                    </Text>
+                  </Box>
+                </Box>
+              ))}
+            </Box>
+          ) : null}
           {recent && last ? (
             <Text size="caption" color="subtle" wrap="wrap">
               {clock(last.at)} {TIER_RU[last.tier] ?? last.tier}: {last.from} → {last.to}{last.reason ? ` (${reasonRu(last.reason)})` : ''}
@@ -1175,7 +1193,11 @@ export const register: Register = on => {
                 }} />
             </Box>
           </Fold>
-          <Fold id="set-panels" title="Панели ревью" byDefault={false}>
+          <Fold id="set-panels" title="Панели — все места сразу" byDefault>
+            <Text size="caption" color="subtle" wrap="wrap">
+              Не путать с цепочками выше: в цепочке работает первый доступный исполнитель, а в панели — все места одновременно.
+              Ревью — рецензенты interrogate, Арена — параллельные варианты решения, Судьи — сравнение вариантов.
+            </Text>
             {Object.entries(o.panels ?? {}).map(([name, seats]) => (
               <Box flexDirection="column" key={`sp-${name}`} paddingTop={1}>
                 <Text size="footnote" color="subtle">{PANEL_RU[name] ?? name}</Text>

@@ -33,12 +33,17 @@ case "$1" in
     if [ "$2" = --show-toplevel ]; then printf '%s\\n' "$repo"
     elif [ "$3" = 'fixture-base^{commit}' ]; then printf 'fixture-base\\n'
     else printf 'fixture-head\\n'; fi ;;
-  show-ref|reset|clean|branch) exit 0 ;;
+  show-ref|reset|clean|branch|read-tree|add) exit 0 ;;
+  write-tree) printf 'fixture-baseline\\n' ;;
   merge-base) printf 'fixture-base\\n' ;;
   log) printf 'abc123 committed change\\n' ;;
   diff)
     printf 'fixture git warning\\n' >&2
-    if [ "$2" = --stat ]; then printf 'tracked.txt | 1 +\\n'; else printf 'fixture binary patch\\n'; fi ;;
+    if [ "$2" = --stat ]; then printf 'tracked.txt | 1 +\\n'
+    elif [ -f "$repo/proof.txt" ]; then
+      printf 'diff --git a/proof.txt b/proof.txt\\nnew file mode 100644\\n--- /dev/null\\n+++ b/proof.txt\\n'
+      printf '@@ -0,0 +1 @@\\n+observed failure\\n'
+    else printf 'fixture binary patch\\n'; fi ;;
   ls-files) printf 'untracked.txt\\0' ;;
   apply) cat > "$repo/applied.patch" ;;
   *) exit 1 ;;
@@ -103,6 +108,7 @@ test('two seats keep run evidence, drop claims without a command, and remove bot
   assert.equal(result.findings[0].rerun_output, 'observed failure\n');
   assert.deepEqual(result.dropped, [{ seat: 1, title: 'No command', reason: 'no run' }]);
   assert.deepEqual(result.seats.map((seat) => seat.status), ['done', 'done']);
+  assert.match(await fs.readFile(result.seats[0].repro, 'utf8'), /b\/proof\.txt[\s\S]*\+observed failure/);
   const calls = await f.calls();
   assert.equal(calls.filter((call) => call.kind === 'done').length, 2);
   assert.equal(calls.filter((call) => call.kind === 'gate').length, 1);

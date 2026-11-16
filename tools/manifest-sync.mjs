@@ -10,6 +10,7 @@ const args = process.argv.slice(2);
 if (args.some(arg => arg !== '--check')) throw new Error('Usage: node tools/manifest-sync.mjs [--check]');
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+const executable = (src, bytes) => src.endsWith('.sh') || bytes.subarray(0, 2).toString() === '#!';
 // Ship the complete vendored plugin, including its verification corpus.
 const excluded = relative => !relative.startsWith('local-plugins/pstack/') && relative.split('/').some(part =>
   ['test', 'tests', '__pycache__', 'node_modules', '.DS_Store'].includes(part)
@@ -35,9 +36,17 @@ manifest.files = manifest.files.filter(file => {
 });
 for (const file of manifest.files) {
   listed.add(file.src);
-  const sha256 = hash(fs.readFileSync(path.join(payload, file.src)));
+  const bytes = fs.readFileSync(path.join(payload, file.src));
+  const sha256 = hash(bytes);
   if (file.sha256 !== sha256) changes.push(`Refresh ${file.src}`);
   file.sha256 = sha256;
+  if (executable(file.src, bytes)) {
+    if (file.executable !== true) changes.push(`Set executable ${file.src}`);
+    file.executable = true;
+  } else if (Object.hasOwn(file, 'executable')) {
+    changes.push(`Remove executable ${file.src}`);
+    delete file.executable;
+  }
   if (file.dest === 'conveyor/orchestration.json' && file.kind !== 'config-if-absent') {
     file.kind = 'config-if-absent';
     changes.push(`Preserve user config ${file.dest}`);
@@ -53,7 +62,7 @@ for (const relative of walk(path.join(payload, 'claude')).sort()) {
   const bytes = fs.readFileSync(path.join(payload, src));
   const kind = relative === 'conveyor/orchestration.json' ? 'config-if-absent' : 'file';
   const file = { src, dest: relative, kind, sha256: hash(bytes) };
-  if (relative.endsWith('.sh') || bytes.subarray(0, 2).toString() === '#!') file.executable = true;
+  if (executable(src, bytes)) file.executable = true;
   manifest.files.push(file);
   changes.push(`Add ${src}`);
 }
