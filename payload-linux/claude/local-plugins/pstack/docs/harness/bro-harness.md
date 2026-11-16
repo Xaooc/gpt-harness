@@ -72,12 +72,18 @@ in the Luna panel, not by hand. Defaults:
 | `swarm workers` | `simple` for edits, `scout` for exploration, `review` for verification | as the job needs |
 | `reflect tooling`, `reflect judgment, divergent, synthesizer` | `review` | `-r` |
 | `arena runners`, `architect runners` | panel `design`: one run per seat (`--panel design --seat <n>`) | `-w`, one worktree per seat |
-| `interrogate reviewers` | panel `review`: one run per seat | `-w` in a throwaway worktree, so findings can be proven by a run |
+| `interrogate reviewers` | `interrogate.mjs` (see below), panel `review` | `-w`, one throwaway worktree per seat |
 | `arena cross-judge pool` | panel `judge`: the first seat whose vendor differs from the orchestrator's (Anthropic) | `-r` |
 
 Panels keep vendors diverse (OpenAI Codex, Google Gemini, Anthropic Claude). Agreement across vendors is
 high-signal; a seat whose provider is unavailable is skipped and reported, never silently replaced by another seat
 of the same vendor.
+
+**Interrogate:** run `node ~/.claude/scripts/conveyor/interrogate.mjs --repo <dir> --intent <file> --out <dir>`
+(optional `--base <ref>` and `--panel <name>`). Verify each finding
+from `findings.json` against its intent and rerun output per arena Phase F; merge findings with the same root cause.
+For exit-4 seats, spawn Claude subagents with the recorded dispatch and brief in fresh throwaway worktrees carrying
+the same scope: the runner removes its worktrees. The runner collects evidence; the orchestrator judges findings.
 
 ## Tools and features
 
@@ -100,8 +106,9 @@ of the same vendor.
 - **Final reply** of a code-changing task ends with the `ledger.mjs checklist` block, after `ledger.mjs crosscheck`.
 - **Prove It Works** is enforced: on a turn that changed code, the stop gate checks the acceptance ledger, the
   evidence and the final checklist. Do not claim done without evidence; the gate will block it.
-- **Encode Lessons in Structure** has a queue: open checks are in `~/.claude/learning/checks.md`; build them with
-  `<pstack>/skills/correct/SKILL.md` only after the user agrees.
+- **Encode Lessons in Structure** has a queue: read it with `node ~/.claude/scripts/conveyor/checks.mjs list`;
+  build checks with `<pstack>/skills/correct/SKILL.md` only after the user agrees, then close each with
+  `node ~/.claude/scripts/conveyor/checks.mjs done <id> --repo <dir> --proof "<command>" --commit <sha>`.
 - Executor results pass the project's fast checks before you see them; a red gate in the result is yours to judge.
 
 ## Replies

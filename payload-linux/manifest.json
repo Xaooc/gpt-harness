@@ -461,7 +461,7 @@
       "src": "claude/local-plugins/pstack/.claude-plugin/plugin.json",
       "dest": "local-plugins/pstack/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "bbf76b5ec1f97e4cdf134e6838ecded75cc2caee28ced8ade57f39f952e857ac"
+      "sha256": "f8e4b2c75fa3b020fdbac6ffc8ac9f7d2113d72cac8ecf833d3b04635d5e1e7a"
     },
     {
       "src": "claude/local-plugins/pstack/LICENSE",
@@ -605,7 +605,7 @@
       "src": "claude/local-plugins/pstack/docs/harness/bro-harness.md",
       "dest": "local-plugins/pstack/docs/harness/bro-harness.md",
       "kind": "file",
-      "sha256": "6cd2e5e2cbaa376164e896aea8b4221733a2189d4f606fdce0b39af4439045a7"
+      "sha256": "75f313fd88c9665d7baefcfcdbe55db840784203db663f5769a3e9d812eccb6b"
     },
     {
       "src": "claude/local-plugins/pstack/docs/harness/claude-code.md",
@@ -3844,6 +3844,20 @@
       "dest": "scripts/gem/gem-run.mjs",
       "kind": "file",
       "sha256": "f6b2a1d7da6c31bd800ae383d60547d7390646e2cda25269f34bd126b9cdf9dc",
+      "executable": true
+    },
+    {
+      "src": "claude/scripts/conveyor/checks.mjs",
+      "dest": "scripts/conveyor/checks.mjs",
+      "kind": "file",
+      "sha256": "f7482b96001a2417b0d63f7c01378ea089d6d2275a7367802210812cee4ad299",
+      "executable": true
+    },
+    {
+      "src": "claude/scripts/conveyor/interrogate.mjs",
+      "dest": "scripts/conveyor/interrogate.mjs",
+      "kind": "file",
+      "sha256": "a138da6d052dc325d89b53670c323e22f5477b5ac0d3c45f7f4cb49ba63b83f9",
       "executable": true
     }
   ],
