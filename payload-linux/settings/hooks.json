@@ -38,6 +38,24 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/conveyor-hygiene-session-start.mjs\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/plugin-quiet.mjs\"",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -70,6 +88,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/conveyor-stop-gate.mjs\"",
+            "timeout": 600
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -92,6 +119,16 @@
             "timeout": 660
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/harness-guards.mjs\"",
+            "timeout": 10
+          }
+        ],
+        "matcher": "Bash|Write|Edit|MultiEdit"
       }
     ],
     "SessionEnd": [
@@ -101,6 +138,28 @@
             "type": "command",
             "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/learning-capture.mjs\"",
             "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/conveyor-prompt-capture.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{NODE}}\" \"{{CLAUDE_HOME}}/hooks/conveyor-subagent-gate.mjs\"",
+            "timeout": 600
           }
         ]
       }
