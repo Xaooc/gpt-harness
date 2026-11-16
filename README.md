@@ -10,7 +10,7 @@ A ready-made Claude Code + Codex setup: Claude orchestrates, Codex executes. One
 |---|---|
 | `luna` and `luna-critics` skills | Rules for orchestration: who executes what, how to write briefs, the critic panels |
 | Luna daemon and wrappers (`luna.sh`, `luna-daemon.mjs`, …) | Every Codex job from every session runs as a thread of one shared `codex app-server`, scheduled fairly, gated by RAM, with a stall watchdog |
-| Heavy-command gate (`heavy-gate.mjs`) | At most 2 heavy commands machine-wide, and only while RAM is free. This protects the PC from freezing |
+| Heavy-command gate (`heavy-gate.mjs`) | At most 3 heavy commands on Linux or 2 on Windows, and only while RAM is free |
 | Broker reaper and Codex plugin patches | Reap process leaks; on Windows, patch the plugin for the review gate |
 | Luna pane (`/luna`) and tray widget (`widget/`) | Live status: RAM, Claude/Codex limits, jobs per session — inside Claude Code and as a Windows tray widget |
 | **Self-learning** (after google-research/harness2), see [SELF-LEARNING.md](SELF-LEARNING.md) | Collects corrections and outcomes, proposes rule edits daily, filtered by code and a critic, with rollback |
@@ -36,8 +36,16 @@ Details and controls: [SELF-LEARNING.md](SELF-LEARNING.md).
 Use Node.js 22+, `bash`, `curl`, and `python3`, then install the stock CLI with
 `npm i -g @openai/codex@0.164.0`. GSD is recommended, as on Windows. No custom Codex build or plugin patches are
 needed. An optional proxy file defaults to `~/.config/luna-proxy.env` and can be selected with `LUNA_PROXY_ENV_FILE`;
-when unset, the legacy `~/.config/bro-env.sh` is used if the default is absent. Disk audit has no default repositories;
-configure `~/.claude/disk-audit.json` to enable it for specific repositories. See [INSTALL.md](INSTALL.md) for setup.
+when unset, the legacy `~/.config/bro-env.sh` is used if the default is absent. Configure `~/.claude/disk-audit.json`
+to override the server snapshot's default repository paths. See [INSTALL.md](INSTALL.md) for setup.
+
+The Linux payload also packages the conveyor: tier dispatcher, project checks, ledger and prompt/subagent/Stop
+gates, harness hygiene, usage accounting, Gemini quota reporting, and the `pstack@luna-local` plugin alongside
+the Luna panel. The panel's `conveyor/orchestration.json` is preserved when present; packaged defaults remain separate.
+
+Installs stop before writing if a payload destination has local edits: exit code **3**, with every drifted path
+listed. A three-way merge into the payload is the usual fix. `--accept-local-drift` explicitly backs up those edits
+and replaces them. `--dry-run` and `--check` also report drift; clean recorded installations upgrade normally.
 
 ## Repo structure
 - `install.mjs`: the installer. It is idempotent, makes backups, and `--check` runs all self-tests.
@@ -45,3 +53,4 @@ configure `~/.claude/disk-audit.json` to enable it for specific repositories. Se
 - `payload-linux/`: the Linux snapshot and portable settings installed into `~/.claude` (see `PACKAGE-SPEC.md`).
 - `codex-build/`: build kit for the custom Codex.
 - `tests/verify-temp-home.mjs`: installs into a temporary home folder and checks everything there.
+- `tools/manifest-sync.mjs`: refreshes Linux manifest entries and hashes; `--check` exits 1 if updates are needed.

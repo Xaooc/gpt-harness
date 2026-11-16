@@ -36,7 +36,13 @@
     "skills/ui-styling/**",
     "skills/ui-ux-pro-max/**",
     "skills/slides/**",
-    "skills/banner-design/**"
+    "skills/banner-design/**",
+    "hooks/managed-hooks-registry.cjs",
+    "scripts/changeset/**",
+    "scripts/lib/allowlist-ratchet.cjs",
+    "scripts/lib/cli-exit.cjs",
+    "skills/bro-server-connect/**",
+    "skills/personal-server-connect/**"
   ],
   "optionalPaths": [
     "~/.claude/heavy-gate-off",

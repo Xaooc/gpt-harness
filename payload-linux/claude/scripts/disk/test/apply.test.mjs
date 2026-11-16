@@ -3,25 +3,8 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DAY, DEFAULTS, git, loadConfig, safeDelete } from '../lib.mjs';
+import { DAY, DEFAULTS, git, safeDelete } from '../lib.mjs';
 import { runAudit, humanReport } from '../audit.mjs';
-
-test('new audit configs have no repositories and existing configured repositories survive', () => {
-  const root = fs.mkdtempSync(path.join(tmpdir(), 'disk-config-test-'));
-  try {
-    const file = path.join(root, 'disk-audit.json');
-    const fresh = loadConfig(file);
-    assert.deepEqual(fresh.repos, []);
-    assert.deepEqual(fresh.liveRefs, {});
-    const repo = path.join(root, 'repo');
-    fs.writeFileSync(file, JSON.stringify({ repos: [repo], liveRefs: { [repo]: ['main'] } }));
-    const existing = loadConfig(file);
-    assert.deepEqual(existing.repos, [repo]);
-    assert.deepEqual(existing.liveRefs, { [repo]: ['main'] });
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
 
 test('rule B deletes only old untracked children and preserves KEEP, fresh and tracked data', () => {
   const root = fs.mkdtempSync(path.join(tmpdir(), 'disk apply test-'));

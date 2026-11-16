@@ -21,6 +21,7 @@ From the cloned repository run:
 node install.mjs --dry-run
 node install.mjs --check
 claude plugin install luna-panel@luna-local
+claude plugin install pstack@luna-local
 ```
 
 `--check` installs the payload and runs the included checks; inspect the PASS/FAIL table. A missing Codex executable
@@ -28,13 +29,28 @@ or missing `gpt-6.1-terra` in the model list is reported as a warning. Restart C
 The pane is installed through the local marketplace, and updates require the marketplace and plugin update commands
 shown in the Windows instructions below.
 
+Linux also installs the conveyor tier dispatcher, project checks, ledger and prompt/subagent/Stop gates,
+harness hygiene, usage accounting, Gemini quota reporting, and the pstack plugin from `luna-local`.
+The installer enables both local plugins. Existing `conveyor/orchestration.json` user configuration is preserved.
+
+If any payload destination differs from both the new payload and its last recorded install hash (or has no
+recorded hash), installation stops with exit code **3** and lists every drifted path before writing anything.
+`--dry-run` and `--check` report the same drift. Usually, three-way merge the local edits into the payload first.
+To deliberately replace them, use `node install.mjs --check --accept-local-drift`; local edits receive timestamped
+backups. Files that still match their recorded hashes upgrade without this flag. User configs installed only
+when absent do not count as drift.
+
+After editing the Linux payload, run `node tools/manifest-sync.mjs` to sync entries and hashes, then
+`node tools/manifest-sync.mjs --check` to verify the manifest is current (exit 1 means changes are needed).
+
 Proxy configuration is optional. When `HTTPS_PROXY` is unset, the wrappers source
 `~/.config/luna-proxy.env`; set `LUNA_PROXY_ENV_FILE` to select another file. For existing installations,
 `~/.config/bro-env.sh` is used only when no override is set and the default file is absent. The shell sources this
 file as shell code, so use a trusted file; the daemon reads only supported proxy and PATH exports.
 
-The disk-audit hook starts with no repositories configured. To use it, add absolute repository paths and their live
-branches to `~/.claude/disk-audit.json`; existing server configurations are preserved.
+The disk-audit snapshot defaults to `~/dev/kriminalist` and `~/rpg`. Set absolute repository paths and their live
+branches in `~/.claude/disk-audit.json` to override them, or use `"repos": []` to disable auditing repositories.
+Existing server configurations are preserved.
 
 ## Windows installation
 

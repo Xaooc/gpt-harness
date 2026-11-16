@@ -2,6 +2,7 @@
 """Offline lifecycle and PID identity regressions; no pytest/uv installation needed."""
 from contextlib import redirect_stdout
 from io import StringIO
+import fcntl
 import importlib.util
 import json
 import os
@@ -159,6 +160,217 @@ class Lifecycle(unittest.TestCase):
                                  cwd=str(self.root), env=env, stdout=stream, stderr=subprocess.STDOUT)
         self.gates.append(child)
         return child, Path(env["FIXTURE_READY"]), output
+
+    def test_waiters_are_served_in_arrival_order(self):
+        self.fixture()
+        config = {"PYTEST_GATE_POOL": "1", "PYTEST_GATE_MAX_WORKERS": "1", "PYTEST_GATE_POLL_S": "0.2"}
+        holder, holder_ready, _ = self.fixture_launch("holder", self.root / "temp-holder", 1, ["tests/"], config)
+        self.assertTrue(eventually(holder_ready.exists))
+        waiters = []
+        for label, poll in (("a", "2"), ("b", "0.5"), ("c", "0.05")):
+            if label == "c":
+                time.sleep(2)  # Also stagger the original gate's fixed five-second polls.
+            options = {**config, "PYTEST_GATE_POLL_S": poll}
+            child, ready, output = self.fixture_launch(label, self.root / ("temp-" + label), 1,
+                                                       ["tests/"], options)
+            waiters.append((child, ready))
+            self.assertTrue(eventually(lambda: "waiting for 1 of 1 slots" in output.read_text()))
+            if label == "b":
+                b_waiting = time.monotonic()
+        time.sleep(max(0, b_waiting + 5.2 - time.monotonic()))
+        (self.root / "holder.release").touch()
+        self.assertEqual(holder.wait(timeout=20), 0)
+        for index, (child, ready) in enumerate(waiters):
+            self.assertTrue(eventually(lambda: any(row[1].exists() for row in waiters[index:])))
+            actual = [label for label, (_, item) in zip(("a", "b", "c"), waiters) if item.exists()]
+            self.assertTrue(ready.exists(), f"expected {('a', 'b', 'c')[index]} first; ready: {actual}")
+            self.assertTrue(eventually(ready.exists))
+            for _, later_ready in waiters[index + 1:]:
+                self.assertFalse(later_ready.exists())
+            (self.root / (("a", "b", "c")[index] + ".release")).touch()
+            self.assertEqual(child.wait(timeout=20), 0)
+        self.assertTrue(gate.may_start(0, [2, 1], 2, 0))
+        self.assertTrue(gate.may_start(1, [2, 1], 1, 0))
+        self.assertFalse(gate.may_start(1, [2, 1], 1, float("inf")))
+        self.assertFalse(gate.may_start(2, [3, 1, 1], 1, 0))
+        self.assertFalse(gate.may_start(1, [3, 2], 1, 0))
+
+    def test_dead_waiter_ticket_is_dropped(self):
+        self.fixture()
+        config = {"PYTEST_GATE_POOL": "1", "PYTEST_GATE_MAX_WORKERS": "1", "PYTEST_GATE_POLL_S": "0.2"}
+        holder, holder_ready, _ = self.fixture_launch("holder", self.root / "temp-holder", 1, ["tests/"], config)
+        self.assertTrue(eventually(holder_ready.exists))
+        first, _, _ = self.fixture_launch("x", self.root / "temp-x", 1, ["tests/"], config)
+        queue = gate.SLOT_DIR / "queue"
+        self.assertTrue(eventually(lambda: len(list(queue.glob("*.ticket"))) == 1))
+        dead_ticket = next(queue.glob("*.ticket"))
+        first.kill()
+        self.assertEqual(first.wait(timeout=20), -signal.SIGKILL)
+        second, second_ready, _ = self.fixture_launch("y", self.root / "temp-y", 1, ["tests/"], config)
+        self.assertTrue(eventually(lambda: not dead_ticket.exists() and len(list(queue.glob("*.ticket"))) == 1))
+        second_ticket = next(queue.glob("*.ticket"))
+        self.assertIn(f"-{second.pid}-", second_ticket.name)
+        old_inode = second_ticket.stat().st_ino
+        with gate.queue_lock():
+            second_ticket.unlink()
+            queue.rmdir()
+        self.assertTrue(eventually(lambda: second_ticket.exists() and second_ticket.stat().st_ino != old_inode))
+        abandoned, recent = queue / ".abandoned.ticket.new", queue / ".recent.ticket.new"
+        abandoned.touch()
+        recent.touch()
+        os.utime(abandoned, (time.time() - 61, time.time() - 61))
+        with gate.queue_lock():
+            gate.queue_entries()
+        self.assertFalse(abandoned.exists())
+        self.assertTrue(recent.exists())
+        earlier = int(second_ticket.name.split("-", 1)[0]) - 1
+        name = f"{earlier:020d}-{first.pid}-deadbeef.ticket"
+        pending, foreign = queue / f".{name}.new", queue / name
+        fd = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            content = (f"pid={first.pid}\npid_start=1\ncwd={self.root}\nslots=1\n"
+                       f"pytest_workers=1\narrived={time.time()}\nargs=tests/\n")
+            os.write(fd, content.encode())
+            os.rename(pending, foreign)
+            before = second_ticket.stat().st_mtime_ns
+            self.assertTrue(eventually(lambda: second_ticket.stat().st_mtime_ns > before))
+            self.assertTrue(foreign.exists())
+            old = time.time() - gate.FROZEN_SECONDS - 1
+            os.utime(fd, (old, old))
+            with gate.queue_lock():
+                rows = gate.queue_entries()
+            self.assertTrue(next(row for row in rows if row["name"] == name)["frozen"])
+            self.assertEqual([row["name"] for row in rows], [name, second_ticket.name])
+            with gate.queue_lock():
+                content = second_ticket.read_text()
+                second_ticket.write_text("\n".join(line for line in content.splitlines()
+                                                   if not line.startswith("pidns=")) + "\n")
+            output = StringIO()
+            legacy_paths = [gate.SLOT_DIR / f"slot-{index}.lock" for index in (2, 3, 4)]
+            with legacy_paths[0].open("w+") as legacy_one, legacy_paths[1].open("w+") as legacy_two, \
+                    legacy_paths[2].open("w+") as local:
+                for stream in (legacy_one, legacy_two):
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    stream.write(f"{first.pid} /a path with spaces\npid_start=1\ntime={time.time() - 63}\n")
+                    stream.flush()
+                fcntl.flock(local.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                start = gate.process_identity(holder.pid)["start"]
+                local.write(f"{holder.pid} /local legacy\npid_start={start}\ntime={time.time()}\n")
+                local.flush()
+                with patch.object(gate, "_head_since", wraps=gate._head_since) as head, redirect_stdout(output):
+                    self.assertEqual(gate.status(), 0)
+            self.assertFalse(head.call_args.args[2])
+            self.assertIn(": 2 slots, 1 busy, 1 free; RAM ", output.getvalue())
+            self.assertIn("holders:", output.getvalue())
+            self.assertIn(f"pid {first.pid} (other pid ns)  -n ?  slots 2", output.getvalue())
+            self.assertIn(f"pid {holder.pid}  -n ?  slots 1", output.getvalue())
+            self.assertIn("(outside pool of 2)", output.getvalue())
+            self.assertIn("/a path with spaces", output.getvalue())
+            self.assertIn("queue (2 waiting;", output.getvalue())
+            self.assertIn("backfill open", output.getvalue())
+            self.assertIn(f"pid {first.pid} (other pid ns)  -n 1  slots 1  waited", output.getvalue())
+            self.assertIn(f"pid {second.pid}  -n 1  slots 1  waited", output.getvalue())
+            self.assertIn("[frozen]", output.getvalue())
+            self.assertFalse((gate.SLOT_DIR / "slot-1.lock").exists())
+            dead = queue / f"{earlier - 1:020d}-{first.pid}-deadbeef.ticket"
+            with gate.queue_lock():
+                dead.write_text(f"pid={first.pid}\npid_start=1\ncwd={self.root}\n")
+                abandoned.touch()
+                os.utime(abandoned, (old, old))
+                unlocked = StringIO()
+                with redirect_stdout(unlocked):
+                    self.assertEqual(gate.status(), 0)
+                self.assertIn("queue.lock busy for 3s+: held by pid", unlocked.getvalue())
+                self.assertIn("[dead]", unlocked.getvalue())
+                self.assertIn("[frozen]", unlocked.getvalue())
+                self.assertTrue(dead.exists())
+                self.assertTrue(abandoned.exists())
+                dead.unlink()
+                abandoned.unlink()
+                warning = StringIO()
+                with patch.object(gate.time, "monotonic", side_effect=[0, 31, 32]), \
+                        patch.object(gate.time, "sleep", side_effect=[None, RuntimeError("stop waiting")]), \
+                        redirect_stdout(warning):
+                    with self.assertRaisesRegex(RuntimeError, "stop waiting"):
+                        with gate.queue_lock():
+                            self.fail("contended lock was acquired")
+                self.assertEqual(warning.getvalue().count("queue.lock held for 30s+"), 1)
+                self.assertIn(f"pid {os.getpid()}", warning.getvalue())
+                self.assertIn("a gate may be stopped mid-decision", warning.getvalue())
+            closed = StringIO()
+            with patch.object(gate, "BACKFILL_SECONDS", 0), redirect_stdout(closed):
+                self.assertEqual(gate.status(), 0)
+            self.assertIn("backfill closed", closed.getvalue())
+            os.utime(fd, None)
+            with gate.queue_lock():
+                rows = gate.queue_entries()
+            self.assertFalse(next(row for row in rows if row["name"] == name)["frozen"])
+            os.utime(fd, (old, old))
+            (self.root / "holder.release").touch()
+            self.assertEqual(holder.wait(timeout=20), 0)
+            self.assertTrue(eventually(second_ready.exists))
+            self.assertTrue(foreign.exists())
+            (self.root / "y.release").touch()
+            self.assertEqual(second.wait(timeout=20), 0)
+        finally:
+            os.close(fd)
+        with gate.queue_lock():
+            self.assertEqual(gate.queue_entries(), [])
+        self.assertFalse(foreign.exists())
+
+    def test_queue_ignoring_gate_is_not_blocked_and_head_survives_it(self):
+        self.fixture()
+        config = {"PYTEST_GATE_POOL": "2", "PYTEST_GATE_MAX_WORKERS": "2", "PYTEST_GATE_POLL_S": "0.2"}
+        h1, h1_ready, _ = self.fixture_launch("h1", self.root / "temp-h1", 1, ["tests/"], config)
+        h2, h2_ready, _ = self.fixture_launch("h2", self.root / "temp-h2", 1, ["tests/"], config)
+        self.assertTrue(eventually(lambda: h1_ready.exists() and h2_ready.exists()))
+        killed, _, _ = self.fixture_launch("k", self.root / "temp-k", 1, ["tests/"], config)
+        queue = gate.SLOT_DIR / "queue"
+        self.assertTrue(eventually(lambda: len(list(queue.glob("*.ticket"))) == 1))
+        dead_ticket = next(queue.glob("*.ticket"))
+        dead_content = dead_ticket.read_bytes()
+        killed.kill()
+        self.assertEqual(killed.wait(timeout=20), -signal.SIGKILL)
+        new, new_ready, _ = self.fixture_launch("n", self.root / "temp-n", 2, ["tests/"], config)
+        self.assertTrue(eventually(lambda: any(f"-{new.pid}-" in path.name for path in queue.glob("*.ticket"))))
+        new_ticket = next(path for path in queue.glob("*.ticket") if f"-{new.pid}-" in path.name)
+        old_code = ('import importlib.util,os,sys,time\n'
+                    'from pathlib import Path\n'
+                    'spec=importlib.util.spec_from_file_location("pytest_gate",sys.argv[1])\n'
+                    'gate=importlib.util.module_from_spec(spec); spec.loader.exec_module(gate)\n'
+                    'while not (slots:=gate.try_acquire(1)): time.sleep(0.2)\n'
+                    'Path(os.environ["FIXTURE_READY"]).touch()\n'
+                    'while not Path(os.environ["FIXTURE_RELEASE"]).exists(): time.sleep(0.05)\n'
+                    'gate.release_slots(slots)\n')
+        env = self.fixture_env("o", self.root / "temp-o")
+        env.update(config)
+        self.releases.append(Path(env["FIXTURE_RELEASE"]))
+        with gate.queue_lock():
+            # N may already have pruned K; restore its unlocked ticket to exercise both cases.
+            if not dead_ticket.exists():
+                dead_ticket.write_bytes(dead_content)
+            old = subprocess.Popen([sys.executable, "-c", old_code, str(SCRIPT)], cwd=str(self.root), env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.gates.append(old)
+            (self.root / "h1.release").touch()
+            self.assertEqual(h1.wait(timeout=20), 0)
+            self.assertTrue(eventually(Path(env["FIXTURE_READY"]).exists))
+            self.assertTrue(dead_ticket.exists())
+            self.assertFalse(new_ready.exists())
+        (self.root / "h2.release").touch()
+        self.assertEqual(h2.wait(timeout=20), 0)
+        before = new_ticket.stat().st_mtime_ns
+        time.sleep(1)
+        self.assertFalse(new_ready.exists())
+        self.assertIsNone(new.poll())
+        self.assertGreater(new_ticket.stat().st_mtime_ns, before)
+        (self.root / "o.release").touch()
+        self.assertEqual(old.wait(timeout=20), 0)
+        self.assertTrue(eventually(new_ready.exists))
+        (self.root / "n.release").touch()
+        self.assertEqual(new.wait(timeout=20), 0)
+        self.assertFalse(dead_ticket.exists())
 
     def test_different_temp_directories_share_pool(self):
         self.fixture()

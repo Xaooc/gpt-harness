@@ -1,6 +1,6 @@
 /**
  * Usage: node install.mjs [--home <dir>] [--platform win32|linux] [--codex-build-root <winpath>]
- *   [--dry-run] [--check] [--no-plugin-patch] [--yes] [--uninstall] [--help]
+ *   [--dry-run] [--check] [--accept-local-drift] [--no-plugin-patch] [--yes] [--uninstall] [--help]
  * Run node install.mjs --self-test for isolated tests using a tiny temporary payload.
  */
 import assert from 'node:assert/strict';
@@ -21,7 +21,9 @@ const END = '<!-- luna-harness:end -->';
 const CHECK_TIMEOUT = 300_000;
 const RECORD = 'luna-harness.installed.json';
 const USAGE = 'Usage: node install.mjs [--home <dir>] [--platform win32|linux] [--codex-build-root <winpath>]\n'
-  + '  [--dry-run] [--check] [--no-plugin-patch] [--yes] [--uninstall] [--self-test] [--help]';
+  + '  [--dry-run] [--check] [--accept-local-drift] [--no-plugin-patch] [--yes] [--uninstall] [--self-test] [--help]\n'
+  + '--accept-local-drift: back up local edits and replace them; otherwise drift exits 3 before any writes.\n'
+  + 'A three-way merge is the usual fix for local drift. --dry-run and --check also list drift.';
 
 function parseArgs(args) {
   const options = { home: os.homedir(), platform: process.platform };
@@ -38,6 +40,7 @@ function parseArgs(args) {
       const flags = {
         '--dry-run': 'dryRun', '--check': 'check', '--no-plugin-patch': 'noPluginPatch',
         '--yes': 'yes', '--self-test': 'selfTest', '--uninstall': 'uninstall', '--help': 'help',
+        '--accept-local-drift': 'acceptLocalDrift',
       };
       if (!flags[arg]) throw new Error(`Unknown option: ${arg}`);
       options[flags[arg]] = true;
@@ -310,6 +313,16 @@ export function substitutePlaceholders(value, claudeHome) {
   return value;
 }
 
+function settingsFragment(ctx, fragmentPath) {
+  const fragment = substitutePlaceholders(readJson(fragmentPath), ctx.claudeHome);
+  if (ctx.platform === 'linux') {
+    fragment.enabledPlugins ??= {};
+    requireObject(fragment.enabledPlugins, 'enabledPlugins');
+    fragment.enabledPlugins['pstack@luna-local'] = true;
+  }
+  return fragment;
+}
+
 function hookIdentity(event, hook) {
   if (typeof hook.command !== 'string') return null;
   const tokens = [...hook.command.matchAll(/"([^"]*)"|'([^']*)'|([^\s]+)/g)]
@@ -393,7 +406,7 @@ function installSettings(ctx, fragmentPath, writer = atomicWrite) {
   let attempted = false;
   try {
     const settings = previous ? JSON.parse(previous.toString('utf8').replace(/^\uFEFF/, '')) : {};
-    const fragment = ctx.prepared?.fragment ?? substitutePlaceholders(readJson(fragmentPath), ctx.claudeHome);
+    const fragment = ctx.prepared?.fragment ?? settingsFragment(ctx, fragmentPath);
     removeHooks(ctx, settings, ctx.droppedHooks ?? []);
     const next = `${JSON.stringify(mergeSettings(settings, fragment), null, 2)}\n`;
     if (previous?.equals(Buffer.from(next))) {
@@ -669,6 +682,7 @@ function prepareInstall(ctx, manifest) {
   if (manifest.version !== 1 || !Array.isArray(manifest.files)) throw new Error('Unsupported payload manifest');
   const existingFiles = new Set();
   const destinations = new Set();
+  const driftedFiles = [];
   for (const file of manifest.files) {
     if (!['file', 'config-if-absent', 'binary'].includes(file.kind)) {
       throw new Error(`Unknown payload kind: ${file.kind}`);
@@ -677,11 +691,19 @@ function prepareInstall(ctx, manifest) {
       throw new Error(`Invalid executable flag: ${file.src}`);
     }
     const source = resolveInside(ctx.payload, file.src);
-    assertHash(fs.readFileSync(source), file.sha256, source);
+    const bytes = fs.readFileSync(source);
+    assertHash(bytes, file.sha256, source);
     const target = resolveInside(ctx.claudeHome, file.dest);
     if (destinations.has(file.dest)) throw new Error(`Duplicate payload destination: ${file.dest}`);
     destinations.add(file.dest);
-    if (fs.existsSync(target)) existingFiles.add(file.dest);
+    const previous = readOptional(target);
+    if (previous) {
+      existingFiles.add(file.dest);
+      if (file.kind !== 'config-if-absent' && !previous.equals(bytes)
+        && sha256(previous) !== ctx.record?.files[file.dest]) {
+        driftedFiles.push(target);
+      }
+    }
   }
   const settingsPath = path.join(ctx.claudeHome, 'settings.json');
   const settings = fs.existsSync(settingsPath) ? requireObject(readJson(settingsPath), 'settings.json') : {};
@@ -689,7 +711,7 @@ function prepareInstall(ctx, manifest) {
   if (ctx.platform === 'linux' || Object.hasOwn(manifest, 'settingsSha256')) {
     assertHash(fs.readFileSync(settingsSource), manifest.settingsSha256, settingsSource);
   }
-  const fragment = substitutePlaceholders(readJson(settingsSource), ctx.claudeHome);
+  const fragment = settingsFragment(ctx, settingsSource);
   const hooks = hookIdentities(mergeSettings({}, structuredClone(fragment)));
   const droppedHooks = (ctx.record?.hooks ?? []).filter(identity => !hooks.includes(identity));
   removeHooks(null, settings, droppedHooks);
@@ -712,7 +734,7 @@ function prepareInstall(ctx, manifest) {
     throw new Error('Custom Codex root cannot contain a newline');
   }
   ctx.droppedHooks = droppedHooks;
-  ctx.prepared = { fragment, hooks, patches, existingFiles };
+  ctx.prepared = { fragment, hooks, patches, existingFiles, driftedFiles };
 }
 
 function protectedData(dest) {
@@ -761,7 +783,7 @@ function restorationBefore(ctx, name) {
     const settings = JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/, ''));
     const before = JSON.stringify(settings);
     removeHooks(null, settings, ctx.prepared.hooks);
-    removeLunaKeys(settings);
+    removeLunaKeys(settings, ctx.platform);
     if (JSON.stringify(settings) !== before) baseline = Buffer.from(`${JSON.stringify(settings, null, 2)}\n`);
   }
   return { before: baseline?.toString('base64') ?? null, restoreExact: !ctx.record };
@@ -811,8 +833,10 @@ function restoreExact(ctx, name, current) {
   return true;
 }
 
-function removeLunaKeys(settings) {
-  for (const [key, name] of [['extraKnownMarketplaces', 'luna-local'], ['enabledPlugins', 'luna-panel@luna-local']]) {
+function removeLunaKeys(settings, platform) {
+  const keys = [['extraKnownMarketplaces', 'luna-local'], ['enabledPlugins', 'luna-panel@luna-local']];
+  if (platform === 'linux') keys.push(['enabledPlugins', 'pstack@luna-local']);
+  for (const [key, name] of keys) {
     if (!settings[key]) continue;
     requireObject(settings[key], key);
     if (!Object.hasOwn(settings[key], name)) continue;
@@ -839,7 +863,7 @@ function uninstall(ctx) {
   const previous = readOptional(settingsPath);
   const settings = previous ? requireObject(readJson(settingsPath), 'settings.json') : {};
   removeHooks(null, settings, ctx.record.hooks);
-  removeLunaKeys(settings);
+  removeLunaKeys(settings, ctx.platform);
   const mdPath = path.join(ctx.claudeHome, 'CLAUDE.md');
   const md = readOptional(mdPath);
   const range = md ? markerRange(md.toString('utf8')) : null;
@@ -905,12 +929,25 @@ function removeEmptyParents(ctx, dests) {
 
 function install(ctx, preflightFn = preflight) {
   if (ctx.uninstall) return uninstall(ctx);
+  const manifestPath = path.join(ctx.payload, 'manifest.json');
+  let manifest;
+  if (!(ctx.dryRun && ctx.check) || fs.existsSync(manifestPath)) {
+    manifest = readJson(manifestPath);
+    ctx.record = readRecord(ctx);
+    prepareInstall(ctx, manifest);
+    for (const target of ctx.prepared.driftedFiles) report(ctx, 'warn', `Local drift: ${target}`);
+    if (ctx.prepared.driftedFiles.length) {
+      report(ctx, 'warn', 'A three-way merge is the usual fix; --accept-local-drift backs up and replaces local edits.');
+      if (!ctx.acceptLocalDrift) {
+        report(ctx, 'FAIL', 'Installation refused due to local drift; nothing written (exit 3).');
+        printSummary(ctx);
+        return 3;
+      }
+    }
+  }
   preflightFn(ctx);
   let checkStatus = 0;
   if (!(ctx.dryRun && ctx.check)) {
-    const manifest = readJson(path.join(ctx.payload, 'manifest.json'));
-    ctx.record = readRecord(ctx);
-    prepareInstall(ctx, manifest);
     const restoration = Object.fromEntries(['settings.json', 'CLAUDE.md'].map(name =>
       [name, restorationBefore(ctx, name)]));
     const created = {
@@ -1031,14 +1068,25 @@ function selfTest() {
       assert.throws(() => parseArgs(['--platform', 'darwin', '--self-test']), /Unsupported platform/);
       assert.throws(() => parseArgs(['--platform']), /Missing value/);
       assert.equal(parseArgs(['--help']).help, true);
+      assert.equal(parseArgs(['--accept-local-drift']).acceptLocalDrift, true);
       assert.match(USAGE, /--dry-run.*--check/);
+      assert.match(USAGE, /drift exits 3 before any writes/);
     });
     test('Linux payload hashes cover installed files and both settings assets', () => {
       const linuxPayload = path.join(REPO_ROOT, 'payload-linux');
       const linuxManifest = readJson(path.join(linuxPayload, 'manifest.json'));
       const listed = new Set(linuxManifest.files.map(file => resolveInside(linuxPayload, file.src)));
-      assert.deepEqual([...listed].sort(), walkFiles(path.join(linuxPayload, 'claude')).sort());
+      const files = walkFiles(path.join(linuxPayload, 'claude'));
+      for (const file of listed) assert.ok(files.includes(file), `Missing listed file: ${file}`);
+      for (const file of files.filter(file => !listed.has(file))) {
+        const relative = path.relative(path.join(linuxPayload, 'claude'), file).replaceAll('\\', '/');
+        assert.ok(!relative.startsWith('local-plugins/pstack/'), `Unpackaged vendored plugin file: ${relative}`);
+        assert.match(relative, /(?:^|\/)(?:test|tests|__pycache__|node_modules)(?:\/|$)|\.test\.|\.bak|(?:^|\/)\.DS_Store$/,
+          `Unpackaged Linux payload file: ${relative}`);
+      }
       assert.ok(linuxManifest.files.some(file => file.dest === 'scripts/lib/luna-linux-test.mjs'));
+      assert.equal(linuxManifest.files.find(file => file.dest === 'conveyor/harness-facts.json')?.kind, 'file');
+      assert.ok(linuxManifest.files.some(file => file.dest === 'local-plugins/pstack/.claude-plugin/plugin.json'));
       const linuxCtx = makeContext({ home: path.join(temp, 'linux-hash-home'), platform: 'linux',
         payload: linuxPayload, log: () => {} });
       prepareInstall(linuxCtx, linuxManifest);
@@ -1070,12 +1118,18 @@ function selfTest() {
       const manifest = readJson(path.join(options.payload, 'manifest.json'));
       const fragment = substitutePlaceholders(readJson(path.join(options.payload, manifest.settings)), linux.claudeHome);
       const settings = readJson(path.join(linux.claudeHome, 'settings.json'));
+      assert.equal(settings.enabledPlugins['pstack@luna-local'], true);
+      assert.equal(settings.enabledPlugins['luna-panel@luna-local'], true);
       assert.equal(fragment.extraKnownMarketplaces['luna-local'].source.path,
         `${linux.claudeHome.replaceAll('\\', '/')}/local-plugins`);
       for (const [event, entries] of Object.entries(fragment.hooks)) {
         for (const entry of entries) for (const hook of entry.hooks) {
           assert.ok(hook.command.startsWith(`"${process.execPath.replaceAll('\\', '/')}" `));
           assert.ok(hook.command.includes(`"${linux.claudeHome.replaceAll('\\', '/')}/`));
+          const script = hook.command.match(/"([^"]+)"/g)[1].slice(1, -1);
+          assert.ok(fs.existsSync(script), `Missing hook target: ${script}`);
+          assert.ok(manifest.files.some(file =>
+            resolveInside(linux.claudeHome, file.dest).replaceAll('\\', '/') === script), `Unlisted hook: ${script}`);
           assert.equal(settings.hooks[event].flatMap(item => item.hooks)
             .filter(item => item.command === hook.command).length, 1);
         }
@@ -1091,12 +1145,17 @@ function selfTest() {
       const second = makeContext(options);
       assert.equal(install(second, () => {}), 0);
       assert.equal(second.written, 0);
+      settings.userAfterInstall = true;
+      atomicWrite(path.join(linux.claudeHome, 'settings.json'), json(settings));
       const installed = snapshot(home);
       assert.equal(install(makeContext({ ...options, uninstall: true, dryRun: true })), 0);
       assert.deepEqual(snapshot(home), installed);
       assert.equal(install(makeContext({ ...options, uninstall: true })), 0);
       assert.equal(fs.readFileSync(plugin, 'utf8'), 'unpatched plugin');
       assert.equal(fs.existsSync(path.join(linux.claudeHome, RECORD)), false);
+      const remaining = readJson(path.join(linux.claudeHome, 'settings.json'));
+      assert.equal(remaining.userAfterInstall, true);
+      assert.equal(remaining.enabledPlugins['pstack@luna-local'], undefined);
     });
     test('placeholder substitution handles Windows backslashes and paths with spaces', () => {
       const result = substitutePlaceholders(readJson(fragmentPath), ch);
@@ -1288,6 +1347,67 @@ function selfTest() {
       const ctx = winContext(options);
       return { ...fixture, ctx, options, ch: ctx.claudeHome };
     }
+    test('local drift refuses every install mode with exit 3 and no writes, with or without a record', () => {
+      for (const recorded of [false, true]) {
+        const fixture = isolated(`drift-refused-${recorded}`);
+        if (recorded) assert.equal(install(fixture.ctx, () => {}), 0);
+        const script = path.join(fixture.ch, 'scripts/example.mjs');
+        const binary = path.join(fixture.ch, 'bin/example.exe');
+        atomicWrite(script, 'local script edit');
+        atomicWrite(binary, 'local binary edit');
+        const before = snapshot(fixture.ctx.home);
+        for (const mode of [{}, { dryRun: true }, { check: true }, { dryRun: true, check: true }]) {
+          const messages = [];
+          const attempt = winContext({ ...fixture.options, ...mode, log: message => messages.push(message) });
+          assert.equal(install(attempt, () => assert.fail('Preflight must not run before drift refusal')), 3);
+          assert.deepEqual(snapshot(fixture.ctx.home), before);
+          assert.equal(fs.readFileSync(script, 'utf8'), 'local script edit');
+          assert.equal(attempt.written, 0);
+          assert.equal(attempt.backups, 0);
+          for (const file of [script, binary]) assert.ok(messages.includes(`[warn] Local drift: ${file}`));
+          assert.ok(messages.some(message => message.includes('three-way merge')));
+        }
+      }
+    });
+    test('accept-local-drift backs up and installs local edits, with or without a record', () => {
+      for (const recorded of [false, true]) {
+        const fixture = isolated(`drift-accepted-${recorded}`);
+        if (recorded) assert.equal(install(fixture.ctx, () => {}), 0);
+        const script = path.join(fixture.ch, 'scripts/example.mjs');
+        atomicWrite(script, 'keep this local edit');
+        const before = snapshot(fixture.ctx.home);
+        const dry = winContext({ ...fixture.options, dryRun: true, acceptLocalDrift: true });
+        assert.equal(install(dry, () => {}), 0);
+        assert.deepEqual(snapshot(fixture.ctx.home), before);
+        const accepted = winContext({ ...fixture.options, acceptLocalDrift: true });
+        assert.equal(install(accepted, () => {}), 0);
+        assert.equal(fs.readFileSync(script, 'utf8'), 'export const version = 1;\n');
+        const backups = fs.readdirSync(path.dirname(script)).filter(name =>
+          /^example\.mjs\.bak-luna-harness-\d{8}-\d{6}(?:-\d+)?$/.test(name));
+        assert.equal(backups.length, 1);
+        assert.equal(fs.readFileSync(path.join(path.dirname(script), backups[0]), 'utf8'), 'keep this local edit');
+      }
+    });
+    test('a clean recorded install upgrades without accepting drift and existing configs never drift', () => {
+      const fixture = isolated('drift-clean-upgrade');
+      assert.equal(install(fixture.ctx, () => {}), 0);
+      const script = path.join(fixture.ch, 'scripts/example.mjs');
+      const source = fixture.manifest.files[0];
+      const previous = fs.readFileSync(script);
+      assert.equal(sha256(previous), readJson(path.join(fixture.ch, RECORD)).files[source.dest]);
+      atomicWrite(path.join(fixture.payload, source.src), 'new clean package version');
+      source.sha256 = sha256('new clean package version');
+      atomicWrite(path.join(fixture.payload, 'manifest.json'), json(fixture.manifest));
+      const config = path.join(fixture.ch, 'learning/config.json');
+      atomicWrite(config, '{"user":true}');
+      const upgrade = winContext(fixture.options);
+      assert.equal(install(upgrade, () => {}), 0);
+      assert.deepEqual(upgrade.prepared.driftedFiles, []);
+      assert.equal(fs.readFileSync(script, 'utf8'), 'new clean package version');
+      assert.equal(fs.readFileSync(config, 'utf8'), '{"user":true}');
+      assert.ok(!upgrade.warnings.some(message => message.startsWith('local edits saved to ')));
+      assert.ok(!fs.readdirSync(path.dirname(script)).some(name => /bak-luna-harness-\d/.test(name)));
+    });
     test('auto-updated target and backup survive dry-run and real uninstall with the same warning', () => {
       const fixture = isolated('plugin-auto-update');
       const plugin = path.join(fixture.ch, 'plugins/test/plugin.mjs');
@@ -1523,10 +1643,11 @@ function selfTest() {
       const fixture = isolated('user-edit');
       const script = path.join(fixture.ch, 'scripts/example.mjs');
       atomicWrite(script, 'before first install');
+      fixture.ctx.acceptLocalDrift = true;
       install(fixture.ctx);
       assert.equal(fs.readFileSync(`${script}${BACKUP_SUFFIX}`, 'utf8'), 'before first install');
       atomicWrite(script, 'my local edit');
-      const upgrade = winContext(fixture.options);
+      const upgrade = winContext({ ...fixture.options, acceptLocalDrift: true });
       install(upgrade);
       const backups = fs.readdirSync(path.dirname(script)).filter(name =>
         /^example\.mjs\.bak-luna-harness-\d{8}-\d{6}(?:-\d+)?$/.test(name));

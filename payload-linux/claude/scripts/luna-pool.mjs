@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Admission is shared with luna.sh. LUNA_NO_GATE=1 skips both RAM and locking.
+// RAM admission is shared with luna.sh. LUNA_NO_GATE=1 skips it, but not the account lease.
 // LUNA_ADMIT_LOCK: directory (default $HOME/.claude/luna-run/admit.lock).
 // LUNA_POOL_SERVER_MB: app-server RAM estimate (default 120 MB).
 // LUNA_POOL_RAMP_MS: hold the admission lock after a start (default 2000 ms).
@@ -19,6 +19,7 @@ import path from 'node:path';
 import {
   availableMemory, codexEnvironment, loadProxyEnv, ownedProcess, readProcess, resolveCodex, stopGroup, stopGroupSync
 } from './lib/luna-runtime.mjs';
+import { bindLeaseChild, heartbeat as leaseHeartbeat, releaseLease, tryShared } from './account-lease.mjs';
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
@@ -26,6 +27,7 @@ const MB = 1024 * 1024;
 const STARTUP_TIMEOUT_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 60_000;
 const MAX_TIMER_MS = 2_147_000_000;
+const monotonic = () => Number(process.hrtime.bigint() / 1_000_000n);
 const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 const REFUSAL_RE = new RegExp([
   String.raw`\b(i|we)\b[^.\n]{0,25}\b` +
@@ -105,7 +107,7 @@ function parseArgs(argv) {
     throw new CliError([
       'usage: node luna-pool.mjs <briefs-dir> <repo-root> [--max N] [--effort E] [--dry-run]',
       '  LUNA_ADMIT_LOCK: shared directory (default $HOME/.claude/luna-run/admit.lock)',
-      '  LUNA_POOL_SERVER_MB=120, LUNA_POOL_RAMP_MS=2000, LUNA_WAIT_MAX_S=1800, LUNA_NO_GATE=1 skips admission',
+      '  LUNA_POOL_SERVER_MB=120, LUNA_POOL_RAMP_MS=2000, LUNA_WAIT_MAX_S=1800, LUNA_NO_GATE=1 skips RAM admission',
       '  LUNA_IDLE_MAX_S=900 (0 disables), LUNA_TURN_TIMEOUT_S=2400; stalls: state=stalled rc=124',
       '  luna.sh uses LUNA_TIMEOUT_S=28800 (8 h hard cap, 0 disables); stalls are caught by idle time'
     ].join('\n'));
@@ -500,7 +502,10 @@ function spawnServer(home, leanArgs) {
 }
 
 function childIdentity(child) {
-  if (child.lunaIdentity) return child.lunaIdentity;
+  if (child.lunaIdentity) {
+    const current = readProcess(child.pid);
+    return current?.started === child.lunaIdentity.started ? current : child.lunaIdentity;
+  }
   if (typeof child.kill === 'function' && child.exitCode === null && child.signalCode === null) {
     return readProcess(child.pid);
   }
@@ -548,6 +553,9 @@ async function runPool(config) {
   let killPromise = null;
   let stdoutClosed = false;
   let processClosed = false;
+  let nextRetryAt = 0;
+  let startupLease;
+  let stopStartupHeartbeat;
   const pending = new Map();
   const byThread = new Map();
   const abortPromise = new Promise((resolve) => { abortMain = resolve; });
@@ -565,6 +573,25 @@ async function runPool(config) {
       for (const job of jobs) log(job, message);
     }
   });
+
+  function releaseAccount(job) {
+    if (job.leaseRelease) return job.leaseRelease;
+    if (!job.accountLease) return Promise.resolve();
+    job.stopLeaseHeartbeat?.();
+    const id = job.accountLease.id;
+    const pending = (async () => {
+      while (true) {
+        try { await releaseLease(id); break; }
+        catch (error) {
+          process.stderr.write(`luna-pool: lease release: ${error.message}\n`);
+          await sleep(250);
+        }
+      }
+      if (job.accountLease?.id === id) job.accountLease = null;
+    })().finally(() => { if (job.leaseRelease === pending) job.leaseRelease = null; });
+    job.leaseRelease = pending;
+    return pending;
+  }
 
   function releaseAdmission(job) {
     if (job && admissionJob !== job) return;
@@ -662,9 +689,14 @@ async function runPool(config) {
   function finishFailure(job, error, rc = 1, detail = {}) {
     if (job.finished) return;
     releaseAdmission(job);
+    job.stopLeaseHeartbeat?.();
+    const cleanup = job.accountLease && job.active && !processClosed ? stopServer() : releaseAccount(job);
     job.finished = true;
-    job.active = false;
-    job.starting = false;
+    void cleanup.then(() => {
+      job.active = false;
+      job.starting = false;
+      signalLoop();
+    });
     job.state = 'failed';
     job.rc = rc;
     if (job.timeout) clearTimeout(job.timeout);
@@ -694,8 +726,18 @@ async function runPool(config) {
   }
 
   function finishTurn(job, turn) {
+    if (job.finished || job.completing) return;
+    job.completing = true;
+    void releaseAccount(job).then(() => {
+      job.completing = false;
+      finishTurnReleased(job, turn);
+    });
+  }
+
+  function finishTurnReleased(job, turn) {
     if (job.finished) return;
     releaseAdmission(job);
+    nextRetryAt = 0;
     if (turn?.id) job.turnId = turn.id;
     if (!job.finalMessage && Array.isArray(turn?.items)) {
       const finalItem = [...turn.items].reverse().find((item) => item?.type === 'agentMessage');
@@ -749,7 +791,7 @@ async function runPool(config) {
         job.active = false;
         job.starting = false;
         job.state = 'starting';
-        job.queuedAt = Date.now();
+        job.queuedAt = monotonic();
         writeStatus(job, 'starting');
         signalLoop();
         return;
@@ -803,10 +845,7 @@ async function runPool(config) {
     if (initialized) {
       for (const job of jobs) {
         if (job.interruptPending) {
-          job.active = false;
-          job.interruptPending = false;
-          if (job.interruptTimer) clearTimeout(job.interruptTimer);
-          job.interruptTimer = null;
+          job.stopLeaseHeartbeat?.();
         }
         if (!job.finished) {
           const suffix = exitInfo ? ` (${exitInfo})` : '';
@@ -903,7 +942,7 @@ async function runPool(config) {
   function handleMessage(message) {
     const params = message?.params ?? {};
     const job = byThread.get(params.threadId ?? params.conversationId);
-    if (job?.active && !job.finished) job.lastEventAt = Date.now();
+    if (job?.active && !job.finished) job.lastEventAt = monotonic();
     if (message && message.id !== undefined && pending.has(message.id)) {
       const entry = pending.get(message.id);
       pending.delete(message.id);
@@ -924,15 +963,20 @@ async function runPool(config) {
     if (!job) return;
 
     if (job.interruptPending && message.method === 'turn/completed') {
-      if (params.turn?.id === job.turnId) {
-        job.active = false;
-        job.interruptPending = false;
-        if (job.interruptTimer) clearTimeout(job.interruptTimer);
-        job.interruptTimer = null;
-        if (job.heartbeat) clearInterval(job.heartbeat);
-        job.heartbeat = null;
-        log(job, 'turn/completed received after timeout; concurrency slot released');
-        signalLoop();
+      if (params.turn?.id === job.turnId && !job.interruptReleasing) {
+        job.interruptReleasing = true;
+        void releaseAccount(job).then(() => {
+          nextRetryAt = 0;
+          job.active = false;
+          job.interruptPending = false;
+          job.interruptReleasing = false;
+          if (job.interruptTimer) clearTimeout(job.interruptTimer);
+          job.interruptTimer = null;
+          if (job.heartbeat) clearInterval(job.heartbeat);
+          job.heartbeat = null;
+          log(job, 'turn/completed received after timeout; concurrency slot released');
+          signalLoop();
+        });
       }
       return;
     }
@@ -989,6 +1033,8 @@ async function runPool(config) {
     job.starting = true;
     job.state = 'starting';
     try {
+      if (!await bindLeaseChild(job.accountLease, server.pid)) throw new Error('account lease was lost');
+      if (job.finished || serverFailure || shuttingDown) return;
       const threadParams = {
         model,
         cwd: repoRoot,
@@ -1005,7 +1051,7 @@ async function runPool(config) {
       const inputText = makePreamble(brief);
       const effort = job.retryEffort ?? job.effort;
       job.active = true;
-      job.turnStartedAt = Date.now();
+      job.turnStartedAt = monotonic();
       job.lastEventAt = job.turnStartedAt;
       const turnStarted = rpc('turn/start', {
         threadId: job.threadId,
@@ -1028,14 +1074,15 @@ async function runPool(config) {
       }, turnTimeoutMs);
       if (idleMaxMs > 0) {
         job.idleTimer = setInterval(() => {
-          if (Date.now() - job.lastEventAt >= idleMaxMs) {
+          if (monotonic() - job.lastEventAt >= idleMaxMs) {
             stallTurn(job, `no events for ${idleMaxMs / 1000}s`);
           }
         }, 5_000);
       }
       signalLoop();
     } catch (error) {
-      if (!job.finished) finishFailure(job, error.message, 1);
+      if (!job.finished && job.active) failServer(error.message);
+      else if (!job.finished) finishFailure(job, error.message, 1);
     }
   }
 
@@ -1071,20 +1118,20 @@ async function runPool(config) {
   }
 
   function setJobState(job, state, extras = {}) {
-    if (job.finished || (job.state === state && !state.startsWith('waiting-'))) return;
+    if (job.finished || (job.state === state && state !== 'queued' && !state.startsWith('waiting-'))) return;
     job.state = state;
     writeStatus(job, state, extras);
   }
 
   function waitForLock(job) {
-    const detail = { waited_s: Math.floor((Date.now() - job.queuedAt) / 1000), ...lock.details() };
+    const detail = { waited_s: Math.floor((monotonic() - job.queuedAt) / 1000), ...lock.details() };
     setJobState(job, 'waiting-lock', detail);
-    if (job.lastLockNote === undefined || Date.now() - job.lastLockNote >= 60_000) {
+    if (job.lastLockNote === undefined || monotonic() - job.lastLockNote >= 60_000) {
       const message = `waiting for admission lock kind=${detail.lock_kind} ` +
         `age=${detail.lock_age_s}s waited=${detail.waited_s}s`;
       process.stderr.write(`luna-pool: ${job.name}: ${message}\n`);
       if (initialized) log(job, message);
-      job.lastLockNote = Date.now();
+      job.lastLockNote = monotonic();
     }
   }
 
@@ -1094,9 +1141,20 @@ async function runPool(config) {
     shuttingDown = true;
     rejectPending(new Error('app-server is shutting down'));
     killPromise = (async () => {
-      if (!server?.pid) return;
-      await killTree(server);
-      await Promise.race([closedPromise, sleep(1_000)]);
+      if (server?.pid) {
+        await killTree(server);
+        await Promise.race([closedPromise, sleep(1_000)]);
+      }
+      await Promise.all(jobs.map((job) => releaseAccount(job)));
+      for (const job of jobs) {
+        if (!job.finished) continue;
+        job.active = false;
+        job.starting = false;
+        job.interruptPending = false;
+        clearTimeout(job.interruptTimer);
+        job.interruptTimer = null;
+      }
+      signalLoop();
     })();
     return killPromise;
   }
@@ -1109,10 +1167,7 @@ async function runPool(config) {
     if (initialized) {
       for (const job of jobs) {
         if (job.interruptPending) {
-          job.active = false;
-          job.interruptPending = false;
-          if (job.interruptTimer) clearTimeout(job.interruptTimer);
-          job.interruptTimer = null;
+          job.stopLeaseHeartbeat?.();
         }
         if (!job.finished) finishFailure(job, serverFailure, 1);
       }
@@ -1136,7 +1191,7 @@ async function runPool(config) {
 
   try {
     try { os.setPriority(os.constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
-    const admissionStarted = Date.now();
+    const admissionStarted = monotonic();
     for (const job of jobs) job.queuedAt = admissionStarted;
     let lastRamNote = 0;
     let admissionCause = 'admission lock';
@@ -1149,25 +1204,57 @@ async function runPool(config) {
         admissionCause = 'RAM';
         for (const job of jobs) {
           setJobState(job, 'waiting-ram', {
-            waited_s: Math.floor((Date.now() - admissionStarted) / 1000),
+            waited_s: Math.floor((monotonic() - admissionStarted) / 1000),
             free_mb: freeMb, need_mb: serverMb, reserve_mb: reserveMb
           });
         }
-        if (lastRamNote === 0 || Date.now() - lastRamNote >= 60_000) {
+        if (lastRamNote === 0 || monotonic() - lastRamNote >= 60_000) {
           process.stderr.write(`luna-pool: waiting for app-server RAM free=${freeMb}MB ` +
             `need=${serverMb}MB reserve=${reserveMb}MB\n`);
-          lastRamNote = Date.now();
+          lastRamNote = monotonic();
         }
       } else {
         admissionCause = 'admission lock';
         for (const job of jobs) waitForLock(job);
       }
-      if (Date.now() - admissionStarted >= waitMaxMs) {
+      if (monotonic() - admissionStarted >= waitMaxMs) {
         const error = `gave up waiting for ${admissionCause} for app-server`;
         for (const job of jobs) finishFailure(job, error, 75);
         throw new CliError(error, 75);
       }
       await Promise.race([sleep(300 + Math.floor(Math.random() * 201)), abortPromise]);
+    }
+    while (!startupLease) {
+      if (serverFailure) throw new Error(serverFailure);
+      const account = tryShared({ purpose: 'luna pool startup' });
+      if (account.lease) {
+        startupLease = account.lease;
+        stopStartupHeartbeat = leaseHeartbeat(startupLease, 7200, (error) => onAbort(error, true));
+        if (noGate || lock.held || lock.acquire()) {
+          if (noGate || Math.floor(availableMemory() / MB) - serverMb >= reserveMb) break;
+        }
+        releaseAdmission();
+        stopStartupHeartbeat();
+        await releaseLease(startupLease.id);
+        startupLease = null;
+        if (monotonic() - admissionStarted >= waitMaxMs) {
+          const error = 'gave up waiting for RAM or admission lock for app-server';
+          for (const job of jobs) finishFailure(job, error, 75);
+          throw new CliError(error, 75);
+        }
+        await Promise.race([sleep(200), abortPromise]);
+        continue;
+      }
+      releaseAdmission();
+      const note = account.blocking
+        ? `waiting: exclusive account lease ${account.blocking.purpose}` : 'waiting: account lease lock';
+      for (const job of jobs) setJobState(job, 'queued', { reason: note, last_note: note });
+      if (monotonic() - admissionStarted >= waitMaxMs) {
+        const error = `gave up ${note}`;
+        for (const job of jobs) finishFailure(job, error, 75);
+        throw new CliError(error, 75);
+      }
+      await Promise.race([sleep(200), abortPromise]);
     }
     server = spawnServer(home, leanArgs);
     rampAdmission();
@@ -1201,6 +1288,7 @@ async function runPool(config) {
       latestStderr = `${latestStderr}${chunk.toString('utf8')}`.slice(-8_000);
     });
 
+    if (!await bindLeaseChild(startupLease, server.pid)) throw new Error('account lease was lost');
     const lines = readline.createInterface({ input: server.stdout, crlfDelay: Infinity });
     lines.on('line', (line) => {
       let message;
@@ -1226,8 +1314,11 @@ async function runPool(config) {
     startupTimeout = null;
     notify('initialized', {});
     initialized = true;
+    stopStartupHeartbeat();
+    await releaseLease(startupLease.id);
+    startupLease = null;
 
-    const now = Date.now();
+    const now = monotonic();
     for (const job of jobs) {
       job.queuedAt = now;
       job.startedAt = nowIso();
@@ -1242,15 +1333,16 @@ async function runPool(config) {
       for (const message of startupReclaims) log(job, message);
     }
 
-    let nextRetryAt = Date.now();
+    nextRetryAt = monotonic();
     while (jobs.some((job) => !job.finished || job.active)) {
       if (serverFailure) break;
-      const time = Date.now();
+      const time = monotonic();
       for (const job of jobs) {
         if (job.finished) continue;
         if (!job.active && !job.starting && time - job.queuedAt >= waitMaxMs) {
           const waitingLock = job.state === 'waiting-lock';
-          finishFailure(job, `gave up waiting for ${waitingLock ? 'admission lock' : 'RAM'}`, 75, {
+          const cause = waitingLock ? 'admission lock' : job.state === 'queued' ? 'account lease' : 'RAM';
+          finishFailure(job, `gave up waiting for ${cause}`, 75, {
             waited_s: Math.floor((time - job.queuedAt) / 1000),
             ...(waitingLock ? lock.details() : {}),
             free_mb: Math.floor(availableMemory() / MB),
@@ -1261,18 +1353,18 @@ async function runPool(config) {
       }
 
       const candidate = jobs.find((job) => !job.finished && !job.active && !job.starting);
-      if (candidate && Date.now() >= nextRetryAt) {
+      if (candidate && monotonic() >= nextRetryAt) {
         const active = jobs.reduce((count, job) => count + (job.active ? 1 : 0), 0);
         if (active >= max) {
           for (const job of jobs) {
             if (!job.active && !job.starting) setJobState(job, 'starting');
           }
-          nextRetryAt = Date.now() + 2_000;
+          nextRetryAt = monotonic() + 2_000;
         } else if (lock.held) {
           for (const job of jobs) {
             if (!job.active && !job.starting) waitForLock(job);
           }
-          nextRetryAt = Date.now() + 300 + Math.floor(Math.random() * 201);
+          nextRetryAt = monotonic() + 300 + Math.floor(Math.random() * 201);
         } else {
           admissionJob = candidate;
           if (!noGate && !lock.acquire()) {
@@ -1280,7 +1372,7 @@ async function runPool(config) {
             for (const job of jobs) {
               if (!job.active && !job.starting) waitForLock(job);
             }
-            nextRetryAt = Date.now() + 300 + Math.floor(Math.random() * 201);
+            nextRetryAt = monotonic() + 300 + Math.floor(Math.random() * 201);
           } else {
             const freeMb = Math.floor(availableMemory() / MB);
             if (!noGate && freeMb - turnMb < reserveMb) {
@@ -1291,14 +1383,27 @@ async function runPool(config) {
                     free_mb: freeMb,
                     need_mb: turnMb,
                     reserve_mb: reserveMb,
-                    waited_s: Math.floor((Date.now() - job.queuedAt) / 1000)
+                    waited_s: Math.floor((monotonic() - job.queuedAt) / 1000)
                   });
                 }
               }
               log(candidate, `waiting for RAM free=${freeMb}MB need=${turnMb}MB reserve=${reserveMb}MB`);
-              nextRetryAt = Date.now() + 2_000;
+              nextRetryAt = monotonic() + 2_000;
             } else {
-              nextRetryAt = Date.now();
+              const account = tryShared({ purpose: `luna pool ${candidate.name}` });
+              if (!account.lease) {
+                releaseAdmission();
+                const note = account.blocking
+                  ? `waiting: exclusive account lease ${account.blocking.purpose}` : 'waiting: account lease lock';
+                for (const job of jobs) {
+                  if (!job.active && !job.starting) setJobState(job, 'queued', { reason: note, last_note: note });
+                }
+                nextRetryAt = monotonic() + 200;
+                continue;
+              }
+              candidate.accountLease = account.lease;
+              candidate.stopLeaseHeartbeat = leaseHeartbeat(account.lease, 7200, (error) => onAbort(error, true));
+              nextRetryAt = monotonic();
               await startJob(candidate);
               continue;
             }
@@ -1308,7 +1413,7 @@ async function runPool(config) {
 
       // A missing turn/completed after interrupt must not keep an otherwise finished pool alive.
       if (jobs.every((job) => job.finished) || serverFailure) break;
-      const waitForRetry = Math.max(50, Math.min(500, nextRetryAt - Date.now()));
+      const waitForRetry = Math.max(50, Math.min(500, nextRetryAt - monotonic()));
       await new Promise((resolve) => {
         let settled = false;
         const finish = () => {
@@ -1354,6 +1459,12 @@ async function runPool(config) {
     return 1;
   } finally {
     releaseAdmission();
+    if (server) await stopServer();
+    if (startupLease) {
+      stopStartupHeartbeat();
+      await releaseLease(startupLease.id);
+    }
+    await Promise.all(jobs.map((job) => releaseAccount(job)));
     for (const job of jobs) {
       clearTimeout(job.timeout);
       clearInterval(job.idleTimer);
@@ -1362,7 +1473,6 @@ async function runPool(config) {
     }
     clearTimeout(startupTimeout);
     clearTimeout(pipeBreakTimer);
-    if (server && !shuttingDown) await stopServer();
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigterm);
     process.removeListener('uncaughtException', onUncaught);

@@ -7,9 +7,11 @@ import { fileURLToPath } from 'node:url';
 
 export const DAY = 24 * 60 * 60 * 1000;
 export const MB = 1024 * 1024;
+const kriminalist = path.join(homedir(), 'dev', 'kriminalist');
+const rpg = path.join(homedir(), 'rpg');
 export const DEFAULTS = {
-  repos: [],
-  liveRefs: {},
+  repos: [kriminalist, rpg],
+  liveRefs: { [kriminalist]: ['claude/tavern-tower', 'master'], [rpg]: ['main', 'master'] },
   sources: path.join(homedir(), 'dev', '_sources'),
   maxWorktreesPerRepo: 4, minFreeGB: 20, tmpMaxAgeDays: 7, cacheIdleHours: 24, worktreeIdleDays: 7,
   ignoreDirty: ['.claude/agents/gsd-executor.md', 'next-env.d.ts']
