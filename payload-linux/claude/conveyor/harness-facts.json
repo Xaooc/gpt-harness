@@ -1,0 +1,23 @@
+{
+  "facts": [
+    {
+      "id": "heavy-gate-slots",
+      "doc": "CLAUDE.md",
+      "docPattern": "heavy-gate defaults\\s+to\\s+(\\d+)\\s+slots",
+      "source": "scripts/heavy-gate.mjs",
+      "sourcePattern": "\\bDEFAULTS\\s*=\\s*\\{\\s*max:\\s*(\\d+)",
+      "compare": "equal"
+    },
+    {
+      "id": "pytest-gate-worker-cap",
+      "doc": "CLAUDE.md",
+      "docPattern": "caps workers per run\\s*\\(default\\s+(\\d+)\\)",
+      "source": "scripts/pytest_gate.py",
+      "sourcePattern": "^MAX_WORKERS\\s*=[^\\n]*min\\(\\s*(\\d+)\\s*,\\s*POOL_SIZE",
+      "compare": "equal"
+    }
+  ],
+  "retiredModels": {
+    "allow": ["gpt-6-astra", "claude-code.md", "claude-plugin"]
+  }
+}
