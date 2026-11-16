@@ -45,7 +45,7 @@ for out in "$@"; do
   st="$out.status"
   state="$(field state "$st")"
   case "$state" in
-    done|failed|incomplete|stalled|'') echo "$out: nothing to stop (state=${state:-missing})"; continue ;;
+    done|failed|incomplete|stalled|unavailable|'') echo "$out: nothing to stop (state=${state:-missing})"; continue ;;
   esac
   wp="$(field wrapper_pid "$st")"
   ws="$(field wrapper_start "$st")"

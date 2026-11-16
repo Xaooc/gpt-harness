@@ -152,7 +152,7 @@ export function matchingProcess(pid, started) {
 export function ownedProcess(pid, started) {
   const row = readProcess(pid);
   return row && row.state !== 'Z' && (started === undefined || row.started === String(started)) &&
-    /codex|luna[-.]/i.test(row.command) ? row : null;
+    /codex|luna[-.]|gem[-.]|(?:^|\/)agy(?:\s|$)/i.test(row.command) ? row : null;
 }
 
 export function processRows() {

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { paths, toWinPath } from "./common.mjs";
 
-export const TERMINAL_JOB_STATES = /^(?:done|incomplete|failed|stalled|killed|timeout)$/;
+export const TERMINAL_JOB_STATES = /^(?:done|incomplete|failed|stalled|killed|timeout|unavailable)$/;
 const MAX_STATUS_BYTES = 64 * 1024;
 const MAX_REGISTRY_BYTES = 64 * 1024 * 1024;
 const registryCache = new Map();

@@ -15,7 +15,7 @@ const DEADLINE_MS = 1750;
 const TAIL_BYTES = 64 * 1024;
 const ACTIVE_LIMIT = 200;
 const LEGACY_MAX_AGE_MS = 10 * 60 * 1000;
-const terminal = new Set(['done', 'failed', 'incomplete', 'stalled', 'completed', 'cancelled']);
+const terminal = new Set(['done', 'failed', 'incomplete', 'stalled', 'completed', 'cancelled', 'unavailable']);
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const string = (value) => typeof value === 'string' ? value : '';
 const number = (value) => typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -371,7 +371,7 @@ async function selfTest() {
     const limits = { v: 1, at: new Date(now - 5000).toISOString(), source: 'test', planType: 'pro',
       ordinaryUsageAllowed: true, reached: false, primary: null, secondary: null, byLimitId: {} };
     await fs.writeFile(path.join(directory, 'codex-limits.json'), JSON.stringify(limits));
-    const states = ['running', 'queued', 'waiting-capacity', 'done', 'failed', 'incomplete', 'stalled'];
+    const states = ['running', 'queued', 'waiting-capacity', 'done', 'failed', 'incomplete', 'stalled', 'unavailable'];
     for (const [index, state] of states.entries()) {
       const out = path.join(directory, `job-${index}`);
       await fs.writeFile(path.join(directory, 'active', `${index + 100}`),

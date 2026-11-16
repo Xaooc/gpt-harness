@@ -14,7 +14,7 @@ const LEFT = "(?<![\\p{L}\\p{N}])";
 const RIGHT = "(?![\\p{L}\\p{N}])";
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 const ACTIVE_STATES = /^(?:starting|queued|waiting-daemon|waiting-ram|waiting-lock|running)$/;
-const TERMINAL_STATES = /^(?:done|incomplete|failed|stalled|killed|timeout|abandoned)$/;
+const TERMINAL_STATES = /^(?:done|incomplete|failed|stalled|killed|timeout|abandoned|unavailable)$/;
 const ABANDONED_MS = 3 * 60 * 60 * 1000;
 const pattern = (name, body, start = false) => [name, new RegExp((start ? "^" : LEFT) + body + RIGHT, "iu")];
 const corrections = [
@@ -195,7 +195,7 @@ function resolvedArgument(raw, command, position, cwd) {
 }
 
 function discover(command, cwd, state, meta) {
-  if (typeof command !== "string" || !/(?:luna\.sh|luna-panel\.sh|luna-pool\.mjs)/.test(command)) return;
+  if (typeof command !== "string" || !/(?:luna\.sh|luna-panel\.sh|luna-pool\.mjs|gem\.sh)/.test(command)) return;
   const add = (raw, position, directory = false) => {
     const resolved = resolvedArgument(raw, command, position, cwd);
     if (!resolved) return;

@@ -9,7 +9,7 @@
 # Prints ONE line per event (each line = one Monitor notification):
 #   STALL  <out> idle=<s>s elapsed=<min>m last_note=...   (once per stall episode; again only after the log moves)
 #   RESUMED <out> after <s>s idle
-#   END    <out> state=<done|failed|incomplete|stalled> rc=<rc>
+#   END    <out> state=<done|failed|incomplete|stalled|unavailable> rc=<rc>
 #   GONE   <out> state=running but pid <pid> is dead (wrapper killed without updating status)
 # Exits when every job has reached a terminal state.
 
@@ -47,7 +47,7 @@ while :; do
     st="$out.status"; log="$out.log"
     state="$(field state "$st")"
     case "$state" in
-      done|failed|incomplete|stalled)
+      done|failed|incomplete|stalled|unavailable)
         echo "END $out state=$state rc=$(field rc "$st") $(field error "$st")"
         done_[$out]=1; continue ;;
     esac
@@ -74,7 +74,7 @@ while :; do
       # The wrapper writes its final status just after the child exits: give it a moment before calling it GONE.
       sleep 3; state="$(field state "$st")"
       case "$state" in
-        done|failed|incomplete|stalled)
+        done|failed|incomplete|stalled|unavailable)
           echo "END $out state=$state rc=$(field rc "$st") $(field error "$st")"
           done_[$out]=1; continue ;;
       esac
