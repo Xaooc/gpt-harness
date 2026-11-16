@@ -63,7 +63,7 @@ export async function main(args = process.argv.slice(2)) {
     arity(1);
     markDone(context, values[0]);
   } else if (command === 'waive') {
-    // `crosscheck` waives only the current unavailable snapshot; `gate` remains limited to checks 5 and 8.
+    // `crosscheck` waives only the current unavailable snapshot; `gate` covers checks 5, 8, and 9.
     arity(1);
     if (!flags['--quote']) throw new Error('waive requires --quote');
     const result = waive(context, values[0], flags['--quote']);

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CLAUSE_RULES, extractClauses, foldLedger } from '../lib/ledger.mjs';
+import { uiFile } from '../lib/profile.mjs';
 import { main as ledgerMain } from '../ledger.mjs';
 import { invoke, invokeHook, shellList, shellLog } from './process-fixture.mjs';
 
@@ -334,3 +335,14 @@ test('crosscheck stops a fake large diff after its bounded preview and still rec
   assert.equal(fs.existsSync(pidFile + '.finished'), false);
   assert.throws(() => process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 0), { code: 'ESRCH' });
 });
+
+
+test('UI file detection covers UI extensions and detected directories while excluding tests and stories',
+  { timeout: 3000 }, () => {
+    for (const file of ['page.tsx', 'widget.jsx', 'src/view.vue', 'view.svelte', 'site.css', 'site.scss', 'index.html',
+      'frontend/api.ts', 'templates/page.jinja']) assert.equal(uiFile(file, ['frontend', 'templates']), true, file);
+    for (const file of ['worker.mjs', 'README.md', 'tests/page.tsx', 'src/__tests__/view.jsx', 'src/page.test.tsx',
+      'src/page.spec.tsx', 'src/page.stories.tsx', 'stories/page.jsx', 'frontend/tests/api.ts', 'templates/test_page.html']) {
+      assert.equal(uiFile(file, ['frontend', 'templates']), false, file);
+    }
+  });

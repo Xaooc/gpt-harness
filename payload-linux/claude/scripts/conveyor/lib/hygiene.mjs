@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import { matchesGlob } from './profile.mjs';
 import { writeJsonAtomic } from './orchestration.mjs';
 
@@ -95,36 +96,73 @@ async function baselineFile(repo, file) {
   return current;
 }
 
-export async function hygieneReport(repo, profile, writeBaseline = false) {
-  const { counters, baseline: baselineName } = profile.hygiene;
-  const file = await baselineFile(repo, baselineName);
+async function totalsFor(repo, counters, baselineName, base = null) {
   const totals = Object.fromEntries(counters.map((counter) => [counter.name, 0]));
-  for (const name of await repositoryFiles(repo)) {
+  const files = base === null ? await repositoryFiles(repo)
+    : (await git(repo, ['ls-tree', '-r', '--name-only', '-z', base])).split('\0').filter(Boolean);
+  for (const name of files) {
     if (name === path.normalize(baselineName)) continue;
     const matching = counters.filter((counter) => applies(counter, name));
     if (!matching.length) continue;
-    const content = await readText(repo, name);
+    const content = base === null ? await readText(repo, name) : await git(repo, ['show', `${base}:${name}`]);
     for (const counter of matching) {
-      const value = count(counter, content);
+      const value = count(counter, content?.includes('\0') ? null : content);
       totals[counter.name] += counter.maxLines === undefined ? value : Number(value > counter.maxLines);
     }
   }
-  let baseline = null;
-  if (writeBaseline) {
-    await writeJsonAtomic(file, { version: 1, totals });
-    baseline = totals;
-  } else {
+  return totals;
+}
+
+export async function writeProfileBaseline(repo, name, baseline) {
+  await writeJsonAtomic(await baselineFile(repo, name), { version: 1, totals: baseline });
+}
+
+async function readBaseline(file) {
+  try {
+    const stored = JSON.parse(await fs.readFile(file, 'utf8'));
+    if (stored?.version !== 1 || !stored.totals || Array.isArray(stored.totals) ||
+        typeof stored.totals !== 'object' || Object.values(stored.totals).some((value) => !Number.isSafeInteger(value) || value < 0)) {
+      throw new Error(`invalid hygiene baseline: ${file}`);
+    }
+    return stored.totals;
+  } catch (error) { if (error.code !== 'ENOENT') throw error; return null; }
+}
+
+export async function defaultBaseline(repo, profile, base = 'HEAD') {
+  const { counters, baseline: file } = profile.hygiene;
+  let baseline = await readBaseline(file);
+  if (baseline === null) {
+    let revision;
+    try { revision = (await git(repo, ['rev-parse', '--verify', '--end-of-options', `${base}^{commit}`])).trim(); }
+    catch (error) {
+      // A newly initialized repository has no committed debt yet.
+      if (base !== 'HEAD' || (await git(repo, ['log', '--all', '-1', '--format=%H'])).trim()) throw error;
+    }
+    baseline = revision ? await totalsFor(repo, counters, file, revision)
+      : Object.fromEntries(counters.map((counter) => [counter.name, 0]));
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      const stored = JSON.parse(await fs.readFile(file, 'utf8'));
-      if (stored?.version !== 1 || !stored.totals || Array.isArray(stored.totals) ||
-          typeof stored.totals !== 'object' || Object.values(stored.totals).some((value) => !Number.isSafeInteger(value) || value < 0)) {
-        throw new Error(`invalid hygiene baseline: ${baselineName}`);
-      }
-      baseline = stored.totals;
-    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      await fs.writeFile(temporary, `${JSON.stringify({ version: 1, totals: baseline }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+      // Publish complete JSON without replacing a baseline initialized by another worktree.
+      try { await fs.link(temporary, file); }
+      catch (error) { if (error.code !== 'EEXIST') throw error; }
+    } finally { await fs.rm(temporary, { force: true }); }
+    baseline = await readBaseline(file);
   }
-  const delta = baseline === null ? null : Object.fromEntries(Object.entries(totals).map(([name, total]) => [
-    name, Object.hasOwn(baseline, name) ? total - baseline[name] : null
+  return { source: 'default', baselineFile: file, baseline };
+}
+
+export async function hygieneReport(repo, profile, writeBaseline = false) {
+  const { counters, baseline: baselineName } = profile.hygiene;
+  const isDefault = profile.hygieneSource === 'default';
+  const file = isDefault ? baselineName : await baselineFile(repo, baselineName);
+  const baseline = isDefault ? (await defaultBaseline(repo, profile)).baseline : writeBaseline ? null : await readBaseline(file);
+  const totals = await totalsFor(repo, counters, baselineName);
+  if (writeBaseline && !isDefault) await writeJsonAtomic(file, { version: 1, totals });
+  const stored = writeBaseline && !isDefault ? totals : baseline;
+  const delta = stored === null ? null : Object.fromEntries(Object.entries(totals).map(([name, total]) => [
+    name, Object.hasOwn(stored, name) ? total - stored[name] : null
   ]));
-  return { ok: true, repo, baselineFile: baselineName, totals, baseline, delta };
+  return { ok: true, repo, source: isDefault ? 'default' : 'profile', baselineFile: baselineName, totals, baseline: stored, delta };
 }

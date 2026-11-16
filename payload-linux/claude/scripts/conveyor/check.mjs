@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // Deterministic checks and per-file hygiene ratchets for executor and stop gates.
 import path from 'node:path';
+import * as fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
-import { loadProfile, matchesGlob, trustProfile } from './lib/profile.mjs';
-import { git, existingFiles, repositoryFiles, ratchet, hygieneReport } from './lib/hygiene.mjs';
+import { autodetect, loadProfile, matchesGlob, trustProfile } from './lib/profile.mjs';
+import { git, existingFiles, repositoryFiles, ratchet, hygieneReport, defaultBaseline, writeProfileBaseline } from './lib/hygiene.mjs';
 
 function options(args, allowed) {
   const result = Object.create(null);
@@ -130,8 +131,10 @@ async function run(repo, opts, profile) {
     } else result = await processResult(repo, '/bin/sh', ['-c', cmd, 'conveyor', ...args], deadline - Date.now());
     results.push({ name: entry.name, cmd, ...result });
   }
+  const baseline = profile.hygieneSource === 'default' ? await defaultBaseline(repo, profile, revision) : null;
   const hygieneFiles = changed.filter((file) => file !== path.normalize(profile.hygiene.baseline));
-  const hygiene = await ratchet(repo, hygieneFiles, profile.hygiene.counters, revision);
+  const hygiene = { ...await ratchet(repo, hygieneFiles, profile.hygiene.counters, revision),
+    ...(baseline ? { source: baseline.source, baselineFile: baseline.baselineFile } : {}) };
   const ok = hygiene.ok && results.every((result) => ['pass', 'skipped'].includes(result.status));
   const trust = profile.profileTrust;
   return { ok, level, repo, base, changed, results, hygiene, profileTrust: trust,
@@ -163,15 +166,41 @@ function print(result, json) {
   }
 }
 
+async function init(repo, write) {
+  const file = path.join(repo, '.claude/conveyor.json');
+  try {
+    await fs.lstat(file);
+    throw new Error(`refusing to overwrite existing profile: ${file}`);
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const detected = await autodetect(repo);
+  const { hygieneSource, ...profile } = detected;
+  if (profile.verify === null) delete profile.verify;
+  profile.hygiene = { ...profile.hygiene, baseline: '.conveyor/hygiene-baseline.json' };
+  if (write) {
+    const report = await defaultBaseline(repo, detected);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    // Exclusive creation also protects a profile created since the initial existence check.
+    await fs.writeFile(file, `${JSON.stringify(profile, null, 2)}\n`, { flag: 'wx' });
+    await writeProfileBaseline(repo, profile.hygiene.baseline, report.baseline);
+    await trustProfile(repo);
+  }
+  process.stdout.write(`${JSON.stringify(profile, null, 2)}\n`);
+  return 0;
+}
+
 export async function main(args = process.argv.slice(2)) {
   const [action, ...rest] = args;
-  if (!['run', 'hygiene', 'trust'].includes(action)) throw new Error('usage: check.mjs run | hygiene | trust --dir <repo> [--json]');
+  if (!['run', 'hygiene', 'trust', 'init'].includes(action)) {
+    throw new Error('usage: check.mjs run | hygiene | trust | init --dir <repo> [--json]');
+  }
   const allowed = { '--dir': true, '--json': false };
   if (action === 'run') Object.assign(allowed, { '--level': true, '--files': true, '--base': true });
   else if (action === 'hygiene') allowed['--write-baseline'] = false;
+  else if (action === 'init') allowed['--write'] = false;
   const opts = options(rest, allowed);
   if (!opts['--dir']) throw new Error('--dir is required');
   const repo = path.resolve(opts['--dir']);
+  if (action === 'init') return init(repo, Boolean(opts['--write']));
   if (action === 'trust') {
     const result = await trustProfile(repo);
     process.stdout.write(`${JSON.stringify(result)}\n`);

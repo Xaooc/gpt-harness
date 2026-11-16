@@ -131,17 +131,81 @@ function defaults(profile) {
   };
 }
 
-function defaultCounters() {
-  return [
+const codeFiles = '**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts,py,sh,bash,zsh,fish,rs,go,java,c,h,cc,cpp,cxx,hpp,hxx,cs,rb,php,'
+  + 'swift,kt,kts,scala,lua,pl,r,sql,vue,svelte,astro,css,scss,less,sass,html,htm,ex,exs,erl,hrl,clj,cljs,ps1,psm1}';
+const defaultExclude = '**/{node_modules,.venv,venv,dist,build,.next,coverage,vendor,.git,generated,__generated__}/**';
+const generatedExclude = '**/*.{min.js,min.css,generated.*,gen.*,map}';
+
+export async function repositorySurface(repo) {
+  let files = [];
+  try {
+    const { stdout } = await execute('git', ['-C', repo, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+      { cwd: repo, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 1000 });
+    files = stdout.split('\0').filter((file) => file && !matchesGlob(file, defaultExclude));
+  } catch { /* Non-git profile trust still supports local manifests. */ }
+  const uiDirs = new Set();
+  let ui = false;
+  for (const dir of ['', 'frontend', 'web', 'app']) {
+    const raw = await optionalText(path.join(repo, dir, 'package.json'));
+    if (raw === null) continue;
+    let pkg;
+    try { pkg = JSON.parse(raw); } catch { continue; }
+    const names = [pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies]
+      .flatMap((deps) => Object.keys(deps ?? {}));
+    if (!names.some((name) => /^(?:next|react|vue|svelte|vite|solid(?:-js)?|@angular)(?:$|\/|-)/.test(name))) continue;
+    ui = true;
+    for (const name of dir ? [dir] : ['src', 'app', 'pages', 'components', 'public', 'frontend', 'web']) uiDirs.add(name);
+  }
+  const python = files.some((file) => file.endsWith('.py')) || files.includes('pyproject.toml');
+  if (python) {
+    for (const dir of ['templates', 'frontend/templates', 'web/templates', 'app/templates']) {
+      if (await fs.stat(path.join(repo, dir)).then((stat) => stat.isDirectory(), () => false)) {
+        ui = true; uiDirs.add(dir);
+      }
+    }
+    for (const file of files) {
+      const parts = file.split('/'), index = parts.indexOf('templates');
+      if (index !== -1) { ui = true; uiDirs.add(parts.slice(0, index + 1).join('/')); }
+    }
+  }
+  return { files, ui, uiDirs: [...uiDirs], code: files.some((file) => matchesGlob(file, codeFiles)) ||
+    ['package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod'].some((file) => files.includes(file)) };
+}
+
+export function uiFile(file, uiDirs = []) {
+  const normalized = file.split(path.sep).join('/');
+  if (matchesGlob(normalized, '**/{test,tests,__tests__,stories,__stories__}/**') ||
+    /(?:^|[/.])(?:test|spec|stories|story)\.[^/]+$/.test(normalized) ||
+    /(?:^|\/)test_[^/]+$/.test(normalized)) return false;
+  return matchesGlob(normalized, '**/*.{tsx,jsx,vue,svelte,css,scss,html}') ||
+    uiDirs.some((dir) => normalized.startsWith(`${dir}/`));
+}
+
+export async function defaultHygiene(repo) {
+  const { files } = await repositorySurface(repo);
+  const has = (glob) => files.some((file) => matchesGlob(file, glob));
+  const exclude = `{${defaultExclude},${generatedExclude}}`;
+  const counters = [
+    { name: 'TODO/FIXME', pattern: String.raw`\b(?:TODO|FIXME)\b`, glob: codeFiles },
+    { name: 'large-files', maxLines: 1500, glob: codeFiles,
+      exclude: `{${defaultExclude},${generatedExclude},**/{test,tests,__tests__}/**,**/*.{test,spec}.*}` }
+  ];
+  if (has(jsFiles)) counters.push(
+    { name: 'empty-catch', pattern: String.raw`\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}`, glob: jsFiles },
     { name: 'eslint-disable', pattern: 'eslint-disable', glob: jsFiles },
     { name: '@ts-ignore', pattern: '@ts-ignore', glob: jsFiles },
-    { name: 'setTimeout', pattern: String.raw`\bsetTimeout\(`, glob: jsFiles },
-    { name: 'broad-except', pattern: 'except Exception', glob: '**/*.py' },
-    { name: 'type-ignore', pattern: '# type: ignore', glob: '**/*.py' },
-    { name: 'time.sleep', pattern: String.raw`\btime\.sleep\(`, glob: '**/*.py' },
-    { name: 'TODO/FIXME', pattern: String.raw`\b(?:TODO|FIXME)\b`, glob: '**/*' },
-    { name: 'large-files', maxLines: 1500, glob: '**/*' }
-  ];
+    { name: '@ts-expect-error', pattern: '@ts-expect-error', glob: jsFiles }
+  );
+  if (has(tsFiles)) counters.push({ name: 'any', pattern: String.raw`:\s*any\b|\bas\s+any\b`, glob: tsFiles });
+  if (has('**/*.py')) counters.push(
+    { name: 'broad-except', pattern: String.raw`\bexcept\s+Exception\b|\bexcept\s*:`, glob: '**/*.py' },
+    { name: 'type-ignore', pattern: String.raw`#\s*type:\s*ignore\b`, glob: '**/*.py' },
+    { name: 'noqa', pattern: String.raw`#\s*noqa\b`, glob: '**/*.py' },
+    { name: 'function-caches', pattern: String.raw`@(?:functools\.)?(?:lru_cache|cache)\b`, glob: '**/*.py' }
+  );
+  const home = process.env.CONVEYOR_HOME || path.join(homedir(), '.claude', 'conveyor');
+  return { counters: counters.map((counter) => ({ exclude, ...counter })),
+    baseline: path.join(path.resolve(home), 'baselines', `${digest(await repositoryIdentity(repo)).slice(0, 16)}.json`) };
 }
 
 async function optionalText(file) {
@@ -149,8 +213,8 @@ async function optionalText(file) {
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
-async function autodetect(repo) {
-  const profile = { version: 1, fast: [], turn: [], hygiene: { counters: defaultCounters() } };
+export async function autodetect(repo) {
+  const profile = { version: 1, fast: [], turn: [] };
   const rawPackage = await optionalText(path.join(repo, 'package.json'));
   if (rawPackage !== null) {
     const pkg = JSON.parse(rawPackage);
@@ -187,7 +251,7 @@ async function autodetect(repo) {
       });
     }
   }
-  return defaults(profile);
+  return { ...defaults(profile), hygiene: await defaultHygiene(repo), hygieneSource: 'default' };
 }
 
 export async function loadProfile(repo) {
@@ -195,13 +259,14 @@ export async function loadProfile(repo) {
   const raw = await optionalText(file);
   try {
     if (raw === null) return { ...await autodetect(repo), profileTrust: 'autodetected' };
-    const profile = defaults(JSON.parse(raw));
+    const parsed = JSON.parse(raw), profile = defaults(parsed);
     const trusted = JSON.parse(await optionalText(trustFile()) || '{}');
     const identity = await repositoryIdentity(repo), sha256 = digest(raw);
     if ((Array.isArray(trusted[identity]) && trusted[identity].includes(sha256)) || trusted[path.resolve(repo)] === sha256) {
-      return { ...profile, profileTrust: 'trusted' };
+      return { ...profile, ...(!parsed.hygiene ? { hygiene: await defaultHygiene(repo), hygieneSource: 'default' } : {}),
+        profileTrust: 'trusted' };
     }
-    return { ...await autodetect(repo), hygiene: profile.hygiene, profileTrust: 'untrusted' };
+    return { ...await autodetect(repo), profileTrust: 'untrusted' };
   }
   catch (error) { throw new Error(`${file}: ${error.message}`); }
 }

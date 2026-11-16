@@ -380,7 +380,7 @@ test('running owned jobs, registered temporary paths, and expired owned worktree
   assert.equal(await f.stop({ FAKE_WORKTREES: future }), null);
 });
 
-test('verified gate waivers cover only checks 5 and 8, and verified item waivers count as done', { timeout }, async (t) => {
+test('verified gate waivers cover checks 5 and 8, and verified item waivers count as done', { timeout }, async (t) => {
   const f = await fixture(t);
   await f.complete();
   const quote = 'You may skip turn checks and cleanup for this task.';
@@ -447,3 +447,85 @@ test('warn mode prints only systemMessage, defaults to calibration, and yields t
   assert.equal(await f.stop({}, { transcript_path: path.join(f.root, 'missing.jsonl') }), null);
   assert.match(fs.readFileSync(path.join(f.root, 'claude/logs/conveyor-gate.log'), 'utf8'), /stop gate:.*ENOENT/);
 });
+
+
+async function uiFixture(t) {
+  const f = await fixture(t);
+  f.env.FAKE_STAGED = '["page.tsx"]';
+  const page = path.join(f.repo, 'page.tsx');
+  fs.writeFileSync(page, 'export const Page = () => <main />;\n');
+  const old = new Date(Date.now() - 10_000);
+  fs.utimesSync(page, old, old);
+  await f.complete();
+  return f;
+}
+
+test('UI changes require image artifacts on reason 9, with warning mode and actionable placeholders',
+  { timeout: 3000 }, async (t) => {
+    const f = await uiFixture(t);
+    blocked(await f.stop(), 9, 'user-facing change without a screenshot');
+    const warning = await f.stop({ CONVEYOR_GATE_MODE: 'warn' });
+    assert.match(warning.systemMessage, /9\. user-facing change without a screenshot/);
+    const image = path.join(f.root, 'desktop.png');
+    fs.writeFileSync(image, 'fake screenshot');
+    await f.command(['evidence', 'L1', '--file', image]);
+    await f.command(['crosscheck']);
+    blocked(await f.stop(), 9, 'ledger evidence <L> --artifact <screenshot>');
+    await f.command(['evidence', 'L1', '--artifact', image]);
+    await f.command(['crosscheck']);
+    assert.equal(await f.stop(), null);
+  });
+
+test('stale image artifacts fail reason 9 even when another artifact satisfies item evidence',
+  { timeout: 3000 }, async (t) => {
+    const f = await uiFixture(t);
+    const image = path.join(f.root, 'desktop.webp');
+    fs.writeFileSync(image, 'fake screenshot');
+    await f.command(['evidence', 'L1', '--artifact', image]);
+    const old = new Date(Date.now() - 10_000);
+    fs.utimesSync(image, old, old);
+    await f.command(['crosscheck']);
+    blocked(await f.stop(), 9, 'user-facing change without a screenshot');
+    fs.utimesSync(image, new Date(), new Date());
+    await f.command(['crosscheck']);
+    assert.equal(await f.stop(), null);
+  });
+
+test('image artifacts must be recorded and refreshed in the current turn', { timeout: 3000 }, async (t) => {
+  const f = await uiFixture(t);
+  const image = path.join(f.root, 'mobile.jpg');
+  fs.writeFileSync(image, 'fake screenshot');
+  await f.command(['evidence', 'L1', '--artifact', image]);
+  f.user('Thanks.');
+  await f.command(['crosscheck']);
+  blocked(await f.stop(), 9, 'user-facing change without a screenshot');
+  fs.utimesSync(image, new Date(), new Date());
+  await f.command(['evidence', 'L1', '--artifact', image]);
+  await f.command(['crosscheck']);
+  assert.equal(await f.stop(), null);
+});
+
+test('detected UI directories require screenshots, test and story changes do not, and user waivers apply',
+  { timeout: 3000 }, async (t) => {
+    const f = await fixture(t);
+    fs.mkdirSync(path.join(f.repo, 'frontend'));
+    fs.writeFileSync(path.join(f.repo, 'frontend/package.json'), '{"dependencies":{"vue":"1"}}');
+    for (const file of ['frontend/view.js', 'frontend/view.test.tsx', 'frontend/view.stories.tsx']) {
+      fs.writeFileSync(path.join(f.repo, file), 'export {};\n');
+      const old = new Date(Date.now() - 10_000);
+      fs.utimesSync(path.join(f.repo, file), old, old);
+    }
+    f.env.FAKE_STAGED = '["frontend/view.test.tsx","frontend/view.stories.tsx"]';
+    await f.complete();
+    assert.equal(await f.stop(), null);
+    f.env.FAKE_STAGED = '["frontend/view.js"]';
+    await f.command(['crosscheck']);
+    blocked(await f.stop(), 9, 'user-facing change without a screenshot');
+    const quote = 'You may skip screenshots for this task.';
+    await f.command(['waive', 'gate', '--quote', quote], {}, 1);
+    blocked(await f.stop(), 9, 'user-facing change without a screenshot');
+    f.user(quote);
+    await f.command(['waive', 'gate', '--quote', quote]);
+    await f.command(['crosscheck']);
+    assert.equal(await f.stop(), null);
+  });

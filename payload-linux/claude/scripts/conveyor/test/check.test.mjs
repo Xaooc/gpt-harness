@@ -141,7 +141,7 @@ test('file placeholders pass literal positional arguments, including legacy quot
   }
 });
 
-test('untrusted profiles use autodetection and hygiene data until the reviewed SHA-256 is trusted', { timeout }, async (t) => {
+test('untrusted profiles use autodetection and default hygiene until the reviewed SHA-256 is trusted', { timeout }, async (t) => {
   const env = await environment(t);
   const bin = path.join(env.root, 'bin'), log = path.join(env.root, 'npm.jsonl');
   await fs.mkdir(bin);
@@ -371,14 +371,18 @@ test('hygiene fails when a large file crosses the line limit', { timeout }, asyn
   assert.deepEqual(report.hygiene.grew, [{ file: 'src/example.ts', counter: 'large-files', before: 1500, after: 1501 }]);
 });
 
-test('hygiene writes a baseline and reports repository totals against it', { timeout }, async (t) => {
+test('default hygiene creates an external baseline and reports repository totals against it', { timeout }, async (t) => {
   const env = await environment(t, undefined, { 'src/example.ts': '// eslint-disable\n// TODO: finish\n' });
   const written = await env.command(['hygiene', '--write-baseline']);
   assert.equal(written.status, 0, written.stderr);
   assert.equal(written.report.totals['eslint-disable'], 1);
   assert.equal(written.report.totals['TODO/FIXME'], 1);
   assert.equal(written.report.totals['large-files'], 0);
-  const file = path.join(env.repo, '.conveyor/hygiene-baseline.json');
+  const identity = await fs.realpath(path.join(env.repo, '.git'));
+  const file = path.join(env.home, 'baselines', `${createHash('sha256').update(identity).digest('hex').slice(0, 16)}.json`);
+  assert.equal(written.report.source, 'default');
+  assert.equal(written.report.baselineFile, file);
+  await assert.rejects(fs.stat(path.join(env.repo, '.conveyor')), { code: 'ENOENT' });
   assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), { version: 1, totals: written.report.totals });
   const read = await env.command(['hygiene']);
   assert.equal(read.status, 0, read.stderr);
@@ -391,5 +395,93 @@ test('hygiene writes a baseline and reports repository totals against it', { tim
   assert.equal(changed.report.totals['eslint-disable'], 2);
   assert.equal(changed.report.baseline['eslint-disable'], 1);
   assert.equal(changed.report.delta['eslint-disable'], 1);
-  assert.deepEqual(await fs.readdir(path.dirname(file)), ['hygiene-baseline.json']);
+  assert.deepEqual(await fs.readdir(path.dirname(file)), [path.basename(file)]);
+});
+
+
+test('zero-config ratchet seeds the base state and shares its baseline with worktrees', { timeout: 3000 }, async (t) => {
+  const env = await environment(t, undefined, { 'src/example.ts': 'export const old = 1 as any;\n' });
+  await env.write('src/example.ts', 'export const old = 1 as any;\nexport const added = 2 as any;\n');
+  const first = await env.command(['run', '--level', 'fast']);
+  assert.equal(first.status, 1, first.stderr);
+  assert.deepEqual(first.report.hygiene.grew, [{ file: 'src/example.ts', counter: 'any', before: 1, after: 2 }]);
+  const file = first.report.hygiene.baselineFile;
+  assert.equal(first.report.hygiene.source, 'default');
+  assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).totals.any, 1);
+  await env.write('src/example.ts', 'export const old = 1 as any;\n');
+  assert.equal((await env.command(['run', '--level', 'turn'])).status, 0);
+  const worktree = path.join(env.root, 'worktree');
+  env.git(['worktree', 'add', '--quiet', '--detach', worktree]);
+  const shared = await env.command(['hygiene'], {}, worktree);
+  assert.equal(shared.status, 0, shared.stderr);
+  assert.equal(shared.report.baselineFile, file);
+  assert.equal(shared.report.baseline.any, 1);
+  await assert.rejects(fs.stat(path.join(env.repo, '.claude/conveyor.json')), { code: 'ENOENT' });
+});
+
+test('init prints without writing, writes a trusted valid profile and seeded baseline, and refuses overwrite',
+  { timeout: 3000 }, async (t) => {
+    const env = await environment(t, undefined, { 'src/example.ts': 'export const old = 1 as any;\n' });
+    await env.write('package.json', JSON.stringify({ scripts: { lint: 'custom-lint' } }));
+    const printed = await env.command(['init']);
+    assert.equal(printed.status, 0, printed.stderr);
+    assert.equal(printed.report.turn[0].run, 'npm run lint');
+    assert.equal(printed.report.hygiene.baseline, '.conveyor/hygiene-baseline.json');
+    await assert.rejects(fs.stat(env.home), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(path.join(env.repo, '.claude')), { code: 'ENOENT' });
+    const external = await env.command(['hygiene']);
+    await env.write('src/example.ts', 'export const old = 1 as any;\nexport const added = 2 as any;\n');
+    const written = await env.command(['init', '--write']);
+    assert.equal(written.status, 0, written.stderr);
+    const baseline = JSON.parse(await fs.readFile(path.join(env.repo, '.conveyor/hygiene-baseline.json'), 'utf8'));
+    assert.deepEqual(baseline.totals, external.report.baseline);
+    assert.equal(baseline.totals.any, 1);
+    assert.equal((await env.load()).profileTrust, 'trusted');
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(env.repo, '.claude/conveyor.json'), 'utf8')), written.report);
+    const refused = await env.command(['init', '--write']);
+    assert.equal(refused.status, 2);
+    assert.match(refused.stderr, /refusing to overwrite/);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(env.repo, '.claude/conveyor.json'), 'utf8')), written.report);
+  });
+
+test('default counters cover language debt and exclude dependencies, generated files, and large tests',
+  { timeout: 3000 }, async (t) => {
+    const env = await environment(t, undefined, { 'src/example.ts': 'export {};\n', 'main.py': 'pass\n' });
+    await env.write('src/example.ts', [
+      '// TODO FIXME eslint-disable @ts-ignore @ts-expect-error',
+      'try {} catch (e) { }', 'const value: any = thing as any;'
+    ].join('\n'));
+    await env.write('main.py', 'except Exception:\nexcept:\n# type: ignore\n# noqa\n@lru_cache\n@cache\n');
+    for (const name of ['node_modules/debt.ts', 'dist/debt.ts', 'src/debt.generated.ts', 'src/debt.min.js']) {
+      await env.write(name, '// TODO\nconst value = 1 as any;\n');
+    }
+    await env.write('tests/large.ts', 'export {};\n'.repeat(1501));
+    const result = await env.command(['hygiene']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.report.totals, {
+      'TODO/FIXME': 2, 'large-files': 0, 'empty-catch': 1, 'eslint-disable': 1,
+      '@ts-ignore': 1, '@ts-expect-error': 1, any: 2, 'broad-except': 2, 'type-ignore': 1, noqa: 1, 'function-caches': 2
+    });
+    assert.ok(Object.values(result.report.baseline).every((total) => total === 0));
+    await env.profile({ version: 1 });
+    assert.equal((await env.command(['hygiene'])).report.source, 'default');
+    await env.profile(profile([], []), false);
+    const untrusted = await env.command(['run', '--level', 'fast']);
+    assert.equal(untrusted.status, 1);
+    assert.equal(untrusted.report.hygiene.source, 'default');
+    assert.ok(untrusted.report.hygiene.grew.some((entry) => entry.counter === 'any'));
+  });
+
+
+test('init seeds zero debt for a new git repository without a commit', { timeout: 3000 }, async (t) => {
+  const env = await environment(t);
+  const repo = path.join(env.root, 'new-repo');
+  await fs.mkdir(repo);
+  git(repo, ['init', '--quiet']);
+  await fs.writeFile(path.join(repo, 'main.ts'), 'export const value = 1 as any;\n');
+  const result = await env.command(['init', '--write'], {}, repo);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal((await env.load(repo)).profileTrust, 'trusted');
+  const baseline = JSON.parse(await fs.readFile(path.join(repo, '.conveyor/hygiene-baseline.json'), 'utf8'));
+  assert.equal(baseline.totals.any, 0);
 });

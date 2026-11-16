@@ -37,7 +37,18 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   same repository (parallel write slices need their own worktrees via `wt-new.mjs`); others come from the executor.
 - **Repo profiles must be trusted:** a repository's `.claude/conveyor.json` runs its commands only after you review it
   and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>` (shared across worktrees for the last five reviewed versions);
-  until then the gate uses the autodetected profile and reports `profileTrust: "untrusted"`.
+  until then the gate uses autodetected checks and default language hygiene counters and reports `profileTrust: "untrusted"`.
+  Missing hygiene sections also get defaults. Baselines start from the task base outside the repository at
+  `~/.claude/conveyor/baselines/<repo-identity-hash>.json`, shared across worktrees.
+- **Automatic profile setup:** on the first code task without a profile, run
+  `node ~/.claude/scripts/conveyor/check.mjs init --dir <repo> --write`. Review and adjust generated checks, measure
+  fast/turn on the change, tell the user, and propose committing `.claude/conveyor.json` and
+  `.conveyor/hygiene-baseline.json`. Init seeds from the external baseline and trusts the generated profile;
+  it refuses to overwrite a profile and never commits. Omit `--write` to print only.
+- **UI proof:** the first UI task in a UI repository without `.claude/skills/verify-*/SKILL.md` creates a skill via
+  pstack `create-verification-skill` (isolated free port and data, Playwright drive, desktop/mobile screenshots
+  retained after cleanup; see kriminalist's `verify-kriminalist`). Stop reason 9 requires fresh image artifact evidence
+  for UI changes: `ledger.mjs evidence <L> --artifact <screenshot>`; calibration and user gate waivers apply.
 - **Executor gate:** every write job is followed by `check.mjs` fast+turn on the job's own changes (profile
   `.claude/conveyor.json`, autodetected when absent); failures go back to the same executor as fix rounds.
 - **Direct wrappers** remain for special cases: `luna.sh` (Codex; `-m gpt-6.1-sol -e max` for complex work) and

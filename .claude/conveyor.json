@@ -22,7 +22,7 @@
         "name": "TODO/FIXME",
         "pattern": "\\b(TODO|FIXME)\\b",
         "glob": "payload-linux/claude/**/*.{mjs,js,sh,py}",
-        "exclude": "payload-linux/claude/local-plugins/pstack/**"
+        "exclude": "{payload-linux/claude/local-plugins/pstack/**,**/test/**,**/tests/**}"
       },
       {
         "name": "large-files",

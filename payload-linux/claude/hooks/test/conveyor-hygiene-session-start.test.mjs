@@ -10,8 +10,8 @@ import { invokeHook } from '../../scripts/conveyor/test/process-fixture.mjs';
 
 const hook = fileURLToPath(new URL('../conveyor-hygiene-session-start.mjs', import.meta.url));
 
-test('profile suggestion is weekly per repo and suppressed by an existing profile or verification skill',
-  { timeout: 5000 }, async (t) => {
+test('code and UI directives recur each session, with independent profile and verify-skill detection',
+  { timeout: 3000 }, async (t) => {
     const root = fs.mkdtempSync(path.join(tmpdir(), 'conveyor-session-start-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const repo = path.join(root, 'repo'), claude = path.join(root, 'claude'), conveyor = path.join(claude, 'conveyor');
@@ -37,23 +37,57 @@ test('profile suggestion is weekly per repo and suppressed by an existing profil
       return result.stdout ? JSON.parse(result.stdout).hookSpecificOutput.additionalContext : '';
     };
     const first = await run();
-    assert.match(first, /propose a check\.mjs profile and create-verification-skill/);
-    assert.equal(first.split('\n').length, 1);
-    assert.equal(await run(), '');
-    const stateFile = path.join(conveyor, 'profile-suggestions.json');
-    const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-    for (const key of Object.keys(state)) state[key] = new Date(Date.now() - 8 * 86400_000).toISOString();
-    fs.writeFileSync(stateFile, JSON.stringify(state));
+    assert.match(first, /This repository has no conveyor profile/);
+    assert.match(first, /init --dir .* --write/);
+    assert.match(first, /measure fast\/turn/);
+    assert.doesNotMatch(first, /UI repository/);
     assert.equal(await run(), first);
-    fs.rmSync(stateFile);
+    const stateFile = path.join(conveyor, 'profile-suggestions.json');
+    assert.equal(fs.existsSync(stateFile), false);
     const profile = write('repo/.claude/conveyor.json', {});
     assert.equal(await run(), '');
-    assert.equal(fs.existsSync(stateFile), false);
-    fs.rmSync(profile);
+    write('repo/package.json', { dependencies: { react: '1' } });
+    assert.match(await run(), /UI repository without a verify skill/);
     fs.mkdirSync(path.join(repo, '.claude', 'skills', 'verify-fixture'), { recursive: true });
+    assert.match(await run(), /UI repository without a verify skill/);
+    write('repo/.claude/skills/verify-fixture/SKILL.md', {});
     assert.equal(await run(), '');
+    fs.rmSync(profile);
+    assert.equal(await run(), first, 'a verify skill does not suppress the missing-profile directive');
     fs.rmSync(path.join(repo, '.claude', 'skills'), { recursive: true });
-    assert.equal(await run(repo, { HARNESS_REPO: repo }), '');
+    write('repo/package.json', {});
+    write('repo/frontend/package.json', { devDependencies: { vite: '1' } });
+    assert.match(await run(), /UI repository without a verify skill/);
+    fs.rmSync(path.join(repo, 'frontend'), { recursive: true });
+    write('repo/main.py', {});
+    write('repo/templates/index.html', {});
+    assert.match(await run(), /UI repository without a verify skill/);
     assert.equal(await run(root), '');
     assert.equal(fs.existsSync(stateFile), false);
+  });
+
+test('scratch workspaces, non-git directories, and git repositories without code have no directives',
+  { timeout: 3000 }, async (t) => {
+    const root = fs.mkdtempSync(path.join(tmpdir(), 'conveyor-scratch-session-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const repo = path.join(root, '.config/Claude/scratch-workspaces/fixture');
+    fs.mkdirSync(repo, { recursive: true });
+    fs.writeFileSync(path.join(repo, 'package.json'), '{"dependencies":{"next":"1"}}');
+    const git = spawnSync('git', ['init', '--quiet', repo], { encoding: 'utf8', timeout: 1000 });
+    assert.equal(git.status, 0, git.stderr);
+    const claude = path.join(root, 'claude');
+    fs.mkdirSync(path.join(claude, 'conveyor/hygiene'), { recursive: true });
+    fs.writeFileSync(path.join(claude, 'conveyor/hygiene/state.json'), JSON.stringify({ lastRunAt: new Date().toISOString() }));
+    for (const cwd of [repo, root]) {
+      const result = await invokeHook(hook, { cwd: root, input: JSON.stringify({ cwd }),
+        env: { ...process.env, HOME: root, CLAUDE_HOME_DIR: claude, CONVEYOR_HOME: path.join(claude, 'conveyor') } });
+      assert.equal(result.stdout, '');
+      assert.equal(result.stderr, '');
+    }
+    fs.rmSync(path.join(repo, 'package.json'));
+    const result = await invokeHook(hook, { cwd: root, input: JSON.stringify({ cwd: repo }),
+      env: { ...process.env, HOME: path.join(root, 'elsewhere'), CLAUDE_HOME_DIR: claude,
+        CONVEYOR_HOME: path.join(claude, 'conveyor') } });
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, '');
   });

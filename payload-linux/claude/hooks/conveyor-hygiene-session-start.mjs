@@ -5,9 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { repositorySurface } from '../scripts/conveyor/lib/profile.mjs';
 
 const day = 24 * 60 * 60 * 1000;
 const runner = fileURLToPath(new URL('../scripts/conveyor/harness-hygiene.mjs', import.meta.url));
@@ -39,42 +39,50 @@ async function sessionCwd() {
   });
 }
 
-async function profileSuggestion(conveyor, now) {
+function scratchWorkspace(cwd) {
+  const scratch = path.join(process.env.HOME || homedir(), '.config', 'Claude', 'scratch-workspaces');
+  let canonical = path.resolve(cwd);
+  try { canonical = fs.realpathSync(cwd); } catch { /* A missing directory has no guidance. */ }
+  return canonical === scratch || canonical.startsWith(`${scratch}${path.sep}`);
+}
+
+async function repositoryDirectives(cwd) {
   try {
-    const cwd = await sessionCwd();
-    const { stdout } = await execute('git', ['-C', cwd, 'rev-parse', '--path-format=absolute',
-      '--show-toplevel', '--git-common-dir'], { timeout: 500, killSignal: 'SIGKILL', maxBuffer: 65536 });
-    const [repo, common] = stdout.trim().split('\n');
-    if (!repo || !common) return '';
-    const canonical = fs.realpathSync(repo);
-    const harness = process.env.HARNESS_REPO || path.join(homedir(), 'dev', 'gpt-harness');
-    if (canonical === path.resolve(harness)
-      || canonical === fs.realpathSync(fileURLToPath(new URL('../../../', import.meta.url)))
-      || fs.existsSync(path.join(repo, 'payload-linux', 'manifest.json'))
-        && fs.existsSync(path.join(repo, 'tools', 'manifest-sync.mjs'))) return '';
-    if (!['package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod'].some((name) => fs.existsSync(path.join(repo, name)))) {
-      return '';
+    const { stdout } = await execute('git', ['-C', cwd, 'rev-parse', '--show-toplevel'],
+      { timeout: 500, killSignal: 'SIGKILL', maxBuffer: 65536 });
+    const repo = stdout.trim();
+    if (!repo || scratchWorkspace(repo)) return '';
+    const surface = await repositorySurface(repo), messages = [];
+    if (!surface.code) return '';
+    if (!fs.existsSync(path.join(repo, '.claude', 'conveyor.json'))) {
+      messages.push('This repository has no conveyor profile. On your first task here that changes code, run '
+        + `node ~/.claude/scripts/conveyor/check.mjs init --dir '${repo.replaceAll("'", "'\\''")}' --write, `
+        + 'review the generated checks (adjust commands that do not fit this repo, measure fast/turn on the change), '
+        + 'tell the user, and propose committing .claude/conveyor.json and .conveyor/hygiene-baseline.json.');
     }
-    if (fs.existsSync(path.join(repo, '.claude', 'conveyor.json'))) return '';
     const skills = path.join(repo, '.claude', 'skills');
-    if (fs.existsSync(skills) && fs.readdirSync(skills).some((name) => name.startsWith('verify-')
-      && fs.statSync(path.join(skills, name)).isDirectory())) return '';
-    const file = path.join(conveyor, 'profile-suggestions.json');
-    const saved = readJson(file);
-    const state = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
-    const key = createHash('sha256').update(fs.realpathSync(common)).digest('hex');
-    if (now - Date.parse(state[key]) < 7 * day) return '';
-    state[key] = new Date(now).toISOString();
-    const temporary = `${file}.${process.pid}.${now}.tmp`;
-    try {
-      fs.writeFileSync(temporary, `${JSON.stringify(state)}\n`, { flag: 'wx', mode: 0o600 });
-      fs.renameSync(temporary, file);
-    } finally { fs.rmSync(temporary, { force: true }); }
-    return 'For this repo, propose a check.mjs profile and create-verification-skill to the user.';
+    const verified = fs.existsSync(skills) && fs.readdirSync(skills).some((name) => name.startsWith('verify-')
+      && fs.existsSync(path.join(skills, name, 'SKILL.md')));
+    if (surface.ui && !verified) {
+      messages.push('UI repository without a verify skill: the first task that changes the UI also creates '
+        + '.claude/skills/verify-<app>/ with the pstack create-verification-skill method '
+        + '(isolated launch on a free port with its own data, Playwright drive, desktop+mobile screenshots kept after cleanup '
+        + "— see kriminalist's verify-kriminalist for a worked example), and proves the change with it.");
+    }
+    return messages.join('\n');
   } catch { return ''; } // Optional guidance must never prevent hygiene output or session startup.
 }
 
+function outputContext(message) {
+  if (message) process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: message }
+  }));
+}
+
 async function main() {
+  const cwd = await sessionCwd();
+  if (scratchWorkspace(cwd)) return;
+  const directives = await repositoryDirectives(cwd);
   const claude = process.env.CLAUDE_HOME_DIR || path.join(homedir(), '.claude');
   const conveyor = process.env.CONVEYOR_HOME || path.join(claude, 'conveyor');
   const directory = path.join(conveyor, 'hygiene'), now = Date.now();
@@ -86,7 +94,7 @@ async function main() {
   } catch { /* No existing lock. */ }
   let descriptor;
   try { descriptor = fs.openSync(lock, 'wx', 0o600); }
-  catch { return; }
+  catch { outputContext(directives); return; }
   try {
     const saved = readJson(stateFile);
     const state = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
@@ -107,7 +115,7 @@ async function main() {
     }
     const age = now - Date.parse(report?.at);
     const counts = report?.counts;
-    let message = '';
+    let message = directives;
     if (age >= 0 && age < 2 * day && counts
       && ['high', 'medium', 'low'].every((key) => Number.isInteger(counts[key]) && counts[key] >= 0)
       && counts.high + counts.medium > 0) {
@@ -116,14 +124,13 @@ async function main() {
         const total = counts.high + counts.medium + counts.low;
         const reportPath = path.resolve(directory) === path.join(homedir(), '.claude', 'conveyor', 'hygiene')
           ? '~/.claude/conveyor/hygiene/latest.json' : path.join(directory, 'latest.json');
-        message = `Гигиена харнесса: ${total} расхождений (${counts.high} важных). Отчёт: ${reportPath}`
+        const reportMessage = `Гигиена харнесса: ${total} расхождений (${counts.high} важных). Отчёт: ${reportPath}`
           + ' — предложи пользователю разобрать, ничего не меняй сам.';
+        message = [message, reportMessage].filter(Boolean).join('\n');
         state.report = { at: report.at, shown: shown + 1 };
         changed = true;
       }
     }
-    const suggestion = await profileSuggestion(conveyor, now);
-    if (suggestion) message = [message, suggestion].filter(Boolean).join('\n');
     if (changed) {
       const temporary = `${stateFile}.${process.pid}.${now}.tmp`;
       try {
@@ -131,11 +138,7 @@ async function main() {
         fs.renameSync(temporary, stateFile);
       } finally { fs.rmSync(temporary, { force: true }); }
     }
-    if (message) {
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: message }
-      }));
-    }
+    outputContext(message);
   } finally {
     fs.closeSync(descriptor);
     fs.unlinkSync(lock);

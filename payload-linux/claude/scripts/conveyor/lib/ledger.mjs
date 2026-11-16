@@ -6,6 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { entryText, isGenuineHumanEntry } from '../../learning/extract.mjs';
 import { readJsonl, sanitizeQuote } from '../../learning/common.mjs';
+import { repositorySurface, uiFile } from './profile.mjs';
 
 const execute = promisify(execFile);
 const now = () => new Date().toISOString();
@@ -340,7 +341,8 @@ export async function runCommand(command, args = [], cwd = process.cwd()) {
 
 export async function addEvidence(context, id, kind, value, expectedRc = 0) {
   findItem(loadLedger(context), id);
-  const record = { type: 'evidence', item: id, kind, value, at: now() };
+  const record = { type: 'evidence', item: id, kind, value, at: now(),
+    offset: context.transcript ? fs.statSync(context.transcript).size : null };
   let rc = 0;
   if (kind === 'command') {
     const result = await runCommand(value, [], context.cwd);
@@ -741,6 +743,31 @@ async function cleanupProblem(context, state, repos) {
   return null;
 }
 
+async function screenshotProblem(context, state, repos) {
+  const uiRepos = [];
+  for (const entry of repos) {
+    const { uiDirs } = await repositorySurface(entry.repo);
+    if (entry.files.some((file) => uiFile(path.relative(entry.repo, path.resolve(entry.repo, file)), uiDirs))) {
+      uiRepos.push(entry);
+    }
+  }
+  if (!uiRepos.length) return false;
+  const changes = await repoChanges(uiRepos);
+  const turn = state.primaryMessages.at(-1);
+  const turnAt = Date.parse(turn?.at || state.task.at);
+  const recordedThisTurn = (evidence) => {
+    if (Date.parse(evidence.at) < turnAt) return false;
+    return !turn || !Number.isInteger(evidence.offset) || evidence.offset >= turn.offset;
+  };
+  const images = state.items.flatMap((item) => item.evidence).filter((evidence) => evidence.kind === 'artifact'
+    && /\.(?:png|jpe?g|webp)$/i.test(evidence.value) && recordedThisTurn(evidence));
+  // One fresh screenshot is the minimum evidence; the verify skill owns journey and viewport coverage.
+  return !images.some((evidence) => {
+    const stat = fs.statSync(evidence.value, { throwIfNoEntry: false });
+    return stat?.isFile() && stat.mtimeMs >= turnAt && [...changes.values()].every((mtime) => stat.mtimeMs >= mtime);
+  });
+}
+
 export async function gateStatus(context) {
   const rows = transcriptRows(context);
   const { applies, repos, nonGit, writes } = await sessionRepos(context, rows);
@@ -758,7 +785,7 @@ export async function gateStatus(context) {
   }
   const scope = nonGit ? '; non-git code edits: ledger checks only, turn checks unavailable' : '';
   const block = (check, reason) => ({ applies: true, ok: false, check,
-    reason: sanitizeQuote(`${check}. ${reason}${scope}`, 1500) });
+    reason: check === 9 ? `${check}. ${reason}${scope}` : sanitizeQuote(`${check}. ${reason}${scope}`, 1500) });
   if (!state.task) return block(1, 'start the ledger and play back the requirements: ledger start');
   const unlinked = state.primaryMessages.flatMap((message) => message.clauses).filter((clause) => !linked(state, clause.id));
   if (unlinked.length) return block(2, `link imperative clauses in the ledger: ${unlinked.map((clause) => clause.id).join(', ')}`);
@@ -792,6 +819,10 @@ export async function gateStatus(context) {
   if (!state.gateWaived && !nonGit) {
     const cleanup = await cleanupProblem(context, state, repos);
     if (cleanup) return block(8, cleanup);
+  }
+  if (!state.gateWaived && await screenshotProblem(context, state, evidenceRepos)) {
+    return block(9, 'user-facing change without a screenshot: drive it with the project\'s verify skill '
+      + '(create .claude/skills/verify-<app> if missing) and record `ledger evidence <L> --artifact <screenshot>`');
   }
   return { applies: true, ok: true };
 }

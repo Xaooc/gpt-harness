@@ -122,7 +122,19 @@ rounds); exit 6 means the gate stayed red and the decision is yours. While your 
 hook lets the turn end without a checklist (work in progress). A repository's own `.claude/conveyor.json` commands run
 only after you review it and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>`; trust covers the last
 five reviewed versions across all worktrees of the repository. Until then checks
-use the autodetected profile.
+use the autodetected profile and default language hygiene counters. Repositories without a hygiene section also
+get default counters; their initial debt is seeded from the task base in
+`~/.claude/conveyor/baselines/<repo-identity-hash>.json`, shared by worktrees without adding repository files.
+On the first code task in a repository without a profile, run
+`node ~/.claude/scripts/conveyor/check.mjs init --dir <repo> --write`, review and adjust the generated checks,
+measure fast/turn on the change, tell the user, and propose committing `.claude/conveyor.json` and
+`.conveyor/hygiene-baseline.json`. Init seeds the local baseline from the external baseline, trusts its generated
+profile, refuses to overwrite an existing profile, and never commits.
+UI repositories without `.claude/skills/verify-*/SKILL.md` create a verify skill on their first UI task with pstack
+`create-verification-skill`: isolated launch on a free port with separate data, Playwright drive, retained desktop/mobile
+screenshots after cleanup (see kriminalist's `verify-kriminalist`). Stop reason 9 requires a fresh image artifact for
+UI changes: `ledger.mjs evidence <L> --artifact <screenshot>`. It uses the same calibration and user gate waiver as
+turn checks and cleanup.
 
 ### Review: pstack `interrogate` on diverse executors
 
