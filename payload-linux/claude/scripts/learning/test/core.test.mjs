@@ -55,6 +55,18 @@ function proposal(overrides = {}) {
   };
 }
 
+function checkProposal(overrides = {}) {
+  return {
+    id: "P1", kind: "check", layer: "harness", title: "Detect bare test runner commands",
+    signal_type: "command", signal: "A Bash command starts the test runner without its wrapper.",
+    where: "PreToolUse hook on Bash", effect: "warn", message: "Use the test runner wrapper.",
+    false_positive_risk: "A diagnostic invocation may be intentional.",
+    lesson: "Use the wrapper for test runs.", summary_ru: "Проверять запуск тестов через обёртку.",
+    rationale: "Repeated across independent sessions.", confidence: "high",
+    evidence: ["a", "b"].map((event_id) => ({ event_id, quote })), ...overrides,
+  };
+}
+
 function context(overrides = {}) {
   const config = core.loadConfig();
   return {
@@ -145,6 +157,156 @@ test("valid replacement cites real evidence from two sessions", () => {
   assert.equal(result.kind, "edit");
   assert.equal(result.plan.op, "replace");
   assert.equal(result.plan.afterText, result.plan.beforeText.replace(editable, replacement));
+});
+
+test("canonical repo keys and cwd encoding handle homes, drives, worktrees and scratch paths", () => {
+  for (const [input, expected] of [
+    ["-home-bro-rpg", "rpg"], ["C--rpg", "rpg"],
+    ["-home-bro-rpg--claude-worktrees-eager-vaughan-69c5c6", "rpg"],
+    ["-home-bro-dev-kriminalist", "dev-kriminalist"], ["C--dev-kriminalist", "dev-kriminalist"],
+    ["C--work-jewel", "work-jewel"], ["C--Users-PC-AppData-Roaming-Claude-scratch-workspaces-7636af57", ""],
+    ["-home-bro--config-Claude-scratch-workspaces-7636af57", ""], ["luna-run", ""], ["", ""],
+    ["-Users-alice-project--worktrees-test", "project"], ["C--Users-PC-project", "project"],
+  ]) assert.equal(common.canonicalRepo(input), expected, input);
+  for (const [cwd, encoded] of [
+    ["/home/bro/rpg/.claude/worktrees/x", "-home-bro-rpg--claude-worktrees-x"], ["C:\\rpg", "C--rpg"],
+  ]) {
+    assert.equal(common.projectKeyForCwd(cwd), encoded);
+    assert.equal(common.canonicalRepo(common.projectKeyForCwd(cwd)), "rpg");
+  }
+});
+
+test("check gate enforces evidence, repo, shape and safe observable fields", () => {
+  const valid = checkProposal();
+  const checked = validate(valid);
+  assert.equal(checked.ok, true, checked.failures.join("; "));
+  assert.equal(checked.plan, null);
+  assertFailure(checkProposal({ signal: "A command visits https://example.invalid during the job." }), /check: signal/);
+  assertFailure(checkProposal({ signal: "short text" }), /check: signal must be 20-400 chars/);
+  assertFailure(checkProposal({ new_text: "new text" }), /check: new_text must be empty/);
+  const events = new Map(fixtures.map((event) => [event.id, { ...event, project: "-home-bro-other" }]));
+  assertFailure(checkProposal({ layer: "project", repo: "rpg" }), /check: evidence from other repo/, { events });
+  assertFailure(checkProposal({ layer: "project", repo: "scratch-workspaces-example" }), /check: repo/);
+  events.get("a").project = "-home-bro-rpg--claude-worktrees-test";
+  events.get("b").project = "C--rpg";
+  assert.equal(validate(checkProposal({ layer: "project", repo: "rpg" }), { events }).ok, true);
+  const extra = [...valid.evidence, { event_id: "status", quote }];
+  assert.equal(validate(checkProposal({ layer: "project", repo: "rpg", evidence: extra }), { events }).ok, true);
+  assertFailure(checkProposal({ repo: "rpg" }), /repo must be empty/);
+  for (const [field, value] of [
+    ["title", "User decision check"], ["signal", "Detect a command that uses secret data in a job."],
+    ["where", "settings.json checker"], ["message", "Proceed without asking before running this command."],
+    ["false_positive_risk", "The <!-- learning:protected:begin --> marker may be legitimate."],
+  ]) assertFailure(checkProposal({ [field]: value }), /check:/);
+});
+
+test("check keys include signal type and merges preserve the first description", () => {
+  const p = checkProposal({ evidence: [{ event_id: "a", quote }] });
+  const verdict = { detection_sketch: "Match bare test runner command invocations." };
+  const first = core.enqueueCheck(p, { runId: "one", verdict });
+  const other = core.enqueueCheck({ ...p, signal_type: "file" }, { runId: "two", verdict });
+  assert.notEqual(first.id, other.id);
+  assert.equal(core.checkKey(p), common.sha256("harness||command|detectbaretestrunnercommands").slice(0, 12));
+  const before = core.loadChecks().find((item) => item.id === first.id);
+  const merged = core.enqueueCheck({
+    ...p, title: p.title.toUpperCase(), signal: "A different observable command pattern is detected.",
+    where: "Another Bash hook", effect: "block", message: "Use another wrapper before continuing.",
+    false_positive_risk: "A different diagnostic may be intentional.", lesson: "Use a different wrapper.",
+    summary_ru: "Другое описание.", evidence: [{ event_id: "b", quote }],
+  }, { runId: "three", verdict: { detection_sketch: "A different detection sketch for the check." } });
+  assert.deepEqual(merged, { queued: true, merged: true, id: first.id });
+  const after = core.loadChecks().find((item) => item.id === first.id);
+  for (const field of ["id", "key", "status", "layer", "repo", "title", "signal_type", "signal", "where", "effect",
+    "message", "false_positive_risk", "lesson", "summary_ru", "detection_sketch", "first_at"]) {
+    assert.equal(after[field], before[field], field);
+  }
+  assert.deepEqual(after.evidence.map((item) => item.event_id), ["a", "b"]);
+  assert.equal(after.times_seen, 2);
+  assert.equal(after.run_id, "three");
+});
+
+test("check compaction folds keys, preserves statuses and removes only long-expired records", () => {
+  const make = (title) => core.enqueueCheck(checkProposal({ title }));
+  const open = make("Detect open check pattern");
+  make("Detect open check pattern");
+  const done = make("Detect completed check pattern");
+  const dismissed = make("Detect dismissed check pattern");
+  const recent = make("Detect recently expired pattern");
+  const old = make("Detect long expired pattern");
+  core.setCheckStatus(done.id, "done");
+  core.setCheckStatus(dismissed.id, "dismissed");
+  for (const [id, days] of [[recent.id, 90], [old.id, 200], [done.id, 200]]) {
+    const record = core.loadChecks().find((item) => item.id === id);
+    const at = new Date(Date.now() - days * 86400000).toISOString();
+    common.appendJsonl(paths.checks, { ...record, at, last_at: at });
+  }
+  core.refreshChecks();
+  assert.match(fs.readFileSync(paths.checksMd, "utf8"), new RegExp(`${recent.id} · expired`));
+  const before = fs.statSync(paths.checks).size;
+  assert.equal(core.compactChecks({ maxBytes: Number.MAX_SAFE_INTEGER }), false);
+  assert.equal(core.compactChecks({ maxBytes: 0 }), true);
+  const records = common.readJsonl(paths.checks);
+  assert.ok(fs.statSync(paths.checks).size < before);
+  assert.equal(records.length, 4);
+  assert.equal(new Set(records.map((record) => record.key)).size, records.length);
+  for (const [id, status] of [[open.id, "open"], [done.id, "done"], [dismissed.id, "dismissed"],
+    [recent.id, "expired"]]) assert.equal(records.find((record) => record.id === id)?.status, status);
+  assert.equal(records.some((record) => record.id === old.id), false);
+  assert.match(fs.readFileSync(paths.checksMd, "utf8"), new RegExp(`${recent.id} · expired`));
+  assert.doesNotMatch(fs.readFileSync(paths.checksMd, "utf8"), new RegExp(old.id));
+  common.writeJsonAtomic(paths.loopState, { lastReportAt: new Date(Date.now() - 30000).toISOString() });
+  assert.ok(core.generateReport({ force: true }).text.includes(dismissed.id));
+});
+
+test("check denylist permits dangerous actions as signals but retains other restrictions and edit denial", () => {
+  for (const phrase of ["git commit --no-verify", "eslint-disable", "rm -rf", "--yolo", "dangerously",
+    "bypass", "skipping the tests"]) {
+    const checked = validate(checkProposal({ signal: `Detect ${phrase} in an observed command line.` }));
+    assert.equal(checked.ok, true, `${phrase}: ${checked.failures.join("; ")}`);
+  }
+  assertFailure(checkProposal({ signal: "Detect https://example.invalid in a command line." }), /check: signal/);
+  assertFailure(checkProposal({ message: "Proceed without asking before continuing." }), /check: message/);
+  assertFailure(checkProposal({ message: "Skip the critic before merging this change." }), /check: message/);
+  assertFailure(checkProposal({ signal: "Detect skip-permissions in an observed command line." }), /check: signal/);
+  assertFailure(proposal({ new_text: "Use --no-verify for this edit." }), /denylist: no-verify/);
+});
+
+test("check queue merges evidence, renders proposals and suppresses dismissed checks", () => {
+  const before = fs.readdirSync(HOME_CLAUDE, { recursive: true }).sort();
+  const p = checkProposal({ title: "Detect optional test runner commands",
+    signal: "A Bash command invokes tests outside hooks/test-runner.mjs." });
+  const first = core.enqueueCheck({ ...p, evidence: [{ event_id: "a", quote }] }, {
+    runId: "run-one", verdict: { detection_sketch: "Match bare test runner command invocations." },
+  });
+  assert.match(first.id, /^CHK-\d{8}-1$/);
+  assert.equal(first.queued, true);
+  assert.ok(fs.readFileSync(paths.checksMd, "utf8").includes(p.title));
+  assert.ok(fs.readFileSync(paths.checksMd, "utf8").includes("hooks/test-runner.mjs"));
+  const merged = core.enqueueCheck({ ...p, evidence: [{ event_id: "b", quote }] }, {
+    runId: "run-two", verdict: { detection_sketch: "Match bare test runner command invocations." },
+  });
+  assert.deepEqual(merged, { queued: true, merged: true, id: first.id });
+  assert.equal(core.loadChecks()[0].times_seen, 2);
+  assert.deepEqual(core.loadChecks()[0].evidence.map((item) => item.event_id), ["a", "b"]);
+  assert.equal(core.setCheckStatus(first.id, "dismissed", "Already covered").ok, true);
+  assert.deepEqual(core.enqueueCheck(p), { queued: false, reason: "suppressed: dismissed" });
+  assert.equal(core.loadChecks({ openOnly: true }).length, 0);
+  assert.match(fs.readFileSync(paths.checksMd, "utf8"), /dismissed/);
+  assert.equal(core.setCheckStatus(first.id, "open").ok, true);
+  common.appendJsonl(paths.checks, { ...core.loadChecks()[0], at: "2000-01-01T00:00:00Z",
+    last_at: "2000-01-01T00:00:00Z" });
+  assert.equal(core.loadChecks()[0].status, "expired");
+  assert.equal(core.setCheckStatus(first.id, "open").ok, true);
+  assert.equal(core.loadChecks({ openOnly: true }).length, 1);
+  const past = new Date(Date.now() - 60000).toISOString();
+  const history = common.readJsonl(paths.checks).map((item) => ({ ...item, at: past, last_at: past }));
+  fs.writeFileSync(paths.checks, history.map((item) => JSON.stringify(item) + "\n").join(""));
+  common.writeJsonAtomic(paths.loopState, { lastReportAt: new Date(Date.now() - 30000).toISOString() });
+  assert.equal(core.enqueueCheck(p, { runId: "after-reopen" }).merged, true);
+  assert.ok(core.generateReport({ force: true }).text.includes(`Предложенные проверки:\n• ${first.id}`));
+  assert.equal(core.setCheckStatus(first.id, "done").ok, true);
+  assert.deepEqual(core.enqueueCheck(p), { queued: false, reason: "suppressed: done" });
+  assert.deepEqual(fs.readdirSync(HOME_CLAUDE, { recursive: true }).sort(), before);
 });
 
 test("threshold requires separate sessions or an explicit transcript correction", () => {

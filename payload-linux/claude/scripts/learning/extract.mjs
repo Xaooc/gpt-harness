@@ -300,8 +300,18 @@ export function eventDigest(event) {
 
 function hasRegisteredProvenance(event, out, jobRoots) {
   const sha = event.data?.status_sha256;
-  if (!(event.data?.trusted === true && typeof sha === "string" && /^[0-9a-f]{64}$/i.test(sha)
-    && isTrustedJob(out, jobRoots) && registryHas(out, sha, jobRoots?.registry ?? paths.jobs))) return false;
+  if (!(event.data?.trusted === true && typeof sha === "string" && /^[0-9a-f]{64}$/i.test(sha))) return false;
+  let trusted = false;
+  if (fs.existsSync(`${toWinPath(out)}.status`)) {
+    trusted = isTrustedJob(out, jobRoots);
+  } else if (isTrustedJobPath(out, jobRoots)) {
+    trusted = true;
+  } else if (typeof out === "string" && path.isAbsolute(toWinPath(out))) {
+    const file = canonicalPath(out);
+    const learn = canonicalPath(LEARN_DIR);
+    trusted = !under(learn, file) && path.relative(learn, file) !== "";
+  }
+  if (!trusted || !registryHas(out, sha, jobRoots?.registry ?? paths.jobs)) return false;
   const normalisedOut = normaliseJobOut(out);
   if (normalisedOut === null) return false;
   const digest = eventDigest(event);

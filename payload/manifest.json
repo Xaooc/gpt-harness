@@ -59,7 +59,7 @@
       "src": "claude/hooks/learning-session-start.mjs",
       "dest": "hooks/learning-session-start.mjs",
       "kind": "file",
-      "sha256": "a1fe44988113973e7048aa69ff0f85b3293a885a45fe8fa9deaae563d1f06c17"
+      "sha256": "dcc552fc6363a18fb8cbf34879bb93c48a38de1db730f89e9fd80a404870ae65"
     },
     {
       "src": "claude/hooks/luna-clean-hook.mjs",
@@ -221,43 +221,43 @@
       "src": "claude/scripts/learning/DESIGN.md",
       "dest": "scripts/learning/DESIGN.md",
       "kind": "file",
-      "sha256": "42f5797fb5fde7d9a4864aaa028dcdcee251b4ab000c2b60f0281e7a60291d47"
+      "sha256": "5df97fa142ae3654a7ecf62fe6fbc74f668c0fd7c8b09627d577827823c3dcc4"
     },
     {
       "src": "claude/scripts/learning/common.mjs",
       "dest": "scripts/learning/common.mjs",
       "kind": "file",
-      "sha256": "4d8f3b87466b8898c1e8d0c5dd23995adc73e491068714f964660e099f6c1cde"
+      "sha256": "aa70bd390f8d8502398516786e1b79f1822d314406994093d069df818f9ae337"
     },
     {
       "src": "claude/scripts/learning/core.mjs",
       "dest": "scripts/learning/core.mjs",
       "kind": "file",
-      "sha256": "78e90990e34228919d79af68082d7054e45b8c73c3ff61f48cdf95c1f8fdf64a"
+      "sha256": "e318ad10f97cc22e870b09b0c0d8756d5073274e1bbf9ae3718309024b466f97"
     },
     {
       "src": "claude/scripts/learning/extract.mjs",
       "dest": "scripts/learning/extract.mjs",
       "kind": "file",
-      "sha256": "4014db71c050d3823be6ac66cb9c5fe92fc40cd6c29b11a3b5bdaadf44e8aa25"
+      "sha256": "a7cd8488495900dd91cd821825afcbe129cef75774aae9f5a7d9b32ef9eb7445"
     },
     {
       "src": "claude/scripts/learning/loop.mjs",
       "dest": "scripts/learning/loop.mjs",
       "kind": "file",
-      "sha256": "e7ff6cf3492d5937c1c416f82047282da319230d8f5dfffb7259f13dd75cfc60"
+      "sha256": "702e98daf70276f611f3cfccb8399ece906c2438071fcd4f389d1b6e2697518a"
     },
     {
       "src": "claude/scripts/learning/prompts/critic.md",
       "dest": "scripts/learning/prompts/critic.md",
       "kind": "file",
-      "sha256": "7182d11b1b74bcbcb6168e0d3126b5197f202cbb9f4ec6fe27f5f74924978c4d"
+      "sha256": "c300cc7d612ad636756c87bf64fa5c37b2ae9ce71c790b022786ff414e40418b"
     },
     {
       "src": "claude/scripts/learning/prompts/proposer.md",
       "dest": "scripts/learning/prompts/proposer.md",
       "kind": "file",
-      "sha256": "475451cbecaa8797515bd911df8d0708280a19c7b143a7e52e278fc9b77877c8"
+      "sha256": "e543c8b0ce799bb5c8b6e0628a31c03d4d9f75bcf8542ecbd945b14a79d8daf2"
     },
     {
       "src": "claude/scripts/learning/registry.mjs",
@@ -269,19 +269,19 @@
       "src": "claude/scripts/learning/test/common.test.mjs",
       "dest": "scripts/learning/test/common.test.mjs",
       "kind": "file",
-      "sha256": "13d182fcbac43b1d4fa5a75279567183624b675afa3eda8d5f8b302b8f8a38f7"
+      "sha256": "788d9754fff520de4fd5a0c5e2340e252ce48cec33f20c24458842b8f909d587"
     },
     {
       "src": "claude/scripts/learning/test/core.test.mjs",
       "dest": "scripts/learning/test/core.test.mjs",
       "kind": "file",
-      "sha256": "7e97b09cec1048308bd452c2f727fa218bf10a894f85918ddd0222c782484b41"
+      "sha256": "7315632f9edd371c1d161987602e977eb51597c322e1d3f57776ee6b1f04a5bb"
     },
     {
       "src": "claude/scripts/learning/test/extract.test.mjs",
       "dest": "scripts/learning/test/extract.test.mjs",
       "kind": "file",
-      "sha256": "5196d0bac3bfb18c3accdd69e0d1efe72ea78d1f1c678896869563a36ddb1a5f"
+      "sha256": "4afb892cd6a0ab2421f4b336542842f161e3df3bce1241cb5a8ad34d35a409bd"
     },
     {
       "src": "claude/scripts/learning/test/fake-luna.mjs",
@@ -293,7 +293,7 @@
       "src": "claude/scripts/learning/test/loop.test.mjs",
       "dest": "scripts/learning/test/loop.test.mjs",
       "kind": "file",
-      "sha256": "94484b8a06ea9228441e0ce2b47262179eb375451ba9083dec7329586cef080a"
+      "sha256": "747521fb7ea305e46ed0bc1f1b185f04dddbef140f350d3dbf9b4f5566996929"
     },
     {
       "src": "claude/scripts/lib/luna-daemon-client-test.sh",
@@ -407,7 +407,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "0f226d30081f7aebbcc9242f589a3139914d4c5e31500c5415934d3d3183bc3b"
+      "sha256": "05494c81e8d1b642d28f2d12b9eb8a668749eab80a1f79e6a30f7008af5af27b"
     },
     {
       "src": "claude/scripts/pytest_gate.py",

@@ -337,4 +337,8 @@ User decision (2026-10-21): lessons from past sessions are applied automatically
 - Session start may show a short Russian report or "needs your decision" items: relay them to the user in 2–4 lines.
 - Pause: create `~/.claude/learning/PAUSED`. State: `node ~/.claude/scripts/learning/loop.mjs status`.
 - Feed it: keep `Assumption:` lines and "accepted / rejected (reason)" in critic syntheses.
+- **Checks first**: lessons a program could detect become proposed checks (harness hook/gate or project lint/test),
+  never built automatically. They queue in `~/.claude/learning/checks.md`; session start shows only their ids.
+  Build one only after the user's yes, then `node ~/.claude/scripts/learning/loop.mjs checks done <id>`
+  (`… checks dismiss <id>` if declined).
 <!-- learning:protected:end -->

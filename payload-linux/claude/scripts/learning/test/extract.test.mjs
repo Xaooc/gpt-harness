@@ -881,24 +881,37 @@ test("missing assumptions and critic outputs require a matching status hash in t
   }
 });
 
-test("registry fallback still requires isTrustedJob after files are deleted", async () => {
+test("registry fallback verifies attested events after files are deleted and rejects tampering", async () => {
   const out = write(path.join(HOME_CLAUDE, "repo", "job.out.md"), "Assumption: local defaults\n");
   const status = job(out);
   assert.equal(recordJob(out), true);
+  const registered = registryRecord(out);
   transcript([bash(`bash luna.sh -o "${toWinPath(out)}"`)]);
   await run();
   assert.equal(readJsonl(paths.attest).length, 2);
   fs.unlinkSync(out);
   const [event] = events("executor_assumption");
   assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
+  write(out, "Assumption: local defaults\n");
   fs.unlinkSync(status);
   assert.equal(isTrustedJob(out), false);
+  const [jobEvent] = events("luna_job");
+  assert.deepEqual(await verifyEventProvenance(jobEvent), { ok: true, reason: "verified" });
+  assert.equal((await verifyEventProvenance(event)).ok, false);
+  fs.unlinkSync(out);
   for (const captured of events()) {
-    assert.deepEqual(await verifyEventProvenance(captured), {
-      ok: false, reason: captured.type === "luna_job"
-        ? "status file gone and not in registry" : "output file gone and not in registry",
-    });
+    assert.deepEqual(await verifyEventProvenance(captured), { ok: true, reason: "verified" });
   }
+  const reason = "status file gone and not in registry";
+  assert.deepEqual(await verifyEventProvenance({ ...jobEvent, quote: "A tampered event row." }), {
+    ok: false, reason,
+  });
+  const inside = path.join(LEARN_DIR, "job.out.md");
+  const forged = { ...jobEvent, source: `${inside}.status`, data: { ...jobEvent.data, out_path: inside } };
+  common.appendJsonl(paths.jobs, { ...registered, out: inside });
+  common.appendJsonl(paths.attest, { id: forged.id, type: forged.type, out: inside,
+    status_sha256: forged.data.status_sha256, event_sha256: eventDigest(forged) });
+  assert.deepEqual(await verifyEventProvenance(forged), { ok: false, reason });
 });
 
 test("old status events remain valid with unchanged files and fail when their data changes", async () => {

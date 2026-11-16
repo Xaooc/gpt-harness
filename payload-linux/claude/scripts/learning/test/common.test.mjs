@@ -25,7 +25,8 @@ test("paths stay under the temporary learning directory and ensureDirs creates d
     events: "events.jsonl", eventsOld: "events.1.jsonl", jobs: "jobs.jsonl", attest: "attest.jsonl",
     attestOld: "attest.1.jsonl", extractState: "extract-state.json",
     loopState: "loop-state.json", config: "config.json", adoptedJsonl: "adopted.jsonl",
-    adoptedMd: "adopted.md", candidates: "candidates.jsonl", needsUser: "needs-user.md", logMd: "log.md",
+    adoptedMd: "adopted.md", candidates: "candidates.jsonl", checks: "checks.jsonl", checksMd: "checks.md",
+    needsUser: "needs-user.md", logMd: "log.md",
     reportsDir: "reports", runsDir: "runs", backupsDir: "backups", locksDir: "locks",
     paused: "PAUSED", captureOff: "CAPTURE_OFF",
   };

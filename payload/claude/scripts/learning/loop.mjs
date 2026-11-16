@@ -5,12 +5,13 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   paths, SCRIPTS_DIR, HOME_CLAUDE, ensureDirs, withLock, readJson, writeJsonAtomic,
-  nowIso, isPaused, findNode, findBash, tryLock,
+  nowIso, isPaused, findNode, findBash, tryLock, canonicalRepo,
 } from "./common.mjs";
 import {
   TARGETS, loadConfig, eventsIndex, readTargets, annotate, protectedLineIndexes, loadAdoptions,
   validateProposal, applyEdit, revertAdoption, recordCandidate, loadCandidates, closeCandidates,
   recordNeedsUser, openNeedsUser, generateReport, compactCandidates, REVERT_MIN_DAYS, isCountingEvent,
+  enqueueCheck, loadChecks, setCheckStatus, displayText, compactChecks, refreshChecks,
 } from "./core.mjs";
 import { verifyEventProvenance } from "./extract.mjs";
 
@@ -47,7 +48,12 @@ function hasEvidenceMap(verdict, proposal, events) {
 export function isApproved(verdict, proposal, events = eventsIndex()) {
   return verdict?.verdict === "approve" && verdict.evidence_real === true
     && verdict.over_generalised === false && verdict.conflicts_user_decision === false
-    && verdict.weakens_safety === false && hasEvidenceMap(verdict, proposal, events);
+    && verdict.weakens_safety === false && hasEvidenceMap(verdict, proposal, events)
+    && (proposal?.kind !== "check" || hasDetectionSketch(verdict));
+}
+
+function hasDetectionSketch(verdict) {
+  return typeof verdict?.detection_sketch === "string" && oneLine(verdict.detection_sketch).length >= 20;
 }
 
 function newSince(events, lastRunAt) {
@@ -79,13 +85,14 @@ function eventText(event, keys, fresh = false) {
   const marks = keys?.length ? " " + keys.map((key) => `(candidate ${key})`).join(" ") : "";
   return `E:${event.id}${marks} | ${event.ts} | ${event.type}${fresh ? " NEW" : ""}`
     + ` | s=${String(event.session || "-").slice(0, 8)} | p=${event.project || "-"}`
+    + ` | repo=${canonicalRepo(event.project) || "-"}`
     + ` | data=${JSON.stringify(data)}\n  quote: ${JSON.stringify(event.quote || "")}`
     + (event.context ? `\n  context: ${JSON.stringify(event.context)}` : "");
 }
 
 export function buildDigest({
   runId, now = nowIso(), events, files, config, lastRunAt, byteSizes = {}, adoptions = loadAdoptions(),
-  candidates = loadCandidates({ openOnly: true }), fullHistory = false,
+  candidates = loadCandidates({ openOnly: true }), checks = loadChecks(), fullHistory = false,
 }) {
   const fresh = newSince(events, lastRunAt);
   const counts = Object.fromEntries(TYPES.map((type) => [type, fresh.filter((e) => e.type === type).length]));
@@ -106,6 +113,12 @@ export function buildDigest({
     `${item.candidate_key} | times_seen=${item.times_seen} | ${item.lesson}\nreason: ${item.reason}\n`
       + `evidence: ${(item.evidence || []).slice(-20).map((e) => e.event_id).join(", ")}`
   )).join("\n\n") || "none";
+  const recentChecks = (statuses) => checks.filter((item) => statuses.includes(item.status))
+    .sort((a, b) => String(b.last_at || "").localeCompare(String(a.last_at || ""))).slice(0, 50);
+  const checkText = [...recentChecks(["open"]), ...recentChecks(["done", "dismissed"])].map((item) => (
+    `${displayText(item.id, 100)} | ${item.status} | ${item.layer} | ${displayText(item.repo, 200) || "—"}`
+      + ` | ${displayText(item.title, 120, { check: true })}`
+  )).join("\n") || "none";
   const cited = new Map();
   for (const item of candidates) {
     for (const evidence of item.evidence || []) {
@@ -141,7 +154,8 @@ export function buildDigest({
     + `## SIZES\n${sizes}\n\n## ACTIVE ADOPTIONS\n`
     + `Explicit transcript corrections override the ${REVERT_MIN_DAYS}-day observation window.\n`
     + `${dataBlock(active)}\n\n`
-    + `## OPEN CANDIDATES\n${dataBlock(candidateText)}\n\n## EVENTS\n`;
+    + `## OPEN CANDIDATES\n${dataBlock(candidateText)}\n\n`
+    + `CHECK QUEUE\n-----------\n${dataBlock(checkText)}\n\n## EVENTS\n`;
   const tail = "\n\n## TARGET FILES\n" + dataBlock(Object.entries(files).map(([target, text]) => (
     `### ${target}\n${annotate(text, target)}`
   )).join("\n\n"));
@@ -187,6 +201,12 @@ export function buildReview({ proposals, gates, events, files, adoptions = loadA
     if (p.kind === "needs_user") return "";
     if (p.kind === "revert") {
       return `### ${p.id} revert\n${JSON.stringify(adoptions.list.find((a) => a.id === p.revert_id), null, 2)}`;
+    }
+    if (p.kind === "check") {
+      const fields = ["layer", "repo", "title", "signal_type", "signal", "where", "effect", "message",
+        "false_positive_risk"];
+      const details = Object.fromEntries(fields.map((key) => [key, p[key] ?? ""]));
+      return `### ${p.id} check\n${JSON.stringify(details, null, 2)}`;
     }
     const plan = gates[i].plan;
     return `### ${p.id} ${p.target}\n${contextWindow(plan.beforeText, plan.start, plan.end, p.target)}`
@@ -322,7 +342,7 @@ export function gateProposals(proposals, ctx) {
 
 function getCritic(proposals, gates, ctx, runDir) {
   const passed = proposals.map((p, i) => ({ p, gate: gates[i] })).filter(({ p, gate }) => (
-    gate.ok && ["edit", "revert", "needs_user"].includes(p.kind)
+    gate.ok && ["edit", "revert", "needs_user", "check"].includes(p.kind)
   ));
   if (!passed.length) return { verdicts: [], unavailable: false };
   try {
@@ -342,14 +362,17 @@ function getCritic(proposals, gates, ctx, runDir) {
 }
 
 export function executeProposals(proposals, gates, critic, ctx, result, dryRun) {
+  result.queuedChecks ??= [];
   const outcomes = proposals.map(() => "dropped");
   const verdicts = proposals.map((p) => {
     const matching = critic.verdicts.filter((v) => v && v.id === p?.id);
     return matching.length === 1 ? matching[0] : null;
   });
   const approved = (i) => gates[i].ok && isApproved(verdicts[i], proposals[i], ctx.events);
+  const reroute = (i) => proposals[i]?.kind === "edit" && gates[i].ok
+    && verdicts[i]?.enforceable_by_code === true && hasDetectionSketch(verdicts[i]);
   result.criticApproved = proposals.filter((p, i) => (
-    ["edit", "revert", "needs_user"].includes(p?.kind) && approved(i)
+    ["edit", "revert", "needs_user", "check"].includes(p?.kind) && approved(i)
   )).length;
   function candidate(p, i, reason, status = "open") {
     // core's candidate writer requires a real lesson, even for malformed model output.
@@ -362,16 +385,27 @@ export function executeProposals(proposals, gates, critic, ctx, result, dryRun) 
     outcomes[i] = `candidate (${status}): ${reason}`;
   }
   for (const [i, p] of proposals.entries()) {
-    if (!p || !["edit", "revert", "log", "needs_user"].includes(p.kind)) continue;
+    if (!p || !["edit", "revert", "log", "needs_user", "check"].includes(p.kind)) continue;
     if (!gates[i].ok) {
       const reason = "gate: " + gates[i].failures.join("; ");
       if (p.kind !== "needs_user") candidate(p, i, reason, p.kind === "log" ? "rejected" : "open");
       else outcomes[i] = "dropped: " + reason;
     } else if (p.kind === "log") candidate(p, i, "logged: below threshold");
-    else if (!approved(i)) {
-      const reason = critic.unavailable ? "critic unavailable"
-        : verdicts[i] && !hasEvidenceMap(verdicts[i], p, ctx.events) ? "critic: missing evidence map"
-          : "critic: " + oneLine(verdicts[i]?.reason || "missing or ambiguous verdict / approval conditions failed");
+    else if (reroute(i)) {
+      candidate(p, i, `critic: enforceable by code — propose as check: ${oneLine(verdicts[i].detection_sketch)
+        .slice(0, 200)}`);
+    } else if (!approved(i)) {
+      let reason;
+      if (critic.unavailable) reason = "critic unavailable";
+      else if (p.kind === "check" && verdicts[i]?.verdict === "reject") {
+        reason = "critic: " + oneLine(verdicts[i].reason || "rejected");
+      } else if (verdicts[i] && !hasEvidenceMap(verdicts[i], p, ctx.events)) {
+        reason = "critic: missing evidence map";
+      } else if (p.kind === "check" && verdicts[i] && !hasDetectionSketch(verdicts[i])) {
+        reason = "critic: missing detection sketch";
+      } else {
+        reason = "critic: " + oneLine(verdicts[i]?.reason || "missing or ambiguous verdict / approval conditions failed");
+      }
       candidate(p, i, reason);
     } else if (p.kind === "needs_user") {
       if (!dryRun) recordNeedsUser(p, { runId: result.runId });
@@ -390,7 +424,9 @@ export function executeProposals(proposals, gates, critic, ctx, result, dryRun) 
     } else candidate(p, i, "revert: " + applied.message);
   }
   const ranks = { high: 3, medium: 2, low: 1 };
-  const edits = proposals.map((p, i) => ({ p, i })).filter(({ p, i }) => p?.kind === "edit" && approved(i))
+  const edits = proposals.map((p, i) => ({ p, i })).filter(({ p, i }) => (
+    p?.kind === "edit" && approved(i) && !reroute(i)
+  ))
     .sort((a, b) => (ranks[b.p.confidence] || 0) - (ranks[a.p.confidence] || 0));
   for (const [n, { p, i }] of edits.entries()) {
     if (n >= ctx.config.max_edits_per_run || !Number.isFinite(ctx.config.max_edits_per_run)) {
@@ -408,6 +444,30 @@ export function executeProposals(proposals, gates, critic, ctx, result, dryRun) 
       });
     } else candidate(p, i, "apply: " + applied.error);
   }
+  const checks = proposals.map((p, i) => ({ p, i })).filter(({ p, i }) => p?.kind === "check" && approved(i))
+    .sort((a, b) => (ranks[b.p.confidence] || 0) - (ranks[a.p.confidence] || 0));
+  for (const [n, { p, i }] of checks.entries()) {
+    if (n >= ctx.config.max_checks_per_run || !Number.isFinite(ctx.config.max_checks_per_run)) {
+      candidate(p, i, "deferred: check cap");
+      continue;
+    }
+    const queued = dryRun ? { queued: true, id: p.id } : enqueueCheck(p, {
+      runId: result.runId, verdict: verdicts[i],
+    });
+    if (!queued.queued) {
+      outcomes[i] = queued.reason;
+      continue;
+    }
+    result.queuedChecks.push(queued.id);
+    outcomes[i] = dryRun ? `would queue ${queued.id}` : `${queued.merged ? "merged" : "queued"} ${queued.id}`;
+    if (!dryRun) {
+      const wanted = new Set(Array.isArray(p.candidate_keys) ? p.candidate_keys : []);
+      const evidence = new Set(p.evidence.map((item) => item.event_id));
+      const related = loadCandidates().filter((item) => wanted.has(item.candidate_key)
+        && item.evidence.some((entry) => evidence.has(entry.event_id))).map((item) => item.candidate_key);
+      closeCandidates(related, { runId: result.runId, reason: `queued ${queued.id}` });
+    }
+  }
   return { outcomes, verdicts };
 }
 
@@ -417,7 +477,8 @@ function finishRun(runDir, result, proposals, gates, review) {
   const lines = [`# ${result.runId}`, "", result.failure ? `FAILED: ${result.failure}` : "Completed."];
   if (result.dryRun) lines.push("Dry run: outcomes below describe what would happen.");
   if (result.extract?.error) lines.push(`Extraction: ${oneLine(result.extract.error)}`);
-  if (result.compactionFailure) lines.push(`Candidates compaction failed: ${result.compactionFailure}`);
+  if (result.compactionFailure) lines.push(`Compaction failed: ${result.compactionFailure}`);
+  if (result.checksRefreshFailure) lines.push(`Checks refresh failed: ${result.checksRefreshFailure}`);
   if (result.droppedProposals) lines.push(`Dropped ${result.droppedProposals} proposals beyond the 20-item limit.`);
   if (result.criticFailure) lines.push(`Critic unavailable: ${result.criticFailure}`);
   for (const [i, p] of proposals.entries()) {
@@ -436,10 +497,14 @@ function finishRun(runDir, result, proposals, gates, review) {
   if (result.failure) log += `FAILED: ${oneLine(result.failure)}`;
   else {
     log += `new events ${result.newEvents} · proposals ${result.proposals}`
-      + ` (edit ${kinds.edit}, log ${kinds.log}, needs_user ${kinds.needs_user}, revert ${kinds.revert})`
+      + ` (edit ${kinds.edit}, log ${kinds.log}, needs_user ${kinds.needs_user}, revert ${kinds.revert},`
+      + ` check ${kinds.check})`
       + ` · gate ok ${result.gatePassed} · critic ok ${result.criticApproved}`
-      + ` · applied ${result.applied.join(", ") || "—"} · reverted ${result.reverted.join(", ") || "—"}`;
-    if (!result.applied.length && !result.reverted.length) log += " · nothing met the threshold";
+      + ` · applied ${result.applied.join(", ") || "—"} · reverted ${result.reverted.join(", ") || "—"}`
+      + ` · queued ${result.queuedChecks.join(", ") || "—"}`;
+    if (!result.applied.length && !result.reverted.length && !result.queuedChecks.length) {
+      log += " · nothing met the threshold";
+    }
   }
   fs.appendFileSync(paths.logMd, log + "\n");
   if (result.failure) updateState({ lastFailure: result.failure });
@@ -472,8 +537,8 @@ async function runLocked(opts) {
   const { runId, runDir } = createRunDir(startedAt);
   const result = {
     runId, startedAt, finishedAt: null, newEvents: fresh.length, extract, proposals: 0,
-    byKind: { edit: 0, log: 0, needs_user: 0, revert: 0 }, gatePassed: 0, criticApproved: 0,
-    applied: [], reverted: [], candidates: 0, needsUser: 0, failure: null, dryRun: !!opts.dryRun,
+    byKind: { edit: 0, log: 0, needs_user: 0, revert: 0, check: 0 }, gatePassed: 0, criticApproved: 0,
+    applied: [], reverted: [], queuedChecks: [], candidates: 0, needsUser: 0, failure: null, dryRun: !!opts.dryRun,
   };
   let proposals = [];
   let gates = [];
@@ -481,10 +546,13 @@ async function runLocked(opts) {
   try {
     if (!opts.dryRun) updateState({ lastAttemptAt: startedAt });
     if (!opts.dryRun) {
-      try {
-        compactCandidates();
-      } catch (error) {
-        result.compactionFailure = oneLine(error.message);
+      for (const [name, compact] of [["candidates", compactCandidates], ["checks", compactChecks]]) {
+        try {
+          compact();
+        } catch (error) {
+          const failure = `${name}: ${oneLine(error.message)}`;
+          result.compactionFailure = [result.compactionFailure, failure].filter(Boolean).join("; ");
+        }
       }
     }
     pruneRuns();
@@ -527,6 +595,13 @@ async function runLocked(opts) {
   } catch (error) {
     result.failure = oneLine(error.message);
   }
+  if (!opts.dryRun) {
+    try {
+      if (fs.existsSync(paths.checks)) refreshChecks();
+    } catch (error) {
+      result.checksRefreshFailure = oneLine(error.message);
+    }
+  }
   finishRun(runDir, result, proposals, gates, review);
   if (!result.failure && !opts.dryRun) {
     try {
@@ -539,7 +614,8 @@ async function runLocked(opts) {
   }
   const line = result.failure ? `run ${runId} FAILED: ${result.failure}`
     : `run ${runId}${opts.dryRun ? " dry-run would:" : ""} applied ${result.applied.length},`
-      + ` reverted ${result.reverted.length}, logged ${result.candidates}, needs user ${result.needsUser}`;
+      + ` reverted ${result.reverted.length}, queued ${result.queuedChecks.length},`
+      + ` logged ${result.candidates}, needs user ${result.needsUser}`;
   return { code: result.failure ? 1 : 0, line };
 }
 
@@ -571,8 +647,30 @@ async function main(args) {
     const state = stateOperation((value) => value);
     console.log(`lastRunAt=${state.lastRunAt || "never"} lastAttemptAt=${state.lastAttemptAt || "never"}`
       + ` active=${loadAdoptions().active.length} candidates=${loadCandidates({ openOnly: true }).length}`
-      + ` needs_user=${openNeedsUser().length} paused=${isPaused()}`);
+      + ` needs_user=${openNeedsUser().length} checks_open=${loadChecks({ openOnly: true }).length}`
+      + ` paused=${isPaused()}`);
     return 0;
+  }
+  if (command === "checks") {
+    if (!rest.length || (rest.length === 1 && rest[0] === "all")) {
+      const checks = loadChecks({ openOnly: !rest.length });
+      console.log(checks.length ? checks.map((item) => (
+        `${displayText(item.id, 100)}  ${rest.length ? `${displayText(item.status, 30)}  ` : ""}`
+          + `${displayText(item.layer, 30)}${item.repo ? `/${displayText(item.repo, 200)}` : ""}`
+          + `  ${displayText(item.effect, 30)}  ${displayText(item.title, 120, { check: true })}`
+      )).join("\n") : "No checks.");
+      return 0;
+    }
+    const [action, id, ...reason] = rest;
+    const statuses = { done: "done", dismiss: "dismissed", reopen: "open" };
+    if (Object.hasOwn(statuses, action) && id && !id.startsWith("--")
+      && (action !== "reopen" || !reason.length)) {
+      const result = setCheckStatus(id, statuses[action], reason.join(" "));
+      console.log(result.ok ? `${id} ${result.status}` : `Unknown check: ${id}`);
+      return result.ok ? 0 : 1;
+    }
+    console.log("Usage: loop.mjs checks [all | done <id> [reason…] | dismiss <id> [reason…] | reopen <id>]");
+    return 2;
   }
   if (command === "list" && !rest.length) {
     const { list } = loadAdoptions();
@@ -592,7 +690,7 @@ async function main(args) {
     return 0;
   }
   console.log("Usage: loop.mjs run [--if-due] [--force] [--dry-run] [--no-extract] [--full-history]"
-    + " | status | revert <id> | list | report");
+    + " | status | checks [all | done|dismiss|reopen <id>] | revert <id> | list | report");
   return 2;
 }
 
