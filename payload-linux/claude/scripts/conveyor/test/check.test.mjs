@@ -65,9 +65,15 @@ async function environment(t, config, files = { 'src/example.ts': 'export const 
     git(args) {
       git(repo, args, env);
     },
-    async command(args, extraEnv = {}) {
-      const result = await invoke(checkMain, [args[0], '--dir', repo, '--json', ...args.slice(1)], {
-        cwd: repo, env: { ...env, ...extraEnv }, prefix: 'conveyor check', errorCode: 2
+    async load(directory = repo) {
+      let loaded;
+      const result = await invoke(async () => { loaded = await loadProfile(directory); }, [], { cwd: directory, env });
+      assert.equal(result.status, 0, result.stderr);
+      return loaded;
+    },
+    async command(args, extraEnv = {}, directory = repo) {
+      const result = await invoke(checkMain, [args[0], '--dir', directory, '--json', ...args.slice(1)], {
+        cwd: directory, env: { ...env, ...extraEnv }, prefix: 'conveyor check', errorCode: 2
       });
       assert.ifError(result.error);
       return { ...result, report: result.stdout ? JSON.parse(result.stdout) : null };
@@ -162,8 +168,12 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) 
   const trusted = await env.command(['trust']);
   assert.equal(trusted.status, 0, trusted.stderr);
   const raw = await fs.readFile(path.join(env.repo, '.claude/conveyor.json'));
+  const identity = await fs.realpath(path.join(env.repo, '.git'));
+  assert.deepEqual(trusted.report, {
+    ok: true, repo: env.repo, identity, profileTrust: 'trusted', sha256: createHash('sha256').update(raw).digest('hex')
+  });
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(env.home, 'trusted-profiles.json'), 'utf8')), {
-    [env.repo]: createHash('sha256').update(raw).digest('hex')
+    [identity]: [trusted.report.sha256]
   });
   for (const level of ['fast', 'turn']) {
     const result = await env.command(['run', '--level', level]);
@@ -174,6 +184,79 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) 
   await fs.appendFile(path.join(env.repo, '.claude/conveyor.json'), '\n');
   assert.equal((await env.command(['run', '--level', 'fast'])).report.profileTrust, 'untrusted');
   await assert.rejects(fs.stat(path.join(env.repo, 'PROFILE_RAN')), { code: 'ENOENT' });
+});
+
+test('profile trust is shared across worktrees but excludes unreviewed edits', { timeout }, async (t) => {
+  const env = await environment(t, profile());
+  const worktree = path.join(env.root, 'worktree');
+  env.git(['worktree', 'add', '--quiet', '--detach', worktree]);
+  const trusted = await env.command(['trust']);
+  assert.equal(trusted.status, 0, trusted.stderr);
+  assert.equal((await env.load(worktree)).profileTrust, 'trusted');
+  const alias = path.join(env.root, 'worktree-alias');
+  await fs.symlink(worktree, alias, 'dir');
+  const shared = await env.command(['trust'], {}, alias);
+  assert.equal(shared.status, 0, shared.stderr);
+  assert.equal(shared.report.identity, trusted.report.identity);
+  await fs.appendFile(path.join(worktree, '.claude/conveyor.json'), '\n');
+  assert.equal((await env.load(worktree)).profileTrust, 'untrusted');
+  assert.equal((await env.load()).profileTrust, 'trusted');
+});
+
+test('legacy profile trust applies only to its path and migrates while preserving the reviewed digest', { timeout }, async (t) => {
+  const env = await environment(t, profile());
+  const worktree = path.join(env.root, 'worktree');
+  env.git(['worktree', 'add', '--quiet', '--detach', worktree]);
+  const file = path.join(env.home, 'trusted-profiles.json');
+  const legacy = JSON.parse(await fs.readFile(file, 'utf8'))[env.repo];
+  assert.equal((await env.load()).profileTrust, 'trusted');
+  assert.equal((await env.load(worktree)).profileTrust, 'untrusted');
+  await env.profile({ ...profile(), gate: { mode: 'warn' } }, false);
+  const trusted = await env.command(['trust']);
+  assert.equal(trusted.status, 0, trusted.stderr);
+  assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), {
+    [trusted.report.identity]: [legacy, trusted.report.sha256]
+  });
+  assert.equal((await env.load()).profileTrust, 'trusted');
+  assert.equal((await env.load(worktree)).profileTrust, 'trusted');
+});
+
+test('profile trust retains five distinct digests in order of their latest review', { timeout }, async (t) => {
+  const env = await environment(t);
+  const digests = [];
+  let identity;
+  for (let index = 0; index < 6; index++) {
+    await env.profile({ ...profile(), budgets: { fast_s: index + 1 } }, false);
+    const trusted = await env.command(['trust']);
+    assert.equal(trusted.status, 0, trusted.stderr);
+    identity = trusted.report.identity;
+    digests.push(trusted.report.sha256);
+  }
+  const file = path.join(env.home, 'trusted-profiles.json');
+  assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), { [identity]: digests.slice(1) });
+  await env.profile({ ...profile(), budgets: { fast_s: 1 } }, false);
+  assert.equal((await env.load()).profileTrust, 'untrusted');
+  await env.profile({ ...profile(), budgets: { fast_s: 2 } }, false);
+  assert.equal((await env.load()).profileTrust, 'trusted');
+  const trusted = await env.command(['trust']);
+  assert.equal(trusted.status, 0, trusted.stderr);
+  assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), {
+    [identity]: [...digests.slice(2), digests[1]]
+  });
+});
+
+test('non-git profile trust keeps the directory path as its identity', { timeout }, async (t) => {
+  const env = await environment(t);
+  const directory = path.join(env.root, 'plain');
+  await fs.mkdir(path.join(directory, '.claude'), { recursive: true });
+  await fs.writeFile(path.join(directory, '.claude/conveyor.json'), JSON.stringify(profile()));
+  const trusted = await env.command(['trust'], {}, directory);
+  assert.equal(trusted.status, 0, trusted.stderr);
+  assert.equal(trusted.report.identity, directory);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(env.home, 'trusted-profiles.json'), 'utf8')), {
+    [directory]: [trusted.report.sha256]
+  });
+  assert.equal((await env.load(directory)).profileTrust, 'trusted');
 });
 
 test('runner skips entries with no matching changed files and excludes deleted files', { timeout }, async (t) => {

@@ -396,7 +396,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "96750ff2a569e8b512891dfd50daedf804a2e83bfd3da5889a8424d50f75801d"
+      "sha256": "58dffe5b26bfd2a6a92213a3ec77c2a5e30c544cfb2fd2c00e8d006acb1f7ee4"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
@@ -3824,7 +3824,7 @@
       "src": "claude/scripts/conveyor/lib/profile.mjs",
       "dest": "scripts/conveyor/lib/profile.mjs",
       "kind": "file",
-      "sha256": "0047b9f614f84a514a6bd5b6514117efdbc619428b22e126c0c6d2d1a473e4f2"
+      "sha256": "99a69329d45965e29c3da34dcc7a20a7b634f2b8138c52952fea5b78a54ca679"
     },
     {
       "src": "claude/scripts/conveyor/usage.mjs",
@@ -3872,5 +3872,5 @@
   "settings": "settings/hooks.json",
   "claudeMd": "claude-md/harness-section.md",
   "settingsSha256": "5de749c86eb7eb5194693f9684e71a2335e5699bf6f2a67dc60e08e17898e5f5",
-  "claudeMdSha256": "9b28cdc8c97accc3bbbc8886ac8c28f50c0ebee325222eae7255089187db7d15"
+  "claudeMdSha256": "f0b6dd04b85be6ef22e209546f40843279c3d62da74c7102623ffaa679f2ade9"
 }

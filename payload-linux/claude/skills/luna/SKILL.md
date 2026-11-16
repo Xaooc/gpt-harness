@@ -36,7 +36,7 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   hygiene ratchet failed after 2 fix rounds; read `## Gate` in the result); 7 another write job already runs in the
   same repository (parallel write slices need their own worktrees via `wt-new.mjs`); others come from the executor.
 - **Repo profiles must be trusted:** a repository's `.claude/conveyor.json` runs its commands only after you review it
-  and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>` (re-run after every change to the file);
+  and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>` (shared across worktrees for the last five reviewed versions);
   until then the gate uses the autodetected profile and reports `profileTrust: "untrusted"`.
 - **Executor gate:** every write job is followed by `check.mjs` fast+turn on the job's own changes (profile
   `.claude/conveyor.json`, autodetected when absent); failures go back to the same executor as fix rounds.

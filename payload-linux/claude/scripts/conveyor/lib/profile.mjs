@@ -2,8 +2,11 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { writeJsonAtomic } from './orchestration.mjs';
 
+const execute = promisify(execFile);
 const jsFiles = '**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}';
 const tsFiles = '**/*.{ts,tsx,mts,cts}';
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -194,7 +197,10 @@ export async function loadProfile(repo) {
     if (raw === null) return { ...await autodetect(repo), profileTrust: 'autodetected' };
     const profile = defaults(JSON.parse(raw));
     const trusted = JSON.parse(await optionalText(trustFile()) || '{}');
-    if (trusted[path.resolve(repo)] === digest(raw)) return { ...profile, profileTrust: 'trusted' };
+    const identity = await repositoryIdentity(repo), sha256 = digest(raw);
+    if ((Array.isArray(trusted[identity]) && trusted[identity].includes(sha256)) || trusted[path.resolve(repo)] === sha256) {
+      return { ...profile, profileTrust: 'trusted' };
+    }
     return { ...await autodetect(repo), hygiene: profile.hygiene, profileTrust: 'untrusted' };
   }
   catch (error) { throw new Error(`${file}: ${error.message}`); }
@@ -207,10 +213,23 @@ function trustFile() {
 
 const digest = (raw) => createHash('sha256').update(raw).digest('hex');
 
+async function repositoryIdentity(repo) {
+  let stdout;
+  try {
+    ({ stdout } = await execute('git', ['rev-parse', '--git-common-dir'], { cwd: repo, encoding: 'utf8' }));
+  } catch { return path.resolve(repo); }
+  return fs.realpath(path.resolve(repo, stdout.replace(/\r?\n$/, '')));
+}
+
 export async function trustProfile(repo) {
   const raw = await fs.readFile(path.join(repo, '.claude', 'conveyor.json'), 'utf8');
   defaults(JSON.parse(raw));
   const file = trustFile(), trusted = JSON.parse(await optionalText(file) || '{}');
-  await writeJsonAtomic(file, { ...trusted, [path.resolve(repo)]: digest(raw) });
-  return { ok: true, repo, profileTrust: 'trusted', sha256: digest(raw) };
+  const identity = await repositoryIdentity(repo), sha256 = digest(raw), repoPath = path.resolve(repo);
+  const previous = Array.isArray(trusted[identity]) ? trusted[identity] : [];
+  const legacy = typeof trusted[repoPath] === 'string' ? [trusted[repoPath]] : [];
+  const digests = [...new Set([...previous, ...legacy])].filter((entry) => entry !== sha256);
+  if (legacy.length) delete trusted[repoPath];
+  await writeJsonAtomic(file, { ...trusted, [identity]: [...digests, sha256].slice(-5) });
+  return { ok: true, repo, identity, profileTrust: 'trusted', sha256 };
 }

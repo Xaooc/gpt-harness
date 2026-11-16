@@ -120,7 +120,8 @@ paths or expired worktrees (warn-only during the first 7 days). Exceptions only 
 gated by the dispatcher: project checks run after every write job, failures go back to the same executor (≤ 2
 rounds); exit 6 means the gate stayed red and the decision is yours. While your own executor jobs still run, the stop
 hook lets the turn end without a checklist (work in progress). A repository's own `.claude/conveyor.json` commands run
-only after you review it and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>`; until then checks
+only after you review it and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>`; trust covers the last
+five reviewed versions across all worktrees of the repository. Until then checks
 use the autodetected profile.
 
 ### Review: pstack `interrogate` on diverse executors
