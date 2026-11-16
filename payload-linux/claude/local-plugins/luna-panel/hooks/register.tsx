@@ -625,25 +625,28 @@ export const register: Register = on => {
       return opts.length ? opts : [{ value: '', label: 'каталог пуст' }]
     }
 
+    // `where` names the chain or panel (['--tier', t] | ['--panel', p]); a tier entry is addressed by --index, a
+    // panel seat by --seat (exec.mjs rejects the other flag).
     const EntryRow = ({ where, index, entry, count }: { where: string[]; index: number; entry: ChainEntry; count: number }) => {
       const id = `${where.join('-')}-${index}`
+      const isTier = where[0] === '--tier'
+      const at = [isTier ? '--index' : '--seat', String(index)]
       const setEntry = (provider: string, model: string, effort: string) => {
         const ok = effortsOf(provider, model)
         const eff = ok.includes(effort) ? effort : ok[ok.length - 1] ?? effort
-        void act($, `set-${id}`, ['config', 'set-entry', ...where, '--index', String(index),
+        void act($, `set-${id}`, ['config', 'set-entry', ...where, ...at,
           '--provider', provider, '--model', model, '--effort', eff], `${modelName(provider, model)} · ${eff}`)
       }
-      const isTier = where[0] === '--tier'
       const menu = [{ value: '-', label: '⋯' },
         ...(index > 0 ? [{ value: 'up', label: '↑ выше' }] : []),
         ...(index < count - 1 ? [{ value: 'down', label: '↓ ниже' }] : []),
         ...(count > 1 ? [{ value: 'rm', label: '✕ убрать' }] : [])]
       const onMenu = (value: string) => {
         if (value === 'up' || value === 'down') {
-          void act($, `mv-${id}`, ['config', 'move-entry', ...where, '--index', String(index),
+          void act($, `mv-${id}`, ['config', 'move-entry', ...where, ...at,
             '--to', String(value === 'up' ? index - 1 : index + 1)], 'Порядок изменён')
         } else if (value === 'rm') {
-          void act($, `rm-${id}`, ['config', 'remove-entry', ...where, '--index', String(index)], 'Убрано из цепочки')
+          void act($, `rm-${id}`, ['config', 'remove-entry', ...where, ...at], isTier ? 'Убрано из цепочки' : 'Место убрано')
         }
       }
       return (
@@ -662,7 +665,7 @@ export const register: Register = on => {
               <Select key={`effort-${id}`} options={effortsOf(entry.provider, entry.model).map(x => ({ value: x, label: x }))}
                 value={entry.effort} onSelect={value => setEntry(entry.provider, entry.model, value)} />
             </Box>
-            {isTier && menu.length > 1 ? (
+            {menu.length > 1 ? (
               <Box flexShrink={0}><Select key={`menu-${id}`} options={menu} value="-" onSelect={onMenu} /></Box>
             ) : null}
           </Box>
@@ -1201,7 +1204,17 @@ export const register: Register = on => {
             {Object.entries(o.panels ?? {}).map(([name, seats]) => (
               <Box flexDirection="column" key={`sp-${name}`} paddingTop={1}>
                 <Text size="footnote" color="subtle">{PANEL_RU[name] ?? name}</Text>
-                {seats.map((s, i) => <EntryRow where={['--panel', name, '--seat', String(i)]} index={i} entry={s} count={seats.length} />)}
+                {seats.map((s, i) => <EntryRow where={['--panel', name]} index={i} entry={s} count={seats.length} />)}
+                <Box paddingLeft={3}>
+                  <Link id={`add-seat-${name}`} label="+ место"
+                    onPress={() => {
+                      const [p, m] = modelOptions()[0]?.value.split('|') ?? []
+                      if (p && m) {
+                        void act($, `add-seat-${name}`, ['config', 'add-entry', '--panel', name, '--provider', p, '--model', m,
+                          '--effort', effortsOf(p, m).slice(-1)[0] ?? 'high'], 'Место добавлено')
+                      }
+                    }} />
+                </Box>
               </Box>
             ))}
           </Fold>

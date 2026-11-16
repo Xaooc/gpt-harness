@@ -517,15 +517,14 @@ async function configCommand(args) {
     const target = await undoTarget();
     return saveResult(target.before, previous, actor, `undo ${target.id}`);
   } else if (['set-entry', 'add-entry', 'remove-entry', 'move-entry'].includes(action)) {
-    const allowed = { '--tier': true };
-    if (action === 'set-entry') Object.assign(allowed, { '--panel': true, '--seat': true });
-    if (action !== 'add-entry') allowed['--index'] = true;
+    const allowed = { '--tier': true, '--panel': true };
+    if (action !== 'add-entry') Object.assign(allowed, { '--index': true, '--seat': true });
     if (action === 'set-entry' || action === 'add-entry') {
       Object.assign(allowed, { '--provider': true, '--model': true, '--effort': true });
     }
     if (action === 'add-entry') allowed['--at'] = true;
     if (action === 'move-entry') allowed['--to'] = true;
-    const opts = options(rest, allowed), chain = chainFor(config, opts, action === 'set-entry');
+    const opts = options(rest, allowed), chain = chainFor(config, opts, true);
     const panel = Boolean(opts['--panel']);
     const flag = panel ? '--seat' : '--index';
     if (opts[panel ? '--index' : '--seat'] !== undefined) throw new Error(`use ${flag} for this target`);
@@ -536,7 +535,9 @@ async function configCommand(args) {
       const index = entryIndex(opts[flag], chain.length - 1, flag);
       if (action === 'set-entry') chain[index] = entryOptions(opts);
       else if (action === 'remove-entry') {
-        if (chain.length === 1) throw new Error('cannot remove the last entry in a chain');
+        if (chain.length === 1) {
+          throw new Error(panel ? 'cannot remove the last seat in a panel' : 'cannot remove the last entry in a chain');
+        }
         chain.splice(index, 1);
       } else {
         const to = entryIndex(opts['--to'], chain.length - 1, '--to');
@@ -544,7 +545,11 @@ async function configCommand(args) {
       }
     }
     note = `${action} ${panel ? 'panel' : 'tier'} ${opts['--panel'] || opts['--tier']}`;
-  } else throw new Error('usage: exec.mjs config get | set | set-entry | add-entry | remove-entry | move-entry | ' +
+  } else throw new Error('usage: exec.mjs config get | set | ' +
+    'set-entry (--tier <name> --index <n>|--panel <name> --seat <n>) --provider <name> --model <name> --effort <name> | ' +
+    'add-entry (--tier <name>|--panel <name>) [--at <n>] --provider <name> --model <name> --effort <name> | ' +
+    'remove-entry (--tier <name> --index <n>|--panel <name> --seat <n>) | ' +
+    'move-entry (--tier <name> --index <n>|--panel <name> --seat <n>) --to <n> | ' +
     'threshold | preset | save-preset | undo | validate');
   return saveResult(config, previous, actor, note);
 }

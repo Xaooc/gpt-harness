@@ -1,6 +1,6 @@
 {
   "name": "luna-panel",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Live pane: limits of Claude, Codex and Gemini, executor chains and settings, every executor job, token usage, CLI updates",
   "types": "./types/index.d.ts"
 }

@@ -85,6 +85,11 @@ test('settings: an effort pick sends set-entry with that effort; a preset applie
   expect(set).toBeTruthy()
   expect(set?.join(' ')).toContain('--tier simple --index 0 --provider gemini --model gemini-3.8-flash --effort medium')
   expect(set).toContain('--actor')
+  // A panel seat is addressed by --seat, never --index (exec.mjs rejects the mix).
+  await $.ui.select({ plugin: PLUGIN, key: 'effort---panel-review-0', value: 'max' })
+  const seat = calls.find(c => c.includes('set-entry') && c.includes('--panel'))
+  expect(seat?.join(' ')).toContain('--panel review --seat 0 --provider codex --model gpt-6.1-sol --effort max')
+  expect(seat).not.toContain('--index')
   await ui.press({ key: 'preset-save-codex' })
   expect(calls.some(c => c.join(' ').includes('config preset save-codex'))).toBe(true)
   await ui.unmount()

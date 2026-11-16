@@ -676,6 +676,62 @@ test('entry actions insert, move and remove; the last chain entry cannot be remo
   } finally { await env.cleanup(); }
 });
 
+test('panel entry actions add, move and remove seats; reject invalid targets and the last seat', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const config = await loadConfig(), initial = config.panels.design[0];
+    config.panels.design = [initial];
+    await saveConfig(config, { actor: 'cli', note: 'fixture panel' });
+    const roles = path.join(process.env.CLAUDE_HOME_DIR, 'rules', 'pstack-models.md');
+    const entry = { provider: 'claude', model: 'sonnet', effort: 'low' };
+    const entryArgs = ['--provider', entry.provider, '--model', entry.model, '--effort', entry.effort];
+    const verify = async (expected, actionName) => {
+      assert.deepEqual((await readJson(paths().config)).panels.design, expected);
+      const journal = (await readLines(paths().journal)).slice(-2);
+      assert.deepEqual(journal.map((entry) => entry.status), ['applying', 'applied']);
+      assert.deepEqual(journal.map((entry) => entry.note), Array(2).fill(`${actionName} panel design`));
+      const rendered = await fs.readFile(roles, 'utf8');
+      const seats = expected.map((seat) => `${seat.provider}/${seat.model}/${seat.effort}`).join(', ');
+      assert.ok(rendered.split('\n').includes(`arena runners: panel design = ${seats}`));
+    };
+    await action(env, ['config', 'add-entry', '--panel', 'design', '--at', '1', ...entryArgs]);
+    await verify([initial, entry], 'add-entry');
+    await action(env, ['config', 'move-entry', '--panel', 'design', '--seat', '1', '--to', '0']);
+    await verify([entry, initial], 'move-entry');
+    await action(env, ['config', 'remove-entry', '--panel', 'design', '--seat', '0']);
+    await verify([initial], 'remove-entry');
+    const before = await fs.readFile(paths().config, 'utf8');
+    const journalBefore = await fs.readFile(paths().journal, 'utf8');
+    const invalid = [
+      [['remove-entry', '--panel', 'design', '--seat', '0'], /cannot remove the last seat in a panel/],
+      [['set-entry', '--panel', 'design', '--index', '0', ...entryArgs], /use --seat for this target/],
+      [['add-entry', '--panel', 'design', '--index', '0', ...entryArgs], /unknown option: --index/],
+      [['remove-entry', '--panel', 'design', '--index', '0'], /use --seat for this target/],
+      [['move-entry', '--panel', 'design', '--index', '0', '--to', '0'], /use --seat for this target/],
+      [['remove-entry', '--tier', 'simple', '--seat', '0'], /use --index for this target/],
+      [['move-entry', '--tier', 'simple', '--seat', '0', '--to', '0'], /use --index for this target/],
+      [['remove-entry', '--panel', 'missing', '--seat', '0'], /unknown panel: missing/],
+      [['add-entry', '--panel', 'design', '--at', '2', ...entryArgs], /--at must be a zero-based index/],
+      [['remove-entry', '--panel', 'design', '--seat', '1'], /--seat must be a zero-based index/],
+      [['move-entry', '--panel', 'design', '--seat', '0', '--to', '1'], /--to must be a zero-based index/],
+      [['add-entry', '--panel', 'design', '--provider', 'other', '--model', 'sonnet', '--effort', 'low'],
+        /unknown provider other/],
+      [['add-entry', '--panel', 'design', '--provider', 'claude', '--model', 'missing', '--effort', 'low'],
+        /model claude\/missing is not in catalog/],
+      [['add-entry', '--panel', 'design', '--provider', 'claude', '--model', 'sonnet', '--effort', 'ultra'],
+        /effort ultra is not in catalog/]
+    ];
+    for (const [args, message] of invalid) {
+      const result = await env.command(['config', ...args]);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, message);
+      assert.equal(await fs.readFile(paths().config, 'utf8'), before);
+      assert.equal(await fs.readFile(paths().journal, 'utf8'), journalBefore);
+    }
+  } finally { await env.cleanup(); }
+});
+
 test('threshold edits preserve omitted hysteresis and reject out-of-range values', { timeout }, async () => {
   const env = await environment();
   try {
