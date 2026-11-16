@@ -18,6 +18,34 @@
     }
   ],
   "retiredModels": {
-    "allow": ["gpt-6-astra", "claude-code.md", "claude-plugin"]
-  }
+    "allow": [
+      "gpt-6-astra",
+      "claude-code.md",
+      "claude-plugin"
+    ]
+  },
+  "unpackagedAllow": [
+    "hooks/gsd-*",
+    "hooks/lib/*",
+    "hooks/*.prev",
+    "skills/gsd-*/**",
+    "get-shit-done/**",
+    "skills/design/**",
+    "skills/design-system/**",
+    "skills/brand/**",
+    "skills/ui-styling/**",
+    "skills/ui-ux-pro-max/**",
+    "skills/slides/**",
+    "skills/banner-design/**"
+  ],
+  "optionalPaths": [
+    "~/.claude/heavy-gate-off",
+    "~/.claude/learning/PAUSED",
+    "~/.claude/learning/CAPTURE_OFF",
+    "~/.claude/learning/checks.md",
+    "~/.claude/luna-autoload-off",
+    "~/.claude/codex-gate-paused",
+    "~/.claude/luna-run/*.log",
+    "~/.claude/logs/*"
+  ]
 }

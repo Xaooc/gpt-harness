@@ -141,7 +141,7 @@ test('prose checks missing paths and retired models, ignoring placeholders and a
     + '`~/.claude/hooks/present.mjs` exists; ~/.claude/hooks/absent.mjs does not.\n'
     + '~/.claude/skills/<name>/SKILL.md ~/.claude/skills/*/SKILL.md ~/.claude/{hooks,scripts}/anything\n'
     + 'Use gpt-6.1-sol, gemini-current and claude-current. Never gpt-6-astra. Old: gpt-5-retired.\n');
-  await fixture.packaged('skills/another/SKILL.md', '---\nname: another\ndescription: |\n  A multiline description.\n---\n'
+  await fixture.packaged('skills/luna/SKILL.md', '---\nname: luna\ndescription: |\n  A multiline description.\n---\n'
     + 'Missing `~/.claude/scripts/absent.py`. Retired gemini-old.\n');
   await fixture.packaged('skills/broken/SKILL.md', '---\nname: broken\n---\n# Missing description\n');
   const result = await fixture.run();
@@ -204,4 +204,18 @@ test('SessionStart detaches stale runs, shows each recent report at most twice a
     const broken = fixture.start(override);
     assert.equal(broken.status, 0);
     assert.equal(broken.stdout + broken.stderr, '');
+  });
+
+test('allowlisted unpackaged file, optional missing path and non-harness skill model produce no findings',
+  { timeout }, async (t) => {
+    const fixture = await environment(t);
+    await write(path.join(fixture.claude, 'hooks/gsd-status.mjs'), '// allowlisted unpackaged hook\n');
+    await write(path.join(fixture.claude, 'CLAUDE.md'), fixture.doc
+      + 'Configured via `~/.claude/heavy-gate-off` and logged to `~/.claude/logs/audit.log`.\n');
+    await fixture.packaged('skills/custom/SKILL.md', '---\nname: custom\ndescription: Non-harness skill\n---\n'
+      + 'Mentions retired model gpt-5-retired and gemini-old in custom skill prose.\n');
+    const result = await fixture.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.report.findings, []);
+    assert.deepEqual(result.report.counts, { high: 0, medium: 0, low: 0 });
   });
