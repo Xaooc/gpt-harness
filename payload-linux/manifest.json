@@ -168,7 +168,7 @@
       "src": "claude/scripts/learning/core.mjs",
       "dest": "scripts/learning/core.mjs",
       "kind": "file",
-      "sha256": "dd4ac48697e437ff11b8c46652ce3bda288f0836cd26882a6b2d80d9bd0c3d6f"
+      "sha256": "18824eb9a16f77dfc80a53fa9a86f72a1b1a5fdf4f0c2e7bc3f922a2b6ec8df5"
     },
     {
       "src": "claude/scripts/learning/DESIGN.md",
@@ -216,7 +216,7 @@
       "src": "claude/scripts/learning/test/core.test.mjs",
       "dest": "scripts/learning/test/core.test.mjs",
       "kind": "file",
-      "sha256": "3f69cece16146f63835973058c388cdcbdfaf9f140780605ed8eeafa3b184a53"
+      "sha256": "36315f7c47465cabae21d40dd9d5f1a9e68e98ba0fded6f5c38a28ef7dc94173"
     },
     {
       "src": "claude/scripts/learning/test/extract.test.mjs",
@@ -420,7 +420,7 @@
       "src": "claude/hooks/conveyor-hygiene-session-start.mjs",
       "dest": "hooks/conveyor-hygiene-session-start.mjs",
       "kind": "file",
-      "sha256": "cf47edee9b8b7173fed7f3fa9f9930f0a18ab40ec3e33ea187601a6075ee63d5",
+      "sha256": "2054d8a2e6853fb8ddd5077b1a35288e070e8865ef2dfa989cbd2d411a331888",
       "executable": true
     },
     {
@@ -3859,6 +3859,13 @@
       "dest": "scripts/conveyor/interrogate.mjs",
       "kind": "file",
       "sha256": "7ae46e60d99d75d6e1ccee7264bf49cd6a31418bbe773c2ee12247b9e82686d9",
+      "executable": true
+    },
+    {
+      "src": "claude/scripts/conveyor/metrics.mjs",
+      "dest": "scripts/conveyor/metrics.mjs",
+      "kind": "file",
+      "sha256": "75d19a607d8a506e930c43583eede33a636786c69e9b6a61ecaf5d9f9387174f",
       "executable": true
     }
   ],

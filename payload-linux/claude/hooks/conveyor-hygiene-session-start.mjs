@@ -5,13 +5,74 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 const day = 24 * 60 * 60 * 1000;
 const runner = fileURLToPath(new URL('../scripts/conveyor/harness-hygiene.mjs', import.meta.url));
+const execute = promisify(execFile);
 const readJson = (file) => {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return null; }
 };
+
+async function sessionCwd() {
+  const fallback = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  if (process.stdin.isTTY) return fallback;
+  // SessionStart supplies JSON on stdin; bound the read so an absent/unfinished payload cannot stall startup.
+  return new Promise((resolve) => {
+    let input = '';
+    const finish = () => {
+      clearTimeout(timer);
+      process.stdin.off('data', data).off('end', finish).off('error', finish);
+      process.stdin.pause();
+      process.stdin.unref?.();
+      try { resolve(JSON.parse(input).cwd || fallback); }
+      catch { resolve(fallback); }
+    };
+    const data = (chunk) => { input += chunk; if (input.length > 65536) finish(); };
+    const timer = setTimeout(finish, 100);
+    process.stdin.on('data', data).once('end', finish).once('error', finish);
+    process.stdin.resume();
+    if (process.stdin.readableEnded) finish();
+  });
+}
+
+async function profileSuggestion(conveyor, now) {
+  try {
+    const cwd = await sessionCwd();
+    const { stdout } = await execute('git', ['-C', cwd, 'rev-parse', '--path-format=absolute',
+      '--show-toplevel', '--git-common-dir'], { timeout: 500, killSignal: 'SIGKILL', maxBuffer: 65536 });
+    const [repo, common] = stdout.trim().split('\n');
+    if (!repo || !common) return '';
+    const canonical = fs.realpathSync(repo);
+    const harness = process.env.HARNESS_REPO || path.join(homedir(), 'dev', 'gpt-harness');
+    if (canonical === path.resolve(harness)
+      || canonical === fs.realpathSync(fileURLToPath(new URL('../../../', import.meta.url)))
+      || fs.existsSync(path.join(repo, 'payload-linux', 'manifest.json'))
+        && fs.existsSync(path.join(repo, 'tools', 'manifest-sync.mjs'))) return '';
+    if (!['package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod'].some((name) => fs.existsSync(path.join(repo, name)))) {
+      return '';
+    }
+    if (fs.existsSync(path.join(repo, '.claude', 'conveyor.json'))) return '';
+    const skills = path.join(repo, '.claude', 'skills');
+    if (fs.existsSync(skills) && fs.readdirSync(skills).some((name) => name.startsWith('verify-')
+      && fs.statSync(path.join(skills, name)).isDirectory())) return '';
+    const file = path.join(conveyor, 'profile-suggestions.json');
+    const saved = readJson(file);
+    const state = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    const key = createHash('sha256').update(fs.realpathSync(common)).digest('hex');
+    if (now - Date.parse(state[key]) < 7 * day) return '';
+    state[key] = new Date(now).toISOString();
+    const temporary = `${file}.${process.pid}.${now}.tmp`;
+    try {
+      fs.writeFileSync(temporary, `${JSON.stringify(state)}\n`, { flag: 'wx', mode: 0o600 });
+      fs.renameSync(temporary, file);
+    } finally { fs.rmSync(temporary, { force: true }); }
+    return 'For this repo, propose a check.mjs profile and create-verification-skill to the user.';
+  } catch { return ''; } // Optional guidance must never prevent hygiene output or session startup.
+}
 
 async function main() {
   const claude = process.env.CLAUDE_HOME_DIR || path.join(homedir(), '.claude');
@@ -61,6 +122,8 @@ async function main() {
         changed = true;
       }
     }
+    const suggestion = await profileSuggestion(conveyor, now);
+    if (suggestion) message = [message, suggestion].filter(Boolean).join('\n');
     if (changed) {
       const temporary = `${stateFile}.${process.pid}.${now}.tmp`;
       try {
@@ -80,4 +143,4 @@ async function main() {
 }
 
 try { await main(); }
-catch { /* SessionStart is fail-silent and never waits for the scan or stdin. */ }
+catch { /* SessionStart is fail-silent and never waits for the scan. */ }
