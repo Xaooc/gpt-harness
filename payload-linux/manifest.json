@@ -74,7 +74,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "7b138f6d7adddb30f83649783cec79517978f69d59c513467e1c01fcfb63816f"
+      "sha256": "14c49e26150ee610614fe5dbfb9c1c8303973fce0c2cbbb12696f2790e443c57"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
@@ -86,13 +86,13 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "aa6f675b6f595c30ec1e5d8ca70776c6de549b5408b5afec57f0b7bf25ae5850"
+      "sha256": "f74d9a2c9731db5ad4f428a7b5e28787e0e7f65c48c6fd5ceb5e8612b578ee1b"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",
       "dest": "local-plugins/luna-panel/tests/pane.test.tsx",
       "kind": "file",
-      "sha256": "7a00a1e2d4131a7ef2e456e693033f06346848ee63eb3de1e396aca500f2b3d1"
+      "sha256": "1b1890670d71e1ec391f2e458d314b62874986fa5aed699142cb03c9ffa15b6d"
     },
     {
       "src": "claude/local-plugins/luna-panel/tsconfig.json",
@@ -180,7 +180,7 @@
       "src": "claude/scripts/learning/extract.mjs",
       "dest": "scripts/learning/extract.mjs",
       "kind": "file",
-      "sha256": "7ce48cb148692dd2d82908192375a4b296e7682fc41438a06ec59ed1578c0dfe"
+      "sha256": "ab9705f43fa1db9e30d9589cc2458c2b14dcabdc6972a3cba94afc2e03cdd8c4"
     },
     {
       "src": "claude/scripts/learning/loop.mjs",
@@ -222,7 +222,7 @@
       "src": "claude/scripts/learning/test/extract.test.mjs",
       "dest": "scripts/learning/test/extract.test.mjs",
       "kind": "file",
-      "sha256": "e9558798ff1b0007738790905285b93f5dd16ebf72b956850536403fb41783a0"
+      "sha256": "77c0c1614682c17db04efa5a87f0a947fe14f6ac3170106297e5a49e495f0a39"
     },
     {
       "src": "claude/scripts/learning/test/fake-luna.mjs",
@@ -3772,7 +3772,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "fd06b1d0a31b9e5541536c9fa292d03e9f3bc4d696d19e7138ab27c626c1a4c7",
+      "sha256": "f7c9534f5967be9f5658e150d8eb619ec2c088e1917e3c62382e25cc510a9659",
       "executable": true
     },
     {

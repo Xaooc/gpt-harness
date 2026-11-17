@@ -352,6 +352,28 @@ async function act($: EngineInterface, key: string, args: string[], okText: stri
   await poll($)
 }
 
+let catalogCheckedAt = 0
+
+/** New Codex models (from the Codex CLI's own model list) and Claude aliases join the catalog by themselves when the
+ *  pane opens and at most hourly after, so a model released yesterday is already in the picker; the link forces it.
+ *  Only adds models, never changes a chain. */
+async function refreshCatalog($: EngineInterface, quiet: boolean): Promise<void> {
+  if (quiet && Date.now() - catalogCheckedAt < 3_600_000) return
+  catalogCheckedAt = Date.now()
+  const h = await home($)
+  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/exec.mjs`, 'catalog', 'refresh', '--provider', 'all',
+    '--actor', 'panel'], 30_000)
+  const added = r.ok && /^added /.test(r.note)
+    ? r.note.replace(/^added /, '').replace(/;.*$/, '').split(/,\s*/).map(x => { const [p, m] = x.split('/'); return m ? modelName(p, m) : x }).join(', ')
+    : ''
+  if (!quiet || added || !r.ok) {
+    const text = !r.ok ? `Поиск моделей: ${r.note}` : added ? `В каталог добавлены: ${added}` : 'Новых моделей нет'
+    const level = (r.ok ? 'success' : 'warning') as 'success' | 'warning'
+    await update($, view, prev => ({ ...(prev ?? VIEW0), note: { text, level, at: Date.now() } }))
+  }
+  if (added) await poll($)
+}
+
 let cliLoadedAt = 0
 let cliLoading = false
 
@@ -442,6 +464,7 @@ export const register: Register = on => {
     queueBeat($)
     void $.ui.open({ id: PANE, title: TITLE })
     void poll($)
+    void refreshCatalog($, true)
     ensureTicker($)
     return started
   })
@@ -491,6 +514,7 @@ export const register: Register = on => {
     ensureTicker($)
     await poll($)
     await $.ui.open({ id: PANE, title: TITLE })
+    void refreshCatalog($, true)
     return { text: 'Luna pane opened.' }
   })
 
@@ -1245,8 +1269,8 @@ export const register: Register = on => {
                 onInput={value => void setView({ draftEfforts: value.replace(/\s+/g, '') })} submitLabel="ок"
                 onSubmit={value => void setView({ draftEfforts: value.replace(/\s+/g, '') })} />
             </Box>
-            <Link id="catalog-refresh" label="найти новые модели Gemini"
-              onPress={() => void act($, 'catalog-refresh', ['catalog', 'refresh', '--provider', 'gemini'], 'Каталог Gemini обновлён')} />
+            <Link id="catalog-refresh" label="найти новые модели Codex и Claude"
+              onPress={() => void refreshCatalog($, false)} />
           </Fold>
         </Box>
       )

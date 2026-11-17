@@ -38,7 +38,9 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, cli
     if (argv.some(a => a.endsWith('exec.mjs')) || argv.some(a => a.endsWith('cli-update.mjs'))) {
       calls.push([...argv])
       const isStatus = argv.includes('status')
-      const out = isStatus && cli ? JSON.stringify(cli) : JSON.stringify({ ok: true, changed: true, note: 'ok' })
+      const isRefresh = argv.includes('refresh')
+      const out = isStatus && cli ? JSON.stringify(cli)
+        : JSON.stringify({ ok: true, changed: true, note: isRefresh ? 'added codex/gpt-7-sol, claude/fable' : 'ok' })
       return { value: { exitCode: 0, stdout: out, stderr: '' } }
     }
     return { value: { exitCode: 0, stdout: '/home/t', stderr: '' } }
@@ -92,6 +94,16 @@ test('settings: an effort pick sends set-entry with that effort; a preset applie
   expect(seat).not.toContain('--index')
   await ui.press({ key: 'preset-save-codex' })
   expect(calls.some(c => c.join(' ').includes('config preset save-codex'))).toBe(true)
+  await ui.unmount()
+})
+
+test('catalog: opening the pane looks for new Codex and Claude models and names what joined', async ($, on) => {
+  const calls: Calls = []
+  engine(on, calls)
+  const ui = await opened($, 'desktop')
+  const refresh = calls.find(c => c.includes('catalog') && c.includes('refresh'))
+  expect(refresh?.join(' ')).toContain('catalog refresh --provider all --actor panel')
+  expect(await ui.find({ type: 'Text', text: /В каталог добавлены: Sol 7, Fable/ })).toBeTruthy()
   await ui.unmount()
 })
 

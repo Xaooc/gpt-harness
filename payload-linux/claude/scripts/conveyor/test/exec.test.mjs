@@ -869,6 +869,77 @@ test('catalog refresh adds Gemini families from a fake command and keeps existin
   } finally { await env.cleanup(); }
 });
 
+test('catalog refresh discovers Codex models and Claude aliases with safe cache failures', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const initial = structuredClone((await loadConfig()).catalog);
+    assert.ok(!initial.claude.some((entry) => entry.model === 'fable'));
+    const cache = path.join(env.root, 'models_cache.json');
+    const command = { CONVEYOR_CODEX_MODELS_CACHE: cache };
+    await fs.writeFile(cache, JSON.stringify({ fetched_at: '2026-11-17T21:04:59Z', models: [
+      { slug: 'gpt-6.2-sol', visibility: 'list', supported_reasoning_levels:
+        ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'unknown'].map((effort) => ({ effort })) },
+      { slug: 'gpt-reserve', visibility: 'hide', supported_reasoning_levels: [{ effort: 'low' }] },
+      // Older releases Codex still lists stay out: only the newest version of a family joins the catalog.
+      { slug: 'gpt-5.6-sol', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] },
+      { slug: 'gpt-6.10-luna-old', visibility: 'hide', supported_reasoning_levels: [{ effort: 'low' }] },
+      { slug: 'gpt-6.2-ASTRA', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] },
+      { slug: initial.codex[0].model, visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] },
+      { slug: 'gpt-no-efforts', visibility: 'list', supported_reasoning_levels: [{ effort: 'ultra' }] },
+      { slug: '', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] }
+    ] }));
+    const refreshed = await action(env, ['catalog', 'refresh', '--provider', 'codex', '--actor', 'panel'], command);
+    assert.equal(refreshed.changed, true);
+    assert.equal(refreshed.note, 'added codex/gpt-6.2-sol');
+    const expected = { ...initial, codex: [...initial.codex,
+      { model: 'gpt-6.2-sol', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] }] };
+    assert.deepEqual((await loadConfig()).catalog, expected);
+    assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
+    let before = await fs.readFile(paths().config);
+    let journal = await fs.readFile(paths().journal);
+    const repeated = await action(env, ['catalog', 'refresh', '--provider', 'codex'], command);
+    assert.equal(repeated.changed, false);
+    assert.equal(repeated.note, 'no models added');
+    assert.deepEqual(await fs.readFile(paths().config), before);
+    assert.deepEqual(await fs.readFile(paths().journal), journal);
+
+    const claude = await action(env, ['catalog', 'refresh', '--provider', 'claude']);
+    assert.equal(claude.changed, true);
+    assert.equal(claude.note, 'added claude/fable');
+    expected.claude = [...initial.claude, { model: 'fable', efforts: ['low', 'medium', 'high'] }];
+    assert.deepEqual((await loadConfig()).catalog, expected);
+    const missing = path.join(env.root, 'missing-cache.json');
+    const missingCommand = { CONVEYOR_CODEX_MODELS_CACHE: missing };
+    before = await fs.readFile(paths().config);
+    journal = await fs.readFile(paths().journal);
+    const failed = await env.command(['catalog', 'refresh', '--provider', 'codex'], missingCommand);
+    assert.equal(failed.status, 1);
+    assert.equal(failed.stdout, '');
+    assert.equal(failed.stderr, `conveyor: codex model cache unreadable: ${missing}\n`);
+    assert.deepEqual(await fs.readFile(paths().config), before);
+    assert.deepEqual(await fs.readFile(paths().journal), journal);
+
+    await action(env, ['catalog', 'remove', '--provider', 'claude', '--model', 'fable']);
+    const applied = (await readLines(paths().journal)).filter((entry) => entry.status === 'applied').length;
+    const all = await action(env, ['catalog', 'refresh', '--provider', 'all', '--actor', 'panel'], missingCommand);
+    assert.equal(all.changed, true);
+    assert.equal(all.note, `added claude/fable; codex model cache unreadable: ${missing}`);
+    assert.deepEqual((await loadConfig()).catalog, expected);
+    const entries = (await readLines(paths().journal)).filter((entry) => entry.status === 'applied');
+    assert.equal(entries.length, applied + 1);
+    assert.equal(entries.at(-1).actor, 'panel');
+    assert.equal(entries.at(-1).note, all.note);
+    before = await fs.readFile(paths().config);
+    journal = await fs.readFile(paths().journal);
+    const unchanged = await action(env, ['catalog', 'refresh', '--provider', 'all'], missingCommand);
+    assert.equal(unchanged.changed, false);
+    assert.equal(unchanged.note, `no models added; codex model cache unreadable: ${missing}`);
+    assert.deepEqual(await fs.readFile(paths().config), before);
+    assert.deepEqual(await fs.readFile(paths().journal), journal);
+  } finally { await env.cleanup(); }
+});
+
 test('catalog add/remove validate efforts and refuse models referenced by tiers or panels', { timeout }, async () => {
   const env = await environment();
   try {

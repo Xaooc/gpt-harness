@@ -3,7 +3,7 @@
 import * as fs from 'node:fs/promises';
 import { readFileSync, writeFileSync, rmSync, statSync, watch, constants } from 'node:fs';
 import path from 'node:path';
-import { constants as osConstants } from 'node:os';
+import { constants as osConstants, homedir } from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -574,11 +574,73 @@ async function catalogCommand(args) {
   required(opts, ['--provider']);
   const provider = opts['--provider'];
   const config = await loadConfig(), previous = structuredClone(config);
-  if (!Object.hasOwn(config.catalog, provider)) throw new Error(`unknown provider: ${provider}`);
+  const providers = action === 'refresh' && provider === 'all' ? ['codex', 'claude'] : [provider];
+  for (const name of providers) {
+    if (!Object.hasOwn(config.catalog, name)) throw new Error(`unknown provider: ${name}`);
+  }
   const catalog = config.catalog[provider];
   let note;
+  if (action === 'refresh' && provider !== 'gemini') {
+    if (!['codex', 'claude', 'all'].includes(provider)) {
+      throw new Error('catalog refresh requires --provider codex|claude|gemini|all');
+    }
+    const added = [];
+    let problem;
+    if (providers.includes('codex')) {
+      const cache = process.env.CONVEYOR_CODEX_MODELS_CACHE ??
+        path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'models_cache.json');
+      let models;
+      try {
+        const data = JSON.parse(await fs.readFile(cache, 'utf8'));
+        if (!Array.isArray(data?.models)) throw new Error('models must be an array');
+        models = data.models;
+      } catch {
+        problem = `codex model cache unreadable: ${cache}`;
+        if (provider !== 'all') throw new Error(problem);
+      }
+      // Codex keeps listing older releases (gpt-5.6-*, gpt-6-sol); only the newest version of each family joins the
+      // picker, so a refresh brings in gpt-6.2-sol without re-adding every model it replaced.
+      const listed = (models || []).filter((entry) => entry?.visibility === 'list' && typeof entry.slug === 'string' &&
+        entry.slug && !/-astra$/i.test(entry.slug));
+      const release = (slug) => /^gpt-(\d+(?:\.\d+)*)-([a-z]+)$/i.exec(slug);
+      const newer = (a, b) => {
+        const x = a.split('.').map(Number), y = b.split('.').map(Number);
+        for (let i = 0; i < Math.max(x.length, y.length); i += 1) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+        return false;
+      };
+      const newest = new Map();
+      for (const entry of listed) {
+        const match = release(entry.slug);
+        if (match && (!newest.has(match[2].toLowerCase()) || newer(match[1], newest.get(match[2].toLowerCase())))) {
+          newest.set(match[2].toLowerCase(), match[1]);
+        }
+      }
+      for (const entry of listed) {
+        const match = release(entry.slug);
+        if (match && newest.get(match[2].toLowerCase()) !== match[1]) continue;
+        const efforts = (Array.isArray(entry.supported_reasoning_levels) ? entry.supported_reasoning_levels : [])
+          .map((level) => level?.effort).filter((effort) => ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort));
+        if (!efforts.length || config.catalog.codex.some((model) => model.model === entry.slug)) continue;
+        config.catalog.codex.push({ model: entry.slug, efforts });
+        added.push(`codex/${entry.slug}`);
+      }
+    }
+    if (providers.includes('claude')) {
+      for (const model of ['opus', 'sonnet', 'haiku', 'fable']) {
+        if (config.catalog.claude.some((entry) => entry.model === model)) continue;
+        config.catalog.claude.push({ model, efforts: ['low', 'medium', 'high'] });
+        added.push(`claude/${model}`);
+      }
+    }
+    note = added.length ? `added ${added.join(', ')}` : 'no models added';
+    if (problem) note += `; ${problem}`;
+    if (!added.length) {
+      process.stdout.write(`${JSON.stringify({ ok: true, changed: false, note })}\n`);
+      return 0;
+    }
+    return saveResult(config, previous, actor, note);
+  }
   if (action === 'refresh') {
-    if (provider !== 'gemini') throw new Error('catalog refresh requires --provider gemini');
     let command = ['/srv/docker/compose/antigravity-parallel/run-agy', 'models'];
     if (process.env.CONVEYOR_AGY_MODELS_CMD !== undefined) {
       try { command = JSON.parse(process.env.CONVEYOR_AGY_MODELS_CMD); }
