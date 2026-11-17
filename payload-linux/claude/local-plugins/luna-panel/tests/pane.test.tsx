@@ -20,8 +20,9 @@ const PANE = {
 type Calls = string[][]
 
 // The engine beneath the plugin: processes answered from a fixture, every exec.mjs/cli-update.mjs call recorded.
-function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, cli: unknown = null, snap: unknown = snapshot) {
-  mock.clock(on)
+function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, cli: unknown = null, snap: unknown = snapshot,
+  shown = true) {
+  const clock = mock.clock(on)
   on('env.get', (_, e) => ({ value: (e as { name?: string }).name === 'HOME' ? '/home/t' : undefined }))
   on('session.id', () => ({ value: 'sess-1' }))
   on('session.usage', () => ({
@@ -29,7 +30,7 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, cli
   }))
   on('command.register', () => ({ value: { command: 'luna' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.panes', () => ({ value: [{ id: PLUGIN, title: 'Luna', isShown: true, isPlaced: true, isFocused: false }] }))
+  on('ui.panes', () => ({ value: [{ id: PLUGIN, title: 'Luna', isShown: shown, isPlaced: true, isFocused: false }] }))
   on('process.run', (_, e) => {
     const argv = (e as { argv: readonly string[] }).argv
     if (argv.some(a => a.endsWith('luna-overview.mjs'))) {
@@ -45,6 +46,7 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, cli
     }
     return { value: { exitCode: 0, stdout: '/home/t', stderr: '' } }
   })
+  return clock
 }
 
 async function opened($: Parameters<Parameters<typeof test>[1]>[0], surface: 'terminal' | 'desktop') {
@@ -97,13 +99,19 @@ test('settings: an effort pick sends set-entry with that effort; a preset applie
   await ui.unmount()
 })
 
-test('catalog: opening the pane looks for new Codex and Claude models and names what joined', async ($, on) => {
+test('catalog: opening the pane looks for new Codex and Claude models and names what joined', { timeoutMs: 15_000 }, async ($, on) => {
   const calls: Calls = []
-  engine(on, calls)
+  // A hidden pane polls every 20 s instead of 5 s, which keeps simulating two hours cheap; the hourly check runs anyway.
+  const clock = engine(on, calls, null, snapshot, false)
   const ui = await opened($, 'desktop')
-  const refresh = calls.find(c => c.includes('catalog') && c.includes('refresh'))
-  expect(refresh?.join(' ')).toContain('catalog refresh --provider all --actor panel')
+  const refreshes = () => calls.filter(c => c.includes('catalog') && c.includes('refresh'))
+  expect(refreshes()[0]?.join(' ')).toContain('catalog refresh --provider all --actor panel')
   expect(await ui.find({ type: 'Text', text: /В каталог добавлены: Sol 7, Fable/ })).toBeTruthy()
+  // While the session runs it looks again every hour, not on every 5-second poll.
+  await clock.advance(30 * 60_000)
+  expect(refreshes().length).toBe(1)
+  await clock.advance(32 * 60_000)
+  expect(refreshes().length).toBe(2)
   await ui.unmount()
 })
 

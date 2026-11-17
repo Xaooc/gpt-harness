@@ -262,6 +262,9 @@ function ensureTicker($: EngineInterface): void {
 }
 
 async function tick($: EngineInterface): Promise<void> {
+  // The catalog is checked hourly even while the pane is hidden, so a model released today is in the picker by the
+  // time the owner looks.
+  void refreshCatalog($, true)
   if ((await $.clock.now()) - lastPollAt < IDLE_POLL_MS) {
     let shown = false
     try { shown = (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced && p.isShown) } catch {}
@@ -352,14 +355,22 @@ async function act($: EngineInterface, key: string, args: string[], okText: stri
   await poll($)
 }
 
-let catalogCheckedAt = 0
+let catalogCheckedAt = -Infinity
+let catalogBusy = false
 
-/** New Codex models (from the Codex CLI's own model list) and Claude aliases join the catalog by themselves when the
- *  pane opens and at most hourly after, so a model released yesterday is already in the picker; the link forces it.
+/** New Codex models (the Codex CLI's live model list) and new Claude aliases (read from Claude Code itself) join the
+ *  catalog by themselves when the session starts and every hour after; the link forces a check now.
  *  Only adds models, never changes a chain. */
 async function refreshCatalog($: EngineInterface, quiet: boolean): Promise<void> {
-  if (quiet && Date.now() - catalogCheckedAt < 3_600_000) return
-  catalogCheckedAt = Date.now()
+  if (catalogBusy) return
+  catalogBusy = true
+  try { await refreshCatalogOnce($, quiet) } finally { catalogBusy = false }
+}
+
+async function refreshCatalogOnce($: EngineInterface, quiet: boolean): Promise<void> {
+  const now = await $.clock.now()
+  if (quiet && now - catalogCheckedAt < 3_600_000) return
+  catalogCheckedAt = now
   const h = await home($)
   const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/exec.mjs`, 'catalog', 'refresh', '--provider', 'all',
     '--actor', 'panel'], 30_000)

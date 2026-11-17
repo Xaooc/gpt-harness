@@ -873,10 +873,20 @@ test('catalog refresh discovers Codex models and Claude aliases with safe cache 
   const env = await environment();
   try {
     await env.setup();
-    const initial = structuredClone((await loadConfig()).catalog);
+    const config = await loadConfig();
+    const initial = structuredClone(config.catalog);
     assert.ok(!initial.claude.some((entry) => entry.model === 'fable'));
     const cache = path.join(env.root, 'models_cache.json');
-    const command = { CONVEYOR_CODEX_MODELS_CACHE: cache };
+    const binary = path.join(env.root, 'claude-code');
+    const secondBinary = path.join(env.root, 'claude-code-other');
+    await fs.writeFile(binary, 'x="A short (3-5 word) description of the task",' +
+      'aSa=["sonnet","opus","haiku","fable","newalias"],y=1');
+    await fs.writeFile(secondBinary, 'x="A short (3-5 word) description of the task",aSa=["newalias",1,"BAD","next-alias"],y=1');
+    const command = {
+      CONVEYOR_CODEX_MODELS_CACHE: cache,
+      CONVEYOR_CODEX_MODELS_CMD: JSON.stringify([process.execPath, '-e', 'process.exit(1)']),
+      CONVEYOR_CLAUDE_BINS: JSON.stringify([binary, secondBinary])
+    };
     await fs.writeFile(cache, JSON.stringify({ fetched_at: '2026-11-17T21:04:59Z', models: [
       { slug: 'gpt-6.2-sol', visibility: 'list', supported_reasoning_levels:
         ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'unknown'].map((effort) => ({ effort })) },
@@ -889,10 +899,30 @@ test('catalog refresh discovers Codex models and Claude aliases with safe cache 
       { slug: 'gpt-no-efforts', visibility: 'list', supported_reasoning_levels: [{ effort: 'ultra' }] },
       { slug: '', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] }
     ] }));
+    const liveModel = { model: 'gpt-7-luna', efforts: ['high'] };
+    const liveListing = { models: [
+      { slug: liveModel.model, visibility: 'list', supported_reasoning_levels: [{ effort: 'high' }] }
+    ] };
+    const execPath = fileURLToPath(new URL('../exec.mjs', import.meta.url));
+    const tierEntry = config.tiers.complex[0];
+    assert.notEqual(tierEntry.effort, 'low');
+    const updateTier = [execPath, 'config', 'set-entry', '--tier', 'complex', '--index', '0', '--actor', 'panel',
+      '--provider', tierEntry.provider, '--model', tierEntry.model, '--effort', 'low'];
+    const liveCommand = { ...command, CONVEYOR_CODEX_MODELS_CMD: JSON.stringify([process.execPath, '-e', `
+      require('node:child_process').execFileSync(process.execPath, ${JSON.stringify(updateTier)});
+      console.log(JSON.stringify(${JSON.stringify(liveListing)}));
+    `]) };
+    const live = await action(env, ['catalog', 'refresh', '--provider', 'codex'], liveCommand);
+    const afterLive = await loadConfig();
+    assert.equal(afterLive.tiers.complex[0].effort, 'low');
+    assert.equal(live.changed, true);
+    assert.equal(live.note, `added codex/${liveModel.model}`);
+    assert.deepEqual(afterLive.catalog, { ...initial, codex: [...initial.codex, liveModel] });
+
     const refreshed = await action(env, ['catalog', 'refresh', '--provider', 'codex', '--actor', 'panel'], command);
     assert.equal(refreshed.changed, true);
     assert.equal(refreshed.note, 'added codex/gpt-6.2-sol');
-    const expected = { ...initial, codex: [...initial.codex,
+    const expected = { ...initial, codex: [...initial.codex, liveModel,
       { model: 'gpt-6.2-sol', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] }] };
     assert.deepEqual((await loadConfig()).catalog, expected);
     assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
@@ -904,19 +934,28 @@ test('catalog refresh discovers Codex models and Claude aliases with safe cache 
     assert.deepEqual(await fs.readFile(paths().config), before);
     assert.deepEqual(await fs.readFile(paths().journal), journal);
 
-    const claude = await action(env, ['catalog', 'refresh', '--provider', 'claude']);
+    const claude = await action(env, ['catalog', 'refresh', '--provider', 'claude'], command);
     assert.equal(claude.changed, true);
-    assert.equal(claude.note, 'added claude/fable');
-    expected.claude = [...initial.claude, { model: 'fable', efforts: ['low', 'medium', 'high'] }];
+    assert.equal(claude.note, 'added claude/fable, claude/newalias, claude/next-alias');
+    expected.claude = [...initial.claude,
+      ...['fable', 'newalias', 'next-alias'].map((model) => ({ model, efforts: ['low', 'medium', 'high'] }))];
     assert.deepEqual((await loadConfig()).catalog, expected);
     const missing = path.join(env.root, 'missing-cache.json');
-    const missingCommand = { CONVEYOR_CODEX_MODELS_CACHE: missing };
+    const missingCommand = { ...command, CONVEYOR_CODEX_MODELS_CACHE: missing, CONVEYOR_CLAUDE_BINS: '[]' };
+    const defaultsNote = '; claude aliases not found in Claude Code, used defaults';
     before = await fs.readFile(paths().config);
     journal = await fs.readFile(paths().journal);
     const failed = await env.command(['catalog', 'refresh', '--provider', 'codex'], missingCommand);
     assert.equal(failed.status, 1);
     assert.equal(failed.stdout, '');
     assert.equal(failed.stderr, `conveyor: codex model cache unreadable: ${missing}\n`);
+    const invalidCommand = { ...command, CONVEYOR_CODEX_MODELS_CMD: '{' };
+    const invalid = await env.command(['catalog', 'refresh', '--provider', 'codex'], invalidCommand);
+    assert.equal(invalid.status, 1);
+    assert.equal(invalid.stderr, 'conveyor: CONVEYOR_CODEX_MODELS_CMD must be non-empty JSON argv\n');
+    const invalidAll = await action(env, ['catalog', 'refresh', '--provider', 'all'], invalidCommand);
+    assert.equal(invalidAll.changed, false);
+    assert.equal(invalidAll.note, 'no models added; CONVEYOR_CODEX_MODELS_CMD must be non-empty JSON argv');
     assert.deepEqual(await fs.readFile(paths().config), before);
     assert.deepEqual(await fs.readFile(paths().journal), journal);
 
@@ -924,8 +963,9 @@ test('catalog refresh discovers Codex models and Claude aliases with safe cache 
     const applied = (await readLines(paths().journal)).filter((entry) => entry.status === 'applied').length;
     const all = await action(env, ['catalog', 'refresh', '--provider', 'all', '--actor', 'panel'], missingCommand);
     assert.equal(all.changed, true);
-    assert.equal(all.note, `added claude/fable; codex model cache unreadable: ${missing}`);
-    assert.deepEqual((await loadConfig()).catalog, expected);
+    assert.equal(all.note, `added claude/fable; codex model cache unreadable: ${missing}${defaultsNote}`);
+    const [fable, ...newAliases] = expected.claude.slice(initial.claude.length);
+    assert.deepEqual((await loadConfig()).catalog, { ...expected, claude: [...initial.claude, ...newAliases, fable] });
     const entries = (await readLines(paths().journal)).filter((entry) => entry.status === 'applied');
     assert.equal(entries.length, applied + 1);
     assert.equal(entries.at(-1).actor, 'panel');
@@ -934,7 +974,7 @@ test('catalog refresh discovers Codex models and Claude aliases with safe cache 
     journal = await fs.readFile(paths().journal);
     const unchanged = await action(env, ['catalog', 'refresh', '--provider', 'all'], missingCommand);
     assert.equal(unchanged.changed, false);
-    assert.equal(unchanged.note, `no models added; codex model cache unreadable: ${missing}`);
+    assert.equal(unchanged.note, `no models added; codex model cache unreadable: ${missing}${defaultsNote}`);
     assert.deepEqual(await fs.readFile(paths().config), before);
     assert.deepEqual(await fs.readFile(paths().journal), journal);
   } finally { await env.cleanup(); }

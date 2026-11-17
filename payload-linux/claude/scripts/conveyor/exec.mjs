@@ -573,34 +573,47 @@ async function catalogCommand(args) {
   const opts = options(rest, allowed);
   required(opts, ['--provider']);
   const provider = opts['--provider'];
-  const config = await loadConfig(), previous = structuredClone(config);
-  const providers = action === 'refresh' && provider === 'all' ? ['codex', 'claude'] : [provider];
-  for (const name of providers) {
-    if (!Object.hasOwn(config.catalog, name)) throw new Error(`unknown provider: ${name}`);
-  }
-  const catalog = config.catalog[provider];
-  let note;
-  if (action === 'refresh' && provider !== 'gemini') {
-    if (!['codex', 'claude', 'all'].includes(provider)) {
-      throw new Error('catalog refresh requires --provider codex|claude|gemini|all');
+  if (action === 'refresh') {
+    if (!['codex', 'claude', 'gemini', 'all'].includes(provider)) {
+      throw new Error(`unknown provider: ${provider}`);
     }
-    const added = [];
-    let problem;
+    const providers = provider === 'all' ? ['codex', 'claude'] : [provider];
+    const candidates = [];
+    const problems = [];
     if (providers.includes('codex')) {
       const cache = process.env.CONVEYOR_CODEX_MODELS_CACHE ??
         path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'models_cache.json');
-      let models;
+      let models = [];
       try {
-        const data = JSON.parse(await fs.readFile(cache, 'utf8'));
-        if (!Array.isArray(data?.models)) throw new Error('models must be an array');
-        models = data.models;
-      } catch {
-        problem = `codex model cache unreadable: ${cache}`;
-        if (provider !== 'all') throw new Error(problem);
+        let command = ['codex', 'debug', 'models'];
+        if (process.env.CONVEYOR_CODEX_MODELS_CMD !== undefined) {
+          try { command = JSON.parse(process.env.CONVEYOR_CODEX_MODELS_CMD); }
+          catch { command = null; }
+          if (!Array.isArray(command) || !command.length || command.some((item) => typeof item !== 'string' || !item)) {
+            throw new Error('CONVEYOR_CODEX_MODELS_CMD must be non-empty JSON argv');
+          }
+        }
+        const parseModels = (json) => {
+          const data = JSON.parse(json);
+          if (!Array.isArray(data?.models)) throw new Error('models must be an array');
+          return data.models;
+        };
+        try {
+          const { stdout } = await execute(command[0], command.slice(1), {
+            encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024
+          });
+          models = parseModels(stdout);
+        } catch {
+          try { models = parseModels(await fs.readFile(cache, 'utf8')); }
+          catch { throw new Error(`codex model cache unreadable: ${cache}`); }
+        }
+      } catch (error) {
+        if (provider !== 'all') throw error;
+        problems.push(error.message);
       }
       // Codex keeps listing older releases (gpt-5.6-*, gpt-6-sol); only the newest version of each family joins the
       // picker, so a refresh brings in gpt-6.2-sol without re-adding every model it replaced.
-      const listed = (models || []).filter((entry) => entry?.visibility === 'list' && typeof entry.slug === 'string' &&
+      const listed = models.filter((entry) => entry?.visibility === 'list' && typeof entry.slug === 'string' &&
         entry.slug && !/-astra$/i.test(entry.slug));
       const release = (slug) => /^gpt-(\d+(?:\.\d+)*)-([a-z]+)$/i.exec(slug);
       const newer = (a, b) => {
@@ -620,63 +633,112 @@ async function catalogCommand(args) {
         if (match && newest.get(match[2].toLowerCase()) !== match[1]) continue;
         const efforts = (Array.isArray(entry.supported_reasoning_levels) ? entry.supported_reasoning_levels : [])
           .map((level) => level?.effort).filter((effort) => ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort));
-        if (!efforts.length || config.catalog.codex.some((model) => model.model === entry.slug)) continue;
-        config.catalog.codex.push({ model: entry.slug, efforts });
-        added.push(`codex/${entry.slug}`);
+        if (efforts.length) candidates.push({ name: 'codex', model: entry.slug, efforts });
       }
     }
     if (providers.includes('claude')) {
-      for (const model of ['opus', 'sonnet', 'haiku', 'fable']) {
-        if (config.catalog.claude.some((entry) => entry.model === model)) continue;
-        config.catalog.claude.push({ model, efforts: ['low', 'medium', 'high'] });
-        added.push(`claude/${model}`);
+      const binaries = new Set();
+      const addBinary = async (file) => {
+        try {
+          const real = await fs.realpath(file);
+          if (!(await fs.stat(real)).isFile()) return false;
+          binaries.add(real);
+          return true;
+        } catch { return false; }
+      };
+      if (process.env.CONVEYOR_CLAUDE_BINS !== undefined) {
+        let files;
+        try { files = JSON.parse(process.env.CONVEYOR_CLAUDE_BINS); }
+        catch { files = []; }
+        if (Array.isArray(files)) {
+          for (const file of files) if (typeof file === 'string' && file) await addBinary(file);
+        }
+      } else {
+        const root = path.join(homedir(), '.config', 'Claude', 'claude-code');
+        for (const version of await fs.readdir(root).catch(() => [])) {
+          const dir = path.join(root, version);
+          for (const hash of await fs.readdir(dir).catch(() => [])) await addBinary(path.join(dir, hash, 'claude'));
+        }
+        for (const dir of process.env.PATH?.split(path.delimiter) ?? []) {
+          if (await addBinary(path.join(dir, 'claude'))) break;
+        }
+      }
+      const aliases = new Set();
+      const pattern = String.raw`description of the task",[A-Za-z0-9_$]+=\[[^]]{1,300}\]`;
+      for (const file of binaries) {
+        let stdout;
+        try {
+          ({ stdout } = await execute('grep', ['-aoE', pattern, file], {
+            encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024
+          }));
+        } catch { continue; }
+        for (const match of stdout.trimEnd().split('\n')) {
+          try {
+            for (const alias of JSON.parse(match.slice(match.indexOf('[')))) {
+              if (typeof alias === 'string' && /^[a-z][a-z0-9-]*$/.test(alias)) aliases.add(alias);
+            }
+          } catch { /* Another bundled copy can still have a valid enum. */ }
+        }
+      }
+      if (!aliases.size) {
+        for (const model of ['opus', 'sonnet', 'haiku', 'fable']) aliases.add(model);
+        problems.push('claude aliases not found in Claude Code, used defaults');
+      }
+      for (const model of aliases) candidates.push({ name: 'claude', model, efforts: ['low', 'medium', 'high'] });
+    }
+    if (provider === 'gemini') {
+      let command = ['/srv/docker/compose/antigravity-parallel/run-agy', 'models'];
+      if (process.env.CONVEYOR_AGY_MODELS_CMD !== undefined) {
+        try { command = JSON.parse(process.env.CONVEYOR_AGY_MODELS_CMD); }
+        catch { throw new Error('CONVEYOR_AGY_MODELS_CMD must be JSON argv'); }
+      }
+      if (!Array.isArray(command) || !command.length || command.some((item) => typeof item !== 'string' || !item)) {
+        throw new Error('CONVEYOR_AGY_MODELS_CMD must be non-empty JSON argv');
+      }
+      const { stdout } = await execute(command[0], command.slice(1), {
+        encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024
+      });
+      for (const line of stdout.split(/\r?\n/)) {
+        const match = /^(gemini-[^\s]+)\t[^\t]+$/.exec(line);
+        if (!match) continue;
+        const model = match[1].replace(/-(low|medium|high)$/, '');
+        candidates.push({ name: 'gemini', model, efforts: ['low', 'medium', 'high'] });
       }
     }
-    note = added.length ? `added ${added.join(', ')}` : 'no models added';
-    if (problem) note += `; ${problem}`;
-    if (!added.length) {
+
+    // Load after discovery so settings saved while a model source was running are included in the update.
+    const config = await loadConfig(), previous = structuredClone(config);
+    const added = [];
+    for (const { name, model, efforts } of candidates) {
+      const catalog = config.catalog[name];
+      if (!Array.isArray(catalog)) throw new Error(`unknown provider: ${name}`);
+      if (catalog.some((entry) => entry.model === model)) continue;
+      catalog.push({ model, efforts });
+      added.push(name === 'gemini' ? model : `${name}/${model}`);
+    }
+    const note = [added.length ? `added ${added.join(', ')}` : 'no models added', ...problems].join('; ');
+    if (!added.length && provider !== 'gemini') {
       process.stdout.write(`${JSON.stringify({ ok: true, changed: false, note })}\n`);
       return 0;
     }
     return saveResult(config, previous, actor, note);
   }
-  if (action === 'refresh') {
-    let command = ['/srv/docker/compose/antigravity-parallel/run-agy', 'models'];
-    if (process.env.CONVEYOR_AGY_MODELS_CMD !== undefined) {
-      try { command = JSON.parse(process.env.CONVEYOR_AGY_MODELS_CMD); }
-      catch { throw new Error('CONVEYOR_AGY_MODELS_CMD must be JSON argv'); }
-    }
-    if (!Array.isArray(command) || !command.length || command.some((item) => typeof item !== 'string' || !item)) {
-      throw new Error('CONVEYOR_AGY_MODELS_CMD must be non-empty JSON argv');
-    }
-    const { stdout } = await execute(command[0], command.slice(1), {
-      encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024
-    });
-    const added = [];
-    for (const line of stdout.split(/\r?\n/)) {
-      const match = /^(gemini-[^\s]+)\t[^\t]+$/.exec(line);
-      if (!match) continue;
-      const model = match[1].replace(/-(low|medium|high)$/, '');
-      if (catalog.some((entry) => entry.model === model)) continue;
-      catalog.push({ model, efforts: ['low', 'medium', 'high'] });
-      added.push(model);
-    }
-    note = added.length ? `added ${added.join(', ')}` : 'no models added';
-  } else {
-    required(opts, action === 'add' ? ['--model', '--efforts'] : ['--model']);
-    const model = opts['--model'];
-    if (action === 'add') catalog.push({ model, efforts: opts['--efforts'].split(',') });
-    else {
-      const inUse = [...Object.values(config.tiers), ...Object.values(config.panels)]
-        .some((chain) => chain.some((entry) => entry.provider === provider && entry.model === model));
-      if (inUse) throw new Error(`model ${provider}/${model} is in use by a tier or panel`);
-      const index = catalog.findIndex((entry) => entry.model === model);
-      if (index < 0) throw new Error(`unknown model: ${provider}/${model}`);
-      catalog.splice(index, 1);
-    }
-    note = `${action} ${provider}/${model}`;
+
+  const config = await loadConfig(), previous = structuredClone(config);
+  if (!Object.hasOwn(config.catalog, provider)) throw new Error(`unknown provider: ${provider}`);
+  const catalog = config.catalog[provider];
+  required(opts, action === 'add' ? ['--model', '--efforts'] : ['--model']);
+  const model = opts['--model'];
+  if (action === 'add') catalog.push({ model, efforts: opts['--efforts'].split(',') });
+  else {
+    const inUse = [...Object.values(config.tiers), ...Object.values(config.panels)]
+      .some((chain) => chain.some((entry) => entry.provider === provider && entry.model === model));
+    if (inUse) throw new Error(`model ${provider}/${model} is in use by a tier or panel`);
+    const index = catalog.findIndex((entry) => entry.model === model);
+    if (index < 0) throw new Error(`unknown model: ${provider}/${model}`);
+    catalog.splice(index, 1);
   }
-  return saveResult(config, previous, actor, note);
+  return saveResult(config, previous, actor, `${action} ${provider}/${model}`);
 }
 
 function statusValues(text) {
