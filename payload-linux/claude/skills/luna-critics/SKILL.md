@@ -6,8 +6,8 @@ description: Persona critics that complement pstack interrogate - clean-context 
 # Luna critics — independent role-play review
 
 **Place in the process (user decision 2026-11-16):** the default review of a change is pstack `interrogate`
-(`<pstack>/skills/interrogate/SKILL.md`) with reviewers from the `review` panel (Codex Sol, Gemini, Codex Luna;
-`exec.mjs run --panel review --seat <n>`), where a finding counts only with the command and output that prove it.
+(`<pstack>/skills/interrogate/SKILL.md`) with reviewers from the `review` panel (as configured in the Luna panel;
+`interrogate.mjs` runs every seat), where a finding counts only with the command and output that prove it.
 Use this skill on top of it for what interrogate does not cover: Рядовой пользователь and Дизайнер on screenshots
 and user flows, Взломщик on auth/money/secrets/sandbox code, Ревизор пробелов after complex-tier implementations,
 domain experts on rules-heavy flows.
@@ -51,7 +51,7 @@ Adding more critics is limited by Claude's synthesis, not by quota. Every findin
 
 | Persona | Hunts for |
 |---|---|
-| **Рядовой пользователь** — non-technical, impatient, first time using it | Confusing user-facing flows: unclear current state, available choice, purpose or processing order; unclear texts/errors, dead ends, "what do I click now", things that break with normal-but-unexpected input |
+| **Рядовой пользователь** — non-technical, impatient, first time using it | Confusing user-facing flows: state, choices, purpose or processing order; text/errors, dead ends, normal-but-unexpected input; hard-to-use actions; controls that obscure content or choices |
 | **Взломщик** — hostile attacker / pentester | Injection, authz/authn gaps, IDOR, secrets in code/logs, unsafe defaults, abuse & DoS vectors, supply chain, trust boundaries |
 | **Дизайнер** — senior product/UX designer | Visual inconsistency, hierarchy, spacing, states (empty/loading/error), accessibility, mobile, dark mode (critique only — fixes are done by Claude) |
 | **Проджект** — PM who owns the outcome | Does it solve the real request? Missing requirements, scope creep, unclear acceptance, rollout/migration for existing users, what to tell stakeholders |

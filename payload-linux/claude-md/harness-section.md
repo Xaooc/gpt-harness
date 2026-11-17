@@ -56,11 +56,16 @@ dispatcher, by **tier**, never by naming a tool:
 node ~/.claude/scripts/conveyor/exec.mjs run --tier <complex|simple|review|scout> (-w|-r) -C <dir> -f <brief.md> -o <out.md>
 ```
 
-| Tier | Chain (first available wins) |
+| Tier | Use |
 | --- | --- |
-| `complex` — any implementation beyond simple: features, non-trivial fixes, refactors, migrations, multi-file, data/API/auth/money/concurrency/security, debugging | Codex Sol 6.1 → Claude Sonnet |
-| `simple` — mechanical edits, scouts, summaries | Gemini (`gem.sh`, full agent, sandboxed) → Codex Luna → Claude Haiku |
-| `review` / `scout` | as configured |
+| `complex` | any implementation beyond simple: features, non-trivial fixes, refactors, migrations, multi-file, data/API/auth/money/concurrency/security, debugging |
+| `simple` | mechanical edits, summaries |
+| `review` / `scout` | critics and second opinions / information gathering |
+
+Which provider, model and effort serve each tier and panel is the owner's choice in the **Luna panel**; the
+session-start digest prints the current setting and `node ~/.claude/scripts/conveyor/exec.mjs status` shows it live.
+Never name a provider yourself: no direct `gem.sh`/`luna.sh` calls for delegated work (a PreToolUse guard blocks
+`gem.sh`; a diagnostic may prefix `CONVEYOR_DIRECT_PROVIDER=1`).
 
 - The chains, models, efforts, panels and pstack roles live in `~/.claude/conveyor/orchestration.json`; the user
   edits them in the **Luna panel** (model and effort per task kind, presets). Do not hand-edit it.
@@ -139,7 +144,7 @@ turn checks and cleanup.
 ### Review: pstack `interrogate` on diverse executors
 
 Review every non-trivial change before calling it done with pstack `interrogate`: its reviewers are the seats of
-the `review` panel (Codex Sol, Gemini, Codex Luna), each in a throwaway worktree, and a finding counts only with
+the `review` panel (as configured in the Luna panel; `interrogate.mjs` runs them), each in a throwaway worktree, and a finding counts only with
 the command and output that prove it. For user-facing work add the `luna-critics` persona briefs that pstack does not
 cover (Рядовой пользователь on screenshots and flows, Дизайнер for visuals), and for Terra/Sol implementations a
 gap reviewer that reads the user's goal and the diff. Claude verifies every finding and reports accepted and

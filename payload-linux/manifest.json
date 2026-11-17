@@ -61,7 +61,7 @@
       "src": "claude/hooks/luna-skill-autoload.mjs",
       "dest": "hooks/luna-skill-autoload.mjs",
       "kind": "file",
-      "sha256": "6e05d0477aec2b1b4c70371bbb7e05804d07b96744b971a26bb9e1cca667e74b",
+      "sha256": "9e9c8deb8b5e93561841b49e6a2e108d1154e8f887ee6f6fcf0eeb3d3f12e0fa",
       "executable": true
     },
     {
@@ -396,13 +396,13 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "f449c9d965818b46bed276cbb0cefb88c214c744bef5d056d79cc65792999629"
+      "sha256": "a39b0b640dd67f81384a2f22ad5f51a93f903b72354921750eb77c9806dff898"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
       "dest": "skills/luna-critics/SKILL.md",
       "kind": "file",
-      "sha256": "03c9f2b4d0af5799051f2e1ee45096ee58b37c3253c7b96f436a266e8440cecd"
+      "sha256": "3bf473cb344bc5ce63a499499ae07e0a86e48f2bc421314d0b2ba9e31d6d2f52"
     },
     {
       "src": "claude/conveyor/harness-facts.json",
@@ -448,7 +448,7 @@
       "src": "claude/hooks/harness-guards.mjs",
       "dest": "hooks/harness-guards.mjs",
       "kind": "file",
-      "sha256": "061b2351d746caf9a749a7d011b65c0d8febb98138781eaeadc196c3ae875382",
+      "sha256": "d1be1bea2155755171b7ead027f36e0f9fb6980756ab77e6feb904b67ac92366",
       "executable": true
     },
     {
@@ -462,7 +462,7 @@
       "src": "claude/local-plugins/pstack/.claude-plugin/plugin.json",
       "dest": "local-plugins/pstack/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "f8e4b2c75fa3b020fdbac6ffc8ac9f7d2113d72cac8ecf833d3b04635d5e1e7a"
+      "sha256": "52e73ca54a58c18895f614797cab767fdd11887c605242a6ac31d85015e1dee8"
     },
     {
       "src": "claude/local-plugins/pstack/LICENSE",
@@ -606,7 +606,7 @@
       "src": "claude/local-plugins/pstack/docs/harness/bro-harness.md",
       "dest": "local-plugins/pstack/docs/harness/bro-harness.md",
       "kind": "file",
-      "sha256": "75f313fd88c9665d7baefcfcdbe55db840784203db663f5769a3e9d812eccb6b"
+      "sha256": "c3e22f9cd7414dc78d0632422795e8c2328f8fba5129b364283a0a6762964f87"
     },
     {
       "src": "claude/local-plugins/pstack/docs/harness/claude-code.md",
@@ -3872,5 +3872,5 @@
   "settings": "settings/hooks.json",
   "claudeMd": "claude-md/harness-section.md",
   "settingsSha256": "5de749c86eb7eb5194693f9684e71a2335e5699bf6f2a67dc60e08e17898e5f5",
-  "claudeMdSha256": "250dc9011a975d5338545cc81b9dfca7f111e2682b699e1dd34a7a2f3fe592c6"
+  "claudeMdSha256": "6d0657046282e444d9ebd663bc49065d76781a86e3be8b979914a1d6a9a0deab"
 }

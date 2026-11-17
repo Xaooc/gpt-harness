@@ -1,6 +1,6 @@
 ---
 name: luna
-description: Executor infrastructure for delegated work - the tier dispatcher (conveyor/exec.mjs) that routes complex implementation to Codex Sol 6.1 (fallback Claude Sonnet) and simple work, scouts and critics to Gemini (gem.sh), then Codex Luna, then Claude Haiku; brief writing, launch hygiene, stall watching, stopping jobs, images. Use for every clear, well-bounded job instead of doing it inline - implementing features, fixes, refactors, tests, migrations, scripts, AND information gathering (codebase exploration, reading logs/docs, summarising, research). The process around it (playbooks, principles, review) is pstack poteto-mode. NOT for visual/UI/UX design work - Opus always does design itself. Executors CAN generate raster images.
+description: Executor infrastructure for delegated work - the tier dispatcher (conveyor/exec.mjs) that routes each tier and panel to the providers the owner set in the Luna panel; brief writing, launch hygiene, stall watching, stopping jobs, images. Use for every clear, well-bounded job instead of doing it inline - implementing features, fixes, refactors, tests, migrations, scripts, AND information gathering (codebase exploration, reading logs/docs, summarising, research). The process around it (playbooks, principles, review) is pstack poteto-mode. NOT for visual/UI/UX design work - Opus always does design itself. Executors CAN generate raster images.
 ---
 
 # Luna: executor infrastructure
@@ -22,8 +22,8 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
 
 | Tier | Chain (first available wins) | When |
 |---|---|---|
-| `complex` | Codex `gpt-6.1-sol` max → Claude Sonnet | Every implementation beyond simple: features (even single-module), non-trivial bug fixes, refactors, migrations, multi-file changes, new logic or architecture, data/API/auth/money/concurrency/security, debugging and root-cause work, fix rounds that need judgement, anything a simple executor failed at once. When in doubt, complex. |
-| `simple` | Gemini (`gem.sh`, full agent in a sandbox) → Codex `gpt-6-luna` → Claude Haiku | Simple, mechanical work with no decisions: renames, reformatting, boilerplate, trivial one-file edits, copying an existing pattern exactly, fix rounds made of precise one-line findings. |
+| `complex` | as configured (Luna panel) | Every implementation beyond simple: features (even single-module), non-trivial bug fixes, refactors, migrations, multi-file changes, new logic or architecture, data/API/auth/money/concurrency/security, debugging and root-cause work, fix rounds that need judgement, anything a simple executor failed at once. When in doubt, complex. |
+| `simple` | as configured (Luna panel) | Simple, mechanical work with no decisions: renames, reformatting, boilerplate, trivial one-file edits, copying an existing pattern exactly, fix rounds made of precise one-line findings. |
 | `scout` / `review` | as configured | Information gathering, summaries, critics. |
 
 - The config is `~/.claude/conveyor/orchestration.json` (tiers, models, efforts, panels, pstack roles, presets);
@@ -51,8 +51,9 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   for UI changes: `ledger.mjs evidence <L> --artifact <screenshot>`; calibration and user gate waivers apply.
 - **Executor gate:** every write job is followed by `check.mjs` fast+turn on the job's own changes (profile
   `.claude/conveyor.json`, autodetected when absent); failures go back to the same executor as fix rounds.
-- **Direct wrappers** remain for special cases: `luna.sh` (Codex; `-m gpt-6.1-sol -e max` for complex work) and
-  `gem.sh` (Gemini; same flags; exit 3 = provider unavailable). Prefer the dispatcher.
+- **Providers are the owner's choice**: the dispatcher picks them from the Luna panel's chains and panels
+  (`exec.mjs status` shows the live setting). Never call `gem.sh` or `luna.sh` yourself for delegated work; a
+  PreToolUse guard blocks `gem.sh` (diagnostic only: prefix `CONVEYOR_DIRECT_PROVIDER=1`).
 - **Don't use `gpt-6-astra`** (user decision, 2026-09-30). Never the fast tier unless the user asks.
 - **Best-of-2 for the riskiest pieces**: pstack `arena` with the `design` panel (one seat per worktree).
 - **Reviews**: pstack `interrogate` on the `review` panel seats; persona critics from `luna-critics` for UI work.
@@ -348,11 +349,10 @@ each with evidence and the expected behaviour, plus the invariants to preserve.
 
 ## Fallback (never stall)
 
-The dispatcher already falls back along each chain (Gemini → Luna → Haiku, Sol → Sonnet). If a whole chain is
+The dispatcher already falls back along each chain as configured in the Luna panel. If a whole chain is
 unavailable (`exec.mjs` exit 5) or an executor times out repeatedly, do the work inline, tell the user in one line
 which providers were down and why, and go back to the dispatcher once they recover. Readiness checks:
-`node ~/.claude/scripts/conveyor/exec.mjs status`, `bash ~/.claude/scripts/luna.sh -e low "Reply with exactly: OK"`,
-`bash ~/.claude/scripts/gem.sh -e low "Reply with exactly: OK"`.
+`node ~/.claude/scripts/conveyor/exec.mjs status` (live chains and why a provider is skipped).
 
 <!-- learning:protected:begin -->
 ## Self-improvement loop (automatic, all projects)

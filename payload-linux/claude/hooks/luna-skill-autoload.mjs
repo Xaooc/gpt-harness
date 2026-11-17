@@ -29,9 +29,10 @@ const PSTACK_MISSING_HEADER =
 
 const EXECUTORS_PART = `Executors (load the \`luna\` skill before the first delegation):
 - Delegate by tier through \`node ~/.claude/scripts/conveyor/exec.mjs run --tier <complex|simple|review|scout>
-  (-w|-r) -C <dir> -f <brief.md> -o <out.md>\`. complex: Codex Sol 6.1 -> Claude Sonnet; simple: Gemini ->
-  Codex Luna -> Claude Haiku. Chains, models and efforts live in ~/.claude/conveyor/orchestration.json and are
-  edited in the Luna panel. Exit 4: spawn a Claude subagent with the model in <out>.dispatch.json.
+  (-w|-r) -C <dir> -f <brief.md> -o <out.md>\` (panels: \`--panel <name> --seat <n>\`). Never call a provider wrapper
+  (gem.sh, luna.sh) for delegated work: the owner picks providers in the Luna panel. Current setting:
+{{CHAINS}}
+  Exit 4: spawn a Claude subagent with the model in <out>.dispatch.json.
 - Briefs are exhaustive (executors are literal; ripples, edge cases, decisions, invariants, non-goals, intent,
   exact checks); review what the brief did NOT say.
 - After every launch: \`luna-status.sh <out>\`, then arm \`luna-watch.sh -i 600 <out>\` with the Monitor tool; stop jobs
@@ -168,11 +169,28 @@ export function resolvePstack(home = os.homedir()) {
   return null;
 }
 
-export function buildDigest(pstackRoot) {
-  if (pstackRoot) {
-    return DIGEST_TEMPLATE.replaceAll("{{PSTACK}}", pstackRoot);
+// The chains and panels are read live from orchestration.json, so the digest never names a provider the owner has
+// taken out of the flow (a hard-coded "simple: Gemini -> …" line once made sessions call gem.sh directly).
+export function liveChains(home = os.homedir()) {
+  try {
+    const conveyor = process.env.CONVEYOR_HOME || path.join(home, ".claude", "conveyor");
+    const config = JSON.parse(fs.readFileSync(path.join(conveyor, "orchestration.json"), "utf8"));
+    const entry = (e) => `${e.provider}/${e.model} ${e.effort}`;
+    const lines = Object.entries(config.tiers || {}).map(([tier, chain]) => `  - ${tier}: ${chain.map(entry).join(" -> ")}`);
+    const panels = Object.entries(config.panels || {}).map(([name, seats]) => `${name} = ${seats.map(entry).join(", ")}`);
+    if (panels.length) lines.push(`  - panels (all seats at once): ${panels.join("; ")}`);
+    return lines.length ? lines.join("\n") : "  - see `node ~/.claude/scripts/conveyor/exec.mjs status`";
+  } catch {
+    return "  - see `node ~/.claude/scripts/conveyor/exec.mjs status`";
   }
-  return `<EXTREMELY_IMPORTANT>\n${PSTACK_MISSING_HEADER}\n${EXECUTORS_PART}\n</EXTREMELY_IMPORTANT>`;
+}
+
+export function buildDigest(pstackRoot, home = os.homedir()) {
+  const executors = EXECUTORS_PART.replace("{{CHAINS}}", liveChains(home));
+  if (pstackRoot) {
+    return DIGEST_TEMPLATE.replace(EXECUTORS_PART, executors).replaceAll("{{PSTACK}}", pstackRoot);
+  }
+  return `<EXTREMELY_IMPORTANT>\n${PSTACK_MISSING_HEADER}\n${executors}\n</EXTREMELY_IMPORTANT>`;
 }
 
 export function runHook(home = os.homedir()) {

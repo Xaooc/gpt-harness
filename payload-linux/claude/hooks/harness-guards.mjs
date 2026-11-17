@@ -14,6 +14,12 @@ const WRAPPER_MESSAGE = "Shared wrapper: write <file>.next, test it, then swap a
 const WORKTREE_MESSAGE = "Prefer node ~/.claude/scripts/disk/wt-new.mjs … (owner/purpose/until, " +
   "shared node_modules) for worktrees that outlive one command.";
 const SHARED_WRAPPERS = ["luna.sh", "luna-daemon.mjs", "luna-pool.mjs", "luna-panel.sh"];
+// Providers are chosen by the dispatcher from the Luna panel's chains and panels, never by naming a wrapper:
+// a session calling gem.sh directly ran Gemini after the owner had taken it out of the flow (2026-11-17).
+const DIRECT_PROVIDERS = new Set(["gem.sh", "gem-run.mjs"]);
+const PROVIDER_MESSAGE = "Providers are chosen by the dispatcher from the Luna panel: run node ~/.claude/scripts/conveyor/" +
+  "exec.mjs run --tier <tier> (or --panel <panel> --seat <n>) instead of gem.sh. For a one-off diagnostic only, " +
+  "prefix the command with CONVEYOR_DIRECT_PROVIDER=1.";
 const SHELL_PREFIXES = new Set("if then else elif fi do done while until ! { } ( ) time".split(" "));
 const RUN_VALUE_OPTIONS = new Set([
   "--project", "--directory", "-C", "--python", "-p", "--with", "-w", "--with-editable",
@@ -243,6 +249,10 @@ function inspectCommand(command, cwd, home, isShared) {
       if (!options.some((arg) => /^(--version|--help|-h)$/.test(arg))) return { block: PYTEST_MESSAGE };
     }
     if (writesShared(name, args, cwd, home, isShared)) return { block: WRAPPER_MESSAGE };
+    const launched = /^(bash|sh|dash|zsh|node)$/.test(name) ? commandName(args.find((arg) => !arg.startsWith("-"))) : name;
+    if (DIRECT_PROVIDERS.has(launched) && !segment.words.includes("CONVEYOR_DIRECT_PROVIDER=1")) {
+      return { block: PROVIDER_MESSAGE };
+    }
     if (/^(bash|sh|dash|zsh)$/.test(name)) {
       const index = args.findIndex((arg) => /^-[a-z]*c[a-z]*$/.test(arg));
       if (index >= 0 && typeof args[index + 1] === "string") {

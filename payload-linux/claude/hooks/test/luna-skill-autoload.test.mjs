@@ -50,7 +50,7 @@ test("two cached versions 0.15.42-bro.1 and 0.15.42-bro.2: newest chosen and pop
     const expected = path.resolve(v2Dir);
     assert.equal(resolved, expected);
 
-    const digest = buildDigest(resolved);
+    const digest = buildDigest(resolved, tempHome);
     assert.equal(digest.includes("{{PSTACK}}"), false);
     const occurrences = digest.split(resolved).length - 1;
     assert.equal(occurrences, 4);
@@ -88,7 +88,7 @@ test("no cache, local-plugins copy present: resolves local-plugins path", () => 
     const expected = path.resolve(localDir);
     assert.equal(resolved, expected);
 
-    const digest = buildDigest(resolved);
+    const digest = buildDigest(resolved, tempHome);
     assert.equal(digest.includes("{{PSTACK}}"), false);
     const occurrences = digest.split(resolved).length - 1;
     assert.equal(occurrences, 4);
@@ -111,7 +111,7 @@ test("nothing: resolves null, digest contains pstack is not installed and Execut
     const resolved = resolvePstack(tempHome);
     assert.equal(resolved, null);
 
-    const digest = buildDigest(resolved);
+    const digest = buildDigest(resolved, tempHome);
     assert.equal(digest.includes("pstack is not installed"), true);
     assert.equal(digest.includes("Executors"), true);
     assert.equal(digest.includes("{{PSTACK}}"), false);

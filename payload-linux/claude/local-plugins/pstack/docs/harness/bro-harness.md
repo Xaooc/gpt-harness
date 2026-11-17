@@ -55,8 +55,8 @@ user in one line.
 
 You own every delegate's work: review the diff and the result yourself; never pass a report through.
 
-Brief size by tier: the `simple` tier starts on Gemini, which explores widely when a brief is open-ended (observed
-2026-11-16: 12–15 min and ~3.4 M tokens for a 60-line change). For `simple` and `scout` briefs, name the exact files
+Brief size by tier: cheap executors explore widely when a brief is open-ended (observed 2026-11-16: 12–15 min and
+~3.4 M tokens for a 60-line change). For `simple` and `scout` briefs, name the exact files
 to read and to change, the commands to run, and say "read nothing else unless a listed file imports it".
 
 ## Roles → tiers
@@ -75,9 +75,9 @@ in the Luna panel, not by hand. Defaults:
 | `interrogate reviewers` | `interrogate.mjs` (see below), panel `review` | `-w`, one throwaway worktree per seat |
 | `arena cross-judge pool` | panel `judge`: the first seat whose vendor differs from the orchestrator's (Anthropic) | `-r` |
 
-Panels keep vendors diverse (OpenAI Codex, Google Gemini, Anthropic Claude). Agreement across vendors is
-high-signal; a seat whose provider is unavailable is skipped and reported, never silently replaced by another seat
-of the same vendor.
+Panels hold the seats the owner set in the Luna panel (the session-start digest lists them); never add or swap a
+provider yourself. Agreement across seats is high-signal; a seat whose provider is unavailable is skipped and
+reported, never silently replaced.
 
 **Interrogate:** run `node ~/.claude/scripts/conveyor/interrogate.mjs --repo <dir> --intent <file> --out <dir>`
 (optional `--base <ref>` and `--panel <name>`). Verify each finding
