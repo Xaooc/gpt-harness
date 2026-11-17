@@ -316,7 +316,10 @@ list above.
 3. **Exact scope**: files to create/touch, files not to touch, what is out of scope.
 4. **Quality bar** (mandatory; this is what saves a rework round):
    - Style observed in neighbouring files: max line length (default ≤120–140), one statement per line, how tests are grouped (`describe`/`it` blocks), naming.
-   - **The exact list of tests that must exist** (cases, not "add tests").
+   - **Tests: none by default** — the change is proven by the Acceptance commands and one real run. Name a test only
+     for what could lose work or data, break production, or touch money/security: the exact cases (≤ 3, extending an
+     existing test or one parametrized test where possible), then "No other tests". The gate allows 5 new test cases
+     per job; a real need gets a line `Test budget: N` in the brief.
    - **Invariants that must not change** (golden counts/tolerances, public API names/signatures, behaviour of X), and "report instead of loosening".
    - Known pitfalls you already spotted (e.g. "column is named minutes but holds hours").
 5. **Acceptance**: checkable bullets plus the **exact** commands to run (typecheck/lint + only the targeted tests). Add: "Run only these commands. No full test suites, benchmarks, memory/scale reports, or dev servers unless listed."

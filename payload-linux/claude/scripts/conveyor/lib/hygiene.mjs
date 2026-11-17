@@ -50,6 +50,65 @@ export async function readText(repo, file) {
   return value.includes(0) ? null : value.toString('utf8');
 }
 
+async function baseFiles(repo, base) {
+  return new Set((await git(repo, ['ls-tree', '-r', '--name-only', '-z', base])).split('\0'));
+}
+
+async function baseText(repo, base, file) {
+  const value = await git(repo, ['show', `${base}:${file}`]);
+  return value.includes('\0') ? null : value;
+}
+
+export function testFile(file) {
+  return /(^|\/)(tests?|__tests__)\//.test(file) || /(^|\/)(test[._-]|.*(?:_test|\.test|\.spec)\.)/.test(file);
+}
+
+function testPattern(file) {
+  const name = path.basename(file), extension = path.extname(name);
+  if (extension === '.py' && name !== 'conftest.py' &&
+      (name.startsWith('test_') || name.endsWith('_test.py') || /(^|\/)tests?\//.test(file))) {
+    return /^[ \t]*(async[ \t]+)?def[ \t]+test\w*[ \t]*\(/gm;
+  }
+  if (/^\.(js|jsx|ts|tsx|mjs|cjs|mts|cts)$/.test(extension) &&
+      (/\.(test|spec)\./.test(name) || /(^|\/)__tests__\//.test(file))) {
+    return /^[ \t]*(it|test)(\.(each|only|skip|concurrent|todo)[^(]*)?[ \t]*\(/gm;
+  }
+  if (name.endsWith('_test.go')) return /^func[ \t]+Test\w*[ \t]*\(/gm;
+  if (extension === '.rs') return /#\[(tokio::)?test\]/gm;
+  return null;
+}
+
+/** The declaration line of every test case in a test file (trimmed), in order; [] for other files. */
+export function testLines(file, text) {
+  const pattern = testFile(file) && testPattern(file);
+  if (!pattern || !text) return [];
+  const lines = text.split('\n');
+  return [...text.matchAll(pattern)].map((match) => lines[text.slice(0, match.index).split('\n').length - 1].trim());
+}
+
+/** Test declaration lines of a file at a git revision ([] when the file is absent there). */
+export async function baseTestLines(repo, base, file) {
+  try { return testLines(file, await baseText(repo, base, file)); }
+  catch { return []; }
+}
+
+export async function testChanges(repo, names, existing, base, budget) {
+  const files = [];
+  let added = 0;
+  const current = new Set(existing);
+  let tracked;
+  for (const file of [...new Set(names.map((name) => path.normalize(name)))].sort()) {
+    const pattern = testFile(file) && testPattern(file);
+    if (!pattern) continue;
+    tracked ??= await baseFiles(repo, base);
+    const before = tracked.has(file) ? (await baseText(repo, base, file))?.match(pattern)?.length ?? 0 : 0;
+    const after = current.has(file) ? (await readText(repo, file))?.match(pattern)?.length ?? 0 : 0;
+    if (before !== after) files.push({ file, before, after });
+    added += after - before;
+  }
+  return { budget, added, ok: added <= budget, files };
+}
+
 function applies(counter, file) {
   return matchesGlob(file, counter.glob) && (!counter.exclude || !matchesGlob(file, counter.exclude));
 }
@@ -65,16 +124,12 @@ function count(counter, content) {
 export async function ratchet(repo, files, counters, base) {
   const grew = [];
   if (!files.length || !counters.length) return { ok: true, grew };
-  const tracked = new Set((await git(repo, ['ls-tree', '-r', '--name-only', '-z', base])).split('\0'));
+  const tracked = await baseFiles(repo, base);
   for (const file of files) {
     const matching = counters.filter((counter) => applies(counter, file));
     if (!matching.length) continue;
     const afterText = await readText(repo, file);
-    let beforeText = '';
-    if (tracked.has(file)) {
-      beforeText = await git(repo, ['show', `${base}:${file}`]);
-      if (beforeText.includes('\0')) beforeText = null;
-    }
+    const beforeText = tracked.has(file) ? await baseText(repo, base, file) : '';
     for (const counter of matching) {
       const before = count(counter, beforeText), after = count(counter, afterText);
       if (after > before && (counter.maxLines === undefined || after > counter.maxLines)) {

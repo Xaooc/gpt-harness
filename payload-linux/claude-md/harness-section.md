@@ -232,6 +232,11 @@ to 3 slots (`Bash` hooks; `HEAVY_GATE_MAX`):
   write tests only for what could destroy work, lose data, break prod, or touch money/security —
   usually 1–3 test files per change. Everything else is checked by one real run (report, smoke,
   screenshot). Executor briefs list the exact few tests and say "No other tests".
+  **Enforced since 2026-11-17** (the prose alone was ignored: 6,139 tests added to rpg in 30 days): the executor
+  and subagent gates reject a change that adds more than 5 new test cases net (`budgets.new_tests` in the project
+  profile; a brief may raise it for one job with a line `Test budget: N`, which Claude writes only for lost-work,
+  data, production, money or security risks). The fix round then trims the job's own new tests. Executors run
+  only the tests the brief names plus affected tests, never the full suite.
 - **Writing tests:** a new test must be cheap by design.
   - Share heavy setup (session or module fixtures, prebuilt snapshots, hardlinks instead of copying
     big data).

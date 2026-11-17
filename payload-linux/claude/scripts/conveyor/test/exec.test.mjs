@@ -4,7 +4,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import test from 'node:test';
@@ -1126,6 +1126,75 @@ test('fix rounds reject edits or deletions of existing tests and allow new tests
       else assert.match(output, /## Gate: fail \(fix round modified tests: source.test.js\)/);
       assert.equal((await readLines(gate.calls)).length, 2);
       assert.equal((await readLines(gate.checks)).length, added ? 4 : 2);
+    } finally { await env.cleanup(); }
+  }
+});
+
+test('the test budget permits trimming job tests, honors a brief override and protects unrelated tests', { timeout }, async () => {
+  const realPath = process.env.PATH;
+  for (const { override, deleteOld, shrinkOld, code, rounds, added } of [
+    { code: 0, rounds: 1, added: 4 },
+    { override: 10, code: 0, rounds: 0, added: 7 },
+    { deleteOld: true, code: 6, rounds: 1, added: 7 },
+    // The job also extends existing.test.js; its trim may drop the job's cases there, never the old one.
+    { shrinkOld: true, code: 6, rounds: 1, added: 5 }
+  ]) {
+    const env = await environment();
+    try {
+      await env.setup();
+      const git = (...args) => execFileSync('git', [
+        '-c', 'user.name=Conveyor test', '-c', 'user.email=conveyor@example.invalid',
+        '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args
+      ], { cwd: env.dir, env: { ...process.env, PATH: realPath, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }, timeout });
+      await fs.writeFile(path.join(env.dir, 'existing.test.js'), "test('existing', () => {});\n");
+      git('init', '--quiet');
+      git('add', 'existing.test.js');
+      git('commit', '--quiet', '-m', 'fixture');
+      if (override !== undefined) await fs.appendFile(env.brief, `\nTest budget: ${override}\n`);
+
+      const wrapper = path.join(env.root, 'budget-wrapper.sh');
+      await fs.writeFile(wrapper, `#!/bin/bash
+set -eu
+while getopts 'wrm:e:C:f:o:' opt; do
+  case "$opt" in C) dir=$OPTARG;; o) out=$OPTARG;; esac
+done
+if [[ "$out" == *.gate-*.out.md ]]; then
+  rm -- "$dir/trim.test.js"
+  if [ "$FAKE_DELETE_OLD_TEST" = 1 ]; then rm -- "$dir/existing.test.js"; fi
+  if [ "$FAKE_SHRINK_OLD_TEST" = 1 ]; then printf "test('%s', () => {});\\n" eight nine > "$dir/existing.test.js"; fi
+else
+  printf "test('%s', () => {});\\n" one two three four > "$dir/new.test.js"
+  printf "test('%s', () => {});\\n" five six seven > "$dir/trim.test.js"
+  if [ "$FAKE_SHRINK_OLD_TEST" = 1 ]; then printf "test('%s', () => {});\\n" eight nine >> "$dir/existing.test.js"; fi
+fi
+exec ${shellQuote(fixture)} "$@"
+`, { mode: 0o755 });
+      const run = await env.run('complex', '-w', {
+        PATH: realPath, CONVEYOR_LUNA_SH: wrapper, CONVEYOR_GEM_SH: wrapper, CONVEYOR_CHECK_CMD: undefined,
+        FAKE_DELETE_OLD_TEST: deleteOld ? '1' : '0', FAKE_SHRINK_OLD_TEST: shrinkOld ? '1' : '0'
+      });
+      assert.equal(run.status, code, run.stderr || await fs.readFile(env.out, 'utf8'));
+      const { gate } = await readJson(`${env.out}.dispatch.json`);
+      assert.equal(gate.rounds, rounds);
+      assert.equal(gate.status, deleteOld || shrinkOld ? 'fail' : 'pass');
+      if (shrinkOld) {
+        assert.deepEqual(gate.touched, ['existing.test.js']);
+        assert.match(await fs.readFile(env.out, 'utf8'), /deleted tests that existed before the job: existing\.test\.js/);
+        continue;
+      }
+      assert.equal(gate.last.tests.budget, override ?? 5);
+      assert.equal(gate.last.tests.added, added);
+      assert.equal(gate.last.tests.ok, !deleteOld);
+      if (rounds) {
+        const fixBrief = await fs.readFile(`${env.out}.gate-1.brief.md`, 'utf8');
+        assert.match(fixBrief, /added 7 new test cases, budget 5 — FAIL/);
+        assert.match(fixBrief, /new\.test\.js: 0 → 4[\s\S]*trim\.test\.js: 0 → 3/);
+        assert.match(fixBrief, /Keep only tests that protect against lost work, lost data, broken production, money or security/);
+        assert.match(fixBrief, /Do not delete tests that existed before this job\. Do not touch production code for this\./);
+        assert.doesNotMatch(fixBrief, /Do not weaken, skip or delete checks/);
+        await assert.rejects(fs.stat(path.join(env.dir, 'trim.test.js')), { code: 'ENOENT' });
+      }
+      if (deleteOld) assert.deepEqual(gate.touched, ['existing.test.js']);
     } finally { await env.cleanup(); }
   }
 });

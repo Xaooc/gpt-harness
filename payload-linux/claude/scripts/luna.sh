@@ -345,8 +345,13 @@ of RAM)."
       echo "- Match the style of neighbouring files (line length, formatting, naming). Never leave lines \
 longer than ~140 characters."
       echo "- Never loosen tests, tolerances or acceptance criteria to make them pass; report the conflict instead."
-      echo "- Tests may take minutes and the sandbox allows local sockets: run the project's tests yourself. Give \
-every test or build command a tool timeout of at least 300 seconds and do not call a slow test hung before that."
+      echo "- Tests: add only the test cases the brief lists (none when it lists none). Prefer extending an existing \
+test or one parametrized test over new tests and new files. The project gate rejects a job that adds more new test \
+cases than its budget (5 unless the brief says 'Test budget: N')."
+      echo "- Run only the tests the brief names and the tests of the files you changed (the project's affected-tests \
+command when it has one), never the whole suite unless the brief asks for it: the orchestrator runs full suites. \
+Tests may take minutes and the sandbox allows local sockets. Give every test or build command a tool timeout of at \
+least 300 seconds and do not call a slow test hung before that."
       echo "- Where the brief is silent and you must decide, pick the most conservative option consistent with \
 neighbouring code and list each such decision under ## Deviations as 'Assumption: ...'."
       echo "- Before finishing, search the repo (rg) for other usages of anything whose name, signature or \

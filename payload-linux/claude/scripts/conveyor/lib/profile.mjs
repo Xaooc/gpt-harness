@@ -93,9 +93,11 @@ function defaults(profile) {
   if (profile.version !== 1) throw new Error('profile.version must be 1');
   const budgets = { fast_s: 20, turn_s: 300 };
   if (profile.budgets !== undefined) {
-    keys(profile.budgets, Object.keys(budgets), 'budgets');
+    keys(profile.budgets, [...Object.keys(budgets), 'new_tests'], 'budgets');
     for (const [key, value] of Object.entries(profile.budgets)) {
-      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value * 1000 > 2 ** 31 - 1) {
+      if (key === 'new_tests') {
+        if (!Number.isInteger(value) || value < 0 || value > 100) throw new Error('budgets.new_tests must be an integer from 0 to 100');
+      } else if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value * 1000 > 2 ** 31 - 1) {
         throw new Error(`budgets.${key} must be positive and fit a process timer`);
       }
       budgets[key] = value;

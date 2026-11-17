@@ -7,7 +7,9 @@ import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { autodetect, loadProfile, matchesGlob, trustProfile } from './lib/profile.mjs';
-import { git, existingFiles, repositoryFiles, ratchet, hygieneReport, defaultBaseline, writeProfileBaseline } from './lib/hygiene.mjs';
+import {
+  git, existingFiles, repositoryFiles, ratchet, hygieneReport, defaultBaseline, writeProfileBaseline, testChanges
+} from './lib/hygiene.mjs';
 
 function options(args, allowed) {
   const result = Object.create(null);
@@ -90,6 +92,13 @@ async function relatedTests(repo, changed) {
 async function run(repo, opts, profile) {
   const level = opts['--level'];
   if (!['fast', 'turn'].includes(level)) throw new Error('--level must be fast or turn');
+  const rawBudget = level === 'turn' ? opts['--test-budget'] : undefined;
+  let budget;
+  if (rawBudget === 'profile') budget = profile.budgets.new_tests ?? 5;
+  else if (rawBudget !== undefined) {
+    if (!/^\d+$/.test(rawBudget) || Number(rawBudget) > 100) throw new Error('--test-budget must be profile or an integer from 0 to 100');
+    budget = Number(rawBudget);
+  }
   const base = opts['--base'] ?? 'HEAD';
   const revision = (await git(repo, ['rev-parse', '--verify', '--end-of-options', `${base}^{commit}`])).trim();
   let names;
@@ -135,9 +144,11 @@ async function run(repo, opts, profile) {
   const hygieneFiles = changed.filter((file) => file !== path.normalize(profile.hygiene.baseline));
   const hygiene = { ...await ratchet(repo, hygieneFiles, profile.hygiene.counters, revision),
     ...(baseline ? { source: baseline.source, baselineFile: baseline.baselineFile } : {}) };
-  const ok = hygiene.ok && results.every((result) => ['pass', 'skipped'].includes(result.status));
+  const tests = budget === undefined ? undefined : await testChanges(repo, names, changed, revision, budget);
+  const ok = hygiene.ok && (tests?.ok ?? true) && results.every((result) => ['pass', 'skipped'].includes(result.status));
   const trust = profile.profileTrust;
   return { ok, level, repo, base, changed, results, hygiene, profileTrust: trust,
+    ...(tests ? { tests } : {}),
     ...(trust === 'untrusted' ? { profile: 'untrusted (run check.mjs trust after review)' } : {}) };
 }
 
@@ -157,6 +168,10 @@ function print(result, json) {
     process.stdout.write(`hygiene: ${result.hygiene.ok ? 'pass' : 'fail'}\n`);
     for (const growth of result.hygiene.grew) {
       process.stdout.write(`  ${growth.file}: ${growth.counter} ${growth.before} -> ${growth.after}\n`);
+    }
+    if (result.tests) {
+      const { budget, added, ok } = result.tests;
+      process.stdout.write(`test budget: added ${added} new test cases, budget ${budget} — ${ok ? 'ok' : 'FAIL'}\n`);
     }
   } else {
     process.stdout.write(`hygiene: ${result.repo}\n`);
@@ -194,7 +209,7 @@ export async function main(args = process.argv.slice(2)) {
     throw new Error('usage: check.mjs run | hygiene | trust | init --dir <repo> [--json]');
   }
   const allowed = { '--dir': true, '--json': false };
-  if (action === 'run') Object.assign(allowed, { '--level': true, '--files': true, '--base': true });
+  if (action === 'run') Object.assign(allowed, { '--level': true, '--files': true, '--base': true, '--test-budget': true });
   else if (action === 'hygiene') allowed['--write-baseline'] = false;
   else if (action === 'init') allowed['--write'] = false;
   const opts = options(rest, allowed);

@@ -12,6 +12,7 @@ import {
   loadConfig, saveConfig, updateConfig, providerState, resolveChain, resolvePanel, markUnavailable,
   recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
 } from './lib/orchestration.mjs';
+import { testFile, testLines, baseTestLines } from './lib/hygiene.mjs';
 
 // Matches luna.sh's retryable_model_error deny pattern, including usage, auth and invalid-model failures.
 const quotaError = new RegExp([
@@ -23,6 +24,9 @@ const execute = promisify(execFile);
 const gitOptions = { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 };
 export const gateInstruction = 'Fix the root cause in the code. Do not weaken, skip or delete checks, ' +
   'tests, lint rules or hygiene counters. Do not revert the requested change.';
+const testBudgetInstruction = 'Keep only tests that protect against lost work, lost data, broken production, money or security. ' +
+  'Merge cases into one parametrized test or extend an existing test, and delete the rest of the tests you added. ' +
+  'Do not delete tests that existed before this job. Do not touch production code for this.';
 
 async function git(repo, args) {
   const { stdout } = await execute('git', ['-C', repo, ...args], gitOptions);
@@ -173,6 +177,11 @@ export function failedCheck(result) {
   return (typeof result.rc === 'number' && result.rc !== 0) || /^(fail|failed|error|timeout)$/.test(result.status);
 }
 
+function budgetOnlyFailure(last) {
+  return !last.ok && last.tests?.ok === false && last.hygiene.ok &&
+    last.results.every((result) => ['pass', 'skipped'].includes(result.status) && !failedCheck(result));
+}
+
 export function gateDetails(last, failuresOnly = false) {
   const lines = [];
   for (const result of last.results || []) {
@@ -183,10 +192,19 @@ export function gateDetails(last, failuresOnly = false) {
   for (const item of last.hygiene?.grew || []) {
     lines.push(`- hygiene: ${item.file} ${item.counter}: ${item.before} → ${item.after}`);
   }
+  if (last.tests && (!failuresOnly || !last.tests.ok)) {
+    const { added, budget, ok, files } = last.tests;
+    lines.push(`- test budget: added ${added} new test cases, budget ${budget} — ${ok ? 'ok' : 'FAIL'}`);
+    if (!ok) {
+      for (const { file, before, after } of files) lines.push(`  ${file}: ${before} → ${after}`);
+      const prefix = budgetOnlyFailure(last) ? '' : 'When the test budget is the only failure, follow this rule. ';
+      lines.push(`\n${prefix}${testBudgetInstruction}`);
+    }
+  }
   return lines.join('\n') || (last.ok ? 'No checks selected.' : 'Checks failed; no failure details were returned.');
 }
 
-export async function runGateChecks(repo, base, files) {
+export async function runGateChecks(repo, base, files, { testBudget = 'profile' } = {}) {
   const last = { ok: true, repo, base, changed: files, results: [], hygiene: { ok: true, grew: [] } };
   if (!files.length) return last;
   let command;
@@ -205,6 +223,7 @@ export async function runGateChecks(repo, base, files) {
   for (const level of ['fast', 'turn']) {
     const args = [...command.slice(1), 'run', '--dir', repo, '--level', level, '--base', base,
       '--files', files.join(','), '--json'];
+    if (level === 'turn') args.push('--test-budget', String(testBudget));
     let stdout, stderr = '', code = 0;
     try {
       ({ stdout, stderr } = await execute(command[0], args, {
@@ -223,7 +242,8 @@ export async function runGateChecks(repo, base, files) {
     if (typeof report.ok !== 'boolean' || !Array.isArray(report.results) || typeof report.hygiene?.ok !== 'boolean') {
       throw new Error('check returned invalid JSON report');
     }
-    last.ok &&= code === 0 && report.ok && report.hygiene.ok && !report.results.some(failedCheck);
+    if (level === 'turn' && report.tests) last.tests = report.tests;
+    last.ok &&= code === 0 && report.ok && report.hygiene.ok && (last.tests?.ok ?? true) && !report.results.some(failedCheck);
     last.results.push(...report.results);
     last.hygiene.ok &&= report.hygiene.ok;
     for (const item of report.hygiene.grew || []) {
@@ -237,10 +257,6 @@ function checkConfiguration(file) {
   const name = path.posix.basename(file);
   return /^(\.eslintrc.*|eslint\.config\..*|tsconfig.*\.json|vitest\.config\..*|jest\.config\..*|pytest\.ini)$/.test(name) ||
     /(^|\/)(\.claude\/conveyor\.json|\.conveyor\/hygiene-baseline\.json)$/.test(file);
-}
-
-function testFile(file) {
-  return /(^|\/)(tests?|__tests__)\//.test(file) || /(^|\/)(test[._-]|.*(?:_test|\.test|\.spec)\.)/.test(file);
 }
 
 function pythonCheckSections(text) {
@@ -268,8 +284,9 @@ export async function protectedFiles(repo) {
   return snapshot;
 }
 
-export function modifiedTests(before, after) {
-  return [...before.keys()].filter((file) => testFile(file) && before.get(file) !== after.get(file)).sort();
+export function modifiedTests(before, after, includeAdded = false) {
+  const files = includeAdded ? new Set([...before.keys(), ...after.keys()]) : before.keys();
+  return [...files].filter((file) => testFile(file) && before.get(file) !== after.get(file)).sort();
 }
 
 async function prepareGate(dir, brief, out, tier, skip) {
@@ -278,6 +295,8 @@ async function prepareGate(dir, brief, out, tier, skip) {
   catch (error) { gate.mode = 'block'; gate.configError = error.message; }
   if (gate.base && gate.mode !== 'off') gate.preExisting = await workingFiles(gate.repo);
   gate.brief = await fs.readFile(brief, 'utf8');
+  const budget = Number(gate.brief.match(/^Test budget:\s*(\d{1,3})\s*$/mi)?.[1]);
+  if (budget <= 100) gate.testBudget = budget;
   await appendRunRecord({
     at: new Date().toISOString(), session: process.env.CLAUDE_CODE_SESSION_ID || 'unknown',
     repo: gate.repo, base: gate.base, out, tier, mode: gate.mode
@@ -314,31 +333,43 @@ async function finishGate(gate, dispatch, entry, dir, out) {
     const raw = process.env.CONVEYOR_GATE_ROUNDS ?? '2';
     if (!/^[0-2]$/.test(raw)) return await configError('CONVEYOR_GATE_ROUNDS must be 0, 1 or 2');
     const limit = Number(raw);
+    const checkOptions = { testBudget: gate.testBudget };
     let files = await gateChangedFiles(gate.repo, gate.base, gate.preExisting);
     if (!files.length) return 0;
     await append('\n## Gate\n');
-    last = await runGateChecks(gate.repo, gate.base, files);
+    last = await runGateChecks(gate.repo, gate.base, files, checkOptions);
     while (true) {
       if (last.configError) return await configError(last.configError);
       await append(`Round ${rounds}: ${last.ok ? 'pass' : 'fail'}\n\n${gateDetails(last)}`);
       if (last.ok || gate.mode === 'warn' || rounds === limit) break;
+      const budgetOnly = budgetOnlyFailure(last);
+      const oldTests = new Map();
+      if (budgetOnly) {
+        for (const file of files.filter(testFile)) {
+          const current = testLines(file, await fs.readFile(path.join(gate.repo, file), 'utf8').catch(() => ''));
+          const kept = (await baseTestLines(gate.repo, gate.base, file)).filter((line) => current.includes(line));
+          if (kept.length) oldTests.set(file, kept);
+        }
+      }
       const before = await protectedFiles(gate.repo);
       rounds++;
       const brief = `${out}.gate-${rounds}.brief.md`, fixOut = `${out}.gate-${rounds}.out.md`;
       await fs.writeFile(brief, gate.brief + '\n\n## The work above is done but failed the project\'s checks\n\n' +
-        `${gateDetails(last, true)}\n\n${gateInstruction}\n`);
+        `${gateDetails(last, true)}\n${budgetOnly ? '' : `\n${gateInstruction}\n`}`);
       const result = await launch(entry, ['-w', '-m', entry.model, '-e', entry.effort,
         '-C', dir, '-f', brief, '-o', fixOut], dir);
       const after = await protectedFiles(gate.repo);
-      const tests = modifiedTests(before, after);
-      if (tests.length) {
-        dispatch.gate = { status: 'fail', rounds, last, touched: tests };
-        await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round modified tests: ${tests.join(', ')})`);
+      const tests = modifiedTests(before, after, budgetOnly);
+      const forbiddenTests = budgetOnly ? tests.filter((file) => !files.includes(file)) : tests;
+      if (forbiddenTests.length) {
+        dispatch.gate = { status: 'fail', rounds, last, touched: forbiddenTests };
+        await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round modified tests: ${forbiddenTests.join(', ')})`);
         return 6;
       }
       const touched = [...new Set([...before.keys(), ...after.keys()])].filter((file) =>
         before.get(file) !== after.get(file) && (checkConfiguration(file) ||
-          path.posix.basename(file) === 'pyproject.toml' || (before.has(file) && !after.has(file)))).sort();
+          path.posix.basename(file) === 'pyproject.toml' ||
+          (before.has(file) && !after.has(file) && !(budgetOnly && testFile(file))))).sort();
       if (touched.length) {
         dispatch.gate = { status: 'fail', rounds, last, touched };
         await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round touched check configuration: ${touched.join(', ')})`);
@@ -350,7 +381,30 @@ async function finishGate(gate, dispatch, entry, dir, out) {
         return 6;
       }
       files = await gateChangedFiles(gate.repo, gate.base, gate.preExisting);
-      last = await runGateChecks(gate.repo, gate.base, files);
+      const previousTests = last.tests;
+      last = await runGateChecks(gate.repo, gate.base, files, checkOptions);
+      if (last.configError) return await configError(last.configError);
+      if (budgetOnly) {
+        if (!files.length) last.tests = { budget: previousTests.budget, added: 0, ok: true, files: [] };
+        if (!last.tests || last.tests.added >= previousTests.added) {
+          dispatch.gate = { status: 'fail', rounds, last, touched: tests };
+          await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round did not reduce the number of new tests)`);
+          return 6;
+        }
+        // A trim may remove only what the job added: every test that existed before the job and was still there
+        // when the round started must still be declared afterwards.
+        const shrunk = [];
+        for (const [file, kept] of oldTests) {
+          const now = testLines(file, await fs.readFile(path.join(gate.repo, file), 'utf8').catch(() => ''));
+          if (kept.some((line) => !now.includes(line))) shrunk.push(file);
+        }
+        if (shrunk.length) {
+          dispatch.gate = { status: 'fail', rounds, last, touched: shrunk };
+          await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round deleted tests that existed before the job: ` +
+            `${shrunk.join(', ')})`);
+          return 6;
+        }
+      }
     }
     const status = last.ok ? 'pass' : gate.mode === 'warn' ? 'warn' : 'fail';
     dispatch.gate = { status, rounds, last };

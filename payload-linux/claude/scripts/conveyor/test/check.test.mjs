@@ -271,6 +271,42 @@ test('runner skips entries with no matching changed files and excludes deleted f
   assert.equal(report.ok, true);
 });
 
+test('turn test budget counts net additions across changed, new and deleted files', { timeout }, async (t) => {
+  const python = (start, count) => Array.from({ length: count }, (_, index) => `def test_${start + index}():\n    pass\n`).join('');
+  const env = await environment(t, { ...profile(), budgets: { new_tests: 10 } }, {
+    'tests/test_existing.py': python(1, 2),
+    'source.spec.ts': "it('exists', () => {});\n"
+  });
+  await env.write('tests/test_existing.py', python(1, 6));
+  await env.write('tests/test_new.py', python(1, 3));
+  await fs.rm(path.join(env.repo, 'source.spec.ts'));
+
+  const turn = ['run', '--level', 'turn'];
+  const pass = await env.command([...turn, '--test-budget', '6']);
+  assert.equal(pass.status, 0, pass.stderr);
+  assert.equal(pass.report.ok, true);
+  const fail = await env.command([...turn, '--test-budget', '5']);
+  assert.equal(fail.status, 1, fail.stderr);
+  assert.equal(fail.report.ok, false);
+  assert.deepEqual(fail.report.tests, {
+    budget: 5, added: 6, ok: false, files: [
+      { file: 'source.spec.ts', before: 1, after: 0 },
+      { file: 'tests/test_existing.py', before: 2, after: 6 },
+      { file: 'tests/test_new.py', before: 0, after: 3 }
+    ]
+  });
+  const configured = await env.command([...turn, '--test-budget', 'profile']);
+  assert.equal(configured.status, 0, configured.stderr);
+  assert.equal(configured.report.ok, true);
+  assert.deepEqual(configured.report.tests, { ...fail.report.tests, budget: 10, ok: true });
+  for (const args of [turn, ['run', '--level', 'fast', '--test-budget', '0']]) {
+    const unchecked = await env.command(args);
+    assert.equal(unchecked.status, 0, unchecked.stderr);
+    assert.equal(unchecked.report.ok, true);
+    assert.equal(Object.hasOwn(unchecked.report, 'tests'), false);
+  }
+});
+
 test('runner returns exit 1 and the last 60 ANSI-free output lines on failure', { timeout }, async (t) => {
   const run = command(String.raw`
     for (let index = 0; index < 65; index++) console.log('\x1b[31mline ' + index + '\x1b[0m');
