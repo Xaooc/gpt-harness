@@ -1080,6 +1080,9 @@ test("exported human predicate and text getter match extraction", () => {
     { isSidechain: true }, { isMeta: true }, { origin: { kind: "sdk" } },
     { message: { content: [{ type: "tool_result", content: "нет" }] } },
   ]) assert.equal(isGenuineHumanEntry(human("нет", extra)), false);
+  // Claude Code marks the compaction summary turnOrigin "human"; it is not the user's words (2026-11-17 ledger bug).
+  const summary = human("This session is being continued from a previous conversation.", { isCompactSummary: true, turnOrigin: "human" });
+  assert.equal(isGenuineHumanEntry(summary), false);
 });
 
 test("provenance verifies genuine corrections and rejects tampered evidence", async () => {

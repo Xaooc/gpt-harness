@@ -170,7 +170,7 @@ export function isGenuineHumanEntry(entry) {
   if (!entry || typeof entry !== "object") return false;
   const content = entry.message?.content ?? entry.content;
   const text = entryText(entry);
-  if (entry.type !== "user" || entry.isSidechain || entry.isMeta) return false;
+  if (entry.type !== "user" || entry.isSidechain || entry.isMeta || entry.isCompactSummary) return false;
   if (typeof content !== "string" && !Array.isArray(content)) return false;
   if (Array.isArray(content) && content.some((block) => block?.type === "tool_result")) return false;
   if (entry.origin?.kind === "human" || entry.turnOrigin === "human") return true;
