@@ -373,7 +373,8 @@ async function refreshCatalogOnce($: EngineInterface, quiet: boolean): Promise<v
   catalogCheckedAt = now
   const h = await home($)
   const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/exec.mjs`, 'catalog', 'refresh', '--provider', 'all',
-    '--actor', 'panel'], 30_000)
+    // 120 s: room for exec.mjs's own limits (Codex 15 s, then the cache; 15 s per Claude Code binary scanned).
+    '--actor', 'panel'], 120_000)
   const added = r.ok && /^added /.test(r.note)
     ? r.note.replace(/^added /, '').replace(/;.*$/, '').split(/,\s*/).map(x => { const [p, m] = x.split('/'); return m ? modelName(p, m) : x }).join(', ')
     : ''

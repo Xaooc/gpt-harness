@@ -9,7 +9,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
-  loadConfig, saveConfig, providerState, resolveChain, resolvePanel, markUnavailable,
+  loadConfig, saveConfig, updateConfig, providerState, resolveChain, resolvePanel, markUnavailable,
   recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
 } from './lib/orchestration.mjs';
 
@@ -599,8 +599,9 @@ async function catalogCommand(args) {
           return data.models;
         };
         try {
+          // 15 s: a stalled Codex still leaves the cache fallback and the Claude scan inside the panel's deadline.
           const { stdout } = await execute(command[0], command.slice(1), {
-            encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024
+            encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024
           });
           models = parseModels(stdout);
         } catch {
@@ -669,7 +670,7 @@ async function catalogCommand(args) {
         let stdout;
         try {
           ({ stdout } = await execute('grep', ['-aoE', pattern, file], {
-            encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024
+            encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024
           }));
         } catch { continue; }
         for (const match of stdout.trimEnd().split('\n')) {
@@ -706,22 +707,23 @@ async function catalogCommand(args) {
       }
     }
 
-    // Load after discovery so settings saved while a model source was running are included in the update.
-    const config = await loadConfig(), previous = structuredClone(config);
-    const added = [];
-    for (const { name, model, efforts } of candidates) {
-      const catalog = config.catalog[name];
-      if (!Array.isArray(catalog)) throw new Error(`unknown provider: ${name}`);
-      if (catalog.some((entry) => entry.model === model)) continue;
-      catalog.push({ model, efforts });
-      added.push(name === 'gemini' ? model : `${name}/${model}`);
-    }
-    const note = [added.length ? `added ${added.join(', ')}` : 'no models added', ...problems].join('; ');
-    if (!added.length && provider !== 'gemini') {
-      process.stdout.write(`${JSON.stringify({ ok: true, changed: false, note })}\n`);
-      return 0;
-    }
-    return saveResult(config, previous, actor, note);
+    // Discovery is done; the config is read, extended and written under one lock, so a setting another process
+    // saved meanwhile is kept, never replaced by an older copy.
+    let note;
+    const saved = await updateConfig((config) => {
+      const added = [];
+      for (const { name, model, efforts } of candidates) {
+        const catalog = config.catalog[name];
+        if (!Array.isArray(catalog)) throw new Error(`unknown provider: ${name}`);
+        if (catalog.some((entry) => entry.model === model)) continue;
+        catalog.push({ model, efforts });
+        added.push(name === 'gemini' ? model : `${name}/${model}`);
+      }
+      note = [added.length ? `added ${added.join(', ')}` : 'no models added', ...problems].join('; ');
+      return added.length ? note : null;
+    }, { actor });
+    process.stdout.write(`${JSON.stringify({ ok: true, changed: saved !== null, note })}\n`);
+    return 0;
   }
 
   const config = await loadConfig(), previous = structuredClone(config);

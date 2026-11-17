@@ -1,4 +1,6 @@
 import * as fs from 'node:fs/promises';
+import fsDefault from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -1161,4 +1163,55 @@ test('warn mode reports failures without repair and non-git jobs skip the gate',
     assert.equal((await readJson(`${env.out}.dispatch.json`)).gate.status, 'skipped');
     assert.match(await fs.readFile(env.out, 'utf8'), /skipped: not a git repository/);
   } finally { await env.cleanup(); }
+});
+
+test('catalog refresh keeps a settings save that lands between its read and its write', { timeout }, async () => {
+  // Reviewer repro (2026-11-17): the panel's hourly refresh used to write back an older copy of the config.
+  const root = await fs.mkdtemp(path.join(tmpdir(), 'catalog-race-'));
+  const saved = { home: process.env.CONVEYOR_HOME, claude: process.env.CLAUDE_HOME_DIR,
+    cmd: process.env.CONVEYOR_CODEX_MODELS_CMD, bins: process.env.CONVEYOR_CLAUDE_BINS };
+  const { rename, open } = fsDefault;
+  try {
+    process.env.CONVEYOR_HOME = path.join(root, 'home');
+    process.env.CLAUDE_HOME_DIR = path.join(root, 'claude');
+    process.env.CONVEYOR_CLAUDE_BINS = '[]';
+    process.env.CONVEYOR_CODEX_MODELS_CMD = JSON.stringify([process.execPath, '-e',
+      "console.log(JSON.stringify({models:[{slug:'gpt-9-sol',visibility:'list',supported_reasoning_levels:[{effort:'high'}]}]}))"]);
+    const config = await loadConfig();
+    await saveConfig(config, { actor: 'cli', note: 'initial' });
+    let writerReady, allowWriter;
+    const ready = new Promise((resolve) => { writerReady = resolve; });
+    const allowed = new Promise((resolve) => { allowWriter = resolve; });
+    // The settings save pauses just before its atomic rename, holding the config lock.
+    fsDefault.rename = async (source, destination) => {
+      if (destination === paths().config) { writerReady(); await allowed; }
+      return rename(source, destination);
+    };
+    syncBuiltinESMExports();
+    config.tiers.complex[0].effort = 'low';
+    const writer = saveConfig(config, { actor: 'panel', note: 'owner sets low' });
+    await ready;
+    // The refresh reaches the lock while the save is still in flight.
+    fsDefault.open = async (file, ...args) => {
+      if (file === `${paths().config}.lock`) { allowWriter(); await writer; }
+      return open(file, ...args);
+    };
+    syncBuiltinESMExports();
+    const stdout = process.stdout.write;
+    process.stdout.write = () => true;
+    try { await execMain(['catalog', 'refresh', '--provider', 'codex', '--actor', 'panel']); }
+    finally { process.stdout.write = stdout; }
+    const after = await loadConfig();
+    assert.equal(after.tiers.complex[0].effort, 'low');
+    assert.ok(after.catalog.codex.some((entry) => entry.model === 'gpt-9-sol'));
+  } finally {
+    fsDefault.rename = rename;
+    fsDefault.open = open;
+    syncBuiltinESMExports();
+    for (const [key, value] of [['CONVEYOR_HOME', saved.home], ['CLAUDE_HOME_DIR', saved.claude],
+      ['CONVEYOR_CODEX_MODELS_CMD', saved.cmd], ['CONVEYOR_CLAUDE_BINS', saved.bins]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

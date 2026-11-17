@@ -273,6 +273,18 @@ export async function saveConfig(config, options = {}) {
   return withLock(paths().config, () => saveUnlocked(copy, options));
 }
 
+/** Loads, changes and saves the config under one lock, so a save made by another process in between is never
+ *  overwritten with an older copy. `change` mutates the config and returns a note, or null to write nothing. */
+export async function updateConfig(change, { actor = 'cli' } = {}) {
+  return withLock(paths().config, async () => {
+    const config = await loadConfig();
+    const note = await change(config);
+    if (note === null) return null;
+    await saveUnlocked(config, { actor, note });
+    return note;
+  });
+}
+
 export async function applyPreset(name, { actor = 'cli', note = `preset ${name}` } = {}) {
   return withLock(paths().config, async () => {
     const config = await loadConfig();
