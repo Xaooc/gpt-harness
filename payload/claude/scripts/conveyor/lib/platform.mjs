@@ -43,8 +43,11 @@ export function killTree(child, signal, { groupOnly = false } = {}) {
     const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
       stdio: 'ignore', windowsHide: true, timeout: 5000
     });
-    if (result.error) throw result.error;
-    if (result.status !== 0 && processAlive(pid)) throw new Error(`taskkill failed for pid ${pid} (exit ${result.status})`);
+    // A failed taskkill is reported to stderr, never thrown: callers are cleaning up after a timeout and must still
+    // write their result.
+    if (result.error || (result.status !== 0 && processAlive(pid))) {
+      process.stderr.write(`taskkill failed for pid ${pid}: ${result.error?.message ?? `exit ${result.status}`}\n`);
+    }
     return;
   }
   try { process.kill(-pid, signal); }

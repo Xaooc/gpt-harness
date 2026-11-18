@@ -144,7 +144,7 @@ async function run(repo, opts, profile) {
   const hygiene = { ...await ratchet(repo, hygieneFiles, profile.hygiene.counters, revision),
     ...(baseline ? { source: baseline.source, baselineFile: baseline.baselineFile } : {}) };
   const exclude = profile.budgets.new_tests_exclude ?? [];
-  const counted = names.filter((name) => !exclude.some((glob) => matchesGlob(name, glob)));
+  const counted = names.filter((name) => !exclude.some((glob) => matchesGlob(path.posix.normalize(name.replaceAll('\\', '/')), glob)));
   const tests = budget === undefined ? undefined : await testChanges(repo, counted, changed, revision, budget);
   const ok = hygiene.ok && (tests?.ok ?? true) && results.every((result) => ['pass', 'skipped'].includes(result.status));
   const trust = profile.profileTrust;

@@ -23,6 +23,9 @@ const windowsFiles = payloadFiles(path.join(windows, 'claude'));
 const shared = new Set(linuxFiles.map(file => `claude/${file}`).filter(src => !excepted(src)));
 const local = windowsFiles.filter(file => excepted(`claude/${file}`));
 const stale = windowsFiles.map(file => `claude/${file}`).filter(src => !excepted(src) && !shared.has(src));
+// Outside claude/ only the manifest, the generated instructions and listed exceptions may exist.
+const allowedOutside = new Set(['manifest.json', 'claude-md/harness-section.md']);
+const outside = payloadFiles(windows).filter(src => !src.startsWith('claude/') && !allowedOutside.has(src) && !excepted(src));
 
 const linuxManifest = buildManifest(JSON.parse(readLinux('manifest.json')), linuxFiles, readLinux);
 const current = readWindows('manifest.json');
@@ -48,6 +51,8 @@ const changes = [...expected].filter(([src, bytes]) => {
   const installed = readWindows(src);
   return !installed || !bytes.equals(installed);
 });
+for (const src of outside) console.error(`Unlisted file outside claude/ (add it to tools/windows-exceptions.json or remove it): payload/${src}`);
+if (outside.length) process.exitCode = 1;
 if (check) {
   for (const [src] of changes) console.error(`Stale or missing: payload/${src}`);
   for (const src of stale) console.error(`Extra generated file: payload/${src}`);

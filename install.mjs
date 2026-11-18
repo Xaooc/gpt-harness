@@ -265,7 +265,7 @@ function preflight(ctx) {
           model = routing.tiers?.complex?.find(entry => entry.provider === 'codex')?.model ?? model;
         } catch { /* keep the default name */ }
         const models = runCommand(codex, ['debug', 'models'], { env: homeEnvironment(ctx) });
-        const available = models.status === 0 && new RegExp(`\\b${model.replace(/[.]/g, '\\.')}\\b`).test(commandOutput(models));
+        const available = models.status === 0 && new RegExp(`(?<![\\w.-])${model.replace(/[.]/g, '\\.')}(?![\\w.-])`).test(commandOutput(models));
         report(ctx, available ? 'ok' : 'warn', available ? `Codex model available: ${model}`
           : `codex debug models did not list ${model}`);
       }
@@ -362,7 +362,8 @@ function preserveExternalSettings(file, before, kind) {
 
 function configureExternals(ctx) {
   const entries = readJson(path.join(REPO_ROOT, 'external.json')).filter(entry => entry.platforms.includes(ctx.platform));
-  const execute = ctx.ownerSetup && !ctx.dryRun && !ctx.check;
+  // --owner-setup is explicit consent and wins over --check (the documented install is `--check --owner-setup`).
+  const execute = ctx.ownerSetup && !ctx.dryRun;
   const env = { ...homeEnvironment(ctx), CLAUDE_CONFIG_DIR: ctx.claudeHome };
   delete env.CLAUDE_PLUGIN_DATA;
   const failures = [];

@@ -24,8 +24,11 @@ export function refuseCredentialFiles(root) {
   for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
     const file = path.join(root, entry.name);
     if (entry.isDirectory()) refuseCredentialFiles(file);
-    else if (/\.local\.md$|^credentials/i.test(entry.name)) {
+    else if (/\.local\.md$|credential|^\.env(\.|$)|^auth\.json$|\.pem$|^id_(rsa|ed25519|ecdsa)/i.test(entry.name)) {
       throw new Error(`Refusing to sync a payload containing a local credential file: ${file}`);
+    } else if (entry.name === 'orchestration.json' && path.basename(root) === 'conveyor') {
+      // The owner's live routing is user data; only orchestration.default.json ships.
+      throw new Error(`Refusing to sync a payload containing the live routing config: ${file}`);
     }
   }
 }

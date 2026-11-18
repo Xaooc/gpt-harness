@@ -480,14 +480,15 @@ if (probe.keys) {
           const before = snapshot(ch);
           assert.equal(run('--owner-setup', '--dry-run'), 0);
           assert.deepEqual(snapshot(ch), before);
-          for (const args of [[], ['--owner-setup', '--check']]) assert.equal(run(...args), 0);
+          assert.equal(run(), 0);
           assert.deepEqual(calls(), []);
           for (const argv of expected) {
             const command = argv.map(arg => arg.includes(' ') ? `'${arg}'` : arg).join(' ');
-            assert.equal(messages.filter(message => message.startsWith('[pending]') && message.endsWith(command)).length, 3);
+            assert.equal(messages.filter(message => message.startsWith('[pending]') && message.endsWith(command)).length, 2);
           }
           assert.ok(!messages.some(message => message.startsWith(`[pending] ${alreadyInstalled}:`)));
-          assert.equal(run('--owner-setup'), 0);
+          // The documented install `--check --owner-setup` runs the setup (review fix: --check used to suppress it).
+          assert.equal(run('--owner-setup', '--check'), 0);
           assert.deepEqual(calls(), expected);
           assert.equal(run('--owner-setup'), 0);
           assert.deepEqual(calls(), expected);
