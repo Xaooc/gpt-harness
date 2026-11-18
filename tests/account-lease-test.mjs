@@ -379,7 +379,8 @@ async function request(info, route, body) {
 }
 
 test('exclusive probes document the active-session gate procedure and report requirements', () => {
-  for (const file of ['payload-linux/claude/skills/luna/SKILL.md', 'payload-linux/claude-md/harness-section.md']) {
+  // Since 2026-11-16 the executor infrastructure details live in the luna skill; CLAUDE.md points there.
+  for (const file of ['payload-linux/claude/skills/luna/SKILL.md']) {
     const text = fs.readFileSync(path.join(root, file), 'utf8');
     // Wrapped prose: compare on single spaces so a line break inside a sentence does not matter.
     const section = text.slice(text.indexOf('**Codex account lease (Linux):')).split(/\n\n|\n- \*\*/)[0].replace(/\s+/g, ' ');
