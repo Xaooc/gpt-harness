@@ -370,7 +370,9 @@ function thresholdState(config, usage, previous) {
     return { switched, skip: false, reason: `codex limits unknown${usage.stale ? ' (stale)' : ''}` };
   }
   const high = readings.find((reading) => reading.percent !== null && reading.percent >= threshold);
-  const recovered = readings.every((reading) => reading.percent !== null && reading.percent < threshold - hysteresis);
+  // A window the provider does not report (null) cannot hold the switch: recovery needs every
+  // reported window below the mark, and at least one window is reported (checked above).
+  const recovered = readings.every((reading) => reading.percent === null || reading.percent < threshold - hysteresis);
   const skip = Boolean(high) || (switched && !recovered);
   if (!skip) return { switched: false, skip: false, reason: 'available' };
   const limiting = high || readings.find((reading) =>

@@ -3812,7 +3812,7 @@
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
       "dest": "scripts/conveyor/lib/orchestration.mjs",
       "kind": "file",
-      "sha256": "d4a31a3786ff2e9a219477c0baa4f0cde6f6849cb61eb2bcbf9c9144976e104e"
+      "sha256": "3a764de9c1555ce73094689baf8099d65959f8763d606697b5bb6ce702ebdc0f"
     },
     {
       "src": "claude/scripts/conveyor/lib/patch-recipes.mjs",
