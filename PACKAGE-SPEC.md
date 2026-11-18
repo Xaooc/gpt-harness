@@ -6,13 +6,14 @@ skills, the Luna daemon & wrappers, heavy-command gate, broker reaper, the Luna 
 (code + config, NO personal data), the patched Codex plugin, and the custom Codex build with busybox shell.
 The Windows owner's personal rules are shipped as-is. Linux carries the server rules with host-specific details removed.
 
-On Linux, the installer uses the server-derived `payload-linux/`, stock Codex 0.164.0 and an unpatched plugin.
-Linux prerequisites are Node 22+, bash, curl, python3 and `npm i -g @openai/codex@0.164.0`; GSD is recommended.
-No custom Codex build, busybox or tray widget is required. Set `LUNA_PROXY_ENV_FILE` for an optional proxy environment
-file; it defaults to `~/.config/luna-proxy.env` and falls back to `~/.config/bro-env.sh` if the default is absent.
-Linux disk-audit carries the server defaults (`~/dev/kriminalist`, `~/rpg`); override them in `~/.claude/disk-audit.json`.
-Linux also packages the conveyor tier dispatcher, project checks, ledger and prompt/subagent/Stop gates,
-harness hygiene, usage accounting, Gemini quota reporting, and the vendored pstack plugin in `luna-local`.
+On Linux the installer uses `payload-linux/`, the single source of every shared file, with the stock Codex CLI
+(verified version in `install.mjs`, currently 0.169.0) and an unpatched Codex plugin. On Windows it uses `payload/`,
+generated from `payload-linux/` by `tools/sync-windows.mjs`; only the paths in `tools/windows-exceptions.json` are
+Windows-specific (busybox shell, custom Codex 0.164.0 build and plugin patches, native process handling, Windows
+instructions preamble, Windows settings fragment). Both platforms get the same process (pstack), conveyor (tier
+dispatcher with approach review, checks with the test budget, ledger, gates, interrogate), skills and CLAUDE.md
+process sections. Third-party tools are not vendored except the design skills (`skills/THIRD-PARTY.md`); `external.json`
+lists the rest with install argv and installed-state probes, and `install.mjs --owner-setup` runs the missing ones.
 
 ## Layout (repo root = C:/dev/luna-harness)
 ```
@@ -20,6 +21,10 @@ README.md, INSTALL.md                 docs (written by the orchestrator, not by 
 PACKAGE-SPEC.md                       this file
 install.mjs                           installer (slice S2)
 tools/manifest-sync.mjs               deterministic Linux manifest sync and --check
+tools/sync-windows.mjs                generates payload/ from payload-linux/ and its manifest; --check
+tools/windows-exceptions.json         Windows-only paths with a reason each
+external.json                         third-party tools: argv, probes, platforms, required
+docs/specs/                           design history
 tests/verify-temp-home.mjs            installs into a temp home and runs --check (slice S2)
 payload/manifest.json                 file list (slice S1)
 payload/claude/...                    mirrors ~/.claude (slice S1)
@@ -50,14 +55,14 @@ codex-build/                          custom Codex build kit (slice S3)
   `<CLAUDE_HOME>/luna-harness/codex-plugin-patches/` so session repair works without the checkout.
 - Linux uses the same schema without `pluginPatches`. Its `settingsSha256` and `claudeMdSha256` cover the two
   non-installed source files, and `executable: true` marks scripts that need executable permissions on Linux.
-  Linux includes the snapshot's listed tests, pytest gate and disk/changeset tooling; GSD hooks and runtime data
-  are excluded. `conveyor/orchestration.json`, when packaged, is `config-if-absent`; `conveyor/harness-facts.json`
-  is a managed `file`.
+  Both payloads include the harness's own tests (conveyor, hooks, learning, the panel) so they can run from an
+  installed home; GSD files, runtime data and any `*.local.md`/`credentials*` file are refused. The shipped routing is
+  `conveyor/orchestration.default.json` (a managed `file`); the user's `conveyor/orchestration.json` is never packaged
+  or overwritten. `conveyor/harness-facts.json` is a managed `file`.
 
 `node tools/manifest-sync.mjs` refreshes all existing source hashes, removes missing sources and appends unlisted
 files under `payload-linux/claude/` sorted by path, preserving existing entry order. New `.sh` files and files with
-a first-line shebang are executable. New entries exclude `test/`, `tests/`, `*.test.*`, `__pycache__/`,
-`node_modules/`, `*.bak*` and `.DS_Store`; already listed test files stay and get fresh hashes. The vendored
+a first-line shebang are executable. New entries exclude `__pycache__/`, `node_modules/`, `*.bak*`, `.DS_Store`, `*.local.md` and `credentials*`; the harness's own tests are included; already listed files get fresh hashes. The vendored
 `local-plugins/pstack/` tree is included in full, including its tests. The tool also hashes raw settings and CLAUDE.md source bytes into
 `settingsSha256` and `claudeMdSha256`. `--check` lists pending changes without writing and exits 1 if any are needed.
 

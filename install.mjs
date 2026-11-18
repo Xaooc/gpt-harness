@@ -252,15 +252,22 @@ function preflight(ctx) {
     }
     ctx.bash = found.bash;
     const codex = findExecutable('codex');
-    if (!codex) report(ctx, 'warn', 'codex not found on PATH; install @openai/codex@0.164.0');
+    // The stock Linux CLI version the harness was last verified with (the panel reads it as the expected version).
+    if (!codex) report(ctx, 'warn', 'codex not found on PATH; install @openai/codex@0.169.0');
     else {
       report(ctx, 'ok', `codex: ${codex}`);
       if (ctx.dryRun) report(ctx, 'warn', 'Codex model check skipped during dry-run to avoid CLI writes');
       else {
+        // Check the model the shipped routing uses first for complex work, so the check follows the config.
+        let model = 'gpt-6.2-sol';
+        try {
+          const routing = readJson(path.join(ctx.payload, 'claude', 'conveyor', 'orchestration.default.json'));
+          model = routing.tiers?.complex?.find(entry => entry.provider === 'codex')?.model ?? model;
+        } catch { /* keep the default name */ }
         const models = runCommand(codex, ['debug', 'models'], { env: homeEnvironment(ctx) });
-        const available = models.status === 0 && /\bgpt-6\.1-terra\b/.test(commandOutput(models));
-        report(ctx, available ? 'ok' : 'warn', available ? 'Codex model available: gpt-6.1-terra'
-          : 'codex debug models did not list gpt-6.1-terra');
+        const available = models.status === 0 && new RegExp(`\\b${model.replace(/[.]/g, '\\.')}\\b`).test(commandOutput(models));
+        report(ctx, available ? 'ok' : 'warn', available ? `Codex model available: ${model}`
+          : `codex debug models did not list ${model}`);
       }
     }
     if (required.some(name => !found[name])) throw new Error('Missing required Linux PATH executables');
@@ -276,7 +283,7 @@ function preflight(ctx) {
   const expected = codex.status === 0 && /\b0\.164\.0\b/.test(version);
   report(ctx, expected ? 'ok' : 'warn', codex.status === 0
     ? `Codex: ${version}${expected ? '' : ' (expected 0.164.0 for the custom build and plugin patches)'}`
-    : 'codex --version failed; install Codex 0.164.0');
+    : 'codex --version failed; install Codex 0.164.0 (npm package @openai/codex, version 0.164.0)');
   const powershell = findExecutable('pwsh') ?? findExecutable('powershell');
   report(ctx, powershell ? 'ok' : 'warn', powershell ? `PowerShell: ${powershell}` : 'PowerShell not found');
 }

@@ -2,137 +2,326 @@
   {
     "id": "luna-local",
     "kind": "marketplace",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "marketplace", "add", "{{CLAUDE_HOME}}/local-plugins"],
-    "probe": [{"path": ".claude/plugins/known_marketplaces.json", "keys": ["luna-local"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "marketplace",
+      "add",
+      "{{CLAUDE_HOME}}/local-plugins"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/known_marketplaces.json",
+        "keys": [
+          "luna-local"
+        ]
+      }
+    ],
     "purpose": "Register the harness's vendored plugin marketplace with Claude Code.",
     "required": true
   },
   {
     "id": "luna-panel@luna-local",
     "kind": "plugin",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "install", "luna-panel@luna-local"],
-    "probe": [{"path": ".claude/plugins/installed_plugins.json", "keys": ["plugins", "luna-panel@luna-local"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "install",
+      "luna-panel@luna-local"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/installed_plugins.json",
+        "keys": [
+          "plugins",
+          "luna-panel@luna-local"
+        ]
+      }
+    ],
     "purpose": "Install the harness's Luna panel.",
     "required": true
   },
   {
     "id": "pstack@luna-local",
     "kind": "plugin",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "install", "pstack@luna-local"],
-    "probe": [{"path": ".claude/plugins/installed_plugins.json", "keys": ["plugins", "pstack@luna-local"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "install",
+      "pstack@luna-local"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/installed_plugins.json",
+        "keys": [
+          "plugins",
+          "pstack@luna-local"
+        ]
+      }
+    ],
     "purpose": "Install the harness's vendored process stack.",
     "required": true
   },
   {
     "id": "openai-codex",
     "kind": "marketplace",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "marketplace", "add", "https://github.com/openai/codex-plugin-cc.git"],
-    "probe": [{"path": ".claude/plugins/known_marketplaces.json", "keys": ["openai-codex"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "marketplace",
+      "add",
+      "https://github.com/openai/codex-plugin-cc.git"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/known_marketplaces.json",
+        "keys": [
+          "openai-codex"
+        ]
+      }
+    ],
     "purpose": "Register the marketplace for the harness's Codex plugin.",
     "required": true
   },
   {
     "id": "codex@openai-codex",
     "kind": "plugin",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "install", "codex@openai-codex"],
-    "probe": [{"path": ".claude/plugins/installed_plugins.json", "keys": ["plugins", "codex@openai-codex"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "install",
+      "codex@openai-codex"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/installed_plugins.json",
+        "keys": [
+          "plugins",
+          "codex@openai-codex"
+        ]
+      }
+    ],
     "purpose": "Install the Codex plugin that owns the harness review gate.",
     "required": true
   },
   {
     "id": "claude-plugins-official",
     "kind": "marketplace",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "marketplace", "add", "anthropics/claude-plugins-official"],
-    "probe": [{"path": ".claude/plugins/known_marketplaces.json", "keys": ["claude-plugins-official"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "marketplace",
+      "add",
+      "anthropics/claude-plugins-official"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/known_marketplaces.json",
+        "keys": [
+          "claude-plugins-official"
+        ]
+      }
+    ],
     "purpose": "Register Anthropic's marketplace for the owner's Context7 and Hookify plugins.",
     "required": false
   },
   {
     "id": "context7@claude-plugins-official",
     "kind": "plugin",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "install", "context7@claude-plugins-official"],
-    "probe": [{"path": ".claude/plugins/installed_plugins.json", "keys": ["plugins", "context7@claude-plugins-official"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "install",
+      "context7@claude-plugins-official"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/installed_plugins.json",
+        "keys": [
+          "plugins",
+          "context7@claude-plugins-official"
+        ]
+      }
+    ],
     "purpose": "Install Context7 for current library documentation.",
     "required": false
   },
   {
     "id": "hookify@claude-plugins-official",
     "kind": "plugin",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "install", "hookify@claude-plugins-official"],
-    "probe": [{"path": ".claude/plugins/installed_plugins.json", "keys": ["plugins", "hookify@claude-plugins-official"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "install",
+      "hookify@claude-plugins-official"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/installed_plugins.json",
+        "keys": [
+          "plugins",
+          "hookify@claude-plugins-official"
+        ]
+      }
+    ],
     "purpose": "Install Hookify for authoring local Claude Code rules.",
     "required": false
   },
   {
     "id": "superpowers-marketplace",
     "kind": "marketplace",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "marketplace", "add", "https://github.com/obra/superpowers-marketplace.git"],
-    "probe": [{"path": ".claude/plugins/known_marketplaces.json", "keys": ["superpowers-marketplace"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "marketplace",
+      "add",
+      "https://github.com/obra/superpowers-marketplace.git"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/known_marketplaces.json",
+        "keys": [
+          "superpowers-marketplace"
+        ]
+      }
+    ],
     "purpose": "Register the owner's Superpowers marketplace.",
     "required": false
   },
   {
     "id": "superpowers@superpowers-marketplace",
     "kind": "plugin",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "install", "superpowers@superpowers-marketplace"],
-    "probe": [{"path": ".claude/plugins/installed_plugins.json", "keys": ["plugins", "superpowers@superpowers-marketplace"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "install",
+      "superpowers@superpowers-marketplace"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/installed_plugins.json",
+        "keys": [
+          "plugins",
+          "superpowers@superpowers-marketplace"
+        ]
+      }
+    ],
     "purpose": "Install the owner's Superpowers engineering workflows.",
     "required": false
   },
   {
     "id": "hyperframes",
     "kind": "marketplace",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "marketplace", "add", "heygen-com/hyperframes"],
-    "probe": [{"path": ".claude/plugins/known_marketplaces.json", "keys": ["hyperframes"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "marketplace",
+      "add",
+      "heygen-com/hyperframes"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/known_marketplaces.json",
+        "keys": [
+          "hyperframes"
+        ]
+      }
+    ],
     "purpose": "Register the owner's HyperFrames marketplace.",
     "required": false
   },
   {
     "id": "hyperframes@hyperframes",
     "kind": "plugin",
-    "platforms": ["linux", "win32"],
-    "argv": ["claude", "plugin", "install", "hyperframes@hyperframes"],
-    "probe": [{"path": ".claude/plugins/installed_plugins.json", "keys": ["plugins", "hyperframes@hyperframes"]}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "claude",
+      "plugin",
+      "install",
+      "hyperframes@hyperframes"
+    ],
+    "probe": [
+      {
+        "path": ".claude/plugins/installed_plugins.json",
+        "keys": [
+          "plugins",
+          "hyperframes@hyperframes"
+        ]
+      }
+    ],
     "purpose": "Install HyperFrames for HTML-based video creation.",
     "required": false
   },
   {
     "id": "gsd-core",
     "kind": "npm-installer",
-    "platforms": ["linux", "win32"],
-    "argv": ["npx", "-y", "--package=@opengsd/gsd-core@1.4.4", "--", "gsd-core", "--claude", "--global"],
-    "probe": [{"path": ".claude/gsd-core/VERSION"}],
+    "platforms": [
+      "linux",
+      "win32"
+    ],
+    "argv": [
+      "npx",
+      "-y",
+      "--package=@opengsd/gsd-core@1.4.4",
+      "--",
+      "gsd-core",
+      "--claude",
+      "--global"
+    ],
+    "probe": [
+      {
+        "path": ".claude/gsd-core/VERSION"
+      }
+    ],
     "purpose": "Install the owner's GSD Core workflows, hooks, and status line.",
     "evidence": "The installed gsd-core/VERSION pins 1.4.4, and gsd-core/workflows/update.md records the Claude global command.",
-    "required": false
-  },
-  {
-    "id": "design-skills",
-    "kind": "manual",
-    "platforms": ["linux", "win32"],
-    "argv": [],
-    "probe": [
-      {"path": ".claude/skills/banner-design/SKILL.md"},
-      {"path": ".claude/skills/brand/SKILL.md"},
-      {"path": ".claude/skills/design/SKILL.md"},
-      {"path": ".claude/skills/design-system/SKILL.md"},
-      {"path": ".claude/skills/slides/SKILL.md"},
-      {"path": ".claude/skills/ui-styling/SKILL.md"},
-      {"path": ".claude/skills/ui-ux-pro-max/SKILL.md"}
-    ],
-    "purpose": "Restore the owner's design skills from a verified source or backup.",
-    "evidence": "Six SKILL.md files identify ckm and author claudekit. The ui-ux-pro-max SKILL.md has no source or install metadata.",
     "required": false
   }
 ]

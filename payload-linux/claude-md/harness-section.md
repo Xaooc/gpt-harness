@@ -20,8 +20,9 @@ can pull and can push with the owner's approval. Read it to understand the desig
 `SELF-LEARNING.md`; `payload-linux/` is what this machine runs, `payload/` is the Windows PC version,
 `codex-build/` is the Windows-only custom Codex build (Rust, busybox-shell patch; not used on Linux).
 `~/.claude` is the installed copy: when you change a harness script or skill there, make the same change in
-`payload-linux/` (and in `payload/` unless it is Linux-specific), update the payload `manifest.json` hashes, and tell
-the user it needs a commit and push.
+`payload-linux/` (the only place shared files are edited), run `node tools/manifest-sync.mjs && node
+tools/sync-windows.mjs` (Linux manifest, generated Windows payload), check that `node install.mjs --check` reports no
+local drift, commit, and push with the owner's yes.
 
 ## Network
 

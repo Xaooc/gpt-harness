@@ -2,36 +2,52 @@
 
 ## Linux installation
 
-The installer selects `payload-linux/` automatically on Linux. Use Node.js 22 or newer, and have `bash`, `curl`,
-`python3`, and `node` on `PATH`. Install the stock Codex CLI and sign in:
+The installer selects `payload-linux/` automatically on Linux. Steps marked **[ASK]** install software or sign in:
+ask your user for a clear "yes" first.
 
-```bash
-npm i -g @openai/codex@0.164.0
-codex login
-codex debug models | grep 'gpt-6.1-terra'
-```
+1. **Prerequisites [ASK for anything missing]:** Node.js 22+, `git`, `bash`, `curl`, `python3`, `uv` (pytest runs go
+   through `~/.claude/scripts/pytest_gate.py`), Claude Code (CLI `claude` on `PATH`), and the GitHub CLI `gh` if this
+   machine will push. Install the stock Codex CLI and sign in (the user signs in themselves):
 
-Claude Code and its `codex@openai-codex` plugin are also needed. GSD is recommended, just as for Windows: install it
-before this harness using `npx -y @opengsd/gsd-core@latest`, or follow the GSD instructions below. Install the stock
-plugin via `/plugin install codex@openai-codex`; this Linux payload does not patch it or require a custom Codex build.
+   ```bash
+   npm i -g @openai/codex@0.169.0
+   codex login
+   codex debug models | grep 'gpt-6.2-sol'
+   ```
 
-From the cloned repository run:
+2. **Clone and dry-run:** clone the private repo the user gives you, then from its root:
 
-```bash
-node install.mjs --dry-run
-node install.mjs --check
-claude plugin install luna-panel@luna-local
-claude plugin install pstack@luna-local
-```
+   ```bash
+   node install.mjs --self-test
+   node install.mjs --dry-run
+   ```
 
-`--check` installs the payload and runs the included checks; inspect the PASS/FAIL table. A missing Codex executable
-or missing `gpt-6.1-terra` in the model list is reported as a warning. Restart Claude Code after installation.
-The pane is installed through the local marketplace, and updates require the marketplace and plugin update commands
-shown in the Windows instructions below.
+   The dry run lists what will be written and every third-party install that is still pending.
 
-Linux also installs the conveyor tier dispatcher, project checks, ledger and prompt/subagent/Stop gates,
-harness hygiene, usage accounting, Gemini quota reporting, and the pstack plugin from `luna-local`.
-The installer enables both local plugins. Existing `conveyor/orchestration.json` user configuration is preserved.
+3. **Install [ASK]:**
+
+   ```bash
+   node install.mjs --check --owner-setup
+   ```
+
+   This installs the payload into `~/.claude`, merges the harness hooks into `settings.json` (other hooks, permissions
+   and settings stay), writes the managed `CLAUDE.md` section, runs the checks, and then — because of `--owner-setup` —
+   installs what `external.json` lists for this platform when it is missing: the `luna-local` marketplace with the Luna
+   panel and pstack, the Codex plugin (required), and the owner's optional tools (GSD, Superpowers, Context7, Hookify,
+   HyperFrames). Exit **4** means a required entry is still pending; the output names it and the exact command.
+   Without `--owner-setup` the same commands are only printed.
+
+4. **Restart Claude Code** and check: `/luna` opens the panel; `node ~/.claude/scripts/conveyor/exec.mjs status` lists
+   every tier with an available provider; the session-start message names the pstack path.
+
+A fresh machine starts with the owner's executor routing (the shipped `conveyor/orchestration.default.json`); edits in
+the Luna panel create `conveyor/orchestration.json`, which reinstalls never overwrite. Sign-ins (Claude, Codex,
+GitHub) and per-machine settings (permissions, status line, MCP servers in `~/.codex/config.toml`, the proxy file)
+are set up on the machine itself.
+
+The Linux payload includes the whole conveyor: tier dispatcher with approach review, project checks with the test
+budget, the acceptance ledger and prompt/subagent/Stop gates, `interrogate`, harness hygiene, usage accounting, the
+vendored pstack and the Luna panel.
 
 If any payload destination differs from both the new payload and its last recorded install hash (or has no
 recorded hash), installation stops with exit code **3** and lists every drifted path before writing anything.
@@ -40,8 +56,10 @@ To deliberately replace them, use `node install.mjs --check --accept-local-drift
 backups. Files that still match their recorded hashes upgrade without this flag. User configs installed only
 when absent do not count as drift.
 
-After editing the Linux payload, run `node tools/manifest-sync.mjs` to sync entries and hashes, then
-`node tools/manifest-sync.mjs --check` to verify the manifest is current (exit 1 means changes are needed).
+After editing the package, run `node tools/manifest-sync.mjs && node tools/sync-windows.mjs` to refresh both manifests
+and the generated Windows payload, then the same two commands with `--check` (exit 1 means changes are needed).
+Shared files are edited only in `payload-linux/`; `payload/` holds generated copies plus the Windows exceptions in
+`tools/windows-exceptions.json`.
 
 Proxy configuration is optional. When `HTTPS_PROXY` is unset, the wrappers source
 `~/.config/luna-proxy.env`; set `LUNA_PROXY_ENV_FILE` to select another file. For existing installations,
@@ -60,12 +78,14 @@ need admin rights: ask your user for a clear "yes" first and tell them what will
 
 ## What this installs
 The same Claude Code + Codex setup as the source machine:
-- **Orchestration:** Claude plans and talks to the user; Codex models (`gpt-6.1-sol` for non-trivial
-  implementation, `gpt-6-luna` for simple work, research and critics) execute through `~/.claude/scripts/luna.sh`,
-  as threads of one shared `codex app-server` daemon (`luna-daemon.mjs`). The daemon does fair scheduling between
-  sessions, RAM admission, stall watchdogs and cancellation.
-- **Skills:** `luna` (how to brief and route executors) and `luna-critics` (panels of role-play critics).
-- **Global rules:** the owner's `CLAUDE.md`, installed as-is.
+- **Process and conveyor (same as Linux):** pstack (poteto-mode) with the harness adapter; the tier dispatcher
+  `~/.claude/scripts/conveyor/exec.mjs` with approach review (`approach`, `architect`, `planner`), project checks with
+  the test budget, the acceptance ledger and prompt/subagent/Stop gates, `interrogate`. Executors run through
+  `~/.claude/scripts/luna.sh` as threads of one shared `codex app-server` daemon (`luna-daemon.mjs`) with fair
+  scheduling, RAM admission, stall watchdogs and cancellation. Shell commands of the conveyor run in Git Bash (or the
+  bundled busybox `sh`); process trees end with `taskkill /T`.
+- **Skills:** `luna`, `luna-critics`, the server skills and the vendored design skills.
+- **Global rules:** the owner's `CLAUDE.md`: the Windows machine facts plus the same process sections as Linux.
 - **Heavy-command gate:** `heavy-gate.mjs`, a Pre/PostToolUse hook. At most 2 heavy commands machine-wide
   (tsc, vitest, pytest, installs, builds), and only while ≥ 2.5 GB RAM is free.
 - **Codex plugin review-gate fixes:** the broker reaper, plus patches to the `codex@openai-codex` plugin (broker
@@ -91,8 +111,9 @@ powershell -NoProfile -Command "Get-PSDrive -PSProvider FileSystem | Select Name
 - **Node.js 20+:** `winget install OpenJS.NodeJS.LTS`.
 - **Git for Windows:** `winget install Git.Git`. It provides Git Bash; every `.sh` here runs in it.
 - **Codex CLI 0.164.0, exactly this version:** `npm i -g @openai/codex@0.164.0`. Then `codex login`; the user
-  signs in with their ChatGPT account. The account must have the models `gpt-6.1-sol` and `gpt-6-luna`; check with
-  `codex debug models | grep -E "gpt-6.1-sol|gpt-6-luna"`.
+  signs in with their ChatGPT account. The account must have the models the shipped routing uses (`gpt-6.2-sol`,
+  `gpt-6.2-astra`, `gpt-6-luna`); check with `codex debug models | grep -E "gpt-6.2-sol|gpt-6.2-astra|gpt-6-luna"`.
+  The custom busybox build (step 7) stays on 0.164.0 because the plugin patches target it.
 - **Claude Code 2.1.299 or newer** (desktop app or CLI). This is the tested version. It needs:
   - function-hook plugins (the Luna pane's `register.tsx`);
   - the built-in **Monitor** tool. The `luna` skill uses it for stall watchers. If Monitor is missing, run
@@ -134,8 +155,11 @@ First a dry run, then the real install with checks:
 ```bash
 ROOT="$(cygpath -w "$USERPROFILE/codex-build")"      # or e.g. ROOT='D:\codex-build' on a drive with more space
 node install.mjs --dry-run --codex-build-root "$ROOT"
-node install.mjs --check --codex-build-root "$ROOT"
+node install.mjs --check --owner-setup --codex-build-root "$ROOT"
 ```
+`--owner-setup` also installs the plugins and tools from `external.json` that are missing (Luna panel, pstack, the
+Codex plugin, and the owner's optional tools); without it they are printed. On a fresh machine run the command a
+second time after step 3 so the Codex plugin patches apply to the plugin it just installed.
 These commands are for Git Bash. In PowerShell use `$env:USERPROFILE\codex-build`. Pick a build root on a drive
 with ≥ 15 GB free; use a non-system drive if C: is tight.
 
