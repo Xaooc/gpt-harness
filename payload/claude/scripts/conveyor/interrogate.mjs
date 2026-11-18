@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolvePanel } from './lib/orchestration.mjs';
+import { bash, killTree, platform, shell } from './lib/platform.mjs';
 
 const scripts = path.join(homedir(), '.claude', 'scripts');
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -43,7 +44,9 @@ function commandOverride(name, fallback) {
 // A positive allowlist keeps credentials, agent session state and shell startup hooks out of repros.
 function runEnv() {
   const env = {};
-  for (const key of ['HOME', 'PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM']) {
+  const keys = ['HOME', 'PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM'];
+  if (platform === 'win32') keys.push('SystemRoot', 'USERPROFILE', 'TEMP', 'TMP');
+  for (const key of keys) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
   return env;
@@ -51,7 +54,9 @@ function runEnv() {
 
 function program(argv, { cwd, input, timeout = 30_000, env = process.env, onTimeout, maxOutput = 64_000 } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(argv[0], argv.slice(1), { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(argv[0], argv.slice(1), {
+      cwd, env, detached: platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe']
+    });
     let output = '', stdout = '', error, timedOut = false, stopping = Promise.resolve();
     const capture = (chunk) => {
       if (output.length < maxOutput) output += chunk.toString().slice(0, maxOutput - output.length);
@@ -64,7 +69,7 @@ function program(argv, { cwd, input, timeout = 30_000, env = process.env, onTime
     child.on('error', (value) => { error = value; });
     child.stdin.on('error', () => {});
     child.stdin.end(input);
-    const kill = (signal) => { try { process.kill(-child.pid, signal); } catch {} };
+    const kill = (signal) => { try { killTree(child, signal, { groupOnly: true }); } catch {} };
     let force;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -161,7 +166,7 @@ async function collect(seat, worktree, out, result) {
     let rerun;
     try {
       await checked([process.execPath, path.join(scripts, 'heavy-gate.mjs'), 'wait'], { cwd: worktree, timeout: 300_000 });
-      rerun = await program(['/bin/sh', '-c', item.command], { cwd: worktree, timeout: 300_000, env: runEnv() });
+      rerun = await program([...shell(), item.command], { cwd: worktree, timeout: 300_000, env: runEnv() });
     } catch (error) { rerun = { code: 127, output: error.message }; }
     result.findings.push({ seat, title, command: item.command, output: item.output,
       expected: typeof item.expected === 'string' ? item.expected : '',
@@ -248,7 +253,7 @@ export async function main(args = process.argv.slice(2)) {
         const launched = await program([...exec, 'run', '--panel', opts.panel, '--seat', String(entry.seat),
           '-w', '-C', worktree, '-f', brief, '-o', output], {
           timeout: deadline - Date.now(),
-          onTimeout: () => checked(['bash', path.join(scripts, 'luna-stop.sh'), output])
+          onTimeout: () => checked([bash(), path.join(scripts, 'luna-stop.sh'), output])
         });
         seat.status = launched.timedOut ? 'timeout' : ({ 0: 'done', 4: 'claude-handoff', 5: 'unavailable',
           6: 'gate-failed', 7: 'write-locked' }[launched.code] || 'failed');

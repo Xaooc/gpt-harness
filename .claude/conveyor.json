@@ -32,5 +32,11 @@
       }
     ],
     "baseline": ".conveyor/hygiene-baseline.json"
+  },
+  "budgets": {
+    "new_tests_exclude": [
+      "payload/**",
+      "**/local-plugins/pstack/**"
+    ]
   }
 }

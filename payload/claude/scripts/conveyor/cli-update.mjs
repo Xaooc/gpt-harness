@@ -4,16 +4,16 @@ import * as fs from 'node:fs/promises';
 import { constants, createReadStream } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { homedir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { home as userHome, killTree, listProcesses, platform } from './lib/platform.mjs';
 
 const updater = 'https://antigravity-cli-auto-updater-974169037036.us-central1.run.app';
 const registry = 'https://registry.npmjs.org/@openai%2Fcodex/latest';
 const allowedHosts = new Set(['registry.npmjs.org', 'storage.googleapis.com', new URL(updater).hostname]);
 const cacheLifetime = 6 * 60 * 60 * 1000;
 const versionPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
-const home = () => path.resolve(process.env.HOME || homedir());
+const home = () => path.resolve(userHome());
 const conveyor = () => path.join(home(), '.claude', 'conveyor');
 const agyDir = () => path.resolve(process.env.CLI_UPDATE_AGY_DIR || '/srv/docker/compose/antigravity-parallel');
 const runDir = () => path.resolve(process.env.LUNA_RUN_DIR || path.join(home(), '.claude', 'luna-run'));
@@ -56,16 +56,11 @@ async function atomicWrite(file, text, mode = 0o600) {
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      env: options.env || process.env, detached: process.platform !== 'win32',
+      env: options.env || process.env, detached: platform !== 'win32',
       stdio: ['pipe', options.stdoutFd ?? 'pipe', 'pipe']
     });
     let stdout = '', stderr = '', failure = null, matched = false;
-    const stop = () => {
-      try {
-        if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');
-        else child.kill('SIGKILL');
-      } catch { child.kill('SIGKILL'); }
-    };
+    const stop = () => { try { killTree(child, 'SIGKILL'); } catch { child.kill('SIGKILL'); } };
     const timer = setTimeout(() => {
       failure = new Error(`${path.basename(command)} timed out after ${options.timeout || 10_000} ms`);
       stop();
@@ -126,7 +121,7 @@ async function fetchOfficial(value, output, redirects = 0) {
 
 function manifestUrl() {
   const arch = { x64: 'amd64', arm64: 'arm64' }[process.arch];
-  return arch && process.platform === 'linux' ? `${updater}/manifests/linux_${arch}.json` : null;
+  return arch && platform === 'linux' ? `${updater}/manifests/linux_${arch}.json` : null;
 }
 
 function agyDownload(value) {
@@ -211,21 +206,6 @@ function newer(latest, installed) {
   return false;
 }
 
-async function processRows() {
-  const rows = new Map();
-  if (process.platform !== 'linux') throw new Error('process inspection requires Linux');
-  for (const name of await fs.readdir('/proc')) {
-    if (!/^\d+$/.test(name)) continue;
-    try {
-      const stat = await fs.readFile(`/proc/${name}/stat`, 'utf8');
-      const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-      const argv = (await fs.readFile(`/proc/${name}/cmdline`, 'utf8')).split('\0').filter(Boolean);
-      rows.set(Number(name), { pid: Number(name), ppid: Number(fields[1]), state: fields[0], argv, started: fields[19] });
-    } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
-  }
-  return rows;
-}
-
 function daemonJobs(stdout) {
   const [first, ...lines] = stdout.trim().split(/\r?\n/), health = JSON.parse(first);
   if (health.ok !== true && health.ok !== false) throw new Error('invalid daemon health');
@@ -244,6 +224,7 @@ async function codexBusy() {
   let jobs = 0;
   const reasons = [];
   try {
+    if (platform !== 'linux') throw new Error('Codex update process inspection unavailable');
     const script = path.join(home(), '.claude', 'scripts', 'luna-daemon.mjs');
     if (await exists(script)) {
       for (const profile of ['default', 'net']) {
@@ -264,7 +245,7 @@ async function codexBusy() {
     } else if (await exists(path.join(runDir(), 'daemon.json')) || await exists(path.join(runDir(), 'daemon-net/daemon.json'))) {
       throw new Error('daemon script missing while discovery exists');
     }
-    const rows = await processRows();
+    const rows = new Map(listProcesses({ argv: true }).map((row) => [row.pid, row]));
     for (const row of rows.values()) {
       if (row.state === 'Z' || !/^codex(?:\.exe)?$/.test(path.basename(row.argv[0] || '')) || !row.argv.includes('exec')) continue;
       let parent = rows.get(row.ppid);
@@ -527,7 +508,7 @@ async function installAgy(candidate, snapshot) {
 }
 
 async function updateAgy(opts, rollback = false) {
-  if (process.platform !== 'linux') throw new Error('agy updates and rollbacks are supported only on Linux');
+  if (platform !== 'linux') throw new Error('agy updates and rollbacks are supported only on Linux');
   const explicit = opts['--url'] ? agyDownload(opts['--url']) : null;
   if (!opts['--confirm']) return { ok: true, dryRun: true, action: rollback ? 'rollback agy to newest agy.prev-*'
     : 'download, smoke, back up, replace agy and update agy_sha256', url: explicit?.url || null };

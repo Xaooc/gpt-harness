@@ -536,7 +536,7 @@
       "src": "claude/hooks/conveyor-hygiene-session-start.mjs",
       "dest": "hooks/conveyor-hygiene-session-start.mjs",
       "kind": "file",
-      "sha256": "5c41773374b9400e09dd87afd0022082b5b1a7423763fa4626adc2aa40279a32",
+      "sha256": "5240889ca5acd19243158c83fa0914ad586d5859cfb94978c1d6bd8129058723",
       "executable": true
     },
     {
@@ -3867,28 +3867,28 @@
       "src": "claude/scripts/conveyor/check.mjs",
       "dest": "scripts/conveyor/check.mjs",
       "kind": "file",
-      "sha256": "a99366f7445dae58e1043815bef4658565d683e5263d654c2412f2e73c6d8ac8",
+      "sha256": "c59eb5a71c7f0c51318c94f90e65471d9e230c2c9fac2c73f401c89700929097",
       "executable": true
     },
     {
       "src": "claude/scripts/conveyor/cli-update.mjs",
       "dest": "scripts/conveyor/cli-update.mjs",
       "kind": "file",
-      "sha256": "75c7d221a46aa0db08ca8de802a52ad7aa1146457ac2faae92970ab710ea1c95",
+      "sha256": "470d901d582981e25ac2210c91d5f57b33b3f94164ef4ad4e36f09bf72b40a42",
       "executable": true
     },
     {
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "309c7736072c804bed0934c6888326446e57832af83c2ac823e130ff34b6e2d9",
+      "sha256": "3c47e116cda576965d10e82e751c221c3c55971edba9bfa348e8d2fece73fcb3",
       "executable": true
     },
     {
       "src": "claude/scripts/conveyor/gemini-quota.mjs",
       "dest": "scripts/conveyor/gemini-quota.mjs",
       "kind": "file",
-      "sha256": "14ecb1819b505aa3666cb9524c485e0e87df774c2941d6b653efb4b5b22bbec1",
+      "sha256": "540889aaea16f0555c98f54c8ff3b3e1ee3d4e889c41787520c52d4026aa9ca1",
       "executable": true
     },
     {
@@ -3915,13 +3915,13 @@
       "src": "claude/scripts/conveyor/lib/ledger.mjs",
       "dest": "scripts/conveyor/lib/ledger.mjs",
       "kind": "file",
-      "sha256": "5a560515441085d0d9bd071e076124553230d75d38d5d52f30bab955e92c1230"
+      "sha256": "ac8a22a599027e85078e63a3ae3f71c92c5ce9c53c18be8ab48f1532aedf77e1"
     },
     {
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
       "dest": "scripts/conveyor/lib/orchestration.mjs",
       "kind": "file",
-      "sha256": "65f666ac0e2b18ad40b4b5b64680a83a15dfa4aba0ad2c3b8d35e7eb8fab9f0b"
+      "sha256": "d4a31a3786ff2e9a219477c0baa4f0cde6f6849cb61eb2bcbf9c9144976e104e"
     },
     {
       "src": "claude/scripts/conveyor/lib/patch-recipes.mjs",
@@ -3930,16 +3930,22 @@
       "sha256": "dd57898d3946bf0454b6785181496751e8737134abecb793a27f8e75ded7b017"
     },
     {
+      "src": "claude/scripts/conveyor/lib/platform.mjs",
+      "dest": "scripts/conveyor/lib/platform.mjs",
+      "kind": "file",
+      "sha256": "966f40249a9e5e82e3d7552203161217836bad7c456c29d63f5c14145bb126d6"
+    },
+    {
       "src": "claude/scripts/conveyor/lib/profile.mjs",
       "dest": "scripts/conveyor/lib/profile.mjs",
       "kind": "file",
-      "sha256": "377dade87bc81ea9be52b4f55420b516c5613c1507b3df58a85457cfd8b55e46"
+      "sha256": "e9d3091369ac647ae6d7052e9d7548010b06b9bbcf0bb786dd87a6288240e2db"
     },
     {
       "src": "claude/scripts/conveyor/usage.mjs",
       "dest": "scripts/conveyor/usage.mjs",
       "kind": "file",
-      "sha256": "0104f9f1ee6e18f3f0ff218b5c244702e539444f8e7ba1875b2ea645f822b50c",
+      "sha256": "ce8fff3883ad9569342f6d65dea5c47f0d9af697d65c9ea9fdde8712c8a64642",
       "executable": true
     },
     {
@@ -3953,7 +3959,7 @@
       "src": "claude/scripts/conveyor/interrogate.mjs",
       "dest": "scripts/conveyor/interrogate.mjs",
       "kind": "file",
-      "sha256": "7ae46e60d99d75d6e1ccee7264bf49cd6a31418bbe773c2ee12247b9e82686d9",
+      "sha256": "8c60853ce828140ea1b9ca9e273ffb171f6cb72fca0546d4524f1c0afc6529ef",
       "executable": true
     },
     {
@@ -4003,7 +4009,7 @@
       "src": "claude/scripts/conveyor/test/check.test.mjs",
       "dest": "scripts/conveyor/test/check.test.mjs",
       "kind": "file",
-      "sha256": "cc1d504384ecc7cefff419d20284fc612dca6af9e38e91b6b976166fa0c89f36"
+      "sha256": "59ec2565354aace79d6fb8209c9ded2b15b7adbf4c295de12f8bc70edd633335"
     },
     {
       "src": "claude/scripts/conveyor/test/checks.test.mjs",
@@ -4065,6 +4071,12 @@
       "dest": "scripts/conveyor/test/metrics.test.mjs",
       "kind": "file",
       "sha256": "352fca8e5180420fc2ad441bac677087d9f039229b9bf0713741fe2321d236e7"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/platform.test.mjs",
+      "dest": "scripts/conveyor/test/platform.test.mjs",
+      "kind": "file",
+      "sha256": "e41c7d13aafa4b1b91256c84e3c42b22ba8fb87276dac734ba33a1d027606a1d"
     },
     {
       "src": "claude/scripts/conveyor/test/process-fixture.mjs",

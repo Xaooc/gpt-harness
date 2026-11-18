@@ -302,6 +302,12 @@ test('turn test budget counts net additions across changed, new and deleted file
   assert.equal(configured.status, 0, configured.stderr);
   assert.equal(configured.report.ok, true);
   assert.deepEqual(configured.report.tests, { ...fail.report.tests, budget: 10, ok: true });
+  // Generated or vendored paths named in budgets.new_tests_exclude do not count as new tests.
+  await env.profile({ ...profile(), budgets: { new_tests: 5, new_tests_exclude: ['tests/test_new.py'] } });
+  const excluded = await env.command([...turn, '--test-budget', 'profile']);
+  assert.equal(excluded.status, 0, excluded.stderr);
+  assert.equal(excluded.report.tests.added, 5);
+  await env.profile({ ...profile(), budgets: { new_tests: 10 } });
   for (const args of [turn, ['run', '--level', 'fast', '--test-budget', '0']]) {
     const unchecked = await env.command(args);
     assert.equal(unchecked.status, 0, unchecked.stderr);

@@ -3,11 +3,11 @@
 // HYGIENE_RUN_CMD is a complete shell command override, used by disposable test runners.
 import fs from 'node:fs';
 import path from 'node:path';
-import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { repositorySurface } from '../scripts/conveyor/lib/profile.mjs';
+import { home, shell } from '../scripts/conveyor/lib/platform.mjs';
 
 const day = 24 * 60 * 60 * 1000;
 const runner = fileURLToPath(new URL('../scripts/conveyor/harness-hygiene.mjs', import.meta.url));
@@ -40,7 +40,7 @@ async function sessionCwd() {
 }
 
 function scratchWorkspace(cwd) {
-  const scratch = path.join(process.env.HOME || homedir(), '.config', 'Claude', 'scratch-workspaces');
+  const scratch = path.join(home(), '.config', 'Claude', 'scratch-workspaces');
   let canonical = path.resolve(cwd);
   try { canonical = fs.realpathSync(cwd); } catch { /* A missing directory has no guidance. */ }
   return canonical === scratch || canonical.startsWith(`${scratch}${path.sep}`);
@@ -83,7 +83,7 @@ async function main() {
   const cwd = await sessionCwd();
   if (scratchWorkspace(cwd)) return;
   const directives = await repositoryDirectives(cwd);
-  const claude = process.env.CLAUDE_HOME_DIR || path.join(homedir(), '.claude');
+  const claude = process.env.CLAUDE_HOME_DIR || path.join(home(), '.claude');
   const conveyor = process.env.CONVEYOR_HOME || path.join(claude, 'conveyor');
   const directory = path.join(conveyor, 'hygiene'), now = Date.now();
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -104,8 +104,8 @@ async function main() {
     if (!Number.isFinite(elapsed) || elapsed > day) {
       const { spawn } = await import('node:child_process');
       const command = process.env.HYGIENE_RUN_CMD;
-      const child = command ? spawn('/bin/sh', ['-c', command], { detached: true, stdio: 'ignore' })
-        : spawn(process.execPath, [runner, 'run'], { detached: true, stdio: 'ignore' });
+      const [executable, ...args] = command ? [...shell(), command] : [process.execPath, runner, 'run'];
+      const child = spawn(executable, args, { detached: true, stdio: 'ignore' });
       child.on('error', () => {});
       child.unref();
       if (child.pid) {
@@ -122,7 +122,7 @@ async function main() {
       const shown = state.report?.at === report.at && Number.isInteger(state.report.shown) ? state.report.shown : 0;
       if (shown >= 0 && shown < 2) {
         const total = counts.high + counts.medium + counts.low;
-        const reportPath = path.resolve(directory) === path.join(homedir(), '.claude', 'conveyor', 'hygiene')
+        const reportPath = path.resolve(directory) === path.join(home(), '.claude', 'conveyor', 'hygiene')
           ? '~/.claude/conveyor/hygiene/latest.json' : path.join(directory, 'latest.json');
         const reportMessage = `Гигиена харнесса: ${total} расхождений (${counts.high} важных). Отчёт: ${reportPath}`
           + ' — предложи пользователю разобрать, ничего не меняй сам.';

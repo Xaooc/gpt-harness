@@ -3758,7 +3758,7 @@
       "src": "claude/scripts/conveyor/check.mjs",
       "dest": "scripts/conveyor/check.mjs",
       "kind": "file",
-      "sha256": "26c2adcb3b98d851792a36977eb2256d1ea47bded2ad97060b6407caa186689e",
+      "sha256": "c59eb5a71c7f0c51318c94f90e65471d9e230c2c9fac2c73f401c89700929097",
       "executable": true
     },
     {
@@ -3830,7 +3830,7 @@
       "src": "claude/scripts/conveyor/lib/profile.mjs",
       "dest": "scripts/conveyor/lib/profile.mjs",
       "kind": "file",
-      "sha256": "377dade87bc81ea9be52b4f55420b516c5613c1507b3df58a85457cfd8b55e46"
+      "sha256": "e9d3091369ac647ae6d7052e9d7548010b06b9bbcf0bb786dd87a6288240e2db"
     },
     {
       "src": "claude/scripts/conveyor/usage.mjs",
@@ -3914,7 +3914,7 @@
       "src": "claude/scripts/conveyor/test/check.test.mjs",
       "dest": "scripts/conveyor/test/check.test.mjs",
       "kind": "file",
-      "sha256": "cc1d504384ecc7cefff419d20284fc612dca6af9e38e91b6b976166fa0c89f36"
+      "sha256": "59ec2565354aace79d6fb8209c9ded2b15b7adbf4c295de12f8bc70edd633335"
     },
     {
       "src": "claude/scripts/conveyor/test/checks.test.mjs",

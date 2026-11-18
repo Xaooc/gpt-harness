@@ -14,6 +14,7 @@ import {
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 import { hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
+import { bash, platform, processAlive, readProcessStat, scanBinary } from './lib/platform.mjs';
 
 // Matches luna.sh's retryable_model_error deny pattern, including usage, auth and invalid-model failures.
 const quotaError = new RegExp([
@@ -34,20 +35,10 @@ async function git(repo, args) {
   return stdout;
 }
 
-function processStart(pid) {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-    return { start: fields[19], zombie: fields[0] === 'Z' };
-  } catch { return { start: null, zombie: false }; }
-}
-
 function writeOwnerAlive(owner) {
-  if (!Number.isSafeInteger(owner?.pid) || owner.pid <= 0) return false;
-  try { process.kill(owner.pid, 0); }
-  catch (error) { if (error.code !== 'EPERM') return false; }
-  const current = processStart(owner.pid);
-  return !current.zombie && (current.start === null || owner.start === null || current.start === String(owner.start));
+  if (!processAlive(owner?.pid)) return false;
+  const start = readProcessStat(owner.pid)?.started;
+  return start === undefined || owner.start === null || start === String(owner.start);
 }
 
 async function writeLockState(lock) {
@@ -100,7 +91,7 @@ async function acquireWriteLock(dir, out, brief) {
   catch (error) { if (error.code !== 128) throw error; key = await fs.realpath(dir); }
   const lock = path.join(paths().home, 'write-locks', createHash('sha256').update(key).digest('hex').slice(0, 16));
   const owner = {
-    pid: process.pid, start: processStart(process.pid).start, key, out, brief,
+    pid: process.pid, start: readProcessStat(process.pid)?.started ?? null, key, out, brief,
     session: process.env.CLAUDE_CODE_SESSION_ID || null, at: new Date().toISOString()
   };
   await fs.mkdir(path.dirname(lock), { recursive: true });
@@ -707,24 +698,23 @@ async function catalogCommand(args) {
         }
       } else {
         const root = path.join(homedir(), '.config', 'Claude', 'claude-code');
+        const name = platform === 'win32' ? 'claude.exe' : 'claude';
         for (const version of await fs.readdir(root).catch(() => [])) {
           const dir = path.join(root, version);
-          for (const hash of await fs.readdir(dir).catch(() => [])) await addBinary(path.join(dir, hash, 'claude'));
+          for (const hash of await fs.readdir(dir).catch(() => [])) await addBinary(path.join(dir, hash, name));
         }
         for (const dir of process.env.PATH?.split(path.delimiter) ?? []) {
-          if (await addBinary(path.join(dir, 'claude'))) break;
+          if (await addBinary(path.join(dir, name))) break;
         }
       }
       const aliases = new Set();
-      const pattern = String.raw`description of the task",[A-Za-z0-9_$]+=\[[^]]{1,300}\]`;
+      const pattern = /description of the task",[A-Za-z0-9_$]+=\[[^\]\n]{1,300}\]/;
       for (const file of binaries) {
-        let stdout;
+        let matches;
         try {
-          ({ stdout } = await execute('grep', ['-aoE', pattern, file], {
-            encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024
-          }));
+          matches = await scanBinary(file, pattern, { signal: AbortSignal.timeout(15_000), maxBytes: 1024 * 1024 });
         } catch { continue; }
-        for (const match of stdout.trimEnd().split('\n')) {
+        for (const match of matches) {
           try {
             for (const alias of JSON.parse(match.slice(match.indexOf('[')))) {
               if (typeof alias === 'string' && /^[a-z][a-z0-9-]*$/.test(alias)) aliases.add(alias);
@@ -845,7 +835,7 @@ async function launch(entry, args, dir) {
   try { await fs.access(wrapper, constants.R_OK); }
   catch (error) { return { code: 127, launchError: error.message }; }
   return new Promise((resolve) => {
-    const child = spawn('bash', [wrapper, ...args], { cwd: dir, stdio: 'inherit' });
+    const child = spawn(bash(), [wrapper, ...args], { cwd: dir, stdio: 'inherit' });
     const forward = (signal) => child.kill(signal);
     const onInt = () => forward('SIGINT');
     const onTerm = () => forward('SIGTERM');

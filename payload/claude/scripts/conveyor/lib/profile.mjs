@@ -93,9 +93,14 @@ function defaults(profile) {
   if (profile.version !== 1) throw new Error('profile.version must be 1');
   const budgets = { fast_s: 20, turn_s: 300 };
   if (profile.budgets !== undefined) {
-    keys(profile.budgets, [...Object.keys(budgets), 'new_tests'], 'budgets');
+    keys(profile.budgets, [...Object.keys(budgets), 'new_tests', 'new_tests_exclude'], 'budgets');
     for (const [key, value] of Object.entries(profile.budgets)) {
-      if (key === 'new_tests') {
+      if (key === 'new_tests_exclude') {
+        // Generated copies and vendored code (e.g. a payload generated from another one) are not new tests.
+        if (!Array.isArray(value) || value.some((glob) => typeof glob !== 'string' || !glob.trim())) {
+          throw new Error('budgets.new_tests_exclude must be an array of glob strings');
+        }
+      } else if (key === 'new_tests') {
         if (!Number.isInteger(value) || value < 0 || value > 100) throw new Error('budgets.new_tests must be an integer from 0 to 100');
       } else if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value * 1000 > 2 ** 31 - 1) {
         throw new Error(`budgets.${key} must be positive and fit a process timer`);
