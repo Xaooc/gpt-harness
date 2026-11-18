@@ -320,7 +320,7 @@
       "src": "claude/scripts/luna-overview.mjs",
       "dest": "scripts/luna-overview.mjs",
       "kind": "file",
-      "sha256": "960f13b0f7a9aad8e7bca1a0a040f356a25494f202d895c971e6fa601a1543da",
+      "sha256": "8565c74f0eacab70d1bda0bbd64bdc1d0c66d15a358660562ac843b3cb661163",
       "executable": true
     },
     {
@@ -408,13 +408,13 @@
       "src": "claude/conveyor/harness-facts.json",
       "dest": "conveyor/harness-facts.json",
       "kind": "file",
-      "sha256": "ebca560809ce5c94e658300a980cecff46b766c1ce690a1bca730791ee5ebf2a"
+      "sha256": "1b5f9b30e0ee572bc220910d51feb137d61195d441c37d3d7ba5ea1d227ad2e6"
     },
     {
       "src": "claude/conveyor/orchestration.default.json",
       "dest": "conveyor/orchestration.default.json",
       "kind": "file",
-      "sha256": "104e3ce3840477eca2f32efcdc5d1f01a2c1ae8f4cf9fa27a6babe8f25a5b977"
+      "sha256": "1c7fb3fd2ffcc74afb15ec48befdc164f98da6d3de0280c4902de80ef684b3e5"
     },
     {
       "src": "claude/hooks/conveyor-hygiene-session-start.mjs",
@@ -3812,7 +3812,7 @@
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
       "dest": "scripts/conveyor/lib/orchestration.mjs",
       "kind": "file",
-      "sha256": "d36b9a20af1e5ba37211e9180e80fe97bb7fa35c72d7afaef23ee460a3a7a432"
+      "sha256": "65f666ac0e2b18ad40b4b5b64680a83a15dfa4aba0ad2c3b8d35e7eb8fab9f0b"
     },
     {
       "src": "claude/scripts/conveyor/lib/patch-recipes.mjs",
@@ -3867,10 +3867,191 @@
       "kind": "file",
       "sha256": "ad3be6e847894eb95fafdc75dc6cd7b9f21b062180e1bc032a26e3d643bc4dac",
       "executable": true
+    },
+    {
+      "src": "claude/hooks/test/conveyor-hygiene-session-start.test.mjs",
+      "dest": "hooks/test/conveyor-hygiene-session-start.test.mjs",
+      "kind": "file",
+      "sha256": "30f5beb88799539aebfb08bab5101f10e72d4691fbfa8e5294e6a2471e92c551"
+    },
+    {
+      "src": "claude/hooks/test/conveyor-stop-gate.test.mjs",
+      "dest": "hooks/test/conveyor-stop-gate.test.mjs",
+      "kind": "file",
+      "sha256": "d1485a602618d75d35b8a2344cbe97f9b0c0b3b8efdfba5b5f59ba4c4254c8a6"
+    },
+    {
+      "src": "claude/hooks/test/conveyor-subagent-gate.test.mjs",
+      "dest": "hooks/test/conveyor-subagent-gate.test.mjs",
+      "kind": "file",
+      "sha256": "d34b6d3eba6c447843692288e3a836724e71d725dbb5977cbabbc160e1a2a9a4"
+    },
+    {
+      "src": "claude/hooks/test/harness-guards.test.mjs",
+      "dest": "hooks/test/harness-guards.test.mjs",
+      "kind": "file",
+      "sha256": "91ab38cb1162d3ab68e331781fee683eae4d18932145c7e5700e079653bba482"
+    },
+    {
+      "src": "claude/hooks/test/luna-skill-autoload.test.mjs",
+      "dest": "hooks/test/luna-skill-autoload.test.mjs",
+      "kind": "file",
+      "sha256": "74fa512dcba5ef6e60a851df67a6b290c8a289bce728d2df2ea56c4f50f71040"
+    },
+    {
+      "src": "claude/local-plugins/luna-panel/tests/snapshot.fixture.ts",
+      "dest": "local-plugins/luna-panel/tests/snapshot.fixture.ts",
+      "kind": "file",
+      "sha256": "7f8976994ad9d794465833e8180964f3dce317a258a2a907a31c5fe010a708aa"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/check.test.mjs",
+      "dest": "scripts/conveyor/test/check.test.mjs",
+      "kind": "file",
+      "sha256": "cc1d504384ecc7cefff419d20284fc612dca6af9e38e91b6b976166fa0c89f36"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/checks.test.mjs",
+      "dest": "scripts/conveyor/test/checks.test.mjs",
+      "kind": "file",
+      "sha256": "cb71152e8a240c70095a227fbdf2e0bd2672bb7d04568e3fb63389acc7b94722"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/cli-update.test.mjs",
+      "dest": "scripts/conveyor/test/cli-update.test.mjs",
+      "kind": "file",
+      "sha256": "90919eca76ca7c42c0b65df089ef5ff565a4222c2ad6e662c658b7a5a9d06bb7"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/exec.test.mjs",
+      "dest": "scripts/conveyor/test/exec.test.mjs",
+      "kind": "file",
+      "sha256": "a2a7d5f245ce86958d51c3fa90900bc088fe6314351292a4f344e7ae76ee66c5"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/fixtures/fake-wrapper.sh",
+      "dest": "scripts/conveyor/test/fixtures/fake-wrapper.sh",
+      "kind": "file",
+      "sha256": "2f815e41fab65d50acc1f4741cb1295a529e9c236cda3ab86e53b00425d78a85",
+      "executable": true
+    },
+    {
+      "src": "claude/scripts/conveyor/test/fixtures/orchestration.json",
+      "dest": "scripts/conveyor/test/fixtures/orchestration.json",
+      "kind": "file",
+      "sha256": "104e3ce3840477eca2f32efcdc5d1f01a2c1ae8f4cf9fa27a6babe8f25a5b977"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/gemini-quota.test.mjs",
+      "dest": "scripts/conveyor/test/gemini-quota.test.mjs",
+      "kind": "file",
+      "sha256": "8ad7485e32b97cde39b11acc40114de826986ad4cbe28bf965822496e5268828"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/harness-hygiene.test.mjs",
+      "dest": "scripts/conveyor/test/harness-hygiene.test.mjs",
+      "kind": "file",
+      "sha256": "c378ca87c57dac3ed7a6dabff096d13ef1e3a6167395b54dd153c93d21842e8d"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/interrogate.test.mjs",
+      "dest": "scripts/conveyor/test/interrogate.test.mjs",
+      "kind": "file",
+      "sha256": "7d76fe5bd9b43b2be38408da5a0780ca658d804c8c14361dfcb0861bb033dc2e"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/ledger.test.mjs",
+      "dest": "scripts/conveyor/test/ledger.test.mjs",
+      "kind": "file",
+      "sha256": "c9081bdffdef009c8ded351b4e8e11d8a12c76982bd423678ace57e13a812c24"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/metrics.test.mjs",
+      "dest": "scripts/conveyor/test/metrics.test.mjs",
+      "kind": "file",
+      "sha256": "352fca8e5180420fc2ad441bac677087d9f039229b9bf0713741fe2321d236e7"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/process-fixture.mjs",
+      "dest": "scripts/conveyor/test/process-fixture.mjs",
+      "kind": "file",
+      "sha256": "3c65f017704fabf68fbf6391398a1542a4ece58aaa41d447498ea931a7d556ea"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/usage.test.mjs",
+      "dest": "scripts/conveyor/test/usage.test.mjs",
+      "kind": "file",
+      "sha256": "5885bf82d55ba84731eecf6b1ef5e9e9af39377a805e8dce88304a297b5d353c"
+    },
+    {
+      "src": "claude/scripts/learning/test/target-fixtures.mjs",
+      "dest": "scripts/learning/test/target-fixtures.mjs",
+      "kind": "file",
+      "sha256": "b2900ab2e19c500ef8c5720cd0851617458c12e8b2fe362a777f4d064e3a72dc"
+    },
+    {
+      "src": "claude/skills/bro-server-connect/.gitignore",
+      "dest": "skills/bro-server-connect/.gitignore",
+      "kind": "file",
+      "sha256": "1720435bd6f038b1a9b48d45c4f8374fa37149d696e24633603f70ff552f9c85"
+    },
+    {
+      "src": "claude/skills/bro-server-connect/SKILL.md",
+      "dest": "skills/bro-server-connect/SKILL.md",
+      "kind": "file",
+      "sha256": "c9ef35e73e2ace9406efa7d33fa5bd3c6043449d2bf41ffbcd4853dc039a23c8"
+    },
+    {
+      "src": "claude/skills/bro-server-connect/references/deploy.md",
+      "dest": "skills/bro-server-connect/references/deploy.md",
+      "kind": "file",
+      "sha256": "2e25351d5519c5a49219b9366be716492546b93934af461eaf0698bef4174d2d"
+    },
+    {
+      "src": "claude/skills/bro-server-connect/references/server-access.md",
+      "dest": "skills/bro-server-connect/references/server-access.md",
+      "kind": "file",
+      "sha256": "a873f366e44b757f8c0376a578c2156e622607b8e09baa3a6687f0a6fa7d78ff"
+    },
+    {
+      "src": "claude/skills/personal-server-connect/.gitignore",
+      "dest": "skills/personal-server-connect/.gitignore",
+      "kind": "file",
+      "sha256": "1720435bd6f038b1a9b48d45c4f8374fa37149d696e24633603f70ff552f9c85"
+    },
+    {
+      "src": "claude/skills/personal-server-connect/SKILL.md",
+      "dest": "skills/personal-server-connect/SKILL.md",
+      "kind": "file",
+      "sha256": "ed1358601777e48bcae59d53e5ea4ef83e40d7bdfa4b0624fd287e0c865df6fc"
+    },
+    {
+      "src": "claude/skills/personal-server-connect/references/connector-api.md",
+      "dest": "skills/personal-server-connect/references/connector-api.md",
+      "kind": "file",
+      "sha256": "34b7ca5f9262df4359ed9bf9844480e1e2666504bed118c8b0b0f585b18e912a"
+    },
+    {
+      "src": "claude/skills/personal-server-connect/references/deploy.md",
+      "dest": "skills/personal-server-connect/references/deploy.md",
+      "kind": "file",
+      "sha256": "1578dc73db9e70fa5d7c0791a317a09b838af3b00bbc338a7e955feca651253a"
+    },
+    {
+      "src": "claude/skills/personal-server-connect/references/server-access.md",
+      "dest": "skills/personal-server-connect/references/server-access.md",
+      "kind": "file",
+      "sha256": "db6d5f0076c8f7c0c7cd9068583c21cb29c64e26806521c208596cb436ec1515"
+    },
+    {
+      "src": "claude/skills/personal-server-connect/references/windows-docker.md",
+      "dest": "skills/personal-server-connect/references/windows-docker.md",
+      "kind": "file",
+      "sha256": "18353b2caf628ed0943f82a432756656c1459a13487829909f232a4a055a9e68"
     }
   ],
   "settings": "settings/hooks.json",
   "claudeMd": "claude-md/harness-section.md",
   "settingsSha256": "5de749c86eb7eb5194693f9684e71a2335e5699bf6f2a67dc60e08e17898e5f5",
-  "claudeMdSha256": "8245a09b4f7328b3986f430e37a62c206cdaea69ec64d3a7c07eb7432cb6abe3"
+  "claudeMdSha256": "f39ea8567e34b75a48c521bb69051201bde42b753b1f01a955d0d4a4042fb66f"
 }

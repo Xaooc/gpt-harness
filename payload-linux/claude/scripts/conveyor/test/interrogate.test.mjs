@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const cli = fileURLToPath(new URL('../interrogate.mjs', import.meta.url));
-const defaults = new URL('../../../conveyor/orchestration.default.json', import.meta.url);
+const configFixture = new URL('./fixtures/orchestration.json', import.meta.url);
 const readJson = async (file) => JSON.parse(await fs.readFile(file, 'utf8'));
 
 async function fixture(t, { claude = false } = {}) {
@@ -19,7 +19,7 @@ async function fixture(t, { claude = false } = {}) {
   await fs.writeFile(path.join(repo, 'untracked.txt'), 'untracked repro input\n');
   const intent = path.join(root, 'intent.md');
   await fs.writeFile(intent, 'Preserve the intended result.\n');
-  const config = await readJson(defaults);
+  const config = await readJson(configFixture);
   config.panels.review = claude ? [{ provider: 'claude', model: 'haiku', effort: 'medium' }]
     : config.panels.review.slice(0, 2);
   await fs.writeFile(path.join(conveyor, 'orchestration.json'), JSON.stringify(config));

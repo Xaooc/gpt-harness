@@ -162,8 +162,14 @@ async function optionalJson(file) {
 }
 
 export async function loadConfig() {
-  const config = await readJson(paths().config, undefined);
-  return validateConfig(config === undefined ? JSON.parse(await fs.readFile(defaultFile, 'utf8')) : config);
+  return (await loadConfigWithSource()).config;
+}
+
+export async function loadConfigWithSource() {
+  const userConfig = await readJson(paths().config, undefined);
+  if (userConfig !== undefined) return { config: validateConfig(userConfig), source: 'user' };
+  const config = JSON.parse(await fs.readFile(defaultFile, 'utf8'));
+  return { config: validateConfig(config), source: 'default' };
 }
 
 export async function writeTextAtomic(file, value) {

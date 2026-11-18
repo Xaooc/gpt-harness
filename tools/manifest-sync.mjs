@@ -4,17 +4,36 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const payload = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../payload-linux');
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const payload = path.join(repo, 'payload-linux');
 const manifestPath = path.join(payload, 'manifest.json');
 const args = process.argv.slice(2);
 if (args.some(arg => arg !== '--check')) throw new Error('Usage: node tools/manifest-sync.mjs [--check]');
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const executable = (src, bytes) => src.endsWith('.sh') || bytes.subarray(0, 2).toString() === '#!';
-// Ship the complete vendored plugin, including its verification corpus.
-const excluded = relative => !relative.startsWith('local-plugins/pstack/') && relative.split('/').some(part =>
-  ['test', 'tests', '__pycache__', 'node_modules', '.DS_Store'].includes(part)
-  || /\.test\.|\.bak/.test(part));
+const shippedTestDirs = [
+  'scripts/conveyor/test', 'hooks/test', 'scripts/learning/test', 'local-plugins/luna-panel/tests'
+];
+function excluded(relative) {
+  const parts = relative.split('/');
+  if (parts.some(part => ['__pycache__', 'node_modules', '.DS_Store'].includes(part) || part.includes('.bak'))) return true;
+  // Ship the complete vendored plugin, including its verification corpus.
+  if (relative.startsWith('local-plugins/pstack/') || shippedTestDirs.some(dir => relative === dir || relative.startsWith(`${dir}/`))) {
+    return false;
+  }
+  return parts.some(part => part === 'test' || part === 'tests' || part.includes('.test.'));
+}
+
+function refuseCredentialFiles(root) {
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const file = path.join(root, entry.name);
+    if (entry.isDirectory()) refuseCredentialFiles(file);
+    else if (/\.local\.md$|^credentials/i.test(entry.name)) {
+      throw new Error(`Refusing to sync a payload containing a local credential file: ${path.relative(repo, file)}`);
+    }
+  }
+}
 
 function walk(root, relative = '') {
   return fs.readdirSync(root, { withFileTypes: true }).flatMap(entry => {
@@ -24,6 +43,10 @@ function walk(root, relative = '') {
     return entry.isDirectory() ? walk(file, rel) : entry.isFile() ? [rel] : [];
   });
 }
+
+refuseCredentialFiles(payload);
+const windowsPayload = path.join(repo, 'payload');
+if (fs.existsSync(windowsPayload)) refuseCredentialFiles(windowsPayload);
 
 const original = fs.readFileSync(manifestPath, 'utf8');
 const manifest = JSON.parse(original);

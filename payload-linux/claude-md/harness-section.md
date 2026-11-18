@@ -15,8 +15,8 @@ LAN IPs drift with DHCP: identify hosts by their SSH host key, not their IP.
 ## Harness source
 
 How this Claude→Codex harness is built (scripts, daemon, skills, hooks, installer, learning loop) lives in the repo
-`~/dev/gpt-harness` (GitHub `Xaooc/gpt-harness`, private; this clone has no GitHub credentials, so it can be read
-but not pulled or pushed from here). Read it to understand the design: `README.md`, `PACKAGE-SPEC.md`, `INSTALL.md`,
+`~/dev/gpt-harness` (private GitHub repo `Xaooc/gpt-harness`). The GitHub CLI is signed in as the owner, so this clone
+can pull and can push with the owner's approval. Read it to understand the design: `README.md`, `PACKAGE-SPEC.md`, `INSTALL.md`,
 `SELF-LEARNING.md`; `payload-linux/` is what this machine runs, `payload/` is the Windows PC version,
 `codex-build/` is the Windows-only custom Codex build (Rust, busybox-shell patch; not used on Linux).
 `~/.claude` is the installed copy: when you change a harness script or skill there, make the same change in

@@ -17,6 +17,7 @@ import {
 } from '../lib/orchestration.mjs';
 
 const fixture = fileURLToPath(new URL('./fixtures/fake-wrapper.sh', import.meta.url));
+const configFixture = new URL('./fixtures/orchestration.json', import.meta.url);
 const defaultFile = new URL('../../../conveyor/orchestration.default.json', import.meta.url);
 const timeout = 600_000;
 const readJson = async (file) => JSON.parse(await fs.readFile(file, 'utf8'));
@@ -35,7 +36,11 @@ async function environment() {
   const dir = path.join(root, 'repo'), brief = path.join(root, 'brief.md'), out = path.join(root, 'answer.md');
   return {
     root, dir, brief, out,
-    async setup() {
+    async setup({ useDefault = false } = {}) {
+      if (!useDefault) {
+        await fs.mkdir(paths().home, { recursive: true });
+        await fs.copyFile(configFixture, paths().config);
+      }
       await fs.mkdir(dir);
       await fs.mkdir(changes.LUNA_RUN_DIR);
       await fs.writeFile(brief, 'Inspect the fixture.\n');
@@ -177,7 +182,7 @@ if [ "$ok" = true ]; then exit 0; else exit 1; fi
 test('validation rejects invalid schema; atomic saves journal a diff', { timeout }, async () => {
   const env = await environment();
   try {
-    await env.setup();
+    await env.setup({ useDefault: true });
     const config = await loadConfig();
     assert.deepEqual(config, await readJson(defaultFile));
     assert.equal(validateConfig(config), config);
@@ -205,7 +210,9 @@ test('validation rejects invalid schema; atomic saves journal a diff', { timeout
       /presets.bad.tiers.simple must be a non-empty array/);
     invalid((copy) => { copy.presets.bad = { label: '', tiers: {} }; }, /presets.bad.label must be a non-empty string/);
     await assert.rejects(fs.stat(paths().config), { code: 'ENOENT' });
-    config.thresholds.codex.switch_percent = 81;
+    const initialPercent = config.thresholds.codex.switch_percent;
+    const nextPercent = initialPercent === 81 ? 82 : 81;
+    config.thresholds.codex.switch_percent = nextPercent;
     await fs.mkdir(paths().journal, { recursive: true });
     await assert.rejects(saveConfig(config, { actor: 'panel', note: 'journal unavailable' }), { code: 'EISDIR' });
     await assert.rejects(fs.stat(paths().config), { code: 'ENOENT' });
@@ -220,7 +227,7 @@ test('validation rejects invalid schema; atomic saves journal a diff', { timeout
     assert.equal(journal.note, 'threshold control');
     assert.deepEqual(journal.before, await readJson(defaultFile));
     assert.ok(Number.isFinite(Date.parse(journal.at)));
-    assert.deepEqual(journal.diff, { 'thresholds.codex.switch_percent': [80, 81] });
+    assert.deepEqual(journal.diff, { 'thresholds.codex.switch_percent': [initialPercent, nextPercent] });
     const before = await fs.readFile(paths().config, 'utf8');
     config.thresholds.codex.switch_percent = 0;
     await assert.rejects(saveConfig(config, { actor: 'cli', note: 'invalid' }), /switch_percent/);
@@ -366,7 +373,6 @@ test('stale config and provider locks are reclaimed for dead and reused process 
   const env = await environment();
   try {
     await env.setup();
-    await fs.mkdir(paths().home);
     const config = await loadConfig();
     await fs.writeFile(`${paths().config}.lock`, JSON.stringify({ pid: 2147483647, pid_start: '1' }));
     await saveConfig(config, { actor: 'cli', note: 'reclaim dead owner' });

@@ -11,7 +11,7 @@ import { statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  loadConfig, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
+  loadConfigWithSource, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
 } from './conveyor/lib/orchestration.mjs';
 import { summarizeUsage, usagePaths } from './conveyor/usage.mjs';
 import { quotaPaths, quotaRefreshLocked } from './conveyor/gemini-quota.mjs';
@@ -51,7 +51,7 @@ function empty(now = Date.now()) {
     ram: { freeMb: null, totalMb: null },
     daemon: { running: false, appServer: null, healthy: false }, jobs: [], codexLimits: null, build: null,
     sessions: [],
-    orchestration: { chains: {}, panels: {}, threshold: null, marks: {}, presets: [], catalog: {}, configError: null },
+    orchestration: { source: null, chains: {}, panels: {}, threshold: null, marks: {}, presets: [], catalog: {}, configError: null },
     switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null,
       quota: { available: false, buckets: [], at: null } },
     usage: { ...summarizeUsage(null, now), stale: true }
@@ -307,9 +307,8 @@ async function geminiMcp(config) {
 
 async function orchestrationStatus(snapshot, now) {
   try {
-    // loadConfig's CLI default remains useful, but the panel must flag an absent user config.
-    await fs.access(orchestrationPaths().config);
-    const config = await loadConfig(), state = await providerState(config, { now, persist: false });
+    const { config, source } = await loadConfigWithSource();
+    const state = await providerState(config, { now, persist: false });
     const chains = Object.create(null), panels = Object.create(null);
     for (const tier of Object.keys(config.tiers)) {
       const resolved = await resolveChain(tier, { config, state, now });
@@ -322,7 +321,7 @@ async function orchestrationStatus(snapshot, now) {
       until: string(mark.until) || null, reason: string(mark.reason) || null
     }]));
     snapshot.orchestration = {
-      chains, panels, threshold: { ...config.thresholds.codex, switched: state.threshold.switched }, marks,
+      source, chains, panels, threshold: { ...config.thresholds.codex, switched: state.threshold.switched }, marks,
       presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
       catalog: config.catalog, configError: null
     };
@@ -583,7 +582,8 @@ async function selfTest() {
     config.registry = path.join(directory, 'jobs.jsonl');
     config.codexConfig = path.join(directory, 'config.toml');
     config.geminiStatus = path.join(directory, 'gateway-status.json');
-    const orchestration = await loadConfig();
+    const fixture = new URL('./conveyor/test/fixtures/orchestration.json', import.meta.url);
+    const orchestration = JSON.parse(await fs.readFile(fixture, 'utf8'));
     await fs.mkdir(orchestrationPaths().home);
     const usageCache = { v: 1, at: new Date(now).toISOString(), days: {}, topJobs: [] };
     await fs.writeFile(usagePaths().cache, JSON.stringify(usageCache));
@@ -699,6 +699,7 @@ async function selfTest() {
       assert.ok(localPath(snapshot.jobs[0].out));
     });
     check('orchestration uses shared resolution', () => {
+      assert.equal(snapshot.orchestration.source, 'user');
       assert.equal(snapshot.orchestration.configError, null);
       assert.equal(snapshot.orchestration.chains.complex[0].selected, true);
       assert.equal(snapshot.orchestration.chains.complex[1].selected, false);
@@ -768,9 +769,10 @@ async function selfTest() {
     check('dead Gemini pointer removed from disk', () => assert.ok(!pointers.includes('dead.json')));
     await fs.unlink(orchestrationPaths().config);
     const noOrchestration = await collect(config, empty(now), now);
-    check('missing orchestration config reports an error and preserves other sections', () => {
-      assert.match(noOrchestration.orchestration.configError, /ENOENT/);
-      assert.deepEqual(noOrchestration.orchestration.chains, {});
+    check('missing orchestration config uses shipped defaults and preserves other sections', () => {
+      assert.equal(noOrchestration.orchestration.source, 'default');
+      assert.equal(noOrchestration.orchestration.configError, null);
+      assert.ok(noOrchestration.orchestration.chains.complex.length > 0);
       assert.deepEqual(noOrchestration.jobs, withGemini.jobs);
       assert.deepEqual(noOrchestration.codexLimits, withGemini.codexLimits);
       assert.deepEqual(noOrchestration.switches, withGemini.switches);

@@ -4,8 +4,8 @@
     "complex": [
       {
         "provider": "codex",
-        "model": "gpt-6.1-sol",
-        "effort": "max"
+        "model": "gpt-6.2-sol",
+        "effort": "high"
       },
       {
         "provider": "claude",
@@ -14,11 +14,6 @@
       }
     ],
     "simple": [
-      {
-        "provider": "gemini",
-        "model": "gemini-3.8-flash",
-        "effort": "high"
-      },
       {
         "provider": "codex",
         "model": "gpt-6-luna",
@@ -37,22 +32,12 @@
         "effort": "high"
       },
       {
-        "provider": "gemini",
-        "model": "gemini-3.8-flash",
-        "effort": "high"
-      },
-      {
         "provider": "claude",
         "model": "haiku",
         "effort": "medium"
       }
     ],
     "scout": [
-      {
-        "provider": "gemini",
-        "model": "gemini-3.8-flash",
-        "effort": "medium"
-      },
       {
         "provider": "codex",
         "model": "gpt-6-luna",
@@ -115,12 +100,7 @@
     "design": [
       {
         "provider": "codex",
-        "model": "gpt-6.1-sol",
-        "effort": "max"
-      },
-      {
-        "provider": "gemini",
-        "model": "gemini-3.8-flash",
+        "model": "gpt-6.2-sol",
         "effort": "high"
       },
       {
@@ -132,12 +112,7 @@
     "review": [
       {
         "provider": "codex",
-        "model": "gpt-6.1-sol",
-        "effort": "high"
-      },
-      {
-        "provider": "gemini",
-        "model": "gemini-3.8-flash",
+        "model": "gpt-6.2-sol",
         "effort": "high"
       },
       {
@@ -148,13 +123,13 @@
     ],
     "judge": [
       {
-        "provider": "gemini",
-        "model": "gemini-3.8-flash",
+        "provider": "codex",
+        "model": "gpt-6.2-sol",
         "effort": "high"
       },
       {
         "provider": "codex",
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6-luna",
         "effort": "high"
       }
     ],
@@ -194,7 +169,7 @@
         ]
       },
       {
-        "model": "gpt-6.2-astra",
+        "model": "gpt-6.2-sol",
         "efforts": [
           "low",
           "medium",
@@ -204,7 +179,17 @@
         ]
       },
       {
-        "model": "gpt-6.2-sol",
+        "model": "gpt-6.1-terra",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      {
+        "model": "gpt-6.2-astra",
         "efforts": [
           "low",
           "medium",
@@ -248,17 +233,25 @@
           "medium",
           "high"
         ]
+      },
+      {
+        "model": "fable",
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ]
       }
     ]
   },
   "thresholds": {
     "codex": {
-      "switch_percent": 80,
+      "switch_percent": 100,
       "windows": [
         "primary",
         "secondary"
       ],
-      "hysteresis_percent": 5
+      "hysteresis_percent": 15
     }
   },
   "unavailable_ttl_s": {
@@ -279,10 +272,10 @@
     "reflect judgment, divergent, synthesizer": "tier:review",
     "arena runners": "panel:design",
     "architect runners": "panel:architect",
-    "approach review: complex architecture or a looping problem": "tier:architect",
-    "approach review: medium change": "tier:approach",
     "interrogate reviewers": "panel:review",
     "arena cross-judge pool": "panel:judge",
+    "approach review: complex architecture or a looping problem": "tier:architect",
+    "approach review: medium change": "tier:approach",
     "technical plan for complex architecture (reviewed by approach)": "tier:planner"
   },
   "presets": {

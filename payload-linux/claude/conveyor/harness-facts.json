@@ -40,9 +40,7 @@
     "hooks/managed-hooks-registry.cjs",
     "scripts/changeset/**",
     "scripts/lib/allowlist-ratchet.cjs",
-    "scripts/lib/cli-exit.cjs",
-    "skills/bro-server-connect/**",
-    "skills/personal-server-connect/**"
+    "scripts/lib/cli-exit.cjs"
   ],
   "optionalPaths": [
     "~/.claude/heavy-gate-off",

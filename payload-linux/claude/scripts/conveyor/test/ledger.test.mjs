@@ -257,6 +257,9 @@ async function crosscheckFixture(t) {
 
 test('stop check 10 audits completed reviews before complex writes and has its own calibration', { timeout }, async (t) => {
   const { f } = await crosscheckFixture(t);
+  const configFile = path.join(f.home, 'orchestration.json');
+  const configFixture = new URL('./fixtures/orchestration.json', import.meta.url);
+  fs.copyFileSync(configFixture, configFile);
   fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
   f.env.FAKE_UNTRACKED = '["worker.mjs"]';
   f.env.CONVEYOR_CHECK_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"ok\":true}'"]);
@@ -310,15 +313,14 @@ test('stop check 10 audits completed reviews before complex writes and has its o
   assert.equal(result.check, 10);
   assert.match(result.reason, /^10\. work restarted after a gate failure without a completed architect review:/);
 
-  const configFile = path.join(f.home, 'orchestration.json');
-  const config = JSON.parse(fs.readFileSync(new URL('../../../conveyor/orchestration.default.json', import.meta.url), 'utf8'));
+  const config = JSON.parse(fs.readFileSync(configFixture, 'utf8'));
   delete config.tiers.approach;
   delete config.tiers.architect;
   config.roles = Object.fromEntries(Object.entries(config.roles)
     .filter(([, target]) => target !== 'tier:approach' && target !== 'tier:architect'));
   fs.writeFileSync(configFile, JSON.stringify(config));
   assert.equal((await status()).ok, true);
-  fs.rmSync(configFile);
+  fs.copyFileSync(configFixture, configFile);
 
   const old = new Date(Date.now() - 8 * 86400_000);
   const age = (file) => {
