@@ -325,6 +325,28 @@ test('Gemini exit 3 falls back, archives artifacts, and journals a cooldown and 
   } finally { await env.cleanup(); }
 });
 
+test('a model the account does not serve is skipped alone; the provider stays in other chains',
+  { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const run = await env.run('architect', '-r', {
+      FAKE_CODEX_RC: '1', FAKE_CODEX_STATE: 'starting',
+      FAKE_CODEX_ERROR: '{"code":"model_not_found",' +
+        '"message":"The model is not supported when using Codex with a ChatGPT account."}'
+    });
+    assert.equal(run.status, 4, run.stderr);
+    const codex = (await readJson(paths().providers)).codex;
+    assert.equal(codex.until, undefined);
+    assert.deepEqual(Object.keys(codex.models).sort(), ['gpt-6.2-astra', 'gpt-6.2-sol']);
+    assert.equal(Date.parse(codex.models['gpt-6.2-sol'].until) - Date.parse(codex.models['gpt-6.2-sol'].at), 1800_000);
+    const architect = await resolveChain('architect');
+    assert.match(architect.chain[0].reason, /codex\/gpt-6\.2-astra unavailable until .*: quota/);
+    assert.equal(architect.selected.provider, 'claude');
+    assert.equal((await resolveChain('review')).selected.model, 'gpt-6-luna');
+  } finally { await env.cleanup(); }
+});
+
 test('a write wrapper that runs, edits a file and hits quota is never retried', { timeout }, async () => {
   const env = await environment();
   try {

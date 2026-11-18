@@ -324,6 +324,26 @@ export async function markUnavailable(provider, reason, note, { config, now = Da
   });
 }
 
+/** Marks one model unavailable (e.g. "model not supported" for this account or CLI version) and keeps the provider's
+ *  other models in the chains. */
+export async function markModelUnavailable(provider, model, reason, note, { config, now = Date.now() } = {}) {
+  if (!providers.includes(provider)) throw new Error(`unknown provider: ${provider}`);
+  if (!reasons.includes(reason)) throw new Error(`unknown unavailable reason: ${reason}`);
+  if (typeof model !== 'string' || !model) throw new Error('model is required');
+  config ??= await loadConfig();
+  return withLock(paths().providers, async () => {
+    const marks = await readProviders();
+    const mark = {
+      until: new Date(now + config.unavailable_ttl_s[reason] * 1000).toISOString(), reason, note,
+      at: new Date(now).toISOString()
+    };
+    const models = object(marks[provider]?.models) ? marks[provider].models : {};
+    marks[provider] = { ...marks[provider], models: { ...models, [model]: mark } };
+    await writeJsonAtomic(paths().providers, marks);
+    return mark;
+  });
+}
+
 async function codexUsage(now) {
   const run = paths().run;
   const candidates = await Promise.all([
@@ -415,11 +435,16 @@ export async function providerState(config, { now = Date.now(), persist = true }
 function resolveEntries(entries, state, now) {
   return entries.map((entry) => {
     const mark = state.providers[entry.provider];
+    const modelMark = object(mark?.models) ? mark.models[entry.model] : null;
     let reason = 'available';
     let available = true;
     if (mark && now < stamp(mark.until)) {
       available = false;
       reason = `${entry.provider} unavailable until ${new Date(stamp(mark.until)).toISOString()}: ${mark.reason}`;
+    } else if (object(modelMark) && now < stamp(modelMark.until)) {
+      available = false;
+      const until = new Date(stamp(modelMark.until)).toISOString();
+      reason = `${entry.provider}/${entry.model} unavailable until ${until}: ${modelMark.reason}`;
     } else if (entry.provider === 'codex' && state.threshold.skip) {
       available = false;
       reason = state.threshold.reason;

@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { home as userHome, killTree, listProcesses, platform } from './lib/platform.mjs';
+import { home as userHome, killTree, listProcesses, platform, processAlive } from './lib/platform.mjs';
 
 const updater = 'https://antigravity-cli-auto-updater-974169037036.us-central1.run.app';
 const registry = 'https://registry.npmjs.org/@openai%2Fcodex/latest';
@@ -18,6 +18,13 @@ const conveyor = () => path.join(home(), '.claude', 'conveyor');
 const agyDir = () => path.resolve(process.env.CLI_UPDATE_AGY_DIR || '/srv/docker/compose/antigravity-parallel');
 const runDir = () => path.resolve(process.env.LUNA_RUN_DIR || path.join(home(), '.claude', 'luna-run'));
 const proxy = () => process.env.HTTPS_PROXY || 'http://127.0.0.1:10809';
+// Windows has npm's own global prefix, and its .cmd shims cannot be spawned without a shell: run the JavaScript
+// entry points with this Node instead.
+const npmPrefix = () => platform === 'win32'
+  ? path.join(process.env.APPDATA || path.join(home(), 'AppData', 'Roaming'), 'npm')
+  : path.join(home(), '.npm-global');
+const terminalStates = new Set(['done', 'failed', 'incomplete', 'stalled', 'completed', 'cancelled', 'unavailable',
+  'stopped']);
 const print = (value) => process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 
 class Failure extends Error {
@@ -171,13 +178,24 @@ async function latestVersions(refresh = false) {
 }
 
 async function codexCommand() {
-  if (process.env.CLI_UPDATE_CODEX_CMD) return process.env.CLI_UPDATE_CODEX_CMD;
-  const global = path.join(home(), '.npm-global', 'bin', 'codex');
-  return await exists(global) ? global : 'codex';
+  if (process.env.CLI_UPDATE_CODEX_CMD) return [process.env.CLI_UPDATE_CODEX_CMD];
+  if (platform === 'win32') {
+    return [process.execPath, path.join(npmPrefix(), 'node_modules', '@openai', 'codex', 'bin', 'codex.js')];
+  }
+  const global = path.join(npmPrefix(), 'bin', 'codex');
+  return [await exists(global) ? global : 'codex'];
+}
+
+function npmCommand() {
+  if (process.env.CLI_UPDATE_NPM_CMD) return [process.env.CLI_UPDATE_NPM_CMD];
+  return platform === 'win32'
+    ? [process.execPath, path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')]
+    : ['npm'];
 }
 
 async function codexVersion() {
-  const text = succeeded(await run(await codexCommand(), ['--version']), 'codex --version');
+  const [command, ...prefix] = await codexCommand();
+  const text = succeeded(await run(command, [...prefix, '--version']), 'codex --version');
   const version = /^codex(?:-cli)?\s+(\S+)/m.exec(text)?.[1];
   if (!versionPattern.test(version)) throw new Error('cannot parse codex --version');
   return version;
@@ -220,11 +238,28 @@ function daemonJobs(stdout) {
   return { health, jobs };
 }
 
+// Windows has no /proc scan: luna.sh leaves one pointer per job in luna-run/active (output path, wrapper PID, start).
+// A pointer counts while its wrapper lives and its status is not terminal.
+async function activeWrapperJobs(reasons) {
+  const active = path.join(runDir(), 'active');
+  const names = await fs.readdir(active).catch((error) => { if (error.code === 'ENOENT') return []; throw error; });
+  let jobs = 0;
+  for (const name of names) {
+    const [out = '', pid = ''] = (await fs.readFile(path.join(active, name), 'utf8').catch(() => '')).split(/\r?\n/);
+    if (!out.trim() || !processAlive(Number(pid))) continue;
+    const status = await fs.readFile(`${out.trim()}.status`, 'utf8').catch(() => '');
+    if (terminalStates.has(/^state=(.*)$/m.exec(status)?.[1]?.trim())) continue;
+    jobs++;
+    reasons.push(`luna.sh job ${path.basename(out.trim())}`);
+  }
+  return jobs;
+}
+
 async function codexBusy() {
   let jobs = 0;
   const reasons = [];
   try {
-    if (platform !== 'linux') throw new Error('Codex update process inspection unavailable');
+    if (!['linux', 'win32'].includes(platform)) throw new Error('Codex update process inspection unavailable');
     const script = path.join(home(), '.claude', 'scripts', 'luna-daemon.mjs');
     if (await exists(script)) {
       for (const profile of ['default', 'net']) {
@@ -244,6 +279,10 @@ async function codexBusy() {
       }
     } else if (await exists(path.join(runDir(), 'daemon.json')) || await exists(path.join(runDir(), 'daemon-net/daemon.json'))) {
       throw new Error('daemon script missing while discovery exists');
+    }
+    if (platform === 'win32') {
+      jobs += await activeWrapperJobs(reasons);
+      return { jobs, reason: reasons.length ? reasons.join('; ') : null };
     }
     const rows = new Map(listProcesses({ argv: true }).map((row) => [row.pid, row]));
     for (const row of rows.values()) {
@@ -376,18 +415,23 @@ async function updateCodex(opts) {
   if (requested !== 'latest' && !versionPattern.test(requested)) throw new Error('invalid Codex version');
   const from = await codexVersion(), expected = await expectedByHarness();
   const note = (to) => expected && to !== expected ? `expectedByHarness=${expected}; update install.mjs and commit` : null;
+  const [npm, ...npmPrefixArgs] = npmCommand();
   if (!opts['--confirm']) return { ok: true, dryRun: true, from, to: requested,
-    command: [process.env.CLI_UPDATE_NPM_CMD || 'npm', 'i', '-g', `@openai/codex@${requested}`], note: note(requested) };
+    command: [npm, ...npmPrefixArgs, 'i', '-g', `@openai/codex@${requested}`], note: note(requested) };
   idle(await codexBusy());
   return withLock(async () => {
     const to = requested === 'latest' ? (await latestVersions(true)).codex.latest : requested;
     if (!to) throw new Error('cannot resolve latest Codex version');
     idle(await codexBusy());
-    const env = { ...process.env, npm_config_prefix: path.join(home(), '.npm-global'),
+    // An idle daemon keeps serving the old binary (on Windows it also locks codex.exe); the next job starts a new one.
+    const daemon = path.join(home(), '.claude', 'scripts', 'luna-daemon.mjs');
+    if (await exists(daemon)) await run(process.execPath, [daemon, '--stop'], { timeout: 30_000 }).catch(() => {});
+    const env = { ...process.env, npm_config_prefix: npmPrefix(),
       npm_config_registry: 'https://registry.npmjs.org', npm_config_proxy: proxy(), npm_config_https_proxy: proxy(),
       npm_config_fetch_retries: '0', npm_config_fetch_timeout: '60000' };
-    const install = async (version) => succeeded(await run(process.env.CLI_UPDATE_NPM_CMD || 'npm',
-      ['i', '-g', `@openai/codex@${version}`], { timeout: 60_000, env }), 'npm install');
+    // A Windows global install unpacks the native binary and takes about two minutes on this kind of machine.
+    const install = async (version) => succeeded(await run(npm,
+      [...npmPrefixArgs, 'i', '-g', `@openai/codex@${version}`], { timeout: 300_000, env }), 'npm install');
     try {
       await install(requested);
       const actual = await codexVersion();
