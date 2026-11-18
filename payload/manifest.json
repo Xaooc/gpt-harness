@@ -190,7 +190,7 @@
       "src": "claude/scripts/luna-overview.mjs",
       "dest": "scripts/luna-overview.mjs",
       "kind": "file",
-      "sha256": "801ecc0ad40ea7e4e767cacd982875e56fd9e044216f7a2c0bdd991527e5a84b",
+      "sha256": "54970b196940a3dcaa00aeeab88cf63e4d3992d9cfed04173bc61c6cb05aba79",
       "executable": true
     },
     {
