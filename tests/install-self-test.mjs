@@ -111,8 +111,10 @@ export function selfTest({
       assert.throws(() => parseArgs(['--platform']), /Missing value/);
       assert.equal(parseArgs(['--help']).help, true);
       assert.equal(parseArgs(['--accept-local-drift']).acceptLocalDrift, true);
+      assert.equal(parseArgs(['--owner-setup']).ownerSetup, true);
       assert.match(USAGE, /--dry-run.*--check/);
       assert.match(USAGE, /drift exits 3 before any writes/);
+      assert.match(USAGE, /--owner-setup:.*Exits 4/);
     });
     test('Linux payload hashes cover installed files and both settings assets', () => {
       const linuxPayload = path.join(REPO_ROOT, 'payload-linux');
@@ -299,7 +301,7 @@ export function selfTest({
       assert.ok(ctx.warnings.some(warning => warning.includes('plugin version differs')));
       const missing = winContext({ home: path.join(temp, 'missing-plugin'), payload, log: () => {} });
       patchPlugins(missing, patchManifest);
-      assert.ok(missing.warnings.some(warning => warning.includes('/plugin install codex@openai-codex')));
+      assert.ok(missing.warnings.some(warning => warning.includes('codex@openai-codex not installed yet')));
     });
     test('env preserves other keys and existing root; explicit root overrides', () => {
       const file = path.join(ch, 'luna-harness.env');
@@ -388,6 +390,128 @@ export function selfTest({
       const options = { home: path.join(root, 'home'), payload: fixture.payload, log: () => {} };
       const ctx = winContext(options);
       return { ...fixture, ctx, options, ch: ctx.claudeHome };
+    }
+    function withFakeExternals(name, action) {
+      const fixture = isolated(name);
+      const { options, manifest, ch } = fixture;
+      const bin = path.join(path.dirname(options.home), 'bin');
+      const callsFile = path.join(path.dirname(options.home), 'calls.jsonl');
+      const externalFile = path.join(REPO_ROOT, 'external.json');
+      manifest.settingsSha256 = sha256(fs.readFileSync(path.join(options.payload, manifest.settings)));
+      manifest.claudeMdSha256 = sha256(fs.readFileSync(path.join(options.payload, manifest.claudeMd)));
+      atomicWrite(path.join(options.payload, 'manifest.json'), json(manifest));
+      for (const cli of ['claude', 'npx']) {
+        const file = path.join(bin, cli);
+        atomicWrite(file, `#!/usr/bin/env node
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const home = process.env.HOME;
+const claude = path.join(home, '.claude');
+assert.equal(home, ${JSON.stringify(options.home)});
+assert.equal(process.env.USERPROFILE, home);
+assert.equal(process.env.CLAUDE_CONFIG_DIR, claude);
+assert.equal(process.cwd(), home);
+assert.ok(fs.existsSync(path.join(claude, 'CLAUDE.md')));
+const argv = [${JSON.stringify(cli)}, ...process.argv.slice(2)];
+fs.appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify(argv) + '\\n');
+const entries = JSON.parse(fs.readFileSync(${JSON.stringify(externalFile)}, 'utf8'));
+const entry = entries.find(item => JSON.stringify(argv) ===
+  JSON.stringify(item.argv.map(arg => arg.replaceAll('{{CLAUDE_HOME}}', claude))));
+assert.ok(entry, JSON.stringify(argv));
+if ((process.env.LUNA_TEST_EXTERNAL_FAILURES || '').split(',').includes(entry.id)) {
+  console.error('simulated failure for ' + entry.id);
+  process.exit(1);
+}
+const [probe] = entry.probe;
+const target = path.join(home, probe.path);
+fs.mkdirSync(path.dirname(target), { recursive: true });
+if (probe.keys) {
+  const registry = fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, 'utf8')) : {};
+  let current = registry;
+  for (const key of probe.keys.slice(0, -1)) current = current[key] ??= {};
+  current[probe.keys.at(-1)] = [{}];
+  fs.writeFileSync(target, JSON.stringify(registry));
+} else {
+  fs.writeFileSync(target, '1.4.4');
+  const settingsPath = path.join(claude, 'settings.json');
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  settings.statusLine = { type: 'command', command: 'gsd-unwanted-replacement' };
+  settings.hooks.PreToolUse.push({ hooks: [{ type: 'command', command: claude + '/hooks/gsd-fake.js' }] });
+  fs.writeFileSync(settingsPath, JSON.stringify(settings));
+}
+`);
+        fs.chmodSync(file, 0o755);
+      }
+      const previousPath = process.env.PATH;
+      const previousFailures = process.env.LUNA_TEST_EXTERNAL_FAILURES;
+      const calls = () => fs.existsSync(callsFile)
+        ? fs.readFileSync(callsFile, 'utf8').trim().split('\n').map(JSON.parse) : [];
+      const messages = [];
+      const run = (...args) => {
+        const flags = parseArgs(['--home', options.home, '--platform', 'linux', ...args]);
+        return install(makeContext({ ...flags, payload: options.payload, log: message => messages.push(message) }), () => {});
+      };
+      try {
+        process.env.PATH = [bin, previousPath].filter(Boolean).join(path.delimiter);
+        delete process.env.LUNA_TEST_EXTERNAL_FAILURES;
+        const entries = readJson(externalFile).filter(entry => entry.platforms.includes('linux') && entry.argv.length);
+        action({ ch, calls, run, messages, entries });
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        if (previousFailures === undefined) delete process.env.LUNA_TEST_EXTERNAL_FAILURES;
+        else process.env.LUNA_TEST_EXTERNAL_FAILURES = previousFailures;
+      }
+    }
+    if (process.platform === 'win32') console.log('[skip] Owner setup fakes require Unix executable scripts');
+    else {
+      test('owner setup previews pending commands and installs each missing entry once', () => {
+        withFakeExternals('owner setup', ({ ch, calls, run, messages, entries }) => {
+          const settingsPath = path.join(ch, 'settings.json');
+          const statusLine = { type: 'command', command: 'user-statusline' };
+          atomicWrite(settingsPath, json({ statusLine }));
+          const config = path.join(ch, 'conveyor/orchestration.json');
+          atomicWrite(config, 'user configuration');
+          const alreadyInstalled = 'hookify@claude-plugins-official';
+          atomicWrite(path.join(ch, 'plugins/installed_plugins.json'), json({ plugins: { [alreadyInstalled]: [{}] } }));
+          const pending = entries.filter(entry => entry.id !== alreadyInstalled);
+          const expected = pending.map(entry => substitutePlaceholders(entry.argv, ch));
+          const before = snapshot(ch);
+          assert.equal(run('--owner-setup', '--dry-run'), 0);
+          assert.deepEqual(snapshot(ch), before);
+          for (const args of [[], ['--owner-setup', '--check']]) assert.equal(run(...args), 0);
+          assert.deepEqual(calls(), []);
+          for (const argv of expected) {
+            const command = argv.map(arg => arg.includes(' ') ? `'${arg}'` : arg).join(' ');
+            assert.equal(messages.filter(message => message.startsWith('[pending]') && message.endsWith(command)).length, 3);
+          }
+          assert.ok(!messages.some(message => message.startsWith(`[pending] ${alreadyInstalled}:`)));
+          assert.equal(run('--owner-setup'), 0);
+          assert.deepEqual(calls(), expected);
+          assert.equal(run('--owner-setup'), 0);
+          assert.deepEqual(calls(), expected);
+          const settings = readJson(settingsPath);
+          assert.deepEqual(settings.statusLine, statusLine);
+          assert.ok(settings.hooks.PreToolUse.some(entry => entry.hooks.some(hook => hook.command.endsWith('/gsd-fake.js'))));
+          assert.equal(fs.readFileSync(config, 'utf8'), 'user configuration');
+        });
+      });
+      test('owner setup warns after optional failures and exits 4 if a required entry stays pending', () => {
+        withFakeExternals('owner setup failure', ({ ch, calls, run, messages }) => {
+          process.env.LUNA_TEST_EXTERNAL_FAILURES = 'pstack@luna-local,gsd-core';
+          assert.equal(run('--owner-setup'), 4);
+          assert.ok(fs.existsSync(path.join(ch, RECORD)));
+          assert.ok(calls().some(argv => argv[0] === 'npx'));
+          assert.ok(messages.some(message => message.includes('simulated failure for pstack@luna-local')));
+          assert.ok(messages.some(message => message.includes('simulated failure for gsd-core')));
+          const count = calls().length;
+          process.env.LUNA_TEST_EXTERNAL_FAILURES = 'gsd-core';
+          assert.equal(run('--owner-setup'), 0);
+          assert.deepEqual(calls().slice(count).map(argv => argv[0] === 'npx' ? argv[0] : argv.at(-1)),
+            ['pstack@luna-local', 'npx']);
+        });
+      });
     }
     test('managed CLAUDE.md edits refuse all modes and repeated accepted edits get distinct whole-file backups', () => {
       for (const recorded of [false, true]) {

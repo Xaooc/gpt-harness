@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { substitutePlaceholders } from '../install.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const TIMEOUT = 300_000;
 
 function backupFiles(root) {
   const files = [];
@@ -29,7 +30,7 @@ function runInstaller(home, { platform = 'win32', check = false, dryRun = false 
   const result = spawnSync(process.execPath, [
     ...args,
   ], {
-    cwd: REPO_ROOT, encoding: 'utf8', windowsHide: true, maxBuffer: 32 * 1024 * 1024,
+    cwd: REPO_ROOT, encoding: 'utf8', windowsHide: true, timeout: TIMEOUT, maxBuffer: 32 * 1024 * 1024,
     env: { ...process.env, HOME: home, USERPROFILE: home },
   });
   if (result.stdout) process.stdout.write(result.stdout);
@@ -52,6 +53,36 @@ function verifyHookCommands(home, payload = 'payload') {
       assert.equal(count, 1, `${event}: expected hook command exactly once: ${hook.command}`);
     }
   }
+}
+
+function verifyConveyor(home) {
+  const claudeHome = path.join(home, '.claude');
+  const conveyor = path.join(claudeHome, 'conveyor');
+  const scripts = path.join(claudeHome, 'scripts/conveyor');
+  const config = path.join(conveyor, 'orchestration.json');
+  const dispatcher = path.join(scripts, 'exec.mjs');
+  const run = (label, args) => {
+    const result = spawnSync(process.execPath, args, {
+      cwd: scripts, encoding: 'utf8', timeout: TIMEOUT,
+      env: {
+        ...process.env, HOME: home, USERPROFILE: home, CONVEYOR_HOME: conveyor, CLAUDE_HOME_DIR: claudeHome,
+        LUNA_RUN_DIR: path.join(claudeHome, 'luna-run'), CODEX_HOME: path.join(home, '.codex'),
+      },
+    });
+    const output = [result.stdout, result.stderr, result.error?.message].filter(Boolean).join('\n').trim();
+    assert.equal(result.status, 0, `${label} failed (${result.status ?? result.signal}):\n${output}`);
+    console.log(`[ok] PASS ${label}`);
+    return result.stdout;
+  };
+  assert.equal(fs.existsSync(config), false, 'Fresh home must start without a live orchestration config');
+  assert.ok(fs.existsSync(path.join(conveyor, 'orchestration.default.json')), 'Default orchestration config must be shipped');
+  run('installed conveyor status', [dispatcher, 'status']);
+  assert.equal(run('installed conveyor config validate', [dispatcher, 'config', 'validate']).trim(), 'valid');
+  assert.equal(fs.existsSync(config), false, 'Dispatcher checks must preserve the shipped config fallback');
+
+  const testDir = path.join(scripts, 'test');
+  if (fs.existsSync(testDir)) run('installed conveyor check.test.mjs', ['--test', path.join(testDir, 'check.test.mjs')]);
+  else console.log('[skip] Installed conveyor test/ directory is absent');
 }
 
 function main() {
@@ -90,7 +121,7 @@ function main() {
     if (process.platform !== 'linux') {
       console.log('[skip] Linux PATH, Codex model, and payload runtime checks require Linux binaries');
     }
-    const firstLinux = runInstaller(home, { platform: 'linux', check: process.platform === 'linux' });
+    const firstLinux = runInstaller(home, { platform: 'linux' });
     exitCode = firstLinux.code;
     if (exitCode !== 0) return exitCode;
     verifyHookCommands(home, 'payload-linux');
@@ -100,14 +131,14 @@ function main() {
     assert.equal(fs.existsSync(path.join(claudeHome, 'luna-harness.env')), false);
     assert.equal(fs.existsSync(path.join(claudeHome, 'bin/luna-sh')), false);
     assert.equal(fs.existsSync(path.join(claudeHome, 'luna-harness/codex-plugin-patches')), false);
+    if (process.platform === 'linux') verifyConveyor(home);
     const beforeLinux = backupFiles(home);
-    const secondLinux = runInstaller(home, { platform: 'linux' });
+    const secondLinux = runInstaller(home, { platform: 'linux', check: process.platform === 'linux' });
     exitCode = secondLinux.code;
-    if (exitCode !== 0) return exitCode;
     assert.match(secondLinux.output, /Summary: 0 files written; \d+ skipped; 0 backups created\./);
     assert.deepEqual(backupFiles(home), beforeLinux, 'Second Linux run must not alter backups');
     console.log('[ok] PASS Linux dry-run, install, idempotency, unchanged backups, and hook commands');
-    return 0;
+    return exitCode;
   } catch (error) {
     console.error(`[FAIL] ${error.message}`);
     return exitCode || 2;

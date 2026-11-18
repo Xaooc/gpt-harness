@@ -1,6 +1,6 @@
 /**
  * Usage: node install.mjs [--home <dir>] [--platform win32|linux] [--codex-build-root <winpath>]
- *   [--dry-run] [--check] [--accept-local-drift] [--no-plugin-patch] [--yes] [--uninstall] [--help]
+ *   [--dry-run] [--check] [--owner-setup] [--accept-local-drift] [--no-plugin-patch] [--yes] [--uninstall] [--help]
  * Run node install.mjs --self-test for isolated tests using a tiny temporary payload.
  */
 import { selfTest } from './tests/install-self-test.mjs';
@@ -21,7 +21,9 @@ const END = '<!-- luna-harness:end -->';
 const CHECK_TIMEOUT = 300_000;
 const RECORD = 'luna-harness.installed.json';
 const USAGE = 'Usage: node install.mjs [--home <dir>] [--platform win32|linux] [--codex-build-root <winpath>]\n'
-  + '  [--dry-run] [--check] [--accept-local-drift] [--no-plugin-patch] [--yes] [--uninstall] [--self-test] [--help]\n'
+  + '  [--dry-run] [--check] [--owner-setup] [--accept-local-drift] [--no-plugin-patch] [--yes] [--uninstall] [--self-test] [--help]\n'
+  + '--owner-setup: install pending external tools. Exits 4 if required entries are still pending.\n'
+  + 'External commands are listed in preview mode, during --check, and without --owner-setup.\n'
   + '--accept-local-drift: back up local edits and replace them; otherwise drift exits 3 before any writes.\n'
   + 'A three-way merge is the usual fix for local drift. --dry-run and --check also list drift.';
 
@@ -40,7 +42,7 @@ function parseArgs(args) {
       const flags = {
         '--dry-run': 'dryRun', '--check': 'check', '--no-plugin-patch': 'noPluginPatch',
         '--yes': 'yes', '--self-test': 'selfTest', '--uninstall': 'uninstall', '--help': 'help',
-        '--accept-local-drift': 'acceptLocalDrift',
+        '--accept-local-drift': 'acceptLocalDrift', '--owner-setup': 'ownerSetup',
       };
       if (!flags[arg]) throw new Error(`Unknown option: ${arg}`);
       options[flags[arg]] = true;
@@ -281,6 +283,120 @@ function preflight(ctx) {
 
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+}
+
+function externalInstalled(ctx, entry) {
+  // The Claude list commands can write startup state. Read the registries directly, including on a dry-run.
+  return entry.probe.every(({ path: relative, keys }) => {
+    const file = resolveInside(ctx.home, relative);
+    if (!keys) return fs.existsSync(file);
+    const bytes = readOptional(file);
+    if (!bytes) return false;
+    let value = JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/, ''));
+    for (const key of keys) value = value && Object.hasOwn(value, key) ? value[key] : undefined;
+    return Array.isArray(value) ? value.length > 0 : Boolean(value);
+  });
+}
+
+function displayArg(arg) {
+  if (/^[\w@%+=:,./-]+$/.test(arg)) return arg;
+  return process.platform === 'win32' ? `'${arg.replaceAll("'", "''")}'` : `'${arg.replaceAll("'", "'\\''")}'`;
+}
+
+function externalExecutable(name) {
+  const native = findExecutable(name, file => process.platform !== 'win32' || /\.(?:exe|com)$/i.test(file));
+  if (native) return [native];
+  if (process.platform !== 'win32' || name !== 'npx') return null;
+  // npm ships npx as a .cmd shim on Windows. Launch the same entry point without shell interpolation.
+  const shim = findExecutable('npx.cmd');
+  const script = shim && path.join(path.dirname(shim), 'node_modules', 'npm', 'bin', 'npx-cli.js');
+  return script && fs.existsSync(script) ? [process.execPath, script] : null;
+}
+
+function retainSettings(before, after) {
+  const merged = { ...after, ...before };
+  for (const [key, value] of Object.entries(before)) {
+    const next = after[key];
+    if (value && next && typeof value === 'object' && typeof next === 'object'
+      && !Array.isArray(value) && !Array.isArray(next)) merged[key] = retainSettings(value, next);
+  }
+  return merged;
+}
+
+function preserveExternalSettings(file, before, kind) {
+  const after = readOptional(file);
+  if (after?.equals(before)) return;
+  try {
+    const previous = requireObject(JSON.parse(before.toString('utf8')), file);
+    const updated = after ? requireObject(JSON.parse(after.toString('utf8').replace(/^\uFEFF/, '')), file) : {};
+    const kept = retainSettings(previous, updated);
+    if (kind === 'npm-installer') {
+      const identities = new Set(hookIdentities(previous));
+      for (const [event, entries] of Object.entries(updated.hooks ?? {})) {
+        if (!Array.isArray(previous.hooks?.[event])) continue;
+        for (const entry of entries) {
+          const hooks = (entry.hooks ?? []).filter(hook => {
+            const identity = hookIdentity(event, hook);
+            if (!identity || identities.has(identity) || !/[\\/]gsd-/.test(hook.command)) return false;
+            identities.add(identity);
+            return true;
+          });
+          if (hooks.length) kept.hooks[event] = [...kept.hooks[event], { ...entry, hooks }];
+        }
+      }
+    }
+    if (stableJson(kept) === stableJson(previous)) atomicWrite(file, before);
+    else if (stableJson(kept) !== stableJson(updated)) atomicWrite(file, `${JSON.stringify(kept, null, 2)}\n`);
+  } catch (error) {
+    atomicWrite(file, before);
+    throw new Error(`Could not preserve settings after external setup: ${error.message}`, { cause: error });
+  }
+}
+
+function configureExternals(ctx) {
+  const entries = readJson(path.join(REPO_ROOT, 'external.json')).filter(entry => entry.platforms.includes(ctx.platform));
+  const execute = ctx.ownerSetup && !ctx.dryRun && !ctx.check;
+  const env = { ...homeEnvironment(ctx), CLAUDE_CONFIG_DIR: ctx.claudeHome };
+  delete env.CLAUDE_PLUGIN_DATA;
+  const failures = [];
+  for (const entry of entries) {
+    const argv = substitutePlaceholders(entry.argv, ctx.claudeHome);
+    const command = argv.map(displayArg).join(' ');
+    const pending = command ? `${entry.id}: ${command}` : `${entry.id}: ${entry.purpose} ${entry.evidence}`;
+    try {
+      if (externalInstalled(ctx, entry)) continue;
+      if (!execute) {
+        report(ctx, 'pending', pending);
+        continue;
+      }
+      if (entry.kind === 'manual') {
+        report(ctx, 'warn', pending);
+        continue;
+      }
+      const executable = externalExecutable(argv[0]);
+      if (!executable) throw new Error(`${argv[0]} not found on PATH`);
+      const [bin, ...prefix] = executable;
+      const settings = path.join(ctx.claudeHome, 'settings.json');
+      const before = fs.readFileSync(settings);
+      const result = runCommand(bin, [...prefix, ...argv.slice(1)], { cwd: ctx.home, env });
+      preserveExternalSettings(settings, before, entry.kind);
+      if (result.status !== 0 || result.error) {
+        throw new Error(commandOutput(result) || `exit ${result.status ?? result.signal}`);
+      }
+      if (!externalInstalled(ctx, entry)) throw new Error('installed-state probe still pending');
+      report(ctx, 'ok', `Installed external entry ${entry.id}`);
+    } catch (error) {
+      report(ctx, 'warn', `${pending} — ${error.message}`);
+      if (execute && entry.required) failures.push(entry);
+    }
+  }
+  return failures.some(entry => {
+    try {
+      return !externalInstalled(ctx, entry);
+    } catch {
+      return true;
+    }
+  }) ? 4 : 0;
 }
 
 function installFiles(ctx, manifest) {
@@ -539,8 +655,7 @@ function patchPlugins(ctx, manifestPath) {
     const expanded = expandRoots(ctx.claudeHome, [relative]);
     if (!expanded.some(root => fs.existsSync(root)) && !ctx.pluginMissingWarned) {
       ctx.pluginMissingWarned = true;
-      report(ctx, 'warn', 'codex@openai-codex not installed yet: run `/plugin install codex@openai-codex`'
-        + ' in Claude Code, then re-run install.mjs');
+      report(ctx, 'warn', 'codex@openai-codex not installed yet; re-run install.mjs after installing it to apply patches');
     }
     return expanded;
   });
@@ -658,13 +773,8 @@ function printSummary(ctx) {
     + (ctx.dryRun ? ' (planned only).' : '.'));
   ctx.log(`Warnings: ${ctx.warnings.length}`);
   for (const warning of ctx.warnings) ctx.log(`  - ${warning}`);
-  if (!ctx.uninstall) {
-    if (ctx.platform === 'linux') {
-      ctx.log('Next steps: install codex@openai-codex via /plugin install codex@openai-codex.');
-    } else {
-      ctx.log('Next steps: build custom Codex using codex-build/BUILD.md if needed;');
-      ctx.log('  install codex@openai-codex via /plugin install codex@openai-codex, then re-run install.mjs.');
-    }
+  if (!ctx.uninstall && ctx.platform === 'win32') {
+    ctx.log('Next steps: build custom Codex using codex-build/BUILD.md if needed.');
   }
 }
 
@@ -1088,9 +1198,10 @@ function installPrepared(ctx, preflightFn) {
     }
     saveRecord(ctx, manifest, restoration, created);
   }
+  const externalStatus = configureExternals(ctx);
   if (ctx.check) checkStatus = runChecks(ctx);
   printSummary(ctx);
-  return checkStatus;
+  return externalStatus || checkStatus;
 }
 
 function main() {
