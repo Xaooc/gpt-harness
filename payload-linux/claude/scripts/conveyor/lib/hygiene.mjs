@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { matchesGlob } from './profile.mjs';
 import { writeJsonAtomic } from './orchestration.mjs';
 
@@ -70,26 +70,74 @@ function testPattern(file) {
     return /^[ \t]*(async[ \t]+)?def[ \t]+test\w*[ \t]*\(/gm;
   }
   if (/^\.(js|jsx|ts|tsx|mjs|cjs|mts|cts)$/.test(extension) &&
-      (/\.(test|spec)\./.test(name) || /(^|\/)__tests__\//.test(file))) {
-    return /^[ \t]*(it|test)(\.(each|only|skip|concurrent|todo)[^(]*)?[ \t]*\(/gm;
+      (/\.(test|spec)\./.test(name) || /(^|\/)(__tests__|tests?)\//.test(file))) {
+    // Not anchored to the line start, so `describe('x', () => { it('a', …); it('b', …); })` counts two cases.
+    return /(?<![^\s;{(,])(it|test)(\.(each|only|skip|concurrent|todo)[^(]*)?[ \t]*\(/gm;
   }
   if (name.endsWith('_test.go')) return /^func[ \t]+Test\w*[ \t]*\(/gm;
   if (extension === '.rs') return /#\[(tokio::)?test\]/gm;
   return null;
 }
 
-/** The declaration line of every test case in a test file (trimmed), in order; [] for other files. */
-export function testLines(file, text) {
-  const pattern = testFile(file) && testPattern(file);
-  if (!pattern || !text) return [];
-  const lines = text.split('\n');
-  return [...text.matchAll(pattern)].map((match) => lines[text.slice(0, match.index).split('\n').length - 1].trim());
+function digest(buffer) {
+  return buffer === null ? null : createHash('sha256').update(buffer).digest('hex');
 }
 
-/** Test declaration lines of a file at a git revision ([] when the file is absent there). */
-export async function baseTestLines(repo, base, file) {
-  try { return testLines(file, await baseText(repo, base, file)); }
-  catch { return []; }
+/** What a budget trim round starts from: the lines of each changed test file and a hash of every other changed file. */
+export async function trimSnapshot(repo, files) {
+  const tests = {}, other = {};
+  for (const file of files) {
+    const buffer = await fs.readFile(path.join(repo, file)).catch(() => null);
+    if (testFile(file) && testPattern(file)) tests[file] = buffer === null ? null : buffer.toString('utf8').split('\n');
+    else other[file] = digest(buffer);
+  }
+  return { tests, other };
+}
+
+function counts(lines) {
+  const map = new Map();
+  for (const line of lines || []) map.set(line, (map.get(line) || 0) + 1);
+  return map;
+}
+
+/**
+ * A trim round may only delete lines from the test files the job changed: no rewritten or added line, no new test
+ * file, no line that existed before the job, and nothing outside those test files. Returns the violations.
+ */
+export async function trimViolations(repo, base, before, filesAfter) {
+  const problems = [];
+  const after = await trimSnapshot(repo, [...new Set([...Object.keys(before.tests), ...Object.keys(before.other), ...filesAfter])]);
+  for (const file of Object.keys(after.other)) {
+    if ((before.other[file] ?? null) !== after.other[file]) problems.push(`${file}: changed outside the tests`);
+  }
+  for (const [file, post] of Object.entries(after.tests)) {
+    const pre = before.tests[file];
+    if (pre === undefined) {
+      if (post !== null) problems.push(`${file}: test file the job had not changed`);
+      continue;
+    }
+    if (pre === null) {
+      if (post !== null) problems.push(`${file}: recreated`);
+      continue;
+    }
+    const kept = post || [];
+    let index = 0;
+    for (const line of pre) if (index < kept.length && kept[index] === line) index++;
+    if (index !== kept.length) {
+      problems.push(`${file}: lines were rewritten or added; a trim may only delete`);
+      continue;
+    }
+    let baseLines = [];
+    try { baseLines = ((await baseText(repo, base, file)) ?? '').split('\n'); } catch { /* new in this job */ }
+    const preCount = counts(pre), postCount = counts(kept);
+    for (const [line, number] of counts(baseLines)) {
+      if ((postCount.get(line) || 0) < Math.min(number, preCount.get(line) || 0)) {
+        problems.push(`${file}: deleted lines that existed before the job`);
+        break;
+      }
+    }
+  }
+  return problems;
 }
 
 export async function testChanges(repo, names, existing, base, budget) {

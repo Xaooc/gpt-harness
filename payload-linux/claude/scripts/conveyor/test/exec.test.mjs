@@ -1132,12 +1132,14 @@ test('fix rounds reject edits or deletions of existing tests and allow new tests
 
 test('the test budget permits trimming job tests, honors a brief override and protects unrelated tests', { timeout }, async () => {
   const realPath = process.env.PATH;
-  for (const { override, deleteOld, shrinkOld, code, rounds, added } of [
+  for (const { override, deleteOld, shrinkOld, prodChange, code, rounds, added } of [
     { code: 0, rounds: 1, added: 4 },
     { override: 10, code: 0, rounds: 0, added: 7 },
     { deleteOld: true, code: 6, rounds: 1, added: 7 },
     // The job also extends existing.test.js; its trim may drop the job's cases there, never the old one.
-    { shrinkOld: true, code: 6, rounds: 1, added: 5 }
+    { shrinkOld: true, code: 6, rounds: 1, added: 5 },
+    // Reviewer repro: a trim round must not also change production code.
+    { prodChange: true, code: 6, rounds: 1, added: 4 }
   ]) {
     const env = await environment();
     try {
@@ -1162,7 +1164,9 @@ if [[ "$out" == *.gate-*.out.md ]]; then
   rm -- "$dir/trim.test.js"
   if [ "$FAKE_DELETE_OLD_TEST" = 1 ]; then rm -- "$dir/existing.test.js"; fi
   if [ "$FAKE_SHRINK_OLD_TEST" = 1 ]; then printf "test('%s', () => {});\\n" eight nine > "$dir/existing.test.js"; fi
+  if [ "$FAKE_PROD_CHANGE" = 1 ]; then echo changed > "$dir/src.js"; fi
 else
+  echo original > "$dir/src.js"
   printf "test('%s', () => {});\\n" one two three four > "$dir/new.test.js"
   printf "test('%s', () => {});\\n" five six seven > "$dir/trim.test.js"
   if [ "$FAKE_SHRINK_OLD_TEST" = 1 ]; then printf "test('%s', () => {});\\n" eight nine >> "$dir/existing.test.js"; fi
@@ -1171,15 +1175,19 @@ exec ${shellQuote(fixture)} "$@"
 `, { mode: 0o755 });
       const run = await env.run('complex', '-w', {
         PATH: realPath, CONVEYOR_LUNA_SH: wrapper, CONVEYOR_GEM_SH: wrapper, CONVEYOR_CHECK_CMD: undefined,
-        FAKE_DELETE_OLD_TEST: deleteOld ? '1' : '0', FAKE_SHRINK_OLD_TEST: shrinkOld ? '1' : '0'
+        FAKE_DELETE_OLD_TEST: deleteOld ? '1' : '0', FAKE_SHRINK_OLD_TEST: shrinkOld ? '1' : '0',
+        FAKE_PROD_CHANGE: prodChange ? '1' : '0'
       });
       assert.equal(run.status, code, run.stderr || await fs.readFile(env.out, 'utf8'));
       const { gate } = await readJson(`${env.out}.dispatch.json`);
       assert.equal(gate.rounds, rounds);
-      assert.equal(gate.status, deleteOld || shrinkOld ? 'fail' : 'pass');
+      assert.equal(gate.status, deleteOld || shrinkOld || prodChange ? 'fail' : 'pass');
       if (shrinkOld) {
-        assert.deepEqual(gate.touched, ['existing.test.js']);
-        assert.match(await fs.readFile(env.out, 'utf8'), /deleted tests that existed before the job: existing\.test\.js/);
+        assert.deepEqual(gate.touched, ['existing.test.js: deleted lines that existed before the job']);
+        continue;
+      }
+      if (prodChange) {
+        assert.deepEqual(gate.touched, ['src.js: changed outside the tests']);
         continue;
       }
       assert.equal(gate.last.tests.budget, override ?? 5);
@@ -1190,7 +1198,7 @@ exec ${shellQuote(fixture)} "$@"
         assert.match(fixBrief, /added 7 new test cases, budget 5 — FAIL/);
         assert.match(fixBrief, /new\.test\.js: 0 → 4[\s\S]*trim\.test\.js: 0 → 3/);
         assert.match(fixBrief, /Keep only tests that protect against lost work, lost data, broken production, money or security/);
-        assert.match(fixBrief, /Do not delete tests that existed before this job\. Do not touch production code for this\./);
+        assert.match(fixBrief, /Only delete lines: do not rewrite or add test code, do not delete tests that existed before this job/);
         assert.doesNotMatch(fixBrief, /Do not weaken, skip or delete checks/);
         await assert.rejects(fs.stat(path.join(env.dir, 'trim.test.js')), { code: 'ENOENT' });
       }

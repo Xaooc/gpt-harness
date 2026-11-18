@@ -12,7 +12,7 @@ import {
   loadConfig, saveConfig, updateConfig, providerState, resolveChain, resolvePanel, markUnavailable,
   recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
 } from './lib/orchestration.mjs';
-import { testFile, testLines, baseTestLines } from './lib/hygiene.mjs';
+import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 
 // Matches luna.sh's retryable_model_error deny pattern, including usage, auth and invalid-model failures.
 const quotaError = new RegExp([
@@ -24,9 +24,9 @@ const execute = promisify(execFile);
 const gitOptions = { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 };
 export const gateInstruction = 'Fix the root cause in the code. Do not weaken, skip or delete checks, ' +
   'tests, lint rules or hygiene counters. Do not revert the requested change.';
-const testBudgetInstruction = 'Keep only tests that protect against lost work, lost data, broken production, money or security. ' +
-  'Merge cases into one parametrized test or extend an existing test, and delete the rest of the tests you added. ' +
-  'Do not delete tests that existed before this job. Do not touch production code for this.';
+const testBudgetInstruction = 'Keep only tests that protect against lost work, lost data, broken production, money or security, ' +
+  'and delete the other tests you added. Only delete lines: do not rewrite or add test code, do not delete tests that existed ' +
+  'before this job, and do not touch any file other than the tests you added.';
 
 async function git(repo, args) {
   const { stdout } = await execute('git', ['-C', repo, ...args], gitOptions);
@@ -177,7 +177,7 @@ export function failedCheck(result) {
   return (typeof result.rc === 'number' && result.rc !== 0) || /^(fail|failed|error|timeout)$/.test(result.status);
 }
 
-function budgetOnlyFailure(last) {
+export function budgetOnlyFailure(last) {
   return !last.ok && last.tests?.ok === false && last.hygiene.ok &&
     last.results.every((result) => ['pass', 'skipped'].includes(result.status) && !failedCheck(result));
 }
@@ -343,14 +343,7 @@ async function finishGate(gate, dispatch, entry, dir, out) {
       await append(`Round ${rounds}: ${last.ok ? 'pass' : 'fail'}\n\n${gateDetails(last)}`);
       if (last.ok || gate.mode === 'warn' || rounds === limit) break;
       const budgetOnly = budgetOnlyFailure(last);
-      const oldTests = new Map();
-      if (budgetOnly) {
-        for (const file of files.filter(testFile)) {
-          const current = testLines(file, await fs.readFile(path.join(gate.repo, file), 'utf8').catch(() => ''));
-          const kept = (await baseTestLines(gate.repo, gate.base, file)).filter((line) => current.includes(line));
-          if (kept.length) oldTests.set(file, kept);
-        }
-      }
+      const trim = budgetOnly ? await trimSnapshot(gate.repo, files) : null;
       const before = await protectedFiles(gate.repo);
       rounds++;
       const brief = `${out}.gate-${rounds}.brief.md`, fixOut = `${out}.gate-${rounds}.out.md`;
@@ -385,23 +378,17 @@ async function finishGate(gate, dispatch, entry, dir, out) {
       last = await runGateChecks(gate.repo, gate.base, files, checkOptions);
       if (last.configError) return await configError(last.configError);
       if (budgetOnly) {
+        const problems = await trimViolations(gate.repo, gate.base, trim, files);
+        if (problems.length) {
+          dispatch.gate = { status: 'fail', rounds, last, touched: problems };
+          await append(`Round ${rounds}: fail\n\n## Gate: fail (the trim round may only delete tests the job added: ` +
+            `${problems.join('; ')})`);
+          return 6;
+        }
         if (!files.length) last.tests = { budget: previousTests.budget, added: 0, ok: true, files: [] };
         if (!last.tests || last.tests.added >= previousTests.added) {
           dispatch.gate = { status: 'fail', rounds, last, touched: tests };
           await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round did not reduce the number of new tests)`);
-          return 6;
-        }
-        // A trim may remove only what the job added: every test that existed before the job and was still there
-        // when the round started must still be declared afterwards.
-        const shrunk = [];
-        for (const [file, kept] of oldTests) {
-          const now = testLines(file, await fs.readFile(path.join(gate.repo, file), 'utf8').catch(() => ''));
-          if (kept.some((line) => !now.includes(line))) shrunk.push(file);
-        }
-        if (shrunk.length) {
-          dispatch.gate = { status: 'fail', rounds, last, touched: shrunk };
-          await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round deleted tests that existed before the job: ` +
-            `${shrunk.join(', ')})`);
           return 6;
         }
       }

@@ -441,7 +441,7 @@
       "src": "claude/hooks/conveyor-subagent-gate.mjs",
       "dest": "hooks/conveyor-subagent-gate.mjs",
       "kind": "file",
-      "sha256": "e24816343088324cde9aeb92a73df2cb39040b2cc5c763e2153706eabc924aab",
+      "sha256": "da1c3a17a8a7869466071b5088a827718b2a37d09ea26a468b73e4bc8285a19e",
       "executable": true
     },
     {
@@ -3772,7 +3772,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "1a2b942d5c781fa75eba0edba38f91061e4fbfbcd6ef21ca3387f686de80d3af",
+      "sha256": "e532379f6e486bfb31d50481f0aaf823178edb98939061eacf078f0cc660a63c",
       "executable": true
     },
     {
@@ -3800,7 +3800,7 @@
       "src": "claude/scripts/conveyor/lib/hygiene.mjs",
       "dest": "scripts/conveyor/lib/hygiene.mjs",
       "kind": "file",
-      "sha256": "f4fce48be3066fc15ecbb48eb1985f897977961192296609a8b2bc710282bbb3"
+      "sha256": "ffcee77ef5643016a86613588f76a01834fe2fe30390ad9f15014a6b7402538d"
     },
     {
       "src": "claude/scripts/conveyor/lib/ledger.mjs",

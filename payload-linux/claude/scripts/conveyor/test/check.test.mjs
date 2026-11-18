@@ -277,22 +277,25 @@ test('turn test budget counts net additions across changed, new and deleted file
     'tests/test_existing.py': python(1, 2),
     'source.spec.ts': "it('exists', () => {});\n"
   });
+  // Cases inside a one-line describe count too, and the JS file lives under tests/ without a .test suffix.
+  await env.write('tests/widget.js', "describe('w', () => { it('a', () => {}); test.each([1, 2])('b %s', () => {}); });\n");
   await env.write('tests/test_existing.py', python(1, 6));
   await env.write('tests/test_new.py', python(1, 3));
   await fs.rm(path.join(env.repo, 'source.spec.ts'));
 
   const turn = ['run', '--level', 'turn'];
-  const pass = await env.command([...turn, '--test-budget', '6']);
+  const pass = await env.command([...turn, '--test-budget', '8']);
   assert.equal(pass.status, 0, pass.stderr);
   assert.equal(pass.report.ok, true);
-  const fail = await env.command([...turn, '--test-budget', '5']);
+  const fail = await env.command([...turn, '--test-budget', '7']);
   assert.equal(fail.status, 1, fail.stderr);
   assert.equal(fail.report.ok, false);
   assert.deepEqual(fail.report.tests, {
-    budget: 5, added: 6, ok: false, files: [
+    budget: 7, added: 8, ok: false, files: [
       { file: 'source.spec.ts', before: 1, after: 0 },
       { file: 'tests/test_existing.py', before: 2, after: 6 },
-      { file: 'tests/test_new.py', before: 0, after: 3 }
+      { file: 'tests/test_new.py', before: 0, after: 3 },
+      { file: 'tests/widget.js', before: 0, after: 2 }
     ]
   });
   const configured = await env.command([...turn, '--test-budget', 'profile']);
