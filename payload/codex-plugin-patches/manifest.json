@@ -84,6 +84,20 @@
           "patchedSha256": "99e9b7ca8f1439d4c1c5f3f0036fac547537f77da4fef5c55b3a950b70646439"
         }
       ]
+    },
+    {
+      "rel": "scripts/session-lifecycle-hook.mjs",
+      "variants": [
+        {
+          "versions": [
+            "1.0.6"
+          ],
+          "orig": "1.0.6/orig/scripts/session-lifecycle-hook.mjs",
+          "origSha256": "5c614d21f78397cc2471ea35c4d81bf2e867e91ca1a7169944f49d74ace4c6b9",
+          "patched": "1.0.6/patched/scripts/session-lifecycle-hook.mjs",
+          "patchedSha256": "884c50a3144879d75b4b986e3fab5314853ffbb2922678d923e3972b69383089"
+        }
+      ]
     }
   ]
 }

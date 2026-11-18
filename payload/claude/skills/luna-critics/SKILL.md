@@ -51,7 +51,7 @@ Adding more critics is limited by Claude's synthesis, not by quota. Every findin
 
 | Persona | Hunts for |
 |---|---|
-| **Рядовой пользователь** — non-technical, impatient, first time using it | Confusing user-facing flows: state, choices, purpose or processing order; text/errors, dead ends, normal-but-unexpected input; hard-to-use actions; controls that obscure content or choices |
+| **Рядовой пользователь** — non-technical, impatient, first time using it | Compare representative user-facing examples, including user-provided screenshots, with the original goal; check language, information, compactness, clarity and requested style; find confusing flows (state, choices, purpose or processing order), unclear texts/errors, dead ends, failures on normal-but-unexpected input, hard-to-use actions, and controls that obscure content or choices |
 | **Взломщик** — hostile attacker / pentester | Injection, authz/authn gaps, IDOR, secrets in code/logs, unsafe defaults, abuse & DoS vectors, supply chain, trust boundaries |
 | **Дизайнер** — senior product/UX designer | Visual inconsistency, hierarchy, spacing, states (empty/loading/error), accessibility, mobile, dark mode (critique only — fixes are done by Claude) |
 | **Проджект** — PM who owns the outcome | Does it solve the real request? Missing requirements, scope creep, unclear acceptance, rollout/migration for existing users, what to tell stakeholders |

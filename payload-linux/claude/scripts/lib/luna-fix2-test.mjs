@@ -31,6 +31,71 @@ const daemonMarker = (out, values = {}) => writeFileSync(`${out}.daemon`,
     daemon_start: readProcess(process.pid).started, ...values })
     .map(([key, value]) => `${key}=${value}\n`).join(''));
 
+await test('watch ends an unmatched pattern after the missing grace period', async () => {
+  await fixture(async (root) => {
+    const pattern = path.join(root, 'missing jobs', '*.out.md');
+    const watched = await collect(spawn('bash', [path.join(scripts, 'luna-watch.sh'), '-p', '0.05', pattern],
+      { env: { ...process.env, LUNA_WATCH_PARENT_CHECK: '0', LUNA_WATCH_MISSING_S: '2' }, timeout: 10_000 }));
+    assert.equal(watched.code, 0, watched.stderr);
+    assert.equal(watched.stdout.trim(), `END ${pattern} state=missing rc= no file matched`);
+  });
+});
+
+await test('watch ends a job whose previously observed status file is removed', async () => {
+  await fixture(async (root) => {
+    const out = path.join(root, 'removed job.md');
+    status(out, { state: 'running', engine: 'exec', pid: process.pid, pid_start: readProcess(process.pid).started });
+    writeFileSync(`${out}.log`, '');
+    const watcher = spawn('bash', [path.join(scripts, 'luna-watch.sh'), '-i', '0', '-p', '0.05', out],
+      { env: { ...process.env, LUNA_WATCH_PARENT_CHECK: '0', LUNA_WATCH_REMOVED_S: '1' }, timeout: 15_000 });
+    let events = '';
+    watcher.stdout.on('data', (chunk) => { events += chunk; });
+    const result = collect(watcher);
+    try {
+      const deadline = Date.now() + 8_000;
+      while (!events.includes('STALL ') && watcher.exitCode === null && Date.now() < deadline) await delay(50);
+      assert.match(events, /^STALL /m, 'watcher observed the running status');
+      rmSync(`${out}.status`);
+      const watched = await result;
+      assert.equal(watched.code, 0, watched.stderr);
+      assert.ok(watched.stdout.includes(`END ${out} state=missing rc= job files removed`));
+    } finally {
+      if (watcher.exitCode === null && watcher.signalCode === null) watcher.kill();
+      await result;
+    }
+  });
+});
+
+await test('watch exits when its parent disappears with no maximum lifetime', async () => {
+  await fixture(async (root) => {
+    const out = path.join(root, 'orphan job.md'), events = path.join(root, 'watch.log');
+    status(out, { state: 'running', engine: 'exec', pid: process.pid, pid_start: readProcess(process.pid).started });
+    writeFileSync(`${out}.log`, '');
+    const launcher = spawn('bash', ['-c', `
+      bash "$1" -i 0 -p 0.05 "$2" > "$3" 2>&1 &
+      child=$!; printf '%s\n' "$child"
+      until grep -q '^STALL ' "$3"; do kill -0 "$child" || exit 1; sleep 0.05; done
+    `, '_', path.join(scripts, 'luna-watch.sh'), out, events],
+    { env: { ...process.env, LUNA_WATCH_PARENT_CHECK: '1', LUNA_WATCH_PARENT_EVERY_S: '1',
+      LUNA_WATCH_MAX_S: '0' }, timeout: 15_000 });
+    let pid;
+    try {
+      const launched = await collect(launcher);
+      pid = Number(launched.stdout.trim());
+      assert.equal(launched.code, 0, launched.stderr);
+      assert.ok(Number.isSafeInteger(pid) && pid > 1);
+      const deadline = Date.now() + 10_000;
+      let row;
+      while ((row = readProcess(pid)) && row.state !== 'Z' && Date.now() < deadline) await delay(50);
+      assert.ok(!row || row.state === 'Z', 'watcher exited after its parent');
+      assert.doesNotMatch(readFileSync(events, 'utf8'), /^(?:GONE|EXPIRED) /m);
+    } finally {
+      const row = pid && readProcess(pid);
+      if (row && row.state !== 'Z') process.kill(pid, 'SIGKILL');
+    }
+  });
+});
+
 await test('watch uses the daemon wrapper identity and waits through running orphan markers', async () => {
   await fixture(async (root) => {
     const out = path.join(root, 'job with spaces.md');
