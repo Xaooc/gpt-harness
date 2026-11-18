@@ -66,13 +66,13 @@
       "src": "codex-plugin-patches/README.md",
       "dest": "luna-harness/codex-plugin-patches/README.md",
       "kind": "file",
-      "sha256": "3c7ef73d13d3845e1ba5aa60946e7398288ea233bac4ab772159bd5ce90e22ef"
+      "sha256": "e76d0243a5204bd825dad9b90194ded435e44693e72819e6b6e7c50a3a899971"
     },
     {
       "src": "codex-plugin-patches/manifest.json",
       "dest": "luna-harness/codex-plugin-patches/manifest.json",
       "kind": "file",
-      "sha256": "b633e3204bcc99649a34529bce3faa9525b19ae021230bd6ddf8900e5f2e2159"
+      "sha256": "f7a204ad4b7824e2c5cff729cd3007ee3ba4daf6e04178c40171b541d7220ef9"
     },
     {
       "src": "codex-plugin-patches/orig/scripts/app-server-broker.mjs",
@@ -239,7 +239,7 @@
       "src": "claude/scripts/luna-watch.sh",
       "dest": "scripts/luna-watch.sh",
       "kind": "file",
-      "sha256": "9af0efd86d558f799a0cae5282c7b5409f0de6c3753ed20af16e46245726971c",
+      "sha256": "981874dfe9436001d6d74a304870a81e90bd4fef4bd4aa4ac51787267eb24f83",
       "executable": true
     },
     {
@@ -317,6 +317,13 @@
       "dest": "hooks/luna-clean-hook.mjs",
       "kind": "file",
       "sha256": "e7999fa384dde39fdbdd60ecd369ef57ed2f2d6a77e6ba5a36847c8b69f842c9",
+      "executable": true
+    },
+    {
+      "src": "claude/scripts/lib/luna-watch-test.sh",
+      "dest": "scripts/lib/luna-watch-test.sh",
+      "kind": "file",
+      "sha256": "1f5c8722310506d963cecfea56f76c3a80ebb73391d4e4671dd06560a4dcde90",
       "executable": true
     },
     {
@@ -512,13 +519,13 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "d29c3197e2e6070b574f36dbd3fbec2a53c99b2c3c536e6be8783729ce4d9c5f"
+      "sha256": "813c0b4061384c1b9be8efc6e89c0d0fd3c6862a8e8f6343d4f8c2e190158f73"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
       "dest": "skills/luna-critics/SKILL.md",
       "kind": "file",
-      "sha256": "3bf473cb344bc5ce63a499499ae07e0a86e48f2bc421314d0b2ba9e31d6d2f52"
+      "sha256": "4d208734ee6b277eff95ea7ef94ee82d489b9723cb09560b525fe25ded994f0b"
     },
     {
       "src": "claude/conveyor/harness-facts.json",

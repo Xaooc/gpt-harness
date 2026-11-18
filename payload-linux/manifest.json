@@ -267,7 +267,7 @@
       "src": "claude/scripts/lib/luna-fix2-test.mjs",
       "dest": "scripts/lib/luna-fix2-test.mjs",
       "kind": "file",
-      "sha256": "89f77c1d5a2078bfa2ea79122ca02bf9503918f616ccd3d8f0a5e22914634b46"
+      "sha256": "8b28c9507bb0e47ce3a073e626e3d36db6de9d849487a90f0b0703f400ab4534"
     },
     {
       "src": "claude/scripts/lib/luna-linux-test.mjs",
@@ -376,7 +376,7 @@
       "src": "claude/scripts/luna-watch.sh",
       "dest": "scripts/luna-watch.sh",
       "kind": "file",
-      "sha256": "650b9df2ed3a3b3841cc0d7f61d56b944e4353c28ffd9613619fb627a61dbb01",
+      "sha256": "a11b2e9562b2cf2d837d492ca89f7b0953bd327d866b103b6be03a2f1234eea8",
       "executable": true
     },
     {
@@ -396,13 +396,13 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "d29c3197e2e6070b574f36dbd3fbec2a53c99b2c3c536e6be8783729ce4d9c5f"
+      "sha256": "813c0b4061384c1b9be8efc6e89c0d0fd3c6862a8e8f6343d4f8c2e190158f73"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
       "dest": "skills/luna-critics/SKILL.md",
       "kind": "file",
-      "sha256": "3bf473cb344bc5ce63a499499ae07e0a86e48f2bc421314d0b2ba9e31d6d2f52"
+      "sha256": "4d208734ee6b277eff95ea7ef94ee82d489b9723cb09560b525fe25ded994f0b"
     },
     {
       "src": "claude/conveyor/harness-facts.json",
