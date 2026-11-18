@@ -1,5 +1,6 @@
 /** Usage: node tests/verify-temp-home.mjs [--keep]. Requires a complete repository payload. */
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,6 +56,62 @@ function verifyHookCommands(home, payload = 'payload') {
   }
 }
 
+function verifyWindowsPayload(home) {
+  const claudeHome = path.join(home, '.claude');
+  const manifest = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'payload/manifest.json'), 'utf8'));
+  for (const { dest, sha256 } of manifest.files) {
+    const installed = fs.readFileSync(path.join(claudeHome, dest));
+    assert.equal(createHash('sha256').update(installed).digest('hex'), sha256, dest);
+  }
+  const destinations = new Set(manifest.files.map(file => file.dest));
+  for (const dest of [
+    'scripts/conveyor/exec.mjs',
+    'conveyor/orchestration.default.json',
+    'conveyor/harness-facts.json',
+    'local-plugins/pstack/.claude-plugin/plugin.json',
+    'local-plugins/pstack/skills/poteto-mode/SKILL.md',
+    'hooks/test/conveyor-hygiene-session-start.test.mjs',
+    'hooks/test/conveyor-stop-gate.test.mjs',
+    'hooks/test/conveyor-subagent-gate.test.mjs',
+    'hooks/test/harness-guards.test.mjs',
+    'hooks/test/luna-skill-autoload.test.mjs',
+  ]) {
+    assert.ok(destinations.has(dest), `Missing Windows payload file: ${dest}`);
+  }
+  const settings = JSON.parse(fs.readFileSync(path.join(claudeHome, 'settings.json'), 'utf8'));
+  const marketplace = JSON.parse(fs.readFileSync(path.join(claudeHome, 'local-plugins/.claude-plugin/marketplace.json'), 'utf8'));
+  assert.ok(marketplace.plugins.some(plugin => plugin.name === 'luna-panel' && plugin.source === './luna-panel'));
+  assert.ok(marketplace.plugins.some(plugin => plugin.name === 'pstack' && plugin.source === './pstack'));
+  assert.equal(settings.enabledPlugins['pstack@luna-local'], true);
+  assert.equal(settings.extraKnownMarketplaces['luna-local'].source.path, `${claudeHome.replaceAll('/', '\\')}\\local-plugins`);
+  for (const [event, file, timeout, matcher] of [
+    ['UserPromptSubmit', 'conveyor-prompt-capture', 10],
+    ['Stop', 'conveyor-stop-gate', 600],
+    ['SubagentStop', 'conveyor-subagent-gate', 600],
+    ['SessionStart', 'conveyor-hygiene-session-start', 10],
+    ['SessionStart', 'plugin-quiet', 10],
+    ['PreToolUse', 'harness-guards', 10, 'Bash|Write|Edit|MultiEdit'],
+  ]) {
+    const dest = `hooks/${file}.mjs`;
+    assert.ok(destinations.has(dest), `Missing Windows hook: ${dest}`);
+    const command = `"${process.execPath.replaceAll('\\', '/')}" "${claudeHome.replaceAll('\\', '/')}/${dest}"`;
+    const matches = Object.entries(settings.hooks).flatMap(([actualEvent, entries]) =>
+      entries.flatMap(entry => entry.hooks.filter(hook => hook.command?.replaceAll('\\', '/').includes(`/${dest}`))
+        .map(hook => [actualEvent, hook.command, hook.timeout, entry.matcher])));
+    assert.deepEqual(matches, [[event, command, timeout, matcher]], file);
+  }
+  const instructions = fs.readFileSync(path.join(claudeHome, 'CLAUDE.md'), 'utf8');
+  const block = /<!-- luna-harness:begin -->([\s\S]*?)<!-- luna-harness:end -->/.exec(instructions);
+  assert.ok(block, 'Missing managed CLAUDE.md block');
+  for (const section of ['Approach review', 'Acceptance ledger', 'Tests: a budget', 'C:/dev/luna-harness']) {
+    assert.ok(block[1].includes(section), `Missing Windows CLAUDE.md text: ${section}`);
+  }
+  const sync = spawnSync(process.execPath, ['tools/sync-windows.mjs', '--check'], {
+    cwd: REPO_ROOT, encoding: 'utf8', timeout: TIMEOUT, windowsHide: true,
+  });
+  assert.equal(sync.status, 0, [sync.stdout, sync.stderr, sync.error?.message].filter(Boolean).join('\n'));
+}
+
 function verifyConveyor(home) {
   const claudeHome = path.join(home, '.claude');
   const conveyor = path.join(claudeHome, 'conveyor');
@@ -95,22 +152,22 @@ function main() {
   let exitCode = 0;
   console.log(`[ok] Temporary homes under: ${temp}`);
   try {
+    const windowsHome = path.join(temp, 'windows');
+    const first = runInstaller(windowsHome, { check: process.platform === 'win32' });
+    exitCode = first.code;
+    if (exitCode !== 0) return exitCode;
+    verifyWindowsPayload(windowsHome);
+    console.log('[ok] PASS Windows manifest hashes, conveyor hooks, pstack, managed instructions, and payload sync');
     if (process.platform === 'win32') {
-      const home = path.join(temp, 'windows');
-      const first = runInstaller(home, { check: true });
-      exitCode = first.code;
-      if (exitCode !== 0) return exitCode;
-      const before = backupFiles(home);
+      const before = backupFiles(windowsHome);
       console.log('[ok] Running Windows installer again to verify idempotency');
-      const second = runInstaller(home, { check: true });
+      const second = runInstaller(windowsHome, { check: true });
       exitCode = second.code;
       if (exitCode !== 0) return exitCode;
       assert.match(second.output, /Summary: 0 files written; \d+ skipped; 0 backups created\./);
-      assert.deepEqual(backupFiles(home), before, 'Second run must not create or alter backups');
-      verifyHookCommands(home);
+      assert.deepEqual(backupFiles(windowsHome), before, 'Second run must not create or alter backups');
+      verifyHookCommands(windowsHome);
       console.log('[ok] PASS Windows idempotency, unchanged backups, and hook commands');
-    } else {
-      console.log('[skip] Windows payload checks require Windows binaries');
     }
 
     const home = path.join(temp, 'linux');

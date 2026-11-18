@@ -2,9 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { collectMetrics } from "../conveyor/metrics.mjs";
 import {
   HOME_CLAUDE, paths, ensureDirs, withLock, readJson, readJsonl, appendJsonl,
-  writeFileAtomic, writeJsonAtomic, loadEvents, sha256, nowIso, sanitizeQuote, canonicalRepo,
+  writeFileAtomic, writeJsonAtomic, loadEvents, sha256, nowIso, sanitizeQuote, isForeignPath, canonicalRepo,
 } from "./common.mjs";
 
 export const TARGETS = Object.freeze(["CLAUDE.md", "skills/luna/SKILL.md", "skills/luna-critics/SKILL.md"]);
@@ -144,7 +145,7 @@ function targetFile(target) {
   if (!TARGETS.includes(target)) throw new Error("target is not allowlisted");
   const file = path.resolve(HOME_CLAUDE, target);
   const canonical = (value) => {
-    const normal = path.normalize(value).replaceAll("\\", "/");
+    const normal = path.normalize(value);
     return process.platform === "win32" ? normal.toLowerCase() : normal;
   };
   const expected = path.resolve(fs.realpathSync(HOME_CLAUDE), target);
@@ -647,8 +648,18 @@ function revertLocked(id, opts) {
   const adoption = loadAdoptions().list.find((item) => item.id === id);
   if (!adoption) return { ok: false, status: "unknown", message: `Unknown adoption: ${id}` };
   if (adoption.status === "reverted") return { ok: true, status: "already", message: `${id} already reverted` };
-  const file = targetFile(adoption.target);
-  const bytes = fs.readFileSync(file);
+  if (isForeignPath(adoption.target)) {
+    return revertFailure(id, "historical Windows target is unavailable on Linux; restore it manually",
+      adoption.backup || "unavailable");
+  }
+  let file;
+  let bytes;
+  try {
+    file = targetFile(adoption.target);
+    bytes = fs.readFileSync(file);
+  } catch (error) {
+    return revertFailure(id, `target is unavailable: ${error.message}`, adoption.backup || "unavailable");
+  }
   const raw = bytes.toString("utf8");
   const text = lf(raw);
   const eol = raw.includes("\r\n") ? "\r\n" : "\n";
@@ -666,7 +677,14 @@ function revertLocked(id, opts) {
   if (patched !== null) {
     expected = Buffer.from(patched.text.replace(/\n/g, eol), "utf8");
   } else if (sha256(bytes) === adoption.sha256_after) {
-    expected = fs.readFileSync(adoption.backup);
+    if (isForeignPath(adoption.backup)) {
+      return revertFailure(id, "historical Windows backup is unavailable on Linux; restore it manually", backup);
+    }
+    try {
+      expected = fs.readFileSync(adoption.backup);
+    } catch (error) {
+      return revertFailure(id, `saved backup is unavailable: ${error.message}`, backup);
+    }
     if (sha256(expected) !== adoption.sha256_before) return revertFailure(id, "backup hash mismatch", backup);
     method = "restore-backup";
   } else {
@@ -960,15 +978,65 @@ function readLogDates() {
     .map((match) => match[1]).filter((date) => Number.isFinite(Date.parse(date)));
 }
 
-function reportSection(title, entries) {
+function reportSection(title, entries, limit = 5) {
   if (entries.length === 0) return [];
-  return [title, ...entries.slice(0, 5).map((entry) => `• ${entry}`),
-    ...(entries.length > 5 ? [`и ещё ${entries.length - 5}`] : [])];
+  return [title, ...entries.slice(0, limit).map((entry) => `• ${entry}`),
+    ...(entries.length > limit ? [`и ещё ${entries.length - limit}`] : [])];
 }
 
 export function russianPlural(count, forms) {
   const n = Math.abs(count) % 100;
   return forms[n >= 11 && n <= 14 ? 2 : n % 10 === 1 ? 0 : n % 10 >= 2 && n % 10 <= 4 ? 1 : 2];
+}
+
+function conveyorReport(start, end) {
+  const metrics = collectMetrics({ start, end, home: HOME_CLAUDE });
+  const entries = [];
+  const repoName = (repo) => displayText(path.basename(repo), 40);
+  const taskCount = `${metrics.tasks} ${russianPlural(metrics.tasks, ["задача", "задачи", "задач"])}`;
+  if (metrics.corrections !== null) {
+    let line = `Поправок: ${metrics.corrections} (периодом раньше ${metrics.previousCorrections})`;
+    if (metrics.afterDone !== null) line += ` · после «готово»: ${metrics.afterDone}`;
+    if (metrics.correctionsPerTask !== null) {
+      line += ` · на задачу: ${metrics.correctionsPerTask.toFixed(1)} (${taskCount})`;
+    } else if (metrics.tasks !== null) line += ` · задач: ${metrics.tasks}`;
+    entries.push(line, `Прерываний: ${metrics.interrupts}`);
+    if (metrics.projects.length) entries.push("По проектам (поправки/прерывания): " + metrics.projects.map((item) => {
+      const project = displayText(canonicalRepo(path.basename(item.project)) || repoName(item.project), 40);
+      return `${project} ${item.corrections}/${item.interrupts}`;
+    }).join(", "));
+  } else if (metrics.tasks !== null) entries.push(`Задач: ${metrics.tasks}`);
+  if (metrics.executor !== null) {
+    const gate = metrics.executor;
+    const runs = `${gate.writeRuns} ${russianPlural(gate.writeRuns, ["запуск", "запуска", "запусков"])}`;
+    let line = `Гейт исполнителя: ${runs} · сразу зелёные ${gate.round0}`
+      + ` · после доработки ${gate.afterFix} · красные ${gate.red}`;
+    const extra = [[gate.handoffs, "передано Claude"], [gate.noProvider, "нет провайдера"],
+      [gate.writeLocked, "запись занята"], [gate.unknown ?? gate.missingDispatch, "нет результата"]];
+    for (const [count, label] of extra) if (count) line += ` · ${label} ${count}`;
+    entries.push(line);
+  }
+  if (metrics.stopGate !== null || metrics.waivers !== null) {
+    let line = "Стоп-гейт:";
+    if (metrics.stopGate !== null) {
+      line += ` сессий с блокировкой или предупреждением ${metrics.stopGate.sessions}`;
+      const reasons = Object.entries(metrics.stopGate.reasons).sort((a, b) => b[1] - a[1] || Number(a[0]) - Number(b[0]));
+      const labels = ["", "журнал не начат", "требования не связаны", "открытые пункты", "нет свежих доказательств",
+        "проверки красные", "нет перекрёстной проверки", "нет итогового списка", "уборка не завершена"];
+      if (reasons.length) line += ` (чаще всего: ${reasons[0][0]} — ${labels[Number(reasons[0][0])]})`;
+    }
+    if (metrics.waivers !== null) line += ` · исключений по словам пользователя ${metrics.waivers}`;
+    entries.push(line);
+  }
+  if (metrics.switches !== null) entries.push("Смены провайдера: " + (Object.entries(metrics.switches)
+    .map(([route, count]) => `${displayText(route, 80)} ${count}`).join(", ") || "0"));
+  if (metrics.checks !== null) {
+    entries.push(`Проверок построено: ${metrics.checks.built}`
+      + (metrics.checks.repos.length ? ` (${metrics.checks.repos.map((item) => repoName(item.repo)).join(", ")})` : ""));
+  }
+  if (metrics.hygiene !== null) entries.push(`Гигиена (последний отчёт): важных ${metrics.hygiene.high}`
+    + ` · средних ${metrics.hygiene.medium} · мелких ${metrics.hygiene.low}`);
+  return reportSection("Конвейер:", entries, entries.length);
 }
 
 function buildReport(config, start, now, { skipChecks = false } = {}) {
@@ -1020,6 +1088,7 @@ function buildReport(config, start, now, { skipChecks = false } = {}) {
     }
     lines.push(`• ${target}: ${size} / ${config.targets[target]?.max_bytes ?? "—"}`);
   }
+  lines.push(...conveyorReport(start, now));
   lines.push("Журнал: ~/.claude/learning/adopted.md · пауза: создать файл ~/.claude/learning/PAUSED");
   return lines.join("\n") + "\n";
 }

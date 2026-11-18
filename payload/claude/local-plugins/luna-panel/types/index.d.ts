@@ -1,4 +1,5 @@
-// Shapes produced by ~/.claude/scripts/luna-overview.mjs (v1) and read by the pane.
+// Shapes produced by ~/.claude/scripts/luna-overview.mjs and ~/.claude/scripts/conveyor/cli-update.mjs,
+// read by the pane. Every section added for the conveyor is optional: older collectors omit it.
 
 export type LimitWindow = { usedPercent: number; windowMins: number | null; resetsAt: string | null }
 
@@ -36,35 +37,81 @@ export type Job = {
   error: string
   queuePos: number | null
   owner: string
-  /** Seconds since the job's log last grew (null: no log). */
+  /** `codex` (Sol, Luna) or `gemini`; absent from older collectors (then Codex). */
+  provider?: string
   idleS?: number | null
-  /** What the agent is doing now, from the tail of its log. */
   activity?: { kind: 'command' | 'thinking' | 'editing' | 'writing' | 'starting' | 'queued' | 'unknown'; text: string; sinceS: number }
 }
 
-/**
- * A Claude session's heartbeat, written by the luna-panel plugin of THAT session to
- * ~/.claude/luna-run/sessions/<sessionId>.json and read by every session's pane (via the collector).
- */
 export type SessionBeat = {
   v: 1
   sessionId: string
-  /** Folder name of the session's cwd; '' for a session with no project folder. */
   name: string
   cwd: string
-  /** ms epoch of the last write; the collector drops beats older than 15 min. */
   updatedAt: number
-  /** What Claude itself is doing in that session now. */
   state: 'thinking' | 'tool' | 'idle'
-  /** For state 'tool': the tool and a short detail (a Bash command's first line, a file name, an agent description). */
   tool: { name: string; detail: string; since: number } | null
-  /** When the current turn began (0 when idle); idleSince when the last turn ended. */
   turnSince: number
   idleSince: number
-  /** Claude subagents currently running in that session. */
   agents: { id: string; description: string; since: number }[]
-  /** Claude rate limits as this session last read them (same for all sessions of one account). */
   limits?: ClaudeLimit[]
+}
+
+export type ChainEntry = {
+  provider: string
+  model: string
+  effort: string
+  available: boolean
+  reason: string
+  selected?: boolean
+}
+
+export type Seat = ChainEntry & { seat: number }
+
+export type CatalogModel = { model: string; efforts: string[] }
+
+export type Orchestration = {
+  chains: Record<string, ChainEntry[]>
+  panels: Record<string, Seat[]>
+  threshold: { switch_percent: number; hysteresis_percent: number; windows: string[]; switched: boolean }
+  marks: Record<string, { until: string; reason: string }>
+  presets: { name: string; label: string }[]
+  catalog: Record<string, CatalogModel[]>
+  configError: string | null
+}
+
+export type Switch = { at: string; tier: string; from: string; to: string; reason: string }
+
+export type QuotaBucket = { name: string; model?: string; usedPercent?: number; remainingFraction?: number; resetAt?: string }
+
+export type GeminiState = {
+  available: boolean
+  reason: string
+  tokensToday: number
+  jobsToday: number
+  /** From conveyor/gemini-quota.mjs when the collector provides it. */
+  quota?: { available: boolean; buckets: QuotaBucket[]; at?: string; reason?: string; lastExhaustedAt?: string | null } | null
+  mcp: {
+    configured: boolean
+    activeItems?: number
+    adaptiveLimit?: number
+    configuredLimit?: number
+    at?: string
+  } | null
+}
+
+export type ProviderTokens = { total: number; input?: number; output?: number; cached?: number }
+
+export type Usage = {
+  at?: string
+  stale?: boolean
+  today?: { claude?: ProviderTokens; codex?: ProviderTokens; gemini?: ProviderTokens }
+  week?: { claude?: ProviderTokens; codex?: ProviderTokens; gemini?: ProviderTokens }
+  days?: { date: string; claude?: number | ProviderTokens; codex?: number | ProviderTokens; gemini?: number | ProviderTokens }[]
+  byModel7d?: { provider: string; model: string; total: number }[]
+  byProject7d?: { project: string; total: number; provider?: string }[]
+  topJobs?: { provider: string; model?: string; name: string; project?: string; total: number; at?: string }[]
+  notes?: string[]
 }
 
 export type Snapshot = {
@@ -86,11 +133,36 @@ export type Snapshot = {
   jobs: Job[]
   codexLimits: CodexLimits | null
   build: { line: string; building: boolean; exeAt: string | null } | null
-  /** Heartbeats of every live Claude session (collector v1 + sessions). */
   sessions?: SessionBeat[]
+  orchestration?: Orchestration | null
+  switches?: Switch[]
+  gemini?: GeminiState | null
+  usage?: Usage | null
 }
 
 export type ClaudeLimit = { kind: string; percentUsed: number; resetsAt?: string }
+
+export type CliStatus = {
+  codex?: {
+    installed?: string | null
+    latest?: string | null
+    expectedByHarness?: string | null
+    updateAvailable?: boolean
+    busy?: { jobs: number; reason: string } | null
+  }
+  agy?: {
+    installed?: string | null
+    sha256?: string | null
+    checksumOk?: boolean
+    latest?: string | null
+    latestUrl?: string | null
+    updateAvailable?: boolean
+    busy?: { jobs: number; reason: string } | null
+    rollbackAvailable?: boolean
+    reason?: string
+  }
+  checkedAt?: string
+}
 
 export type PanelData = {
   snapshot: Snapshot | null
@@ -98,15 +170,28 @@ export type PanelData = {
   error: string
   polledAt: number
   sessionId: string
-  /** Heartbeat diagnostics: '' ok, else why this session's beat was not sent. */
   beatNote?: string
 }
 
-/** Which cards are collapsed, by card id (memory, limits, daemon, jobs, build). */
 export type Collapsed = Record<string, boolean>
+
+/** Which tab is open, which tier's inline editor is open, the job filter, a pending confirmation and the last result. */
+export type View = {
+  tab: 'overview' | 'usage' | 'settings' | 'updates'
+  editTier: string | null
+  filter: 'all' | 'codex' | 'gemini' | 'claude'
+  confirm: { key: string; until: number } | null
+  busy: string | null
+  note: { text: string; level: 'success' | 'warning' | 'error'; at: number } | null
+  cli: CliStatus | null
+  draftModel: string
+  draftProvider: string
+  draftEfforts: string
+  presetName: string
+}
 
 declare module 'claude-code' {
   interface PluginState {
-    'luna-panel': { data: PanelData; collapsed: Collapsed }
+    'luna-panel': { data: PanelData; collapsed: Collapsed; view: Shaped<View> }
   }
 }

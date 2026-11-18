@@ -3,18 +3,12 @@
 // OFF SWITCH: create ~/.claude/learning/CAPTURE_OFF to stop capture.
 // Fail-safe: any error exits 0 silently; never block a session or print a decision.
 
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
 
 const timer = setTimeout(() => process.exit(0), 2000);
 
 try {
-  const local = new URL("../scripts/learning/common.mjs", import.meta.url);
-  const commonUrl = fs.existsSync(fileURLToPath(local)) ? local
-    : pathToFileURL(path.join(os.homedir(), ".claude", "scripts", "learning", "common.mjs"));
-  const { isCaptureOff, spawnDetached, findNode, SCRIPTS_DIR } = await import(commonUrl.href);
+  const { isCaptureOff, spawnDetached, findNode, SCRIPTS_DIR } = await import("../scripts/learning/common.mjs");
   if (!isCaptureOff()) {
     let input = "";
     process.stdin.setEncoding("utf8");
