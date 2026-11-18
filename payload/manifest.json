@@ -3881,14 +3881,14 @@
       "src": "claude/scripts/conveyor/cli-update.mjs",
       "dest": "scripts/conveyor/cli-update.mjs",
       "kind": "file",
-      "sha256": "fae73ea96045005737c53a6bbb4d8e548da90271082e98e7375b29901a9eb819",
+      "sha256": "36892cd06e3979e2497e4784d2af5e9093d7533b41a7f64e1a5c19099a8fff7b",
       "executable": true
     },
     {
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "23be37c771cb00146f8dc0d78bc48a089afa42c9e780337b491f57e92bcf8520",
+      "sha256": "7357d5f603821a831f6435337f8afeda992e1bd1ebe01ea361dc5ab1ef7f4832",
       "executable": true
     },
     {

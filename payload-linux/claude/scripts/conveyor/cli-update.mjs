@@ -423,9 +423,8 @@ async function updateCodex(opts) {
     const to = requested === 'latest' ? (await latestVersions(true)).codex.latest : requested;
     if (!to) throw new Error('cannot resolve latest Codex version');
     idle(await codexBusy());
-    // An idle daemon keeps serving the old binary (on Windows it also locks codex.exe); the next job starts a new one.
-    const daemon = path.join(home(), '.claude', 'scripts', 'luna-daemon.mjs');
-    if (await exists(daemon)) await run(process.execPath, [daemon, '--stop'], { timeout: 30_000 }).catch(() => {});
+    // An idle daemon is left running: it keeps the old binary until its idle exit (npm moves a locked codex.exe
+    // aside on Windows), and stopping it here could cut off a job admitted after the idle check.
     const env = { ...process.env, npm_config_prefix: npmPrefix(),
       npm_config_registry: 'https://registry.npmjs.org', npm_config_proxy: proxy(), npm_config_https_proxy: proxy(),
       npm_config_fetch_retries: '0', npm_config_fetch_timeout: '60000' };

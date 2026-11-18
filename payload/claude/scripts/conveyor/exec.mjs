@@ -882,7 +882,9 @@ async function switchProvider(tier, from, to, reason, out) {
 
 function failureReason(result, status) {
   if (result.launchError) return { reason: 'start', note: result.launchError };
-  const model = result.code !== 0 && modelError.test(status?.error || '');
+  // An explicit region or auth reason from the wrapper concerns the whole provider, whatever the text says.
+  const model = result.code !== 0 && modelError.test(status?.error || '') &&
+    !['region', 'auth'].includes(status?.unavailable_reason);
   if (result.code === 3) {
     const reason = unavailableReasons.includes(status?.unavailable_reason) ? status.unavailable_reason
       : quotaError.test(status?.error || '') ? 'quota' : 'start';
