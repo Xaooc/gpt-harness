@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { autodetect, loadProfile, matchesGlob, trustProfile } from './lib/profile.mjs';
+import { killTree, platform, shell } from './lib/platform.mjs';
 import {
   git, existingFiles, repositoryFiles, ratchet, hygieneReport, defaultBaseline, writeProfileBaseline, testChanges
 } from './lib/hygiene.mjs';
@@ -41,18 +42,13 @@ function processResult(repo, executable, args, budgetMs) {
     let output = '', timedOut = false, closed = false, escalation = null, rc = null;
     const append = (chunk) => { output = (output + chunk).split('\n').slice(-61).join('\n'); };
     const child = spawn(executable, args, {
-      cwd: repo, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: repo, detached: platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env, npm_config_offline: 'true', npm_config_yes: 'false', npm_config_audit: 'false',
         UV_OFFLINE: '1', UV_NO_SYNC: '1', CARGO_NET_OFFLINE: 'true', PIP_NO_INDEX: '1',
         RUFF_NO_CACHE: 'true', PYTHONDONTWRITEBYTECODE: '1', MYPY_CACHE_DIR: '/dev/null'
       }
     });
-    function signalGroup(signal) {
-      if (!child.pid) return;
-      try { process.kill(-child.pid, signal); }
-      catch (error) { if (error.code !== 'ESRCH') throw error; }
-    }
     function finish() {
       clearTimeout(timer);
       resolve({
@@ -62,10 +58,10 @@ function processResult(repo, executable, args, budgetMs) {
     }
     const timer = setTimeout(() => {
       timedOut = true;
-      signalGroup('SIGTERM');
+      killTree(child, 'SIGTERM', { groupOnly: true });
       // Escalate even if the shell exits first: a descendant can ignore SIGTERM and close its pipes.
       escalation = setTimeout(() => {
-        signalGroup('SIGKILL');
+        killTree(child, 'SIGKILL', { groupOnly: true });
         escalation = null;
         if (closed) finish();
       }, 200);
@@ -137,7 +133,10 @@ async function run(repo, opts, profile) {
     if (admission && admission.status !== 'pass') result = admission;
     else if (deadline <= Date.now()) {
       result = { status: 'timeout', rc: null, durationMs: 0, outputTail: 'level budget exhausted' };
-    } else result = await processResult(repo, '/bin/sh', ['-c', cmd, 'conveyor', ...args], deadline - Date.now());
+    } else {
+      const [executable, ...prefix] = shell();
+      result = await processResult(repo, executable, [...prefix, cmd, 'conveyor', ...args], deadline - Date.now());
+    }
     results.push({ name: entry.name, cmd, ...result });
   }
   const baseline = profile.hygieneSource === 'default' ? await defaultBaseline(repo, profile, revision) : null;

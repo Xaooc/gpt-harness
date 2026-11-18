@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { readProcess } from '../../lib/luna-runtime.mjs';
+import { lockOwnerAlive, lockOwnerStart } from './platform.mjs';
 
 const providers = ['codex', 'gemini', 'claude'];
 const reasons = ['quota', 'region', 'auth', 'start'];
@@ -199,8 +199,7 @@ async function reclaimLock(lock) {
     stat = await fs.stat(lock);
     owner = await optionalJson(lock);
   } catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  const process = readProcess(owner?.pid);
-  if (process && process.state !== 'Z' && process.started === String(owner?.pid_start)) return;
+  if (lockOwnerAlive(owner?.pid, owner?.pid_start)) return;
   // A new owner needs time to populate a freshly created lock file.
   if (!owner?.pid && Date.now() - stat.mtimeMs < 10_000) return;
   const stale = `${lock}.${randomUUID()}.stale`;
@@ -219,7 +218,7 @@ async function withLock(file, work) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const lock = `${file}.lock`;
   const deadline = Date.now() + 10_000;
-  const owner = { pid: process.pid, pid_start: readProcess(process.pid)?.started, token: randomUUID() };
+  const owner = { pid: process.pid, pid_start: lockOwnerStart(), token: randomUUID() };
   let handle;
   while (!handle) {
     try { handle = await fs.open(lock, 'wx', 0o600); }

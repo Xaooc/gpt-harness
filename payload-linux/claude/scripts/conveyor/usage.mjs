@@ -2,11 +2,10 @@
 // Incremental, local-only token accounting. State contains counters and metadata, never message text.
 import fs from 'node:fs';
 import path from 'node:path';
-import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { canonicalRepo, projectKeyForCwd } from '../learning/common.mjs';
-import { matchingProcess, readProcess } from '../lib/luna-runtime.mjs';
+import { home as userHome, lockOwnerAlive, lockOwnerStart } from './lib/platform.mjs';
 
 const providers = ['claude', 'codex', 'gemini'];
 const tokenKeys = ['input', 'output', 'cacheRead', 'cacheWrite', 'total', 'messages'];
@@ -21,7 +20,7 @@ const hasUsage = (values) => ['usage_input', 'usage_output', 'usage_total'].some
 const jobLog = (file) => file.endsWith('.log') && !['daemon.log', 'clean.log'].includes(path.basename(file));
 
 export function usagePaths(env = process.env) {
-  const home = path.resolve(env.HOME || homedir());
+  const home = path.resolve(userHome(env));
   const claude = path.resolve(env.CLAUDE_HOME_DIR || path.join(home, '.claude'));
   const cacheHome = path.resolve(env.CONVEYOR_HOME || path.join(claude, 'conveyor'));
   return {
@@ -103,7 +102,7 @@ export function acquireUsageLock(paths = usagePaths()) {
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
       const owner = readJson(path.join(paths.lock, 'owner.json'));
-      if (owner ? matchingProcess(owner.pid, owner.start) : Date.now() - fs.statSync(paths.lock).mtimeMs < 60_000) {
+      if (owner ? lockOwnerAlive(owner.pid, owner.start) : Date.now() - fs.statSync(paths.lock).mtimeMs < 60_000) {
         return null;
       }
       const retired = `${paths.lock}.${randomUUID()}.stale`;
@@ -111,7 +110,7 @@ export function acquireUsageLock(paths = usagePaths()) {
       catch (caught) { if (caught.code === 'ENOENT') continue; throw caught; }
       // Recheck after renaming so a competing stale-lock reaper cannot evict a new owner.
       const moved = readJson(path.join(retired, 'owner.json'));
-      if (moved && matchingProcess(moved.pid, moved.start)) {
+      if (moved && lockOwnerAlive(moved.pid, moved.start)) {
         try { fs.renameSync(retired, paths.lock); } catch {}
         return null;
       }
@@ -119,7 +118,7 @@ export function acquireUsageLock(paths = usagePaths()) {
       continue;
     }
     const nonce = randomUUID();
-    try { writeJson(path.join(paths.lock, 'owner.json'), { pid: process.pid, start: readProcess(process.pid)?.started, nonce }); }
+    try { writeJson(path.join(paths.lock, 'owner.json'), { pid: process.pid, start: lockOwnerStart(), nonce }); }
     catch (error) { fs.rmSync(paths.lock, { recursive: true, force: true }); throw error; }
     return () => {
       if (readJson(path.join(paths.lock, 'owner.json'))?.nonce === nonce) fs.rmSync(paths.lock, { recursive: true, force: true });

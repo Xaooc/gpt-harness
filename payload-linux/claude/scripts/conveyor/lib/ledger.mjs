@@ -8,6 +8,7 @@ import { entryText, isGenuineHumanEntry } from '../../learning/extract.mjs';
 import { readJsonl, sanitizeQuote } from '../../learning/common.mjs';
 import { loadConfig } from './orchestration.mjs';
 import { repositorySurface, uiFile } from './profile.mjs';
+import { shell } from './platform.mjs';
 
 const execute = promisify(execFile);
 const now = () => new Date().toISOString();
@@ -334,7 +335,7 @@ export async function runCommand(command, args = [], cwd = process.cwd()) {
   if (Array.isArray(command)) argv = [...command, ...args];
   else if (command.trim().startsWith('[')) argv = [...JSON.parse(command), ...args];
   else if (fs.existsSync(command)) argv = [command, ...args];
-  else argv = ['/bin/sh', '-c', `${command} "$@"`, 'conveyor', ...args];
+  else argv = [...shell(), `${command} "$@"`, 'conveyor', ...args];
   if (!argv.length || argv.some((value) => typeof value !== 'string')) throw new Error('invalid command');
   try {
     const result = await execute(argv[0], argv.slice(1), {

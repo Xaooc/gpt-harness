@@ -6,13 +6,13 @@ import {
   constants, readFileSync, readdirSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, statSync
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { matchingProcess, readProcess } from '../lib/luna-runtime.mjs';
 import { spawn } from 'node:child_process';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { writeJsonAtomic } from './lib/orchestration.mjs';
+import { home as userHomeDir, listProcesses, lockOwnerAlive, lockOwnerStart, platform, shell } from './lib/platform.mjs';
 
 const cli = fileURLToPath(import.meta.url);
 const AGY_ROOT = '/srv/docker/compose/antigravity-parallel';
@@ -25,7 +25,7 @@ const iso = (value) => typeof value === 'string' && Number.isFinite(Date.parse(v
   ? new Date(value).toISOString() : null;
 
 export function quotaPaths(env = process.env) {
-  const home = path.resolve(env.CONVEYOR_HOME || path.join(env.HOME || homedir(), '.claude', 'conveyor'));
+  const home = path.resolve(env.CONVEYOR_HOME || path.join(userHomeDir(env), '.claude', 'conveyor'));
   return { home, cache: path.join(home, 'gemini-quota.json'), lock: path.join(home, 'gemini-quota.lock') };
 }
 
@@ -40,7 +40,7 @@ function lockOwners(lock) {
 
 export function quotaRefreshLocked(env = process.env) {
   const { lock } = quotaPaths(env), owners = lockOwners(lock);
-  if (owners.some((owner) => matchingProcess(owner.pid, owner.start))) return true;
+  if (owners.some((owner) => lockOwnerAlive(owner.pid, owner.start))) return true;
   // Cover the mkdir -> owner publication gap without permanently retaining an abandoned lock.
   try { return (!owners.length || owners.some((owner) => !owner.pid || !owner.start)) &&
     Date.now() - statSync(lock).mtimeMs < 60_000; }
@@ -58,13 +58,13 @@ export function acquireQuotaRefreshLock(env = process.env) {
       // A unique owner marker prevents concurrent stale reapers from deleting a new live lock.
       // Never recursively remove this directory: rmdir must fail while any live marker exists.
       for (const owner of lockOwners(lock)) {
-        if (matchingProcess(owner.pid, owner.start)) return null;
+        if (lockOwnerAlive(owner.pid, owner.start)) return null;
         try { unlinkSync(path.join(lock, owner.name)); } catch {}
       }
       try { rmdirSync(lock); } catch { return null; }
       continue;
     }
-    const owner = { pid: process.pid, start: readProcess(process.pid)?.started, nonce: randomUUID() };
+    const owner = { pid: process.pid, start: lockOwnerStart(), nonce: randomUUID() };
     const marker = path.join(lock, `owner.${owner.nonce}.json`);
     try {
       writeFileSync(marker, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
@@ -137,7 +137,7 @@ async function names(directory) {
 
 // This is an observation of exhaustion, not a percentage or a provider reset prediction.
 async function exhaustionProxy(env, home, deadline) {
-  const userHome = env.HOME || homedir();
+  const userHome = userHomeDir(env);
   const run = env.LUNA_RUN_DIR || path.join(userHome, '.claude', 'luna-run');
   const files = new Set();
   const proxy = { source: 'gem-job-statuses', lastExhaustedAt: null };
@@ -188,22 +188,8 @@ async function exhaustionProxy(env, home, deadline) {
   return proxy;
 }
 
-// Read only process identities and ancestry; never inspect process environments or credential-bearing arguments.
-function processTable() {
-  const rows = [];
-  for (const name of readdirSync('/proc')) {
-    if (!/^\d+$/.test(name)) continue;
-    try {
-      const stat = readFileSync(`/proc/${name}/stat`, 'utf8');
-      const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-      rows.push({ pid: Number(name), state: fields[0], ppid: Number(fields[1]),
-        group: Number(fields[2]), started: fields[19] });
-    } catch {}
-  }
-  return rows;
-}
-
 async function queryAgy(env, timeoutMs, overallDeadline) {
+  if (platform !== 'linux') throw new Error('agy status-line quota refresh unavailable: process inspection requires Linux');
   const deadline = overallDeadline - 1500;
   if (performance.now() >= deadline) throw new Error('Quota reader overall deadline reached before starting agy');
   const temporary = await fs.mkdtemp(path.join(tmpdir(), 'gemini-quota-'));
@@ -211,7 +197,7 @@ async function queryAgy(env, timeoutMs, overallDeadline) {
   let child, tracking;
   const members = new Map();
   const track = () => {
-    const rows = processTable();
+    const rows = listProcesses();
     const owned = new Set(rows.filter((row) => row.pid === child?.pid ||
       members.get(row.pid)?.started === row.started).map((row) => row.pid));
     const groups = new Set(rows.filter((row) => owned.has(row.pid)).map((row) => row.group));
@@ -230,7 +216,7 @@ async function queryAgy(env, timeoutMs, overallDeadline) {
     for (const row of rows) if (owned.has(row.pid)) members.set(row.pid, row);
   };
   const signalTree = (signal) => {
-    const current = new Map(processTable().map((row) => [row.pid, row]));
+    const current = new Map(listProcesses().map((row) => [row.pid, row]));
     for (const row of [...members.values()].reverse()) {
       if (current.get(row.pid)?.started !== row.started || current.get(row.pid)?.state === 'Z') continue;
       try { process.kill(row.pid, signal); } catch {}
@@ -256,7 +242,7 @@ async function queryAgy(env, timeoutMs, overallDeadline) {
       HOME: path.join(AGY_ROOT, 'data', 'home'), XDG_RUNTIME_DIR: '/run/user/1000',
       DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus', AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       AGY_CLI_MODEL_API_MAX_RETRIES: '1', HTTP_PROXY: 'http://127.0.0.1:10809', HTTPS_PROXY: 'http://127.0.0.1:10809',
-      NO_PROXY: 'localhost,127.0.0.1,::1', TERM: 'xterm-256color', SHELL: '/bin/sh'
+      NO_PROXY: 'localhost,127.0.0.1,::1', TERM: 'xterm-256color', SHELL: shell()[0]
     };
     if (performance.now() >= deadline) throw new Error('Quota reader overall deadline reached before starting agy');
     // script gives agy a terminal. The hook exports structured JSON; terminal output is discarded.
@@ -290,7 +276,7 @@ async function queryAgy(env, timeoutMs, overallDeadline) {
         signalTree('SIGKILL');
         const stoppedBy = performance.now() + 300;
         while (performance.now() < stoppedBy) {
-          const live = processTable().some((row) => members.get(row.pid)?.started === row.started && row.state !== 'Z');
+          const live = listProcesses().some((row) => members.get(row.pid)?.started === row.started && row.state !== 'Z');
           if (!live) break;
           await delay(20);
           track();

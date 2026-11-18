@@ -7,15 +7,18 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { matchingProcess, processRows, readProcess } from './lib/luna-runtime.mjs';
+import {
+  home as userHome, killTree, linuxBootId, linuxUptimeMs as monotonic, platform, readProcessCommand, readProcessStat
+} from './conveyor/lib/platform.mjs';
 
-const home = path.resolve(process.env.HOME || os.homedir());
+const { matchingProcess, processRows, readProcess } = platform === 'linux' ? await import('./lib/luna-runtime.mjs') : {};
+
+const home = path.resolve(userHome());
 const run = path.join(home, '.claude', 'luna-run');
 const dir = path.join(run, 'account-lease');
 const lockDir = path.join(dir, 'lease.lock');
 const logFile = path.join(dir, 'lease.log');
-const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-const monotonic = () => Number(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]) * 1000;
+const bootId = linuxBootId();
 const lockLimitMs = 30_000;
 const childTermGraceMs = 5000;
 const defaultTtl = (mode) => mode === 'exclusive' ? 1800 : 7200;
@@ -23,6 +26,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const token = () => randomBytes(16).toString('hex');
 const safe = (text) => String(text ?? '').replace(/[\r\n\0]+/g, ' ').trim();
 const fileFor = (owner, id) => path.join(owner.directory, `${id}.json`);
+
+function requireLeaseInspection() {
+  if (bootId === null) throw new Error('account leases unavailable: process identity and group inspection requires Linux');
+}
 
 function log(message) {
   fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${safe(message)}\n`, { mode: 0o600 });
@@ -76,6 +83,7 @@ function prepareOwner(owner) {
 }
 
 function takeLock() {
+  requireLeaseInspection();
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const owner = newOwner();
   try {
@@ -162,7 +170,7 @@ function stopLeaseChild(lease, wait = false) {
     return groupMembers(pid).length === 0;
   }
   if (groupMembers(pid).length) {
-    try { process.kill(-pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    killTree(pid, 'SIGKILL', { groupOnly: true });
   }
   if (!wait) return groupMembers(pid).length === 0;
   const deadline = monotonic() + 1500;
@@ -183,12 +191,12 @@ function reclaimLeaseChild(owner, lease) {
   const now = monotonic();
   if (!Number.isFinite(lease.child_term_mono)) {
     assertOwner(owner);
-    try { process.kill(-pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    killTree(pid, 'SIGTERM', { groupOnly: true });
     lease.child_term_mono = now;
     save(owner, lease);
   } else if (now - lease.child_term_mono >= childTermGraceMs) {
     assertOwner(owner);
-    try { process.kill(-pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    killTree(pid, 'SIGKILL', { groupOnly: true });
   }
   return false;
 }
@@ -275,6 +283,7 @@ export async function releaseLease(id) {
 }
 
 export async function bindLeaseChild(lease, pid) {
+  requireLeaseInspection();
   const child = readProcess(pid);
   if (!child || child.state === 'Z' || child.group !== pid) return false;
   const start = child.started;
@@ -390,17 +399,13 @@ function exclusiveReady(active, lease) {
 
 function codexProcesses(rows = processRows()) {
   const found = [];
-  try {
-    // The shared process helper deliberately excludes pid 1 from signal targets; scanning must include it.
-    const stat = fs.readFileSync('/proc/1/stat', 'utf8');
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-    rows.unshift({ pid: 1, state: fields[0], group: Number(fields[2]), started: fields[19] });
-  } catch {}
+  // The shared process helper deliberately excludes pid 1 from signal targets; scanning must include it.
+  const init = readProcessStat(1);
+  if (init) rows.unshift(init);
   for (const row of rows) {
     if (row.state === 'Z') continue;
     try {
-      const argv = fs.readFileSync(`/proc/${row.pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
-      const exe = fs.readlinkSync(`/proc/${row.pid}/exe`).replace(/ \(deleted\)$/, '');
+      const { argv, exe } = readProcessCommand(row.pid);
       // The sandbox launcher shares the Codex executable but does not use the account itself.
       if (path.basename(argv[0] || '') === 'codex-linux-sandbox') continue;
       const executable = path.basename(exe) === 'codex' || path.basename(argv[0] || '') === 'codex';
@@ -453,6 +458,7 @@ function managedDaemonProcesses(rows) {
 }
 
 export async function acquire(options) {
+  requireLeaseInspection();
   const { mode, purpose, ttl = defaultTtl(mode), wait = 1800, onWait = () => {} } = options;
   const lease = makeLease({ ...options, ttl });
   const holder = { pid: lease.pid, pid_start: lease.pid_start };
@@ -617,8 +623,8 @@ async function runCommand(options, command) {
   const forward = (name) => {
     signal ||= name;
     if (child?.pid) {
-      try { process.kill(-child.pid, name); } catch {}
-      killTimer ||= setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 2000);
+      try { killTree(child, name, { groupOnly: true }); } catch {}
+      killTimer ||= setTimeout(() => { try { killTree(child, 'SIGKILL', { groupOnly: true }); } catch {} }, 2000);
     }
   };
   const handlers = new Map(['SIGINT', 'SIGTERM', 'SIGHUP'].map((name) => [name, () => forward(name)]));
@@ -679,7 +685,7 @@ async function runCommand(options, command) {
     const code = await result;
     // Any background descendants still in this command's group must stop before its lease is released.
     if (lease.child_pid && groupMembers(lease.child_pid).length) {
-      try { process.kill(-lease.child_pid, 'SIGKILL'); } catch {}
+      try { killTree(lease.child_pid, 'SIGKILL', { groupOnly: true }); } catch {}
       if (!stopLeaseChild(lease, true)) {
         releaseSafe = false;
         throw new Error('command process group did not stop');
@@ -713,7 +719,7 @@ async function runChild() {
   return new Promise((resolve) => {
     let child;
     const disconnected = () => {
-      try { process.kill(-process.pid, 'SIGKILL'); } catch { process.exitCode = 1; }
+      try { killTree(process.pid, 'SIGKILL', { groupOnly: true }); } catch { process.exitCode = 1; }
     };
     const finish = (code) => {
       process.removeListener('disconnect', disconnected);
@@ -740,6 +746,7 @@ async function runChild() {
 }
 
 async function main() {
+  requireLeaseInspection();
   const args = process.argv.slice(2);
   const command = args.shift();
   if (command === '_child' && !args.length && process.send) return runChild();
