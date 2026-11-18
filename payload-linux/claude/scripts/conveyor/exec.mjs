@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
   loadConfig, saveConfig, updateConfig, providerState, resolveChain, resolvePanel, markUnavailable,
-  recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
+  markModelUnavailable, recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 import { hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
@@ -21,6 +21,8 @@ const quotaError = new RegExp([
   String.raw`usage limit|quota|insufficient|billing|unauthorized|forbidden|\b40[0134]\b|"status":\s*4\d\d`,
   'model_not_found|not supported|invalid|context window|context_length|too long'
 ].join('|'), 'i');
+// A model this account or CLI version does not serve: only that model is skipped, the provider stays in the chains.
+const modelError = /model_not_found|\bmodel\b[^\n]{0,120}\bnot supported\b|\bunsupported model\b|\bunknown model\b/i;
 const unavailableReasons = ['quota', 'region', 'auth', 'start'];
 const execute = promisify(execFile);
 const gitOptions = { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 };
@@ -880,12 +882,15 @@ async function switchProvider(tier, from, to, reason, out) {
 
 function failureReason(result, status) {
   if (result.launchError) return { reason: 'start', note: result.launchError };
+  // An explicit region or auth reason from the wrapper concerns the whole provider, whatever the text says.
+  const model = result.code !== 0 && modelError.test(status?.error || '') &&
+    !['region', 'auth'].includes(status?.unavailable_reason);
   if (result.code === 3) {
     const reason = unavailableReasons.includes(status?.unavailable_reason) ? status.unavailable_reason
       : quotaError.test(status?.error || '') ? 'quota' : 'start';
-    return { reason, note: status?.error || status?.unavailable_reason || 'wrapper exited 3' };
+    return { reason, note: status?.error || status?.unavailable_reason || 'wrapper exited 3', model };
   }
-  if (result.code !== 0 && quotaError.test(status?.error || '')) return { reason: 'quota', note: status.error };
+  if (result.code !== 0 && quotaError.test(status?.error || '')) return { reason: 'quota', note: status.error, model };
   return null;
 }
 
@@ -1035,7 +1040,9 @@ async function runCommand(args) {
         reached_running: observed.reachedRunning
       });
       dispatch.code = result.code;
-      if (failure) await markUnavailable(entry.provider, failure.reason, failure.note, { config });
+      if (failure?.model) {
+        await markModelUnavailable(entry.provider, entry.model, failure.reason, failure.note, { config });
+      } else if (failure) await markUnavailable(entry.provider, failure.reason, failure.note, { config });
       const retryable = result.code === 3 || (result.code !== 0 && quotaError.test(observed.values?.error || ''));
       if (panel || !retryable || (mode === 'write' && observed.reachedRunning) || result.signal) {
         attempt.retry = false;

@@ -3765,14 +3765,14 @@
       "src": "claude/scripts/conveyor/cli-update.mjs",
       "dest": "scripts/conveyor/cli-update.mjs",
       "kind": "file",
-      "sha256": "470d901d582981e25ac2210c91d5f57b33b3f94164ef4ad4e36f09bf72b40a42",
+      "sha256": "36892cd06e3979e2497e4784d2af5e9093d7533b41a7f64e1a5c19099a8fff7b",
       "executable": true
     },
     {
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "3c47e116cda576965d10e82e751c221c3c55971edba9bfa348e8d2fece73fcb3",
+      "sha256": "7357d5f603821a831f6435337f8afeda992e1bd1ebe01ea361dc5ab1ef7f4832",
       "executable": true
     },
     {
@@ -3812,7 +3812,7 @@
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
       "dest": "scripts/conveyor/lib/orchestration.mjs",
       "kind": "file",
-      "sha256": "3a764de9c1555ce73094689baf8099d65959f8763d606697b5bb6ce702ebdc0f"
+      "sha256": "cc23687ffbb8189a04c9e643580c14deeef088497141916de9b743695aec4eba"
     },
     {
       "src": "claude/scripts/conveyor/lib/patch-recipes.mjs",
@@ -3932,7 +3932,7 @@
       "src": "claude/scripts/conveyor/test/exec.test.mjs",
       "dest": "scripts/conveyor/test/exec.test.mjs",
       "kind": "file",
-      "sha256": "a2a7d5f245ce86958d51c3fa90900bc088fe6314351292a4f344e7ae76ee66c5"
+      "sha256": "8ddb4ea5f886046ed8ae3cc85cba8fbb1e89b60cbfd3e6c5c4c218e9c953dd7f"
     },
     {
       "src": "claude/scripts/conveyor/test/fixtures/fake-wrapper.sh",

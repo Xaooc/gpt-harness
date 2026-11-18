@@ -13,6 +13,12 @@ import {
 } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import {
+  loadConfigWithSource, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
+} from './conveyor/lib/orchestration.mjs';
+import { lockOwnerAlive } from './conveyor/lib/platform.mjs';
+import { summarizeUsage, usagePaths } from './conveyor/usage.mjs';
+import { quotaPaths, quotaRefreshLocked } from './conveyor/gemini-quota.mjs';
 
 const DEADLINE_MS = 3750;
 const TAIL_BYTES = 64 * 1024;
@@ -46,7 +52,10 @@ function configuration() {
   return {
     run,
     daemon: path.resolve(process.env.LUNA_DAEMON_HOME || run),
-    build: path.resolve(build || path.join(homedir(), 'codex-build'))
+    build: path.resolve(build || path.join(homedir(), 'codex-build')),
+    codexConfig: path.join(home, '.codex', 'config.toml'),
+    // The Antigravity gateway runs on the Linux host only; on Windows the file is absent unless pointed at.
+    geminiStatus: process.env.LUNA_GEMINI_STATUS || '/srv/docker/compose/antigravity-parallel/data/status.json'
   };
 }
 
@@ -57,7 +66,11 @@ function empty(now = Date.now()) {
     ram: { freeMb: null, totalMb: null },
     daemon, daemons: { default: daemon, net: { ...daemon } },
     jobs: [], codexLimits: null, build: null,
-    sessions: []
+    sessions: [],
+    orchestration: { source: null, chains: {}, panels: {}, threshold: null, marks: {}, presets: [], catalog: {}, configError: null },
+    switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null,
+      quota: { available: false, buckets: [], at: null } },
+    usage: { ...summarizeUsage(null, now), stale: true }
   };
 }
 
@@ -79,6 +92,124 @@ async function readJson(file) {
     const value = JSON.parse(await readText(file));
     return object(value) ? value : null;
   } catch { return null; }
+}
+
+async function readTail(file, limit = TAIL_BYTES) {
+  let handle;
+  try {
+    handle = await fs.open(file, 'r');
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
+    const start = Math.max(0, stat.size - limit);
+    const buffer = Buffer.alloc(Math.min(stat.size, limit));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    const text = buffer.subarray(0, bytesRead).toString('utf8').replace(/^﻿/, '');
+    return start ? (text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '') : text;
+  } catch { return null; }
+  finally { if (handle) await handle.close().catch(() => {}); }
+}
+
+function jsonLines(text) {
+  return (text || '').trimEnd().split(/\r?\n/).flatMap((line) => {
+    try { const value = JSON.parse(line); return object(value) ? [value] : []; }
+    catch { return []; }
+  });
+}
+
+// Detached background refresh through this Node binary; a failure only leaves the cached value in place.
+function spawnRefresh(script, args) {
+  try {
+    const child = spawn(process.execPath, [script, ...args], { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch {}
+}
+
+async function usageStatus(now) {
+  const paths = usagePaths(), cache = await readJson(paths.cache);
+  const usage = summarizeUsage(cache?.v === 1 ? cache : null, now);
+  usage.stale = !Number.isFinite(Date.parse(usage.at)) || now - Date.parse(usage.at) > 120_000;
+  if (usage.stale) {
+    const owner = await readJson(path.join(paths.lock, 'owner.json'));
+    if (!owner || !lockOwnerAlive(owner.pid, owner.start)) {
+      // Override supports an isolated fake collector; real collectors serialize on usage-state.json.lock.
+      spawnRefresh(process.env.LUNA_USAGE_COLLECTOR || fileURLToPath(new URL('./conveyor/usage.mjs', import.meta.url)),
+        ['collect']);
+    }
+  }
+  return usage;
+}
+
+async function geminiQuotaStatus(now) {
+  const cache = await readJson(quotaPaths().cache);
+  const age = now - Date.parse(cache?.at);
+  const quota = {
+    available: cache?.available === true, buckets: Array.isArray(cache?.buckets) ? cache.buckets.map((bucket) => ({
+      name: string(bucket.name),
+      ...(number(bucket.remainingFraction) !== null ? { remainingFraction: bucket.remainingFraction } : {}),
+      ...(number(bucket.usedPercent) !== null ? { usedPercent: bucket.usedPercent } : {}),
+      ...(string(bucket.resetAt) ? { resetAt: bucket.resetAt } : {})
+    })) : [], at: string(cache?.at) || null,
+    ...(string(cache?.reason) ? { reason: cache.reason } : {}),
+    ...(string(cache?.lastExhaustedAt || cache?.proxy?.lastExhaustedAt)
+      ? { lastExhaustedAt: cache.lastExhaustedAt || cache.proxy.lastExhaustedAt } : {})
+  };
+  if ((!Number.isFinite(age) || age < 0 || age > 600_000) && !quotaRefreshLocked()) {
+    spawnRefresh(process.env.LUNA_GEMINI_QUOTA_CMD || fileURLToPath(new URL('./conveyor/gemini-quota.mjs', import.meta.url)),
+      ['--json', '--refresh']);
+  }
+  return quota;
+}
+
+async function geminiMcp(config) {
+  const [status, toml] = await Promise.all([readJson(config.geminiStatus), readText(config.codexConfig)]);
+  if (!status) return null;
+  return {
+    configured: /^[ \t]*\[[ \t]*mcp_servers\.(?:antigravity-parallel|"antigravity-parallel"|'antigravity-parallel')[ \t]*\]/m
+      .test(toml || ''),
+    activeItems: number(status.activeItems), adaptiveLimit: number(status.adaptiveLimit),
+    configuredLimit: number(status.configuredLimit), at: string(status.at) || null
+  };
+}
+
+async function orchestrationStatus(snapshot, now) {
+  try {
+    const { config, source } = await loadConfigWithSource();
+    const state = await providerState(config, { now, persist: false });
+    const chains = Object.create(null), panels = Object.create(null);
+    for (const tier of Object.keys(config.tiers)) {
+      const resolved = await resolveChain(tier, { config, state, now });
+      chains[tier] = resolved.chain.map((entry) => ({ ...entry, selected: entry === resolved.selected }));
+    }
+    for (const panel of Object.keys(config.panels)) {
+      panels[panel] = (await resolvePanel(panel, { config, state, now })).seats;
+    }
+    const marks = Object.fromEntries(Object.entries(state.providers).map(([provider, mark]) => [provider, {
+      until: string(mark.until) || null, reason: string(mark.reason) || null
+    }]));
+    snapshot.orchestration = {
+      source, chains, panels, threshold: { ...config.thresholds.codex, switched: state.threshold.switched }, marks,
+      presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
+      catalog: config.catalog, configError: null
+    };
+    // Resolve an availability probe even when no configured tier or panel currently uses Gemini.
+    const model = config.catalog.gemini?.[0];
+    if (model) {
+      const probe = { tiers: { gemini: [{ provider: 'gemini', model: model.model, effort: model.efforts[0] }] } };
+      const entry = (await resolveChain('gemini', { config: probe, state, now })).chain[0];
+      Object.assign(snapshot.gemini, { available: entry.available, reason: entry.reason });
+    }
+  } catch (error) {
+    snapshot.orchestration.configError = cleanText(String(error.message), 500);
+    snapshot.gemini.reason = snapshot.orchestration.configError;
+  }
+}
+
+async function switches() {
+  const text = await readTail(orchestrationPaths().switches);
+  const lines = (text || '').trimEnd().split(/\r?\n/).slice(-8).reverse().join('\n');
+  return jsonLines(lines).filter((event) => ['at', 'tier', 'from', 'to', 'reason']
+    .every((key) => typeof event[key] === 'string')).map(({ at, tier, from, to, reason }) => ({ at, tier, from, to, reason }));
 }
 
 function statusValues(text) {
@@ -506,7 +637,12 @@ async function collect(config, snapshot, now) {
       snapshot.codexLimits = limits ? { ...limits, ageS: seconds(limits.at, now) } : null;
     }),
     buildStatus(config.build, now).then((build) => { snapshot.build = build; }),
-    sessionBeats(config.run, now).then((sessions) => { snapshot.sessions = sessions; })
+    sessionBeats(config.run, now).then((sessions) => { snapshot.sessions = sessions; }),
+    orchestrationStatus(snapshot, now),
+    switches().then((events) => { snapshot.switches = events; }),
+    geminiMcp(config).then((mcp) => { snapshot.gemini.mcp = mcp; }),
+    geminiQuotaStatus(now).then((quota) => { snapshot.gemini.quota = quota; }),
+    usageStatus(now).then((usage) => { snapshot.usage = usage; })
   ]);
   snapshot.jobs = reconcileConflictJobs([...snapshot.jobs, ...conflictJobs], snapshot.daemons);
   return snapshot;
@@ -584,7 +720,8 @@ async function selfTest() {
     });
     check('JSON shape', () => {
       assert.deepEqual(Object.keys(snapshot), [
-        'v', 'at', 'ram', 'daemon', 'daemons', 'jobs', 'codexLimits', 'build', 'sessions'
+        'v', 'at', 'ram', 'daemon', 'daemons', 'jobs', 'codexLimits', 'build', 'sessions', 'orchestration', 'switches',
+        'gemini', 'usage'
       ]);
       assert.equal(snapshot.v, 1);
       assert.equal(snapshot.at, new Date(now).toISOString());
@@ -869,7 +1006,7 @@ async function selfTest() {
     });
     check('token absent', () => {
       assert.ok(!JSON.stringify(snapshot).includes('SECRET-NEVER-PRINT'));
-      assert.ok(!JSON.stringify(snapshot).includes('token'));
+      assert.ok(!JSON.stringify(snapshot).includes('"token"'));
     });
     check('limits pass through', () => assert.deepEqual(snapshot.codexLimits, { ...limits, ageS: 5 }));
     check('UTF-16 tail and executable mtime', () => {
