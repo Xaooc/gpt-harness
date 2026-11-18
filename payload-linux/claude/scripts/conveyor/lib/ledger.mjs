@@ -6,6 +6,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { entryText, isGenuineHumanEntry } from '../../learning/extract.mjs';
 import { readJsonl, sanitizeQuote } from '../../learning/common.mjs';
+import { loadConfig } from './orchestration.mjs';
 import { repositorySurface, uiFile } from './profile.mjs';
 
 const execute = promisify(execFile);
@@ -77,13 +78,20 @@ export function claudeHome() {
   return process.env.CLAUDE_HOME_DIR || path.join(os.homedir(), '.claude');
 }
 
+const validSession = (session) => typeof session === 'string' && /^[a-z0-9][a-z0-9._-]*$/i.test(session);
+
+export function ledgerHome() {
+  return path.resolve(process.env.CONVEYOR_HOME || path.join(claudeHome(), 'conveyor'));
+}
+
 export function ledgerPaths(session) {
-  if (typeof session !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/i.test(session)) throw new Error('invalid or missing session id');
-  const home = path.resolve(process.env.CONVEYOR_HOME || path.join(claudeHome(), 'conveyor'));
+  if (!validSession(session)) throw new Error('invalid or missing session id');
+  const home = ledgerHome();
   return {
     home, ledger: path.join(home, 'ledgers', `${session}.jsonl`), runs: path.join(home, 'sessions', `${session}.jsonl`),
     context: path.join(home, 'sessions', `${session}.ledger.json`), bases: path.join(home, 'sessions', `${session}.base.json`),
     calibration: path.join(home, 'gate-calibration-start'),
+    approachCalibration: path.join(home, 'gate-calibration-start-10'),
     stops: path.join(home, 'gate-state', `${session}.json`)
   };
 }
@@ -768,6 +776,78 @@ async function screenshotProblem(context, state, repos) {
   });
 }
 
+export function hasApproachReviewTiers(config) {
+  return Object.hasOwn(config.tiers, 'approach') || Object.hasOwn(config.tiers, 'architect');
+}
+
+export function validReviewSkip(reason) {
+  return typeof reason === 'string' && !!reason.trim() && [...reason].length <= 300;
+}
+
+function approachReviewRuns(session, task) {
+  const started = Date.parse(task.at);
+  return readJsonl(ledgerPaths(session).runs).filter((run) => run.session === session && Date.parse(run.at) >= started);
+}
+
+function approachReviewRequirement(runs, before = Infinity) {
+  let review = -Infinity, approach = -Infinity, architect = -Infinity, planner = -Infinity, failure = -Infinity;
+  let plannerModel = null;
+  const approaches = [];
+  for (const run of runs) {
+    const at = Date.parse(run.at);
+    if (run.event !== 'end' || at >= before) continue;
+    if (run.code === 0) {
+      const reviewer = run.panel ?? run.tier;
+      if (reviewer === 'architect') architect = Math.max(architect, at);
+      if (!run.panel && reviewer === 'approach') {
+        approach = Math.max(approach, at);
+        approaches.push({ at, model: run.model ?? null });
+      }
+      if (!run.panel && reviewer === 'planner' && at >= planner) {
+        planner = at;
+        plannerModel = run.model ?? null;
+      }
+      if (reviewer === 'architect' || (!run.panel && reviewer === 'approach')) review = Math.max(review, at);
+    }
+    if (run.code === 6 && run.gate?.status === 'fail') failure = Math.max(failure, at);
+  }
+  if (failure !== -Infinity && architect <= failure) return 'retry';
+  // A plan written by the planner tier (Astra) is reviewed by a different model: tier approach, after the plan.
+  // The reviewer must be another model in fact, not just another tier: a fallback can make both the same model.
+  if (planner !== -Infinity && !approaches.some((entry) => entry.at > planner
+    && (!plannerModel || !entry.model || entry.model !== plannerModel))) return 'independent';
+  return review === -Infinity ? 'initial' : null;
+}
+
+export function taskApproachReviewRequirement(session) {
+  if (!validSession(session)) return null;
+  const task = readJsonl(ledgerPaths(session).ledger).findLast((record) => record.type === 'start');
+  return task ? approachReviewRequirement(approachReviewRuns(session, task)) : null;
+}
+
+function approachReviewProblem(context, task) {
+  const runs = approachReviewRuns(context.session, task);
+  for (const run of runs) {
+    // Write starts in the existing index have no event field and use the gate mode.
+    if ((run.event !== undefined && run.event !== 'start') || run.panel || run.tier !== 'complex'
+      || !['write', 'block', 'warn', 'off'].includes(run.mode) || validReviewSkip(run.reviewSkip)) continue;
+    const requirement = approachReviewRequirement(runs, Date.parse(run.at));
+    if (requirement === 'initial') {
+      return 'non-trivial change started without a completed approach review: run exec.mjs run --tier approach (medium) '
+        + 'or --tier architect (complex architecture) -r on the plan before implementing; record what you accepted';
+    }
+    if (requirement === 'independent') {
+      return 'the plan from tier planner (Astra) was not reviewed by a different model: run tier approach on it '
+        + 'before implementing';
+    }
+    if (requirement === 'retry') {
+      return 'work restarted after a gate failure without a completed architect review: '
+        + 'run an approach review on tier architect with the failure history before another attempt';
+    }
+  }
+  return null;
+}
+
 export async function gateStatus(context) {
   const rows = transcriptRows(context);
   const { applies, repos, nonGit, writes } = await sessionRepos(context, rows);
@@ -824,11 +904,24 @@ export async function gateStatus(context) {
     return block(9, 'user-facing change without a screenshot: drive it with the project\'s verify skill '
       + '(create .claude/skills/verify-<app> if missing) and record `ledger evidence <L> --artifact <screenshot>`');
   }
+  if (!state.gateWaived && hasApproachReviewTiers(await loadConfig())) {
+    const mode = approachReviewMode(context.session);
+    const approach = approachReviewProblem(context, state.task);
+    if (approach) return { ...block(10, approach), mode };
+  }
   return { applies: true, ok: true };
 }
 
 export function gateMode(session) {
-  const file = ledgerPaths(session).calibration;
+  return calibrationMode(ledgerPaths(session).calibration);
+}
+
+function approachReviewMode(session) {
+  const mode = calibrationMode(ledgerPaths(session).approachCalibration);
+  return mode === 'warn' ? mode : gateMode(session);
+}
+
+function calibrationMode(file) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   try { fs.writeFileSync(file, `${now()}\n`, { flag: 'wx' }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
@@ -867,7 +960,7 @@ export function stopOutput(context, status, active) {
     logGate(`${context.session}: ${systemMessage}`);
     return { systemMessage };
   }
-  if (gateMode(context.session) === 'warn') return { systemMessage: `conveyor gate: ${status.reason}` };
+  if ((status.mode ?? gateMode(context.session)) === 'warn') return { systemMessage: `conveyor gate: ${status.reason}` };
   return { decision: 'block', reason: status.reason };
 }
 

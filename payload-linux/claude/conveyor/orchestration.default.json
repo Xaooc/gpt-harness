@@ -1,38 +1,272 @@
 {
   "version": 1,
   "tiers": {
-    "complex": [{"provider": "codex", "model": "gpt-6.1-sol", "effort": "max"},
-                {"provider": "claude", "model": "sonnet", "effort": "high"}],
-    "simple":  [{"provider": "gemini", "model": "gemini-3.8-flash", "effort": "high"},
-                {"provider": "codex", "model": "gpt-6-luna", "effort": "high"},
-                {"provider": "claude", "model": "haiku", "effort": "medium"}],
-    "review":  [{"provider": "codex", "model": "gpt-6-luna", "effort": "high"},
-                {"provider": "gemini", "model": "gemini-3.8-flash", "effort": "high"},
-                {"provider": "claude", "model": "haiku", "effort": "medium"}],
-    "scout":   [{"provider": "gemini", "model": "gemini-3.8-flash", "effort": "medium"},
-                {"provider": "codex", "model": "gpt-6-luna", "effort": "medium"},
-                {"provider": "claude", "model": "haiku", "effort": "medium"}]
+    "complex": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "max"
+      },
+      {
+        "provider": "claude",
+        "model": "sonnet",
+        "effort": "high"
+      }
+    ],
+    "simple": [
+      {
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "effort": "high"
+      },
+      {
+        "provider": "codex",
+        "model": "gpt-6-luna",
+        "effort": "high"
+      },
+      {
+        "provider": "claude",
+        "model": "haiku",
+        "effort": "medium"
+      }
+    ],
+    "review": [
+      {
+        "provider": "codex",
+        "model": "gpt-6-luna",
+        "effort": "high"
+      },
+      {
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "effort": "high"
+      },
+      {
+        "provider": "claude",
+        "model": "haiku",
+        "effort": "medium"
+      }
+    ],
+    "scout": [
+      {
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "effort": "medium"
+      },
+      {
+        "provider": "codex",
+        "model": "gpt-6-luna",
+        "effort": "medium"
+      },
+      {
+        "provider": "claude",
+        "model": "haiku",
+        "effort": "medium"
+      }
+    ],
+    "architect": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.2-astra",
+        "effort": "max"
+      },
+      {
+        "provider": "codex",
+        "model": "gpt-6.2-sol",
+        "effort": "max"
+      },
+      {
+        "provider": "claude",
+        "model": "opus",
+        "effort": "high"
+      }
+    ],
+    "approach": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.2-sol",
+        "effort": "max"
+      },
+      {
+        "provider": "claude",
+        "model": "opus",
+        "effort": "high"
+      }
+    ],
+    "planner": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.2-astra",
+        "effort": "max"
+      },
+      {
+        "provider": "codex",
+        "model": "gpt-6.2-sol",
+        "effort": "max"
+      },
+      {
+        "provider": "claude",
+        "model": "opus",
+        "effort": "high"
+      }
+    ]
   },
   "panels": {
-    "design": [{"provider": "codex", "model": "gpt-6.1-sol", "effort": "max"},
-               {"provider": "gemini", "model": "gemini-3.8-flash", "effort": "high"},
-               {"provider": "codex", "model": "gpt-6-luna", "effort": "high"}],
-    "review": [{"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"},
-               {"provider": "gemini", "model": "gemini-3.8-flash", "effort": "high"},
-               {"provider": "codex", "model": "gpt-6-luna", "effort": "high"}],
-    "judge":  [{"provider": "gemini", "model": "gemini-3.8-flash", "effort": "high"},
-               {"provider": "codex", "model": "gpt-6.1-sol", "effort": "high"}]
+    "design": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "max"
+      },
+      {
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "effort": "high"
+      },
+      {
+        "provider": "codex",
+        "model": "gpt-6-luna",
+        "effort": "high"
+      }
+    ],
+    "review": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "high"
+      },
+      {
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "effort": "high"
+      },
+      {
+        "provider": "codex",
+        "model": "gpt-6-luna",
+        "effort": "high"
+      }
+    ],
+    "judge": [
+      {
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "effort": "high"
+      },
+      {
+        "provider": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "high"
+      }
+    ],
+    "architect": [
+      {
+        "provider": "codex",
+        "model": "gpt-6.2-astra",
+        "effort": "max"
+      },
+      {
+        "provider": "codex",
+        "model": "gpt-6.2-sol",
+        "effort": "max"
+      }
+    ]
   },
   "catalog": {
-    "codex":  [{"model": "gpt-6.1-sol", "efforts": ["low","medium","high","xhigh","max"]},
-               {"model": "gpt-6-luna", "efforts": ["low","medium","high","xhigh","max"]}],
-    "gemini": [{"model": "gemini-3.8-flash", "efforts": ["low","medium","high"]}],
-    "claude": [{"model": "sonnet", "efforts": ["low","medium","high"]},
-               {"model": "haiku", "efforts": ["low","medium","high"]},
-               {"model": "opus", "efforts": ["low","medium","high"]}]
+    "codex": [
+      {
+        "model": "gpt-6.1-sol",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      {
+        "model": "gpt-6-luna",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      {
+        "model": "gpt-6.2-astra",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      {
+        "model": "gpt-6.2-sol",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    ],
+    "gemini": [
+      {
+        "model": "gemini-3.8-flash",
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    ],
+    "claude": [
+      {
+        "model": "sonnet",
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      {
+        "model": "haiku",
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      {
+        "model": "opus",
+        "efforts": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    ]
   },
-  "thresholds": {"codex": {"switch_percent": 80, "windows": ["primary", "secondary"], "hysteresis_percent": 5}},
-  "unavailable_ttl_s": {"quota": 1800, "region": 3600, "auth": 3600, "start": 600},
+  "thresholds": {
+    "codex": {
+      "switch_percent": 80,
+      "windows": [
+        "primary",
+        "secondary"
+      ],
+      "hysteresis_percent": 5
+    }
+  },
+  "unavailable_ttl_s": {
+    "quota": 1800,
+    "region": 3600,
+    "auth": 3600,
+    "start": 600
+  },
   "roles": {
     "feature, refactoring": "tier:complex",
     "bug-fix": "tier:complex",
@@ -44,38 +278,113 @@
     "reflect tooling": "tier:review",
     "reflect judgment, divergent, synthesizer": "tier:review",
     "arena runners": "panel:design",
-    "architect runners": "panel:design",
+    "architect runners": "panel:architect",
+    "approach review: complex architecture or a looping problem": "tier:architect",
+    "approach review: medium change": "tier:approach",
     "interrogate reviewers": "panel:review",
-    "arena cross-judge pool": "panel:judge"
+    "arena cross-judge pool": "panel:judge",
+    "technical plan for complex architecture (reviewed by approach)": "tier:planner"
   },
   "presets": {
     "max-quality": {
       "label": "Максимум качества",
       "tiers": {
-        "complex": [{"provider": "codex", "model": "gpt-6.1-sol", "effort": "max"},
-                    {"provider": "claude", "model": "sonnet", "effort": "high"}],
-        "simple": [{"provider": "gemini", "model": "gemini-3.8-flash", "effort": "high"},
-                   {"provider": "codex", "model": "gpt-6-luna", "effort": "xhigh"},
-                   {"provider": "claude", "model": "haiku", "effort": "high"}]
+        "complex": [
+          {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "max"
+          },
+          {
+            "provider": "claude",
+            "model": "sonnet",
+            "effort": "high"
+          }
+        ],
+        "simple": [
+          {
+            "provider": "gemini",
+            "model": "gemini-3.8-flash",
+            "effort": "high"
+          },
+          {
+            "provider": "codex",
+            "model": "gpt-6-luna",
+            "effort": "xhigh"
+          },
+          {
+            "provider": "claude",
+            "model": "haiku",
+            "effort": "high"
+          }
+        ]
       }
     },
     "save-codex": {
       "label": "Экономия Codex",
       "tiers": {
-        "complex": [{"provider": "claude", "model": "sonnet", "effort": "high"},
-                    {"provider": "codex", "model": "gpt-6.1-sol", "effort": "max"}],
-        "simple": [{"provider": "gemini", "model": "gemini-3.8-flash", "effort": "high"},
-                   {"provider": "claude", "model": "haiku", "effort": "medium"},
-                   {"provider": "codex", "model": "gpt-6-luna", "effort": "high"}]
+        "complex": [
+          {
+            "provider": "claude",
+            "model": "sonnet",
+            "effort": "high"
+          },
+          {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "max"
+          }
+        ],
+        "simple": [
+          {
+            "provider": "gemini",
+            "model": "gemini-3.8-flash",
+            "effort": "high"
+          },
+          {
+            "provider": "claude",
+            "model": "haiku",
+            "effort": "medium"
+          },
+          {
+            "provider": "codex",
+            "model": "gpt-6-luna",
+            "effort": "high"
+          }
+        ]
       }
     },
     "claude-only": {
       "label": "Только Claude",
       "tiers": {
-        "complex": [{"provider": "claude", "model": "sonnet", "effort": "high"}],
-        "simple": [{"provider": "claude", "model": "haiku", "effort": "medium"}],
-        "review": [{"provider": "claude", "model": "haiku", "effort": "medium"}],
-        "scout": [{"provider": "claude", "model": "haiku", "effort": "medium"}]
+        "complex": [
+          {
+            "provider": "claude",
+            "model": "sonnet",
+            "effort": "high"
+          }
+        ],
+        "simple": [
+          {
+            "provider": "claude",
+            "model": "haiku",
+            "effort": "medium"
+          }
+        ],
+        "review": [
+          {
+            "provider": "claude",
+            "model": "haiku",
+            "effort": "medium"
+          }
+        ],
+        "scout": [
+          {
+            "provider": "claude",
+            "model": "haiku",
+            "effort": "medium"
+          }
+        ]
       }
     }
   }

@@ -10,6 +10,7 @@ import { once } from 'node:events';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { main as execMain } from '../exec.mjs';
+import { appendRecord, ledgerPaths } from '../lib/ledger.mjs';
 import { gitState, invoke, shellQuote, shellLog } from './process-fixture.mjs';
 import {
   loadConfig, validateConfig, saveConfig, applyPreset, markUnavailable, resolveChain, paths
@@ -557,7 +558,7 @@ test('all providers skipped returns exit 5 with reasons and a status snapshot', 
     const status = await env.command(['status', '--json']);
     assert.equal(status.status, 0, status.stderr);
     const result = JSON.parse(status.stdout);
-    assert.deepEqual(Object.keys(result.tiers).sort(), ['complex', 'review', 'scout', 'simple']);
+    assert.deepEqual(Object.keys(result.tiers).sort(), ['approach', 'architect', 'complex', 'planner', 'review', 'scout', 'simple']);
     assert.equal(result.providers.claude.reason, 'quota');
     assert.equal(result.usage.codex.known, false);
     assert.equal(result.usage.claude.known, false);
@@ -890,13 +891,14 @@ test('catalog refresh discovers Codex models and Claude aliases with safe cache 
       CONVEYOR_CLAUDE_BINS: JSON.stringify([binary, secondBinary])
     };
     await fs.writeFile(cache, JSON.stringify({ fetched_at: '2026-11-17T21:04:59Z', models: [
-      { slug: 'gpt-6.2-sol', visibility: 'list', supported_reasoning_levels:
+      { slug: 'gpt-6.3-sol', visibility: 'list', supported_reasoning_levels:
         ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'unknown'].map((effort) => ({ effort })) },
       { slug: 'gpt-reserve', visibility: 'hide', supported_reasoning_levels: [{ effort: 'low' }] },
       // Older releases Codex still lists stay out: only the newest version of a family joins the catalog.
       { slug: 'gpt-5.6-sol', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] },
       { slug: 'gpt-6.10-luna-old', visibility: 'hide', supported_reasoning_levels: [{ effort: 'low' }] },
       { slug: 'gpt-6.2-ASTRA', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] },
+      { slug: 'gpt-6-astra', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] },
       { slug: initial.codex[0].model, visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] },
       { slug: 'gpt-no-efforts', visibility: 'list', supported_reasoning_levels: [{ effort: 'ultra' }] },
       { slug: '', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] }
@@ -923,10 +925,12 @@ test('catalog refresh discovers Codex models and Claude aliases with safe cache 
 
     const refreshed = await action(env, ['catalog', 'refresh', '--provider', 'codex', '--actor', 'panel'], command);
     assert.equal(refreshed.changed, true);
-    assert.equal(refreshed.note, 'added codex/gpt-6.2-sol');
+    assert.equal(refreshed.note, 'added codex/gpt-6.3-sol, codex/gpt-6.2-ASTRA');
     const expected = { ...initial, codex: [...initial.codex, liveModel,
-      { model: 'gpt-6.2-sol', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] }] };
+      { model: 'gpt-6.3-sol', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      { model: 'gpt-6.2-ASTRA', efforts: ['low'] }] };
     assert.deepEqual((await loadConfig()).catalog, expected);
+    assert.ok(!(await loadConfig()).catalog.codex.some((entry) => entry.model === 'gpt-6-astra'));
     assert.equal((await readLines(paths().journal)).at(-1).actor, 'panel');
     let before = await fs.readFile(paths().config);
     let journal = await fs.readFile(paths().journal);
@@ -1010,6 +1014,35 @@ test('catalog add/remove validate efforts and refuse models referenced by tiers 
   } finally { await env.cleanup(); }
 });
 
+test('a complex write requires a completed approach review or a recorded skip reason', { timeout }, async () => {
+  const env = await environment();
+  try {
+    await env.setup();
+    const session = process.env.CLAUDE_CODE_SESSION_ID;
+    appendRecord(session, { type: 'start' });
+    const blocked = await env.run('complex', '-w');
+    assert.equal(blocked.status, 8, blocked.stderr);
+    assert.match(blocked.stderr, /^approach review required before the first complex write of this task:/);
+    await assert.rejects(fs.stat(`${env.out}.log`), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(ledgerPaths(session).runs), { code: 'ENOENT' });
+
+    const skipped = await env.run('complex', '-w', {}, ['--review-skip', 'rename only']);
+    assert.equal(skipped.status, 0, skipped.stderr);
+    const runs = ledgerPaths(session).runs;
+    let records = await readLines(runs);
+    assert.equal(records[0].reviewSkip, 'rename only');
+
+    const reviewOut = path.join(env.root, 'approach.md');
+    const review = await env.command(['run', '--tier', 'approach', '-r', '-C', env.dir, '-f', env.brief, '-o', reviewOut]);
+    assert.equal(review.status, 0, review.stderr);
+    const reviewed = await env.run('complex', '-w');
+    assert.equal(reviewed.status, 0, reviewed.stderr);
+    records = await readLines(runs);
+    assert.deepEqual(records.filter((record) => record.out === reviewOut).map(({ event, code }) => [event, code]), [['end', 0]]);
+    assert.equal(records.at(-2).reviewSkip, undefined);
+  } finally { await env.cleanup(); }
+});
+
 test('a green write gate appends checks and records the owner, excluding pre-existing dirt', { timeout }, async () => {
   const env = await environment();
   try {
@@ -1090,7 +1123,9 @@ test('a gate still red after the configured repair budget exits 6 and records it
     assert.deepEqual(dispatch.gate.last.results.map((result) => result.name), ['fast-check', 'turn-check']);
     assert.equal((await readLines(gate.calls)).length, 2);
     assert.equal((await readLines(gate.checks)).length, 4);
-    assert.match(await fs.readFile(env.out, 'utf8'), /Round 0: fail[\s\S]*Round 1: fail[\s\S]*## Gate: fail/);
+    const output = await fs.readFile(env.out, 'utf8');
+    assert.match(output, /Round 0: fail[\s\S]*Round 1: fail[\s\S]*## Gate: fail/);
+    assert.match(output, /## Gate: fail[\s\S]*## Approach review[\s\S]*--tier architect/);
   } finally { await env.cleanup(); }
 });
 

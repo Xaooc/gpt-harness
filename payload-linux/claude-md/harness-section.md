@@ -61,6 +61,9 @@ node ~/.claude/scripts/conveyor/exec.mjs run --tier <complex|simple|review|scout
 | `complex` | any implementation beyond simple: features, non-trivial fixes, refactors, migrations, multi-file, data/API/auth/money/concurrency/security, debugging |
 | `simple` | mechanical edits, summaries |
 | `review` / `scout` | critics and second opinions / information gathering |
+| `architect` | approach review of complex architecture (several subsystems, a new subsystem, data model, concurrency, money/security core, migrations) and of any problem that keeps coming back |
+| `approach` | approach review of a medium change (a feature or fix across a few files with a real design choice); also the independent review of a `planner` plan |
+| `planner` | the technical plan of a complex architecture, written from the scouts' facts within Claude's requirements |
 
 Which provider, model and effort serve each tier and panel is the owner's choice in the **Luna panel**; the
 session-start digest prints the current setting and `node ~/.claude/scripts/conveyor/exec.mjs status` shows it live.
@@ -74,7 +77,8 @@ Never name a provider yourself: no direct `gem.sh`/`luna.sh` calls for delegated
   another provider. Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`; exit 5: no provider
   available; exit 6: the project's checks stayed red after the fix rounds; exit 7: another write job already runs in
   that repository, so start the slice in its own worktree (`wt-new.mjs`) or wait for it.
-- Never `gpt-6-astra`. Never the fast tier (`-t fast`) unless the user asks.
+- Never `gpt-6-astra`. `gpt-6.2-astra` is allowed (owner 2026-11-18) and serves the `architect` tier. Never `ultra` effort
+  (it delegates to sub-agents). Never the fast tier (`-t fast`) unless the user asks.
 - Briefs are self-contained and exhaustive: executors are literal and see only the brief (see the `luna` skill,
   "The executors are literal"). Every write brief ends with "Edit files only. Do NOT run git add / commit / push".
   Claude verifies every result (diff, gates, spot-checks) and commits itself.
@@ -84,6 +88,34 @@ Never name a provider yourself: no direct `gem.sh`/`luna.sh` calls for delegated
 **Priorities: quality of the final result > speed through parallelism > quota.** Fan out scouts, use best-of-2
 (pstack `arena`) for the riskiest core pieces, run independent slices in parallel; decompose by independence,
 never into pieces smaller than a coherent unit.
+
+**Approach review: a high-level critic before code and when stuck** (owner decision 2026-11-18, every repository).
+A trial on three real problems showed GPT-6.2 Astra and Sol at max find design flaws and better approaches that
+ordinary critics and fix rounds found only after two rounds or missed. So:
+- **Before implementing** anything beyond a small change, after the scouts and Claude's own plan: run the plan
+  through `--tier approach` (medium change) or `--tier architect` (complex architecture: several subsystems, a new
+  subsystem or data model, concurrency, money/security core, migrations). For the riskiest architecture use the
+  `architect` panel (Astra and Sol seats in parallel) for two independent views.
+- **Complex architecture, planned by Astra:** after the scouts, Claude writes the requirements and limits (the
+  owner's intent stays with Claude), `--tier planner` writes the technical plan from the facts (modules, order of
+  verifiable steps, risks), then `--tier approach` (a different model) reviews that plan; Claude merges, decides and
+  slices the work into briefs. The reviewer is never the plan's author.
+- **When a problem loops** (the same failure twice, `exec.mjs` exit 6, two fix rounds without convergence, or the
+  user correcting the same thing again): stop retrying and run `--tier architect` with the history.
+- **The brief** (Astra is literal and lazy, strong but without creative or directorial vision; OpenAI advises
+  outcome-first prompts with few rules): the goal and why; the facts the scouts found (short, pre-digested); the
+  current plan; one question. Ask for up to three options, the strongest first, each in 2–4 sentences with why it
+  works and the one fact or scenario that would kill it, then a pick. Read-only (`-r`), no code or patches, state
+  assumptions, "before you finish, check you answered the question and each option says how it fails". Point it at
+  the repository; do not paste the whole conversation.
+- **Never for** visual/UI/UX/product/game design (Opus), implementation, or line-by-line diff review (critics and
+  `interrogate`).
+- Claude judges the answer, verifies the claims it relies on by a run, and tells the user what it accepted and
+  rejected. Enforced at the point where the plan can still change: `exec.mjs run` refuses the first `complex` write
+  of a ledger task (exit 8) until an approach review has completed in that task, refuses a new attempt after a gate
+  failure until an `architect` review has completed, and refuses a write after a `planner` plan until `approach`
+  reviewed it; `--review-skip "<reason>"` is for a change with no design choice and is recorded. The stop gate's
+  check 10 audits the same rules (its own 7-day warn period); exit 6 prints the `architect` command.
 
 **Design is done by Opus itself, NEVER delegated.** Opus is the main Claude model in this session, and it is far
 better than GPT with the visual side of websites and apps. Design means visual/UI/UX, layout, styling/CSS, look &

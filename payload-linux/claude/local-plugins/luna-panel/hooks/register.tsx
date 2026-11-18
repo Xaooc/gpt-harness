@@ -29,15 +29,22 @@ const view = atom({ plugin: 'luna-panel', key: 'view' } as const, VIEW0, { shape
 
 // ---- Words -----------------------------------------------------------------------------------------------------
 
-const TIER_RU: Record<string, string> = { complex: 'Сложное', simple: 'Простое', review: 'Ревью', scout: 'Разведка' }
+const TIER_RU: Record<string, string> = {
+  complex: 'Сложное', simple: 'Простое', review: 'Ревью', scout: 'Разведка', architect: 'Архитектура', approach: 'Подход', planner: 'План',
+}
 const TIER_HINT: Record<string, string> = {
   complex: 'реализация, отладка, рефакторинг',
   simple: 'механика, шаблонные правки',
   review: 'критики и ревью',
   scout: 'поиск и чтение',
+  architect: 'ревью сложной архитектуры и задач, что ходят по кругу',
+  approach: 'ревью подхода для средних задач',
+  planner: 'технический план сложной архитектуры по фактам',
 }
-const PANEL_RU: Record<string, string> = { design: 'Арена (проектирование)', review: 'Ревью (interrogate)', judge: 'Судьи' }
-const PANEL_SHORT: Record<string, string> = { design: 'Арена', review: 'Ревью', judge: 'Судьи' }
+const PANEL_RU: Record<string, string> = {
+  design: 'Арена (проектирование)', review: 'Ревью (interrogate)', judge: 'Судьи', architect: 'Эскизы архитектуры',
+}
+const PANEL_SHORT: Record<string, string> = { design: 'Арена', review: 'Ревью', judge: 'Судьи', architect: 'Архитектура' }
 const EFFORTS_ALL = ['low', 'medium', 'high', 'xhigh', 'max']
 const STATE_RU: Record<string, string> = {
   running: 'работает', queued: 'в очереди', starting: 'старт', 'waiting-daemon': 'ждёт место',

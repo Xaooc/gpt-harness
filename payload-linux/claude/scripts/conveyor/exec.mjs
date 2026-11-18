@@ -13,6 +13,7 @@ import {
   recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
+import { hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
 
 // Matches luna.sh's retryable_model_error deny pattern, including usage, auth and invalid-model failures.
 const quotaError = new RegExp([
@@ -170,7 +171,7 @@ export async function gateMode(repo) {
 }
 
 export function gateSessionFile(session) {
-  return path.join(paths().home, 'sessions', `${encodeURIComponent(session)}.jsonl`);
+  return path.join(ledgerHome(), 'sessions', `${encodeURIComponent(session)}.jsonl`);
 }
 
 export function failedCheck(result) {
@@ -289,9 +290,9 @@ export function modifiedTests(before, after, includeAdded = false) {
   return [...files].filter((file) => testFile(file) && before.get(file) !== after.get(file)).sort();
 }
 
-async function prepareGate(dir, brief, out, tier, skip) {
+async function prepareGate(dir, brief, out, tier, panel, skip, reviewSkip) {
   const gate = { ...await gateRepository(dir), mode: 'off', preExisting: [] };
-  try { gate.mode = skip ? 'off' : await gateMode(gate.repo); }
+  try { gate.mode = panel || skip ? 'off' : await gateMode(gate.repo); }
   catch (error) { gate.mode = 'block'; gate.configError = error.message; }
   if (gate.base && gate.mode !== 'off') gate.preExisting = await workingFiles(gate.repo);
   gate.brief = await fs.readFile(brief, 'utf8');
@@ -299,7 +300,8 @@ async function prepareGate(dir, brief, out, tier, skip) {
   if (budget <= 100) gate.testBudget = budget;
   await appendRunRecord({
     at: new Date().toISOString(), session: process.env.CLAUDE_CODE_SESSION_ID || 'unknown',
-    repo: gate.repo, base: gate.base, out, tier, mode: gate.mode
+    repo: gate.repo, base: gate.base, out, tier, ...(panel ? { panel } : {}), mode: gate.mode,
+    ...(reviewSkip === undefined ? {} : { reviewSkip })
   });
   return gate;
 }
@@ -317,6 +319,18 @@ async function appendRunRecord(record) {
 async function finishGate(gate, dispatch, entry, dir, out) {
   if (!gate || gate.mode === 'off') return 0;
   const append = (text) => fs.appendFile(out, `${text}\n`);
+  const report = async (text) => {
+    const failed = dispatch.gate.status === 'fail';
+    if (failed) {
+      const repo = `'${gate.repo.replaceAll("'", "'\\''")}'`;
+      text += '\n\n## Approach review\n'
+        + 'The checks stayed red after the fix rounds. Before another attempt, ask for an approach review:\n'
+        + `node ~/.claude/scripts/conveyor/exec.mjs run --tier architect -r -C ${repo} -f <brief.md> -o <out.md>\n`
+        + '(brief: the goal and why, what was tried, the failing output, one question: what is the better approach?)';
+    }
+    await append(text);
+    return failed ? 6 : 0;
+  };
   if (!gate.base) {
     dispatch.gate = { status: 'skipped', reason: 'not a git repository with HEAD' };
     await append(`\n## Gate\n\nskipped: ${dispatch.gate.reason}`);
@@ -356,8 +370,7 @@ async function finishGate(gate, dispatch, entry, dir, out) {
       const forbiddenTests = budgetOnly ? tests.filter((file) => !files.includes(file)) : tests;
       if (forbiddenTests.length) {
         dispatch.gate = { status: 'fail', rounds, last, touched: forbiddenTests };
-        await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round modified tests: ${forbiddenTests.join(', ')})`);
-        return 6;
+        return await report(`Round ${rounds}: fail\n\n## Gate: fail (fix round modified tests: ${forbiddenTests.join(', ')})`);
       }
       const touched = [...new Set([...before.keys(), ...after.keys()])].filter((file) =>
         before.get(file) !== after.get(file) && (checkConfiguration(file) ||
@@ -365,13 +378,11 @@ async function finishGate(gate, dispatch, entry, dir, out) {
           (before.has(file) && !after.has(file) && !(budgetOnly && testFile(file))))).sort();
       if (touched.length) {
         dispatch.gate = { status: 'fail', rounds, last, touched };
-        await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round touched check configuration: ${touched.join(', ')})`);
-        return 6;
+        return await report(`Round ${rounds}: fail\n\n## Gate: fail (fix round touched check configuration: ${touched.join(', ')})`);
       }
       if (result.code !== 0) {
         dispatch.gate = { status: 'fail', rounds, last, fixCode: result.code };
-        await append(`Round ${rounds}: wrapper exited ${result.code}\n\n## Gate: fail\n\n${gateDetails(last)}`);
-        return 6;
+        return await report(`Round ${rounds}: wrapper exited ${result.code}\n\n## Gate: fail\n\n${gateDetails(last)}`);
       }
       files = await gateChangedFiles(gate.repo, gate.base, gate.preExisting);
       const previousTests = last.tests;
@@ -381,27 +392,23 @@ async function finishGate(gate, dispatch, entry, dir, out) {
         const problems = await trimViolations(gate.repo, gate.base, trim, files);
         if (problems.length) {
           dispatch.gate = { status: 'fail', rounds, last, touched: problems };
-          await append(`Round ${rounds}: fail\n\n## Gate: fail (the trim round may only delete tests the job added: ` +
+          return await report(`Round ${rounds}: fail\n\n## Gate: fail (the trim round may only delete tests the job added: ` +
             `${problems.join('; ')})`);
-          return 6;
         }
         if (!files.length) last.tests = { budget: previousTests.budget, added: 0, ok: true, files: [] };
         if (!last.tests || last.tests.added >= previousTests.added) {
           dispatch.gate = { status: 'fail', rounds, last, touched: tests };
-          await append(`Round ${rounds}: fail\n\n## Gate: fail (fix round did not reduce the number of new tests)`);
-          return 6;
+          return await report(`Round ${rounds}: fail\n\n## Gate: fail (fix round did not reduce the number of new tests)`);
         }
       }
     }
     const status = last.ok ? 'pass' : gate.mode === 'warn' ? 'warn' : 'fail';
     dispatch.gate = { status, rounds, last };
-    await append(`\n## Gate: ${status}\n\n${gateDetails(last)}`);
-    return status === 'fail' ? 6 : 0;
+    return await report(`\n## Gate: ${status}\n\n${gateDetails(last)}`);
   } catch (error) {
     const status = gate.mode === 'warn' ? 'warn' : 'fail';
     dispatch.gate = { status, rounds, last, message: error.message };
-    await append(`\n## Gate: ${status}\n\n${error.message}`);
-    return status === 'fail' ? 6 : 0;
+    return await report(`\n## Gate: ${status}\n\n${error.message}`);
   }
 }
 
@@ -411,7 +418,10 @@ function options(args, allowed) {
     const key = args[index];
     if (!Object.hasOwn(allowed, key)) throw new Error(`unknown option: ${key}`);
     if (Object.hasOwn(result, key)) throw new Error(`duplicate option: ${key}`);
-    if (allowed[key]) {
+    if (key === '--review-skip') {
+      const value = args[index + 1];
+      result[key] = value === undefined || Object.hasOwn(allowed, value) ? '' : args[++index];
+    } else if (allowed[key]) {
       if (!args[index + 1] || args[index + 1].startsWith('-')) throw new Error(`${key} requires a value`);
       result[key] = args[++index];
     } else result[key] = true;
@@ -656,7 +666,7 @@ async function catalogCommand(args) {
       // Codex keeps listing older releases (gpt-5.6-*, gpt-6-sol); only the newest version of each family joins the
       // picker, so a refresh brings in gpt-6.2-sol without re-adding every model it replaced.
       const listed = models.filter((entry) => entry?.visibility === 'list' && typeof entry.slug === 'string' &&
-        entry.slug && !/-astra$/i.test(entry.slug));
+        entry.slug && !/^gpt-6-astra$/i.test(entry.slug));
       const release = (slug) => /^gpt-(\d+(?:\.\d+)*)-([a-z]+)$/i.exec(slug);
       const newer = (a, b) => {
         const x = a.split('.').map(Number), y = b.split('.').map(Number);
@@ -902,12 +912,33 @@ function targetFor(opts, config) {
   throw new Error('one of --tier, --panel or --role is required');
 }
 
+function refuseUnreviewedWrite(session) {
+  const requirement = taskApproachReviewRequirement(session);
+  if (!requirement) return false;
+  const message = requirement === 'retry'
+    ? "this task's work failed the gate: run an approach review on tier architect with the failure history "
+      + 'before another attempt (or --review-skip "<reason>")'
+    : requirement === 'independent'
+    ? 'the plan was written by tier planner (Astra): review it on tier approach (a different model) before implementing '
+      + '(or --review-skip "<reason>")'
+    : 'approach review required before the first complex write of this task: run exec.mjs run --tier approach '
+      + '(medium change) or --tier architect (complex architecture) -r -C <dir> -f <plan-brief.md> -o <out.md>, '
+      + 'then record what you accepted; or pass --review-skip "<reason>" for a change with no design choice';
+  process.stderr.write(`${message}\n`);
+  return true;
+}
+
 async function runCommand(args) {
   const opts = options(args, {
     '--tier': true, '--panel': true, '--seat': true, '--role': true,
-    '--no-gate': false, '--waive': true,
+    '--no-gate': false, '--waive': true, '--review-skip': true,
     '-w': false, '-r': false, '-C': true, '-f': true, '-o': true
   });
+  const reviewSkip = opts['--review-skip'];
+  if (reviewSkip !== undefined && !validReviewSkip(reviewSkip)) {
+    process.stderr.write('conveyor: --review-skip requires a non-empty reason of at most 300 characters\n');
+    return 2;
+  }
   required(opts, ['-C', '-f', '-o']);
   if (Boolean(opts['-w']) === Boolean(opts['-r'])) throw new Error('exactly one of -w or -r is required');
   if ((opts['--no-gate'] && !opts['--waive']) || (opts['--waive'] && !/^W-\d+$/.test(opts['--waive']))) {
@@ -927,6 +958,11 @@ async function runCommand(args) {
   if (!(await fs.stat(brief)).isFile()) throw new Error('-f must be a brief file');
   if (out === brief) throw new Error('brief and output paths must differ');
   const mode = opts['-w'] ? 'write' : 'read';
+  const session = process.env.CLAUDE_CODE_SESSION_ID;
+  // Any route to the complex tier counts, including a pstack role that maps to it.
+  const enforceReview = reviewSkip === undefined && mode === 'write' && !panel
+    && tier === 'complex' && hasApproachReviewTiers(config);
+  if (enforceReview && refuseUnreviewedWrite(session)) return 8;
   let state = await providerState(config);
   const resolve = async () => {
     if (!panel) return resolveChain(tier, { config, state });
@@ -944,8 +980,7 @@ async function runCommand(args) {
   if (opts['--waive']) dispatch.waive = opts['--waive'];
   if (opts['--no-gate']) dispatch.noGate = true;
   const saveDispatch = () => writeJsonAtomic(`${out}.dispatch.json`, dispatch);
-  const session = process.env.CLAUDE_CODE_SESSION_ID || 'unknown';
-  let lock, code = 1;
+  let lock, code = 1, reviewRefused = false;
   try {
     lock = mode === 'write' ? await acquireWriteLock(dir, out, brief) : null;
     if (lock && !lock.release) {
@@ -956,7 +991,10 @@ async function runCommand(args) {
         'Run this slice in its own worktree (node ~/.claude/scripts/disk/wt-new.mjs …) or wait for it.\n');
       return code = 7;
     }
-    const gate = mode === 'write' ? await prepareGate(dir, brief, out, tier, panel || opts['--no-gate']) : null;
+    // A previous writer may have recorded a failure while this dispatch acquired the repository lock.
+    reviewRefused = enforceReview && refuseUnreviewedWrite(session);
+    if (reviewRefused) return 8;
+    const gate = mode === 'write' ? await prepareGate(dir, brief, out, tier, panel, opts['--no-gate'], reviewSkip) : null;
     let cursor = -1, from = null, failedReason = null;
     while (true) {
       const index = resolution.chain.findIndex((entry, position) => position > cursor && entry.available);
@@ -1028,14 +1066,13 @@ async function runCommand(args) {
       resolution = await resolve();
     }
   } finally {
-    try { lock?.release?.(); }
-    finally {
-      await appendRunRecord({
-        event: 'end', at: new Date().toISOString(), session, out, tier, mode,
+    try {
+      if (!reviewRefused) await appendRunRecord({
+        event: 'end', at: new Date().toISOString(), session: session || 'unknown', out, tier, ...(panel ? { panel } : {}), mode,
         provider: dispatch.provider ?? null, model: dispatch.model ?? null, code,
         gate: dispatch.gate ? { status: dispatch.gate.status, rounds: dispatch.gate.rounds ?? null } : null
       });
-    }
+    } finally { lock?.release?.(); }
   }
 }
 
@@ -1100,9 +1137,9 @@ export async function main(args = process.argv.slice(2)) {
   }
   throw new Error('usage: exec.mjs resolve (--tier <tier>|--panel <name>|--role <name>) [--json] ' +
     '[--first-available] | run (--tier <tier>|--panel <name> --seat <n>|--role <name>) ' +
-    '(-w|-r) -C <dir> -f <brief> -o <out> [--no-gate --waive W-<digits>] | ' +
+    '(-w|-r) -C <dir> -f <brief> -o <out> [--no-gate --waive W-<digits>] [--review-skip <reason>] | ' +
     'roles render [--out <path>] | status [--json] | config … | catalog …; ' +
-    'exit codes: 4 Claude hand-off, 5 no provider available, 6 gate failed, 7 repository write-locked');
+    'exit codes: 4 Claude hand-off, 5 no provider available, 6 gate failed, 7 repository write-locked, 8 approach review required');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

@@ -11,6 +11,7 @@ import { invoke, invokeHook, shellList, shellLog } from './process-fixture.mjs';
 
 const cli = fileURLToPath(new URL('../ledger.mjs', import.meta.url));
 const capture = fileURLToPath(new URL('../../../hooks/conveyor-prompt-capture.mjs', import.meta.url));
+const stop = fileURLToPath(new URL('../../../hooks/conveyor-stop-gate.mjs', import.meta.url));
 const timeout = 600_000;
 
 async function fixture(t, text = 'Please add a safe ledger. Ensure cleanup.') {
@@ -102,7 +103,7 @@ esac
     return result.stdout;
   }
   assert.equal(await prompt(text), '');
-  return { root, repo, home, transcript, env, append, user, command, prompt,
+  return { root, repo, home, transcript, env, append, user, command, prompt, run,
     state: async () => JSON.parse(await command(['show', '--json'])),
     records: () => fs.readFileSync(path.join(home, 'ledgers/ledger-test.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
 }
@@ -253,6 +254,91 @@ async function crosscheckFixture(t) {
   await f.command(['done', 'L1']);
   return { f, original };
 }
+
+test('stop check 10 audits completed reviews before complex writes and has its own calibration', { timeout }, async (t) => {
+  const { f } = await crosscheckFixture(t);
+  fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
+  f.env.FAKE_UNTRACKED = '["worker.mjs"]';
+  f.env.CONVEYOR_CHECK_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"ok\":true}'"]);
+  f.env.CONVEYOR_OVERVIEW_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"jobs\":[]}'"]);
+  await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
+  await f.command(['crosscheck']);
+  f.append({ type: 'assistant', message: { content: await f.command(['checklist']) } });
+
+  const runs = path.join(f.home, 'sessions', 'ledger-test.jsonl');
+  const baseline = fs.readFileSync(runs, 'utf8');
+  const taskAt = Date.parse((await f.state()).task.at);
+  const record = (offset, fields) => JSON.stringify({
+    session: 'ledger-test', at: new Date(taskAt + offset).toISOString(), ...fields
+  }) + '\n';
+  const history = (...records) => fs.writeFileSync(runs, baseline + records.join(''));
+  const status = async (rc = 0) => JSON.parse(await f.command(['status', '--json'], {}, rc));
+  const work = { tier: 'complex', out: path.join(f.root, 'implementation.md'), mode: 'block' };
+  const review = { event: 'end', tier: 'approach', mode: 'read', out: path.join(f.root, 'review.md'), code: 0 };
+  const write = record(2, work);
+  history(write);
+  let result = await status(1);
+  assert.equal(result.check, 10);
+  assert.match(result.reason, /^10\. non-trivial change started without a completed approach review:/);
+
+  history(record(1, review), write);
+  assert.equal((await status()).ok, true);
+  history(record(1, { ...review, code: 5 }), write);
+  assert.equal((await status(1)).check, 10);
+  history(write, record(3, review));
+  assert.equal((await status(1)).check, 10);
+  history(record(2, { ...work, reviewSkip: 'rename only' }));
+  assert.equal((await status()).ok, true);
+  // A plan from the planner tier (Astra) needs a review by a different model (tier approach) after it.
+  const plan = record(0, { ...review, tier: 'planner', out: path.join(f.root, 'plan.md') });
+  history(plan, record(1, { ...review, tier: 'architect', out: path.join(f.root, 'self-review.md') }), write);
+  assert.match((await status(1)).reason, /^10\. the plan from tier planner \(Astra\) was not reviewed by a different model/);
+  history(plan, record(1, review), write);
+  assert.equal((await status()).ok, true);
+  // After a fallback the plan and the review can come from the same model; that is not an independent review.
+  const solPlan = record(0, { ...review, tier: 'planner', model: 'gpt-6.2-sol', out: path.join(f.root, 'plan.md') });
+  history(solPlan, record(1, { ...review, model: 'gpt-6.2-sol' }), write);
+  assert.equal((await status(1)).check, 10);
+
+  const failure = record(3, { ...work, event: 'end', code: 6, gate: { status: 'fail', rounds: 2 } });
+  const architect = record(4, { ...review, tier: 'architect', panel: 'architect', out: path.join(f.root, 'architect.md') });
+  const retry = record(5, { ...work, event: 'start', out: path.join(f.root, 'retry.md') });
+  history(record(1, review), write, failure, architect, retry);
+  assert.equal((await status()).ok, true);
+  history(record(1, review), write, failure, retry);
+  result = await status(1);
+  assert.equal(result.check, 10);
+  assert.match(result.reason, /^10\. work restarted after a gate failure without a completed architect review:/);
+
+  const configFile = path.join(f.home, 'orchestration.json');
+  const config = JSON.parse(fs.readFileSync(new URL('../../../conveyor/orchestration.default.json', import.meta.url), 'utf8'));
+  delete config.tiers.approach;
+  delete config.tiers.architect;
+  config.roles = Object.fromEntries(Object.entries(config.roles)
+    .filter(([, target]) => target !== 'tier:approach' && target !== 'tier:architect'));
+  fs.writeFileSync(configFile, JSON.stringify(config));
+  assert.equal((await status()).ok, true);
+  fs.rmSync(configFile);
+
+  const old = new Date(Date.now() - 8 * 86400_000);
+  const age = (file) => {
+    fs.writeFileSync(file, old.toISOString() + '\n');
+    fs.utimesSync(file, old, old);
+  };
+  age(path.join(f.home, 'gate-calibration-start'));
+  const stopGate = async (mode) => {
+    const output = await f.run(stop, [], { CONVEYOR_GATE_MODE: mode }, JSON.stringify({
+      session_id: 'ledger-test', transcript_path: f.transcript, cwd: f.repo
+    }));
+    assert.equal(output.status, 0, output.stderr);
+    return JSON.parse(output.stdout);
+  };
+  const calibration = path.join(f.home, 'gate-calibration-start-10');
+  assert.ok(Date.parse(fs.readFileSync(calibration, 'utf8').trim()) >= taskAt);
+  assert.deepEqual(await stopGate(''), { systemMessage: `conveyor gate: ${result.reason}` });
+  age(calibration);
+  assert.deepEqual(await stopGate(''), { decision: 'block', reason: result.reason });
+});
 
 test('crosscheck uses a fake command, stores a state hash, and removes its temporary files', { timeout }, async (t) => {
   const { f, original } = await crosscheckFixture(t);

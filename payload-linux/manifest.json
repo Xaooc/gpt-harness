@@ -74,7 +74,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "0d21207bcb89613d017db4d05c162261218c7927fc9b23b85e60b5e52b5fc2b6"
+      "sha256": "3cd2110b37d25276f12c4932b15ae898b4a80dd5b3072504609eb1ca1942d47e"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
@@ -86,7 +86,7 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "0474ebac8c07c64c41d59e3a7e0c847079c5229c8b99b1199a8940efd197e33c"
+      "sha256": "a4876ab241c02541fc418e257bcc37c334825c306543d20b5b148af00398dde8"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",
@@ -414,7 +414,7 @@
       "src": "claude/conveyor/orchestration.default.json",
       "dest": "conveyor/orchestration.default.json",
       "kind": "file",
-      "sha256": "7752ade4baef824c0be3e42228a7523fe5ead94726bdb4105dfaf1051b804abd"
+      "sha256": "104e3ce3840477eca2f32efcdc5d1f01a2c1ae8f4cf9fa27a6babe8f25a5b977"
     },
     {
       "src": "claude/hooks/conveyor-hygiene-session-start.mjs",
@@ -462,7 +462,7 @@
       "src": "claude/local-plugins/pstack/.claude-plugin/plugin.json",
       "dest": "local-plugins/pstack/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "52e73ca54a58c18895f614797cab767fdd11887c605242a6ac31d85015e1dee8"
+      "sha256": "d949d763e376aac66f4d35b03c004e52007cc7038038987d7444bd45af3e96c8"
     },
     {
       "src": "claude/local-plugins/pstack/LICENSE",
@@ -606,7 +606,7 @@
       "src": "claude/local-plugins/pstack/docs/harness/bro-harness.md",
       "dest": "local-plugins/pstack/docs/harness/bro-harness.md",
       "kind": "file",
-      "sha256": "c3e22f9cd7414dc78d0632422795e8c2328f8fba5129b364283a0a6762964f87"
+      "sha256": "928286be6f5e3bc864464a01b881b926c8ac048ce43539f43fd07a55be3c5e9b"
     },
     {
       "src": "claude/local-plugins/pstack/docs/harness/claude-code.md",
@@ -3772,7 +3772,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "e532379f6e486bfb31d50481f0aaf823178edb98939061eacf078f0cc660a63c",
+      "sha256": "309c7736072c804bed0934c6888326446e57832af83c2ac823e130ff34b6e2d9",
       "executable": true
     },
     {
@@ -3793,7 +3793,7 @@
       "src": "claude/scripts/conveyor/ledger.mjs",
       "dest": "scripts/conveyor/ledger.mjs",
       "kind": "file",
-      "sha256": "fb1b825f09ad6b6a939237410e7466701bb7bb880e1ca43b0fe3701f3c16359b",
+      "sha256": "c910cc74b751c58d673dba940ccbb3a10529feb2bc8cd1616b44468469f9b396",
       "executable": true
     },
     {
@@ -3806,7 +3806,7 @@
       "src": "claude/scripts/conveyor/lib/ledger.mjs",
       "dest": "scripts/conveyor/lib/ledger.mjs",
       "kind": "file",
-      "sha256": "fb854629dc0673d8131363636534c51ac80ee87a59f8f5d070cef10c83fbe1f7"
+      "sha256": "5a560515441085d0d9bd071e076124553230d75d38d5d52f30bab955e92c1230"
     },
     {
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
@@ -3872,5 +3872,5 @@
   "settings": "settings/hooks.json",
   "claudeMd": "claude-md/harness-section.md",
   "settingsSha256": "5de749c86eb7eb5194693f9684e71a2335e5699bf6f2a67dc60e08e17898e5f5",
-  "claudeMdSha256": "e5c74208d639fe4a4de217eb0ae8fcd0130142c0a99acdfbe4fcf311d84f26ca"
+  "claudeMdSha256": "8245a09b4f7328b3986f430e37a62c206cdaea69ec64d3a7c07eb7432cb6abe3"
 }

@@ -71,9 +71,21 @@ in the Luna panel, not by hand. Defaults:
 | `judgment and prose` | done by the orchestrator itself; a second opinion uses `review` | `-r` |
 | `swarm workers` | `simple` for edits, `scout` for exploration, `review` for verification | as the job needs |
 | `reflect tooling`, `reflect judgment, divergent, synthesizer` | `review` | `-r` |
-| `arena runners`, `architect runners` | panel `design`: one run per seat (`--panel design --seat <n>`) | `-w`, one worktree per seat |
+| `arena runners` | panel `design`: one run per seat (`--panel design --seat <n>`) | `-w`, one worktree per seat |
+| `architect runners` | panel `architect` (GPT-6.2 Astra and Sol at max): one run per seat | `-w`, one worktree per seat |
+| `approach review: complex architecture or a looping problem` | `architect` | `-r` |
+| `approach review: medium change` | `approach` | `-r` |
+| `technical plan for complex architecture (reviewed by approach)` | `planner`, then `approach` reviews the plan | `-r` |
 | `interrogate reviewers` | `interrogate.mjs` (see below), panel `review` | `-w`, one throwaway worktree per seat |
 | `arena cross-judge pool` | panel `judge`: the first seat whose vendor differs from the orchestrator's (Anthropic) | `-r` |
+
+**Approach review is part of every playbook** (owner 2026-11-18): after grounding and Claude's own plan, before the
+first implementation job, send the plan to `approach` (medium change) or `architect` (complex architecture), and send
+any problem that fails the gate to `architect`. For complex architecture `planner` (Astra) may write the technical
+plan from the facts; `approach` (a different model) then reviews it. `exec.mjs` refuses the first complex write of a
+task until the review has completed (exit 8; `--review-skip "<reason>"` for a change with no design choice). Brief and rules: the "Approach review" section of `~/.claude/CLAUDE.md`.
+It complements `interrogate` (which reviews the diff after implementation) and never covers visual or product design.
+The stop gate's check 10 enforces it.
 
 Panels hold the seats the owner set in the Luna panel (the session-start digest lists them); never add or swap a
 provider yourself. Agreement across seats is high-signal; a seat whose provider is unavailable is skipped and
