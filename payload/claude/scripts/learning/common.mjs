@@ -264,20 +264,32 @@ export function canonicalJson(value) {
   return encode(JSON.parse(json));
 }
 
+// Keep the export name for existing callers; historical paths are never migrated here.
 export function toWinPath(p) {
   if (typeof p !== "string" || !p) return "";
-  let result = p.replace(/^(["'])([\s\S]*)\1$/, "$2").replace(/\\/g, "/");
+  let result = p.replace(/^(["'])([\s\S]*)\1$/, "$2");
+  if (process.platform === "win32") result = result.replace(/\\/g, "/");
   if (result === "~" || result.startsWith("~/")) {
-    result = os.homedir().replace(/\\/g, "/") + result.slice(1);
+    result = os.homedir() + result.slice(1);
   } else if (result.startsWith("$HOME/") || result.startsWith("${HOME}/")) {
-    result = os.homedir().replace(/\\/g, "/") + result.replace(/^\$(?:HOME|\{HOME\})/, "");
+    result = os.homedir() + result.replace(/^\$(?:HOME|\{HOME\})/, "");
   }
-  return result.replace(/^\/([a-z])(?=\/|$)/i, (_, drive) => `${drive.toUpperCase()}:`);
+  if (process.platform === "win32") {
+    return result.replace(/\\/g, "/").replace(/^\/([a-z])(?=\/|$)/i, (_, drive) => `${drive.toUpperCase()}:`);
+  }
+  if (isForeignPath(result)) return result;
+  return path.normalize(result);
+}
+
+export function isForeignPath(p) {
+  return process.platform !== "win32" && typeof p === "string" && /^(?:[a-z]:[/\\]|\\\\)/i.test(p);
 }
 
 export function findBash() {
-  for (const file of ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"]) {
-    if (fs.existsSync(file)) return file;
+  if (process.platform === "win32") {
+    for (const file of ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"]) {
+      if (fs.existsSync(file)) return file;
+    }
   }
   return "bash";
 }

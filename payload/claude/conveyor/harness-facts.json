@@ -1,0 +1,55 @@
+{
+  "facts": [
+    {
+      "id": "heavy-gate-slots",
+      "doc": "CLAUDE.md",
+      "docPattern": "heavy-gate defaults\\s+to\\s+(\\d+)\\s+slots",
+      "source": "scripts/heavy-gate.mjs",
+      "sourcePattern": "\\bDEFAULTS\\s*=\\s*\\{\\s*max:\\s*(\\d+)",
+      "compare": "equal"
+    },
+    {
+      "id": "pytest-gate-worker-cap",
+      "doc": "CLAUDE.md",
+      "docPattern": "caps workers per run\\s*\\(default\\s+(\\d+)\\)",
+      "source": "scripts/pytest_gate.py",
+      "sourcePattern": "^MAX_WORKERS\\s*=[^\\n]*min\\(\\s*(\\d+)\\s*,\\s*POOL_SIZE",
+      "compare": "equal"
+    }
+  ],
+  "retiredModels": {
+    "allow": [
+      "gpt-6-astra",
+      "claude-code.md",
+      "claude-plugin"
+    ]
+  },
+  "unpackagedAllow": [
+    "hooks/gsd-*",
+    "hooks/lib/*",
+    "hooks/*.prev",
+    "skills/gsd-*/**",
+    "get-shit-done/**",
+    "skills/design/**",
+    "skills/design-system/**",
+    "skills/brand/**",
+    "skills/ui-styling/**",
+    "skills/ui-ux-pro-max/**",
+    "skills/slides/**",
+    "skills/banner-design/**",
+    "hooks/managed-hooks-registry.cjs",
+    "scripts/changeset/**",
+    "scripts/lib/allowlist-ratchet.cjs",
+    "scripts/lib/cli-exit.cjs"
+  ],
+  "optionalPaths": [
+    "~/.claude/heavy-gate-off",
+    "~/.claude/learning/PAUSED",
+    "~/.claude/learning/CAPTURE_OFF",
+    "~/.claude/learning/checks.md",
+    "~/.claude/luna-autoload-off",
+    "~/.claude/codex-gate-paused",
+    "~/.claude/luna-run/*.log",
+    "~/.claude/logs/*"
+  ]
+}

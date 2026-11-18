@@ -452,11 +452,9 @@ export function substitutePlaceholders(value, claudeHome) {
 
 function settingsFragment(ctx, fragmentPath) {
   const fragment = substitutePlaceholders(readJson(fragmentPath), ctx.claudeHome);
-  if (ctx.platform === 'linux') {
-    fragment.enabledPlugins ??= {};
-    requireObject(fragment.enabledPlugins, 'enabledPlugins');
-    fragment.enabledPlugins['pstack@luna-local'] = true;
-  }
+  fragment.enabledPlugins ??= {};
+  requireObject(fragment.enabledPlugins, 'enabledPlugins');
+  fragment.enabledPlugins['pstack@luna-local'] = true;
   return fragment;
 }
 
@@ -987,7 +985,7 @@ function restorationBefore(ctx, name) {
     const settings = JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/, ''));
     const before = JSON.stringify(settings);
     removeHooks(null, settings, ctx.prepared.hooks);
-    removeLunaKeys(settings, ctx.platform);
+    removeLunaKeys(settings);
     if (JSON.stringify(settings) !== before) baseline = Buffer.from(`${JSON.stringify(settings, null, 2)}\n`);
   }
   return { before: baseline?.toString('base64') ?? null, restoreExact: !ctx.record };
@@ -1050,9 +1048,12 @@ function restoreExact(ctx, name, current) {
   return true;
 }
 
-function removeLunaKeys(settings, platform) {
-  const keys = [['extraKnownMarketplaces', 'luna-local'], ['enabledPlugins', 'luna-panel@luna-local']];
-  if (platform === 'linux') keys.push(['enabledPlugins', 'pstack@luna-local']);
+function removeLunaKeys(settings) {
+  const keys = [
+    ['extraKnownMarketplaces', 'luna-local'],
+    ['enabledPlugins', 'luna-panel@luna-local'],
+    ['enabledPlugins', 'pstack@luna-local'],
+  ];
   for (const [key, name] of keys) {
     if (!settings[key]) continue;
     requireObject(settings[key], key);
@@ -1080,7 +1081,7 @@ function uninstall(ctx) {
   const previous = readOptional(settingsPath);
   const settings = previous ? requireObject(readJson(settingsPath), 'settings.json') : {};
   removeHooks(null, settings, ctx.record.hooks);
-  removeLunaKeys(settings, ctx.platform);
+  removeLunaKeys(settings);
   const mdPath = path.join(ctx.claudeHome, 'CLAUDE.md');
   const md = readOptional(mdPath);
   const range = md ? markerRange(md.toString('utf8')) : null;

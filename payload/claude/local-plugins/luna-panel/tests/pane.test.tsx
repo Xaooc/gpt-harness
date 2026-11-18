@@ -1,244 +1,159 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import type { PanelData } from '../types'
+import snapshot from './snapshot.fixture'
 
-const PANE = { component: 'Pane', requestId: 'luna-panel', props: { bodyColumns: 48 } } as const
-const NOW = Date.parse('2026-10-21T12:00:00Z')
-
-const SAMPLE: PanelData = {
-  sessionId: 'sess-aaaaaaaa-1111',
-  polledAt: NOW,
-  error: '',
-  claude: [
-    { kind: 'five_hour', percentUsed: 42, resetsAt: '2026-10-21T14:30:00Z' },
-    { kind: 'seven_day', percentUsed: 93, resetsAt: '2026-10-25T00:00:00Z' },
-  ],
-  snapshot: {
-    v: 1,
-    at: '2026-10-21T12:00:00Z',
-    ram: { freeMb: 900, totalMb: 16226 },
-    daemon: {
-      running: true, pid: 1, uptimeS: 120, max: 12, runningJobs: 2, queuedJobs: 1,
-      owners: [
-        { owner: 'sess-aaaaaaaa-1111', running: 1, queued: 1 },
-        { owner: 'sess-bbbbbbbb-2222', running: 1, queued: 0 },
-      ],
-      jobs: [],
-    },
-    jobs: [
-      { out: 'C:/x/fix-auth.out.md', state: 'running', model: 'gpt-6.1-sol', effort: 'high', sandbox: 'workspace-write',
-        engine: 'daemon', ageS: 340, dir: 'C:/repo', error: '', queuePos: null, owner: 'sess-aaaaaaaa-1111', idleS: 4,
-        activity: { kind: 'command', text: 'rg -n auth src/', sinceS: 4 } },
-      { out: 'C:/x/stuck.out.md', state: 'running', model: 'gpt-6-luna', effort: 'low', sandbox: 'read-only',
-        engine: 'exec', ageS: 1200, dir: 'C:/repo', error: '', queuePos: null, owner: 'sess-bbbbbbbb-2222', idleS: 960 },
-      { out: 'C:/x/scout.out.md', state: 'queued', model: 'gpt-6-luna', effort: 'medium', sandbox: 'read-only',
-        engine: 'daemon', ageS: 20, dir: 'C:/repo', error: '', queuePos: 1, owner: 'sess-aaaaaaaa-1111' },
-    ],
-    codexLimits: {
-      v: 1, at: '2026-10-21T11:58:00Z', ageS: 120, planType: 'pro', reached: null,
-      primary: { usedPercent: 12, windowMins: 300, resetsAt: '2026-10-21T15:00:00Z' },
-      secondary: { usedPercent: 71, windowMins: 10080, resetsAt: '2026-10-27T00:00:00Z' },
-    },
-    build: { line: 'Compiling codex-cli v0.162.1', building: true, exeAt: null },
-    sessions: [
-      { v: 1, sessionId: 'sess-aaaaaaaa-1111', name: 'my-app', cwd: 'C:/code/my-app', updatedAt: NOW - 2000,
-        state: 'thinking', tool: null, turnSince: NOW - 90_000, idleSince: 0,
-        agents: [{ id: 'ag1', description: 'Explore auth flow', since: NOW - 60_000 }] },
-      { v: 1, sessionId: 'sess-bbbbbbbb-2222', name: 'shop-api', cwd: 'C:/code/shop-api', updatedAt: NOW - 3000,
-        state: 'tool', tool: { name: 'Bash', detail: 'npm test', since: NOW - 12_000 }, turnSince: NOW - 40_000,
-        idleSince: 0, agents: [] },
-    ],
+const PLUGIN = 'luna-panel'
+const PANE = {
+  plugin: PLUGIN,
+  component: 'Pane',
+  requestId: PLUGIN,
+  props: {
+    title: 'Luna',
+    isFocused: true,
+    bodyColumns: 64,
+    placement: 'dock',
+    scroll: { offset: 0, bodyRows: 40 },
+    view: {},
   },
+} as const
+
+type Calls = string[][]
+
+// The engine beneath the plugin: processes answered from a fixture, every exec.mjs/cli-update.mjs call recorded.
+function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, cli: unknown = null, snap: unknown = snapshot,
+  shown = true) {
+  const clock = mock.clock(on)
+  on('env.get', (_, e) => ({ value: (e as { name?: string }).name === 'HOME' ? '/home/t' : undefined }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.usage', () => ({
+    value: { rateLimits: [{ kind: 'seven_day', percentUsed: 69, resetsAt: '2026-11-19T22:00:00.000Z' }] },
+  }))
+  on('command.register', () => ({ value: { command: 'luna' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.panes', () => ({ value: [{ id: PLUGIN, title: 'Luna', isShown: shown, isPlaced: true, isFocused: false }] }))
+  on('process.run', (_, e) => {
+    const argv = (e as { argv: readonly string[] }).argv
+    if (argv.some(a => a.endsWith('luna-overview.mjs'))) {
+      return { value: { exitCode: 0, stdout: JSON.stringify(snap), stderr: '' } }
+    }
+    if (argv.some(a => a.endsWith('exec.mjs')) || argv.some(a => a.endsWith('cli-update.mjs'))) {
+      calls.push([...argv])
+      const isStatus = argv.includes('status')
+      const isRefresh = argv.includes('refresh')
+      const out = isStatus && cli ? JSON.stringify(cli)
+        : JSON.stringify({ ok: true, changed: true, note: isRefresh ? 'added codex/gpt-7-sol, claude/fable' : 'ok' })
+      return { value: { exitCode: 0, stdout: out, stderr: '' } }
+    }
+    return { value: { exitCode: 0, stdout: '/home/t', stderr: '' } }
+  })
+  return clock
 }
 
-test('pane draws every section from a snapshot on desktop and terminal', async ($, on) => {
-  mock.clock(on, { now: NOW })
-  mock.env(on, { USERPROFILE: 'C:/Users/tester', CLAUDE_CODE_SESSION_ID: SAMPLE.sessionId })
-  let argv: readonly string[] = []
-  on('process.run', async (_$, e) => {
-    argv = e.argv
-    return { value: { exitCode: 0, stdout: JSON.stringify(SAMPLE.snapshot), stderr: '', isStdoutTruncated: false,
-      isStderrTruncated: false } }
-  })
-  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: SAMPLE.claude, context: { window: 200000 } } }) as never)
-  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
-  on('ui.status', async () => ({ value: undefined }) as never)
-  await $.command.run({ command: 'luna', args: '' } as never)
-  expect(argv.join(' ')).toContain('/.claude/scripts/luna-overview.mjs')
-  for (const surface of ['desktop', 'terminal'] as const) {
-    const ui = await $.ui.mount({ plugin: 'luna-panel', surface, ...PANE })
-    expect(await ui.find({ type: 'Text', text: /^Память$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Мало памяти/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Claude · 5 часов/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /^93%$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Codex · неделя/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /^my-app · эта$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /^shop-api$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /агент: Explore auth flow/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Bash: npm test/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /думает · 1м/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /fix-auth/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /в очереди/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /ищет в коде/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /тишина 16м — похоже, завис/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Compiling codex-cli/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /^2\/12 в работе · очередь 1$/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /требует внимания · \d/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /Luna «stuck» молчит 16м — похоже, завис/ })).toBeDefined()
-    await ui.press({ key: 'toggle-resources' })
-    expect(await ui.find({ type: 'Text', text: /Claude · 5 часов/ })).toBeUndefined()
-    await ui.press({ key: 'toggle-resources' })
-    expect(await ui.find({ type: 'Text', text: /Claude · 5 часов/ })).toBeDefined()
+async function opened($: Parameters<Parameters<typeof test>[1]>[0], surface: 'terminal' | 'desktop') {
+  await $.command.run({ command: 'luna', args: '' })
+  return $.ui.mount({ ...PANE, surface })
+}
+
+test('overview: every limit window, the active executor per tier, on every surface', async ($, on) => {
+  const calls: Calls = []
+  engine(on, calls)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await opened($, surface)
+    expect(await ui.find({ type: 'Text', text: /Luna/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^Claude$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^Codex$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^Gemini$/ })).toBeTruthy()
+    // The active executor of the complex tier is named in full, version included.
+    expect(await ui.find({ type: 'Text', text: /^Sol 6\.1$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^Сложное\s*$/ })).toBeTruthy()
+    // Claude's five-hour window is shown from the session heartbeats, next to the week.
+    expect(await ui.find({ type: 'Text', text: /^5 ч/ })).toBeTruthy()
+    // Groups inside a section card are separated by a drawn rule (text, so every surface shows it).
+    expect(await ui.find({ type: 'Text', text: /^┈{20,}$/ })).toBeTruthy()
+    // Panels run all their seats at once; they are listed in the overview so they are never mistaken for chains.
+    expect(await ui.find({ type: 'Text', text: /все места работают одновременно/ })).toBeTruthy()
     await ui.unmount()
   }
 })
 
-test('pane shows a waiting message before the first snapshot', async $ => {
-  for (const surface of ['desktop', 'terminal'] as const) {
-    const ui = await $.ui.mount({ plugin: 'luna-panel', surface, ...PANE })
-    expect(await ui.find({ type: 'Text', text: /загрузка|нет данных/ })).toBeDefined()
-    await ui.unmount()
-  }
-})
-
-test('the periodic poll keeps running after /luna, even with no session.start', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  mock.env(on, { USERPROFILE: 'C:/Users/tester', CLAUDE_CODE_SESSION_ID: SAMPLE.sessionId })
-  let runs = 0
-  on('process.run', async (_$, e) => {
-    if (e.argv.some(a => a.endsWith('luna-overview.mjs'))) runs += 1
-    return { value: { exitCode: 0, stdout: JSON.stringify(SAMPLE.snapshot), stderr: '', isStdoutTruncated: false,
-      isStderrTruncated: false } }
-  })
-  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: [], context: { window: 200000 } } }) as never)
-  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
-  on('ui.status', async () => ({ value: undefined }) as never)
-  on('ui.panes', async () => ({ value: [{ id: 'luna-panel', title: 'Luna', isShown: true, isFocused: false,
-    isPlaced: true }] }) as never)
-  await $.command.run({ command: 'luna', args: '' } as never)
-  const afterCommand = runs
-  await clock.advance(5_000)
-  await clock.advance(5_000)
-  await clock.advance(5_000)
-  expect(afterCommand).toBe(1)
-  expect(runs).toBeGreaterThanOrEqual(4)
-})
-
-test('each poll sends this session heartbeat to the collector: thinking, then the running tool', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  mock.env(on, { USERPROFILE: 'C:/Users/tester', CLAUDE_CODE_SESSION_ID: 'sess-cccccccc-3333' })
-  const beats: Record<string, unknown>[] = []
-  on('process.run', async (_$, e) => {
-    if (e.argv.includes('-e')) {
-      return { value: { exitCode: 0, stdout: 'C:/code/billing', stderr: '', isStdoutTruncated: false,
-        isStderrTruncated: false } }
-    }
-    if (e.argv.includes('--beat') && typeof e.init?.stdin === 'string') beats.push(JSON.parse(e.init.stdin))
-    return { value: { exitCode: 0, stdout: JSON.stringify(SAMPLE.snapshot), stderr: '', isStdoutTruncated: false,
-      isStderrTruncated: false } }
-  })
-  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: [], context: { window: 200000 } } }) as never)
-  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
-  on('turn.start', async (_$, e) => ({ turnId: e.turnId }) as never)
-  let releaseTool: () => void = () => {}
-  on('tool.call', async () => {
-    await new Promise<void>(resolve => { releaseTool = resolve })
-    return { result: { stdout: 'ok', stderr: '', interrupted: false } } as never
-  })
-  await $.command.run({ command: 'luna', args: '' } as never)
-  await $.turn.start({ text: 'hi', turnId: 't1' } as never)
-  await clock.advance(1100)
-  const toolCall = $.tool.call({ tool: 'Bash', command: 'npm run build\nsecond line', tool_use_id: 'u1' } as never)
-  await clock.advance(1100)
-  await clock.advance(5000)
-  releaseTool()
-  await toolCall
-  expect(beats.some(b => b.state === 'thinking' && b.name === 'billing')).toBe(true)
-  expect(beats.some(b => b.state === 'tool' && (b.tool as { detail: string }).detail === 'npm run build')).toBe(true)
-  expect(beats.every(b => b.sessionId === 'sess-cccccccc-3333')).toBe(true)
-})
-test('with the pane hidden the ticker polls every 20 s, not every 5 s', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  mock.env(on, { USERPROFILE: 'C:/Users/tester', CLAUDE_CODE_SESSION_ID: SAMPLE.sessionId })
-  let runs = 0
-  on('process.run', async (_$, e) => {
-    if (e.argv.some(a => a.endsWith('luna-overview.mjs'))) runs += 1
-    return { value: { exitCode: 0, stdout: JSON.stringify(SAMPLE.snapshot), stderr: '', isStdoutTruncated: false,
-      isStderrTruncated: false } }
-  })
-  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: [], context: { window: 200000 } } }) as never)
-  on('ui.open', async () => ({ value: { isPlaced: false } }) as never)
-  on('ui.panes', async () => ({ value: [] }) as never)
-  await $.command.run({ command: 'luna', args: '' } as never)
-  const first = runs
-  for (let i = 0; i < 8; i++) await clock.advance(5_000)
-  expect(runs - first).toBeGreaterThanOrEqual(1)
-  expect(runs - first).toBeLessThanOrEqual(2)
-})
-
-test('a prompt opens the pane when it is not on screen, once', async ($, on) => {
-  mock.clock(on, { now: NOW })
-  mock.env(on, { USERPROFILE: 'C:/Users/tester', CLAUDE_CODE_SESSION_ID: SAMPLE.sessionId })
-  let opens = 0
-  let placed = false
-  on('process.run', async () => ({ value: { exitCode: 0, stdout: JSON.stringify(SAMPLE.snapshot), stderr: '',
-    isStdoutTruncated: false, isStderrTruncated: false } }))
-  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: [], context: { window: 200000 } } }) as never)
-  on('ui.status', async () => ({ value: undefined }) as never)
-  on('ui.open', async () => { opens += 1; placed = true; return { value: { isPlaced: true } } as never })
-  on('ui.panes', async () => ({ value: placed ? [{ id: 'luna-panel', title: 'Luna', isShown: true, isFocused: false,
-    isPlaced: true }] : [] }) as never)
-  on('prompt.submit', async (_$, e) => ({ text: e.text }) as never)
-  await $.prompt.submit({ text: 'hello' } as never)
-  expect(opens).toBe(1)
-  await $.prompt.submit({ text: 'again' } as never)
-  expect(opens).toBe(1)
-  await $.command.run({ command: 'luna', args: '' } as never)
-  expect(opens).toBe(2)
-})
-
-test('without CLAUDE_CODE_SESSION_ID the heartbeat uses $.session.id()', async ($, on) => {
-  mock.clock(on, { now: NOW })
-  mock.env(on, { USERPROFILE: 'C:/Users/tester' })
-  const beats: Record<string, unknown>[] = []
-  on('process.run', async (_$, e) => {
-    if (e.argv.includes('-e')) {
-      return { value: { exitCode: 0, stdout: 'C:/code/billing', stderr: '', isStdoutTruncated: false,
-        isStderrTruncated: false } }
-    }
-    if (e.argv.includes('--beat') && typeof e.init?.stdin === 'string') beats.push(JSON.parse(e.init.stdin))
-    return { value: { exitCode: 0, stdout: JSON.stringify(SAMPLE.snapshot), stderr: '', isStdoutTruncated: false,
-      isStderrTruncated: false } }
-  })
-  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: [], context: { window: 200000 } } }) as never)
-  on('session.id', async () => ({ value: 'sess-dddddddd-4444' }) as never)
-  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
-  on('ui.status', async () => ({ value: undefined }) as never)
-  await $.command.run({ command: 'luna', args: '' } as never)
-  expect(beats.length).toBeGreaterThanOrEqual(1)
-  expect(beats.every(b => b.sessionId === 'sess-dddddddd-4444')).toBe(true)
-})
-
-test('a session without heartbeat is named after the project of its Codex jobs', async ($, on) => {
-  mock.clock(on, { now: NOW })
-  mock.env(on, { USERPROFILE: 'C:/Users/tester', CLAUDE_CODE_SESSION_ID: SAMPLE.sessionId })
-  const job = (out: string, dir: string, owner: string) => ({ out, state: 'running', model: 'gpt-6.1-sol', effort: 'high',
-    sandbox: 'workspace-write', engine: 'daemon', ageS: 60, dir, error: '', queuePos: null, owner, idleS: 5 })
-  const snap = { ...SAMPLE.snapshot!, sessions: [], jobs: [
-    job('C:/x/a.out.md', 'C:/rpg/.claude/worktrees/ld-g1', 'sess-old-1'),
-    job('C:/x/b.out.md', 'C:/rpg/.claude/worktrees/ld-g5', 'sess-old-1'),
-    job('C:/x/c.out.md', 'C:/rpg-wt/gq', 'sess-old-2'),
-    job('C:/x/d.out.md', 'C:/rpg-wt/tc', 'sess-old-2'),
-  ] }
-  on('process.run', async () => ({ value: { exitCode: 0, stdout: JSON.stringify(snap), stderr: '',
-    isStdoutTruncated: false, isStderrTruncated: false } }))
-  on('session.usage', async () => ({ value: { startedAt: NOW, rateLimits: [], context: { window: 200000 } } }) as never)
-  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
-  on('ui.status', async () => ({ value: undefined }) as never)
-  await $.command.run({ command: 'luna', args: '' } as never)
-  const ui = await $.ui.mount({ plugin: 'luna-panel', surface: 'desktop', ...PANE })
-  expect(await ui.find({ type: 'Text', text: /^rpg$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^rpg-wt$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^Без папки$/ })).toBeUndefined()
+test('settings: an effort pick sends set-entry with that effort; a preset applies by name', async ($, on) => {
+  const calls: Calls = []
+  engine(on, calls)
+  const ui = await opened($, 'desktop')
+  await ui.press({ key: 'tab-settings' })
+  expect(await ui.find({ type: 'Text', text: /МОДЕЛИ ПО ЗАДАЧАМ/ })).toBeTruthy()
+  // A tier opens its editor in place; only then do its selects exist.
+  await ui.press({ key: 'edit-simple' })
+  await $.ui.select({ plugin: PLUGIN, key: 'effort---tier-simple-0', value: 'medium' })
+  const set = calls.find(c => c.includes('set-entry'))
+  expect(set).toBeTruthy()
+  expect(set?.join(' ')).toContain('--tier simple --index 0 --provider gemini --model gemini-3.8-flash --effort medium')
+  expect(set).toContain('--actor')
+  // A panel seat is addressed by --seat, never --index (exec.mjs rejects the mix).
+  await $.ui.select({ plugin: PLUGIN, key: 'effort---panel-review-0', value: 'max' })
+  const seat = calls.find(c => c.includes('set-entry') && c.includes('--panel'))
+  expect(seat?.join(' ')).toContain('--panel review --seat 0 --provider codex --model gpt-6.1-sol --effort max')
+  expect(seat).not.toContain('--index')
+  await ui.press({ key: 'preset-save-codex' })
+  expect(calls.some(c => c.join(' ').includes('config preset save-codex'))).toBe(true)
   await ui.unmount()
+})
+
+test('catalog: opening the pane looks for new Codex and Claude models and names what joined', { timeoutMs: 15_000 }, async ($, on) => {
+  const calls: Calls = []
+  // A hidden pane polls every 20 s instead of 5 s, which keeps simulating two hours cheap; the hourly check runs anyway.
+  const clock = engine(on, calls, null, snapshot, false)
+  const ui = await opened($, 'desktop')
+  const refreshes = () => calls.filter(c => c.includes('catalog') && c.includes('refresh'))
+  expect(refreshes()[0]?.join(' ')).toContain('catalog refresh --provider all --actor panel')
+  expect(await ui.find({ type: 'Text', text: /В каталог добавлены: Sol 7, Fable/ })).toBeTruthy()
+  // While the session runs it looks again every hour, not on every 5-second poll.
+  await clock.advance(30 * 60_000)
+  expect(refreshes().length).toBe(1)
+  await clock.advance(32 * 60_000)
+  expect(refreshes().length).toBe(2)
+  await ui.unmount()
+})
+
+test('updates: an update needs a second press, and the second press runs it with --confirm', async ($, on) => {
+  const calls: Calls = []
+  engine(on, calls, {
+    codex: { installed: '0.164.0', latest: '0.169.0', expectedByHarness: '0.164.0', updateAvailable: true, busy: { jobs: 0, reason: null } },
+    agy: { installed: '1.5.9', latest: '1.5.9', checksumOk: true, updateAvailable: false, busy: { jobs: 0, reason: null } },
+    checkedAt: '2026-11-16T14:45:17.526Z',
+  })
+  const ui = await opened($, 'desktop')
+  await ui.press({ key: 'tab-updates' })
+  expect(calls.some(c => c.includes('status'))).toBe(true)
+  await ui.press({ key: 'upd-codex' })
+  expect(calls.some(c => c.includes('update'))).toBe(false)
+  await ui.press({ key: 'upd-codex' })
+  const upd = calls.find(c => c.includes('update'))
+  expect(upd?.join(' ')).toContain('update codex --version 0.169.0 --confirm')
+  await ui.unmount()
+})
+
+test('usage: today and the week per provider, with the heaviest jobs', async ($, on) => {
+  const calls: Calls = []
+  const tok = (total: number) => ({ total, input: total / 2, output: total / 10, cached: total / 3 })
+  engine(on, calls, null, {
+    ...snapshot,
+    usage: {
+      at: '2026-11-16T15:17:00.000Z',
+      today: { claude: tok(4_200_000), codex: tok(1_900_000), gemini: tok(6_900_000) },
+      week: { claude: tok(31_000_000), codex: tok(12_000_000), gemini: tok(20_000_000) },
+      days: Array.from({ length: 7 }, (_, i) => ({ date: `2026-11-${10 + i}`, claude: 1_000_000 * i, codex: 500_000, gemini: 2_000_000 })),
+      byModel7d: [{ provider: 'codex', model: 'gpt-6.1-sol', total: 9_000_000 }],
+      byProject7d: [{ project: 'rpg', total: 22_000_000 }],
+      topJobs: [{ provider: 'gemini', model: 'gemini-3.8-flash', name: 'h2fix', project: 'gpt-harness', total: 3_400_000 }],
+    },
+  })
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await opened($, surface)
+    await ui.press({ key: 'tab-usage' })
+    expect(await ui.find({ type: 'Text', text: /^СЕГОДНЯ$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^7 ДНЕЙ$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /h2fix/ })).toBeTruthy()
+    await ui.unmount()
+  }
 })

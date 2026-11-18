@@ -6,8 +6,8 @@ import assert from "node:assert/strict";
 import childProcess, { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
+import { editableHeading, targetFixtures } from "./target-fixtures.mjs";
 
-const root = fileURLToPath(new URL("../../../", import.meta.url));
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "learning-core-"));
 process.env.CLAUDE_HOME_DIR = path.join(temporary, "home");
 process.env.CLAUDE_LEARNING_DIR = path.join(temporary, "data");
@@ -17,9 +17,7 @@ const common = await import("../common.mjs");
 const { paths, HOME_CLAUDE } = common;
 const coreFile = fileURLToPath(new URL("../core.mjs", import.meta.url));
 const revertScript = fileURLToPath(new URL("../../learning-revert.sh", import.meta.url));
-const originals = Object.fromEntries(core.TARGETS.map((target) => [
-  target, fs.readFileSync(path.join(root, target)),
-]));
+const originals = targetFixtures(core.TARGETS);
 const quote = "Always preserve the local change when undoing an adopted lesson.";
 const fixtures = [
   { id: "a", type: "luna_job", session: "session-A", source: "a.status", data: { trusted: true } },
@@ -35,7 +33,7 @@ const fixtures = [
   quote: event.id === "b" ? `${quote} A separate job result.` : quote,
   context: "A separate context sentence.",
 }));
-const editable = "## Division of labour: Claude orchestrates, Luna executes";
+const editable = editableHeading;
 const replacement = "## Division of labour and careful execution";
 
 function writeTarget(text, target = "CLAUDE.md") {
@@ -428,7 +426,7 @@ test("protected spans, repeated text and targets outside the allowlist fail", ()
   assertFailure(proposal({ target: "../CLAUDE.md" }), /allowlisted/);
 });
 
-test("real CLAUDE critic panel line and target-specific review policy vocabulary are protected", () => {
+test("fixture critic panel line and target-specific review policy vocabulary are protected", () => {
   const text = originals["CLAUDE.md"].toString("utf8").replace(/\r/g, "");
   const lines = text.split("\n");
   const index = lines.findIndex((line) => /3[–-]5/.test(line) && /critic/i.test(line));
@@ -778,6 +776,55 @@ test("weekly Russian reports preserve state, respect due dates and use unique pa
 
 const DAY_MS = 86400000;
 
+test("weekly report appends Russian conveyor metrics from synthetic sources", { timeout: 5000 }, (t) => {
+  const conveyor = path.join(HOME_CLAUDE, "conveyor");
+  t.after(() => fs.rmSync(conveyor, { recursive: true, force: true }));
+  const start = "2026-11-09T00:00:00Z", at = "2026-11-10T12:00:00Z";
+  const write = (file, value) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, Array.isArray(value)
+      ? value.map((row) => JSON.stringify(row)).join("\n") + "\n" : JSON.stringify(value));
+    return file;
+  };
+  common.writeJsonAtomic(paths.loopState, { lastReportAt: start });
+  write(paths.events, [
+    { type: "user_correction", session: "a", project: "kriminalist", ts: start },
+    { type: "user_correction", session: "b", project: "kriminalist", ts: start },
+    { type: "user_correction", session: "a", project: "kriminalist", ts: "2026-11-10T13:00:00Z",
+      quote: "PRIVATE fixture message" },
+    ...["2026-11-02T00:00:00Z", "2026-11-08T00:00:00Z"].map((ts) => ({ type: "user_correction", ts })),
+    { type: "user_interrupt", project: "kriminalist", ts: at }
+  ]);
+  write(path.join(conveyor, "ledgers/a.jsonl"), [{ type: "done", at }, { type: "waive", at, quote: "PRIVATE waiver" }]);
+  write(path.join(conveyor, "ledgers/b.jsonl"), [{ type: "start", at }]);
+  const runs = [0, 0, 1, 2].map((rounds, i) => {
+    const out = path.join(temporary, `report-executor-${i}`);
+    const dispatch = write(`${out}.dispatch.json`, { mode: "write", code: i === 3 ? 6 : 0,
+      gate: { status: i === 3 ? "fail" : "pass", rounds } });
+    t.after(() => fs.rmSync(dispatch, { force: true }));
+    return { at, session: "a", repo: "/code/kriminalist", out, tier: "complex", mode: "block" };
+  });
+  write(path.join(conveyor, "sessions/a.jsonl"), runs);
+  const gateState = write(path.join(conveyor, "gate-state/a.json"), { reasons: ["1. PRIVATE reason", "1. PRIVATE reason"] });
+  fs.utimesSync(gateState, new Date(at), new Date(at));
+  write(path.join(conveyor, "switches.jsonl"), [{ at, from: "gemini", to: "codex" }]);
+  write(paths.checks, [1, 2].map((id) => ({ id, at, status: "built", repo: "/code/kriminalist" })));
+  write(path.join(conveyor, "hygiene/latest.json"), { at, counts: { high: 1, medium: 2, low: 3 } });
+  const report = core.generateReport({ force: true, now: new Date("2026-11-16T00:00:00Z") });
+  assert.ok(report.text.indexOf("Конвейер:") > report.text.indexOf("Размеры файлов:"));
+  for (const line of [
+    "Конвейер:",
+    "• Поправок: 3 (периодом раньше 2) · после «готово»: 1 · на задачу: 1.5 (2 задачи)",
+    "• Прерываний: 1", "• По проектам (поправки/прерывания): kriminalist 3/1",
+    "• Гейт исполнителя: 4 запуска · сразу зелёные 2 · после доработки 1 · красные 1",
+    "• Стоп-гейт: сессий с блокировкой или предупреждением 1 (чаще всего: 1 — журнал не начат)"
+      + " · исключений по словам пользователя 1",
+    "• Смены провайдера: gemini→codex 1", "• Проверок построено: 2 (kriminalist)",
+    "• Гигиена (последний отчёт): важных 1 · средних 2 · мелких 3"
+  ]) assert.ok(report.text.split("\n").includes(line), line);
+  assert.doesNotMatch(report.text, /PRIVATE/);
+});
+
 test("protected indexes cover frontmatter, case-insensitive never, blocks and dated user attribution", () => {
   const text = [
     "---", "name: example", "description: example", "---", "never alone", "NEVER remove this",
@@ -1001,7 +1048,7 @@ test("forced empty report omits empty sections and limits long lists", () => {
   assert.ok(long.short.length <= 1200);
 });
 
-test("real CLAUDE safety, permission and ask lines are protected against replacement", () => {
+test("fixture safety, permission and ask lines are protected against replacement", () => {
   const text = originals["CLAUDE.md"].toString("utf8").replace(/\r/g, "");
   const lines = text.split("\n");
   const indexes = core.protectedLineIndexes(text, "CLAUDE.md");
@@ -1347,3 +1394,22 @@ test("revert rejects two complete copies of the saved region and context", () =>
   assert.equal(readTarget(), before);
   assert.ok(core.openNeedsUser()[0].text.includes(result.id));
 });
+
+
+for (const field of ["target", "backup"]) {
+  test(`historical Windows ${field} fails gracefully on Linux`, { skip: process.platform === "win32" }, () => {
+    const before = readTarget();
+    const record = {
+      event: "adopt", id: "L-historical", target: "CLAUDE.md", backup: "unused-backup",
+      op: "replace", new_text: "missing reverse patch", ctx_before: "", ctx_after: "",
+      sha256_after: common.sha256(Buffer.from(before)),
+      [field]: "C:/Users/PC/.claude/CLAUDE.md",
+    };
+    common.appendJsonl(paths.adoptedJsonl, record);
+    const reverted = core.revertAdoption(record.id);
+    assert.equal(reverted.status, "failed");
+    assert.match(reverted.message, /historical Windows .* unavailable on Linux/);
+    assert.equal(readTarget(), before);
+    assert.equal(core.loadAdoptions().list[0][field], record[field]);
+  });
+}

@@ -286,6 +286,11 @@ export function isForeignPath(p) {
 }
 
 export function findBash() {
+  if (process.platform === "win32") {
+    for (const file of ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"]) {
+      if (fs.existsSync(file)) return file;
+    }
+  }
   return "bash";
 }
 

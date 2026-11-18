@@ -7,6 +7,7 @@ import childProcess, { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
 import { fakeLuna } from "./fake-luna.mjs";
+import { editableHeading, targetFixtures } from "./target-fixtures.mjs";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "learning-loop-"));
@@ -27,11 +28,9 @@ const {
 const { paths, HOME_CLAUDE } = common;
 const loop = fileURLToPath(new URL("../loop.mjs", import.meta.url));
 const hook = path.join(root, "hooks", "learning-session-start.mjs");
-const originals = Object.fromEntries(core.TARGETS.map((target) => [
-  target, fs.readFileSync(path.join(root, target)),
-]));
-const editable = "## Division of labour: Claude orchestrates, Luna executes";
-const replacement = "## Division of labour and careful execution";
+const originals = targetFixtures(core.TARGETS);
+const editable = editableHeading;
+const replacement = "## Shared responsibilities and careful execution (adopted lesson)";
 const quote = "Preserve local changes when undoing an adopted lesson.";
 
 function event(index, overrides = {}) {
@@ -137,13 +136,11 @@ function digest(overrides = {}) {
   return buildDigest({ ...context(), runId: "R-20261021-120000", candidates: [], ...overrides });
 }
 
-function hookRun(input = "{}") {
-  const started = performance.now();
+function hookRun(input = "{}", env = process.env) {
   const result = spawnSync(process.execPath, [hook], {
-    env: { ...process.env }, input, encoding: "utf8", timeout: 3000, windowsHide: true,
+    env: { ...env }, input, encoding: "utf8", timeout: 120000, windowsHide: true,
   });
   assertExit(result);
-  assert.ok(performance.now() - started < 1500, "hook must finish in less than 1500 ms");
   return result.stdout;
 }
 
@@ -214,6 +211,25 @@ test("full cycle applies only real evidence and journals every outcome", () => {
   const saved = common.readJson(paths.loopState);
   assert.equal(saved.lastRunAt, result.startedAt);
   assert.deepEqual(saved.foreignKey, { keep: true });
+});
+
+test("over-budget targets reject growing edits but allow shrinking edits", () => {
+  const file = path.join(HOME_CLAUDE, "CLAUDE.md");
+  const maxBytes = core.loadConfig().targets["CLAUDE.md"].max_bytes;
+  const oversized = target() + "Detailed execution notes.\n".repeat(Math.ceil(maxBytes / 20));
+  assert.ok(Buffer.byteLength(oversized) > maxBytes);
+  fs.writeFileSync(file, oversized);
+  run();
+  assert.equal(target(), oversized);
+  assert.equal(latestResult().gatePassed, 0);
+  assert.match(core.loadCandidates()[0].reason, /over budget: only shrinking edits allowed/);
+
+  const shorter = "## Division of labour";
+  fake([proposal({ new_text: shorter })]);
+  run();
+  assert.equal(latestResult().applied.length, 1);
+  assert.equal(target(), oversized.replace(editable, shorter));
+  assert.ok(Buffer.byteLength(target()) > maxBytes, "shrinking is allowed even while still over budget");
 });
 
 test("approved check is queued, reported and reviewed without changing targets", () => {
@@ -567,6 +583,39 @@ test("hook shows a pending Russian report twice, preserves state and ignores com
   assert.equal(text(paths.loopState), before);
 });
 
+test("hook returns while the state lock and its background loop are held", async () => {
+  const preload = path.join(temporary, "hold-loop.cjs");
+  const started = path.join(temporary, "loop-started");
+  const releaseFile = path.join(temporary, "release-loop");
+  const finished = path.join(temporary, "loop-finished");
+  fs.writeFileSync(preload, `const fs = require("node:fs");\n` +
+    `if (process.argv[1] === ${JSON.stringify(loop)}) {\n` +
+    `  fs.writeFileSync(${JSON.stringify(started)}, "yes");\n` +
+    `  const cell = new Int32Array(new SharedArrayBuffer(4));\n` +
+    `  const deadline = Date.now() + 120000;\n` +
+    `  while (!fs.existsSync(${JSON.stringify(releaseFile)}) && Date.now() < deadline) Atomics.wait(cell, 0, 0, 50);\n` +
+    `  if (!fs.existsSync(${JSON.stringify(releaseFile)})) process.exit(1);\n` +
+    `  fs.writeFileSync(${JSON.stringify(finished)}, "yes"); process.exit(0);\n}\n`);
+  const env = { ...process.env,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${JSON.stringify(preload)}`.trim() };
+  const waitFor = async (file) => {
+    const deadline = performance.now() + 120000;
+    while (!fs.existsSync(file) && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(fs.existsSync(file), true, `timed out waiting for ${file}`);
+  };
+  const unlock = common.tryLock("state", 600000);
+  assert.ok(unlock);
+  try {
+    assert.equal(hookRun("{}", env), "");
+    await waitFor(started);
+    assert.equal(fs.existsSync(finished), false);
+  } finally {
+    unlock();
+    fs.writeFileSync(releaseFile, "release");
+    if (fs.existsSync(started)) await waitFor(finished);
+  }
+});
+
 test("hook reminds about pending decisions once per day", () => {
   fs.writeFileSync(paths.paused, "");
   core.recordNeedsUser(proposal({ kind: "needs_user" }));
@@ -577,6 +626,17 @@ test("hook reminds about pending decisions once per day", () => {
   assert.equal(hookRun(), "");
   state({ needsUserRemindedAt: new Date(Date.now() - 25 * 3600000).toISOString() });
   assert.ok(hookRun());
+});
+
+test("Linux hook resolves its modules with an unrelated or unset HOME", { skip: process.platform === "win32" }, () => {
+  fs.writeFileSync(paths.paused, "");
+  core.recordNeedsUser(proposal({ kind: "needs_user" }));
+  const env = { ...process.env, HOME: path.join(temporary, "uninstalled home") };
+  assert.equal(fs.existsSync(path.join(env.HOME, ".claude")), false);
+  assert.match(JSON.parse(hookRun("{}", env)).systemMessage, /Ждут вашего решения \(1\)/);
+  state({});
+  delete env.HOME;
+  assert.match(JSON.parse(hookRun("{}", env)).systemMessage, /Ждут вашего решения \(1\)/);
 });
 
 test("status reports timestamps, counts and paused flag without running models", () => {

@@ -162,7 +162,7 @@
       "src": "claude/scripts/learning/common.mjs",
       "dest": "scripts/learning/common.mjs",
       "kind": "file",
-      "sha256": "bcdf0ea2b2117a77837b4156d237cbbfb9401a2746016ad2dde1b0ff2efc15f7"
+      "sha256": "b12fbf01c608a91e36bf71daf389ff0004a94470d7bd6e0813da20856fb8472a"
     },
     {
       "src": "claude/scripts/learning/core.mjs",

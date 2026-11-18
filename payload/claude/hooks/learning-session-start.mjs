@@ -3,17 +3,10 @@
 // OFF SWITCH: ~/.claude/learning/PAUSED stops runs; reports still show.
 // Fail-safe: any error exits 0 with no output; never block session start.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
-function learningModule(name) {
-  const local = new URL(`../scripts/learning/${name}.mjs`, import.meta.url);
-  return fs.existsSync(fileURLToPath(local)) ? local.href
-    : pathToFileURL(path.join(os.homedir(), ".claude", "scripts", "learning", `${name}.mjs`)).href;
-}
-
-const { displayText } = await Promise.resolve().then(() => import(learningModule("core"))).catch(() => ({}));
+const { displayText } = await import("../scripts/learning/core.mjs").catch(() => ({}));
 
 const DAY = 86400000;
 const sanitizeMessage = (text) => text.split(/\r?\n/).map((line) => {
@@ -118,8 +111,8 @@ export function buildOutput(message) {
 async function main() {
   const input = await readInput();
   if (!input || typeof input !== "object" || input.source === "compact") return;
-  const common = await import(learningModule("common"));
-  const core = await import(learningModule("core"));
+  const common = await import("../scripts/learning/common.mjs");
+  const core = await import("../scripts/learning/core.mjs");
   const scripts = common.SCRIPTS_DIR;
   common.ensureDirs();
   if (!common.isPaused()) common.spawnDetached(common.findNode(), [path.join(scripts, "loop.mjs"), "run", "--if-due"]);

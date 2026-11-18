@@ -20,10 +20,10 @@
   {
     "id": "pstack@luna-local",
     "kind": "plugin",
-    "platforms": ["linux"],
+    "platforms": ["linux", "win32"],
     "argv": ["claude", "plugin", "install", "pstack@luna-local"],
     "probe": [{"path": ".claude/plugins/installed_plugins.json", "keys": ["plugins", "pstack@luna-local"]}],
-    "purpose": "Install the harness's Linux process stack panel.",
+    "purpose": "Install the harness's vendored process stack.",
     "required": true
   },
   {

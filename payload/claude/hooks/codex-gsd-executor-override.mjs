@@ -30,18 +30,13 @@ const MARKER = "codex-auto-override:v1";
 
 const OVERRIDE = `---
 name: gsd-executor
-description: >-
-  AUTO override (${MARKER}) — GSD plan executor that writes production code via Codex
-  (gpt-6.1-terra @ max effort, ~/.claude/scripts/luna.sh) while following the standard gsd-executor protocol exactly.
-  Dropped by the global codex-gsd-executor-override hook so every GSD command (quick, execute-phase, autonomous,
-  progress, ship, manager) implements via Codex automatically.
+description: AUTO override (${MARKER}) — GSD plan executor that writes production code via Codex (gpt-6.1-terra @ max effort, ~/.claude/scripts/luna.sh) while following the standard gsd-executor protocol exactly. Dropped by the global codex-gsd-executor-override hook so every GSD command (quick, execute-phase, autonomous, progress, ship, manager) implements via Codex automatically.
 tools: Read, Write, Edit, Bash, Grep, Glob, mcp__context7__*
 color: cyan
 effort: high
 ---
 
-<!-- ${MARKER} : managed by ~/.claude/hooks/codex-gsd-executor-override.mjs.
-Safe to edit; the hook only rewrites this file if this marker is present. -->
+<!-- ${MARKER} : managed by ~/.claude/hooks/codex-gsd-executor-override.mjs. Safe to edit; the hook only rewrites this file if this marker is present. -->
 
 <role>
 You are the GSD plan executor. You follow the standard GSD executor protocol
@@ -81,7 +76,7 @@ bash ~/.claude/scripts/luna.sh -w -m gpt-6.1-terra -e max -C "<repo root>" -f <b
   exact change + acceptance criteria for THIS task, files to touch, house
   patterns/constraints from PLAN.md and CLAUDE.md, and the literal line:
   **"Edit files only. Do NOT run git add or git commit."**
-- Write the brief to a temp file first (\`mktemp\`). Pass \`-m gpt-6.1-terra -e max\`
+- Write the brief to a temp file first (\`mktemp\`). pass \`-m gpt-6.1-terra -e max\`
   explicitly; luna.sh closes stdin — never call bare \`codex exec\` (it
   can hang waiting on stdin).
 - luna.sh edits the tree directly and returns when done (no approval prompt).

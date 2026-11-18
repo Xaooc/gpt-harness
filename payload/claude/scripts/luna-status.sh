@@ -12,6 +12,7 @@ set -u
 
 epoch() { date -d "$1" +%s 2>/dev/null || echo ""; }
 for OUT in "$@"; do
+  status_note_present=0
   echo "== $OUT"
   if [ ! -f "$OUT.status" ]; then
     echo "state=unknown (no status file — launched by an old wrapper, or never started)"
@@ -23,6 +24,9 @@ for OUT in "$@"; do
     [ -n "$s" ] && [ -n "$e" ] && echo "elapsed_min=$(( (e - s) / 60 ))"
     pid=$(sed -n 's/^pid=//p' "$OUT.status")
     state=$(sed -n 's/^state=//p' "$OUT.status")
+    if grep -q '^last_note=' "$OUT.status"; then
+      status_note_present=1
+    fi
     if [ "$state" = running ] && [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
       echo "warning=status says running but pid $pid is gone (wrapper killed?)"
     fi
@@ -30,9 +34,15 @@ for OUT in "$@"; do
   if [ -f "$OUT.log" ]; then
     age=$(( $(date +%s) - $(date -r "$OUT.log" +%s) ))
     echo "log_bytes=$(wc -c < "$OUT.log") log_idle_s=$age"
-    # Latest free-text progress note Codex wrote (block after the last "codex" line).
-    note=$(tr -d '\r' < "$OUT.log" | awk '/^codex$/{buf=""; grab=1; next} /^(exec|collab:|tokens used|thinking)/{grab=0} grab{buf=buf $0 " "} END{print buf}' | cut -c1-400)
-    [ -n "$note" ] && echo "last_note=$note"
+    if [ "$status_note_present" != 1 ]; then
+      # Latest free-text progress note Codex wrote (block after the last "codex" line).
+      note=$(tr -d '\r' < "$OUT.log" | awk '
+        /^codex$/{buf=""; grab=1; next}
+        /^(exec|collab:|tokens used|thinking)/{grab=0}
+        grab{buf=buf $0 " "}
+        END{print buf}' | cut -c1-400)
+      [ -n "$note" ] && echo "last_note=$note"
+    fi
   else
     echo "log=missing"
   fi
