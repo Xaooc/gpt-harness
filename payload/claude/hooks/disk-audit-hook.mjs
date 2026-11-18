@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-let homePaths, loadConfig, exists, assertPlainPath;
+import { homePaths, loadConfig, exists, assertPlainPath } from '../scripts/disk/lib.mjs';
 
 function ageText(ms) {
   if (ms < 60_000) return `${Math.max(0, Math.floor(ms / 1000))}s`;
@@ -25,17 +25,14 @@ function printCached(state) {
     const parts = [];
     const removable = repo.worktrees.filter((item) => item.verdict === 'removable');
     const expired = repo.worktrees.filter((item) => item.expired && item.verdict !== 'removable');
-    const unregistered = repo.worktrees.filter((item) => !item.lock &&
-      !['removable', 'unknown'].includes(item.verdict));
+    const unregistered = repo.worktrees.filter((item) => !item.lock && !['removable', 'unknown'].includes(item.verdict));
     if (removable.length) {
       const names = removable.slice(0, 3).map((item) => path.basename(item.path)).join(', ');
       parts.push(`${removable.length} removable worktrees (${names}${removable.length > 3 ? ', ...' : ''})`);
     }
     if (expired.length) parts.push(`${expired.length} expired`);
     if (unregistered.length) parts.push(`${unregistered.length} unregistered`);
-    if (repo.count > report.maxWorktreesPerRepo) {
-      parts.push(`${repo.count} worktrees (limit ${report.maxWorktreesPerRepo})`);
-    }
+    if (repo.count > report.maxWorktreesPerRepo) parts.push(`${repo.count} worktrees (limit ${report.maxWorktreesPerRepo})`);
     if (parts.length) items.push(`- ${path.basename(repo.path)}: ${parts.join(', ')}`);
   }
   if (!items.length) return;
@@ -46,7 +43,6 @@ function printCached(state) {
 }
 
 try {
-  ({ homePaths, loadConfig, exists, assertPlainPath } = await import('../scripts/disk/lib.mjs'));
   const { state } = homePaths();
   for (const repo of loadConfig().repos) {
     if (!exists(repo)) process.stdout.write(`disk-audit: ${repo.replace(/[\r\n]/g, ' ')}: missing repository\n`);

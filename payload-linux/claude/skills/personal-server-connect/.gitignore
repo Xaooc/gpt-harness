@@ -1,0 +1,3 @@
+# Never commit local-only secrets
+references/credentials.local.md
+*.local.md

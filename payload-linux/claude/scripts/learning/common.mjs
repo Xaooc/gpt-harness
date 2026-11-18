@@ -21,6 +21,8 @@ export const paths = Object.freeze({
   adoptedJsonl: path.resolve(LEARN_DIR, "adopted.jsonl"),
   adoptedMd: path.resolve(LEARN_DIR, "adopted.md"),
   candidates: path.resolve(LEARN_DIR, "candidates.jsonl"),
+  checks: path.resolve(LEARN_DIR, "checks.jsonl"),
+  checksMd: path.resolve(LEARN_DIR, "checks.md"),
   needsUser: path.resolve(LEARN_DIR, "needs-user.md"),
   logMd: path.resolve(LEARN_DIR, "log.md"),
   reportsDir: path.resolve(LEARN_DIR, "reports"),
@@ -39,6 +41,21 @@ export function ensureDirs() {
 
 export function nowIso() {
   return new Date().toISOString();
+}
+
+export function canonicalRepo(projectKey) {
+  if (typeof projectKey !== "string" || !projectKey || projectKey === "luna-run"
+    || /scratch-workspaces/i.test(projectKey)) return "";
+  return projectKey.replace(/--(?:claude-)?worktrees-.*$/i, "")
+    .replace(/^-home-[^-]+-/i, "")
+    .replace(/^-Users-[^-]+-/i, "")
+    .replace(/^[A-Za-z]--Users-[^-]+-/i, "")
+    .replace(/^[A-Za-z]--/, "")
+    .toLowerCase();
+}
+
+export function projectKeyForCwd(cwd) {
+  return typeof cwd === "string" ? cwd.replace(/[^A-Za-z0-9]/g, "-") : "";
 }
 
 function sleep(ms) {
@@ -269,6 +286,11 @@ export function isForeignPath(p) {
 }
 
 export function findBash() {
+  if (process.platform === "win32") {
+    for (const file of ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"]) {
+      if (fs.existsSync(file)) return file;
+    }
+  }
   return "bash";
 }
 

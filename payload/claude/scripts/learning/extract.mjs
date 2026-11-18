@@ -14,7 +14,7 @@ const LEFT = "(?<![\\p{L}\\p{N}])";
 const RIGHT = "(?![\\p{L}\\p{N}])";
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 const ACTIVE_STATES = /^(?:starting|queued|waiting-daemon|waiting-ram|waiting-lock|running)$/;
-const TERMINAL_STATES = /^(?:done|incomplete|failed|stalled|killed|timeout|abandoned)$/;
+const TERMINAL_STATES = /^(?:done|incomplete|failed|stalled|killed|timeout|abandoned|unavailable)$/;
 const ABANDONED_MS = 3 * 60 * 60 * 1000;
 const pattern = (name, body, start = false) => [name, new RegExp((start ? "^" : LEFT) + body + RIGHT, "iu")];
 const corrections = [
@@ -170,7 +170,7 @@ export function isGenuineHumanEntry(entry) {
   if (!entry || typeof entry !== "object") return false;
   const content = entry.message?.content ?? entry.content;
   const text = entryText(entry);
-  if (entry.type !== "user" || entry.isSidechain || entry.isMeta) return false;
+  if (entry.type !== "user" || entry.isSidechain || entry.isMeta || entry.isCompactSummary) return false;
   if (typeof content !== "string" && !Array.isArray(content)) return false;
   if (Array.isArray(content) && content.some((block) => block?.type === "tool_result")) return false;
   if (entry.origin?.kind === "human" || entry.turnOrigin === "human") return true;
@@ -195,7 +195,7 @@ function resolvedArgument(raw, command, position, cwd) {
 }
 
 function discover(command, cwd, state, meta) {
-  if (typeof command !== "string" || !/(?:luna\.sh|luna-panel\.sh|luna-pool\.mjs)/.test(command)) return;
+  if (typeof command !== "string" || !/(?:luna\.sh|luna-panel\.sh|luna-pool\.mjs|gem\.sh)/.test(command)) return;
   const add = (raw, position, directory = false) => {
     const resolved = resolvedArgument(raw, command, position, cwd);
     if (!resolved) return;
@@ -244,7 +244,9 @@ async function* transcriptLines(file, offset = 0) {
 function transcriptSource(source) {
   const match = typeof source === "string" && /^(.*)#L([1-9]\d*)$/.exec(source);
   if (!match) throw new Error("invalid transcript source");
-  if (match[1].split(/[/\\]/).includes("..")) throw new Error("invalid transcript path");
+  if (match[1].split(process.platform === "win32" ? /[/\\]/ : /\//).includes("..")) {
+    throw new Error("invalid transcript path");
+  }
   const file = toWinPath(match[1]);
   if (!path.isAbsolute(file) || file.split("/").includes("..")) throw new Error("invalid transcript path");
   const projects = path.join(HOME_CLAUDE, "projects");
@@ -298,8 +300,18 @@ export function eventDigest(event) {
 
 function hasRegisteredProvenance(event, out, jobRoots) {
   const sha = event.data?.status_sha256;
-  if (!(event.data?.trusted === true && typeof sha === "string" && /^[0-9a-f]{64}$/i.test(sha)
-    && isTrustedJob(out, jobRoots) && registryHas(out, sha, jobRoots?.registry ?? paths.jobs))) return false;
+  if (!(event.data?.trusted === true && typeof sha === "string" && /^[0-9a-f]{64}$/i.test(sha))) return false;
+  let trusted = false;
+  if (fs.existsSync(`${toWinPath(out)}.status`)) {
+    trusted = isTrustedJob(out, jobRoots);
+  } else if (isTrustedJobPath(out, jobRoots)) {
+    trusted = true;
+  } else if (typeof out === "string" && path.isAbsolute(toWinPath(out))) {
+    const file = canonicalPath(out);
+    const learn = canonicalPath(LEARN_DIR);
+    trusted = !under(learn, file) && path.relative(learn, file) !== "";
+  }
+  if (!trusted || !registryHas(out, sha, jobRoots?.registry ?? paths.jobs)) return false;
   const normalisedOut = normaliseJobOut(out);
   if (normalisedOut === null) return false;
   const digest = eventDigest(event);
@@ -720,8 +732,7 @@ export async function extract(opts = {}) {
       if (captureStatus(out, meta, state, emit, opts.jobRoots)) statusFiles++;
     }
     const appended = withLock("events", { waitMs: 5000 }, () => {
-      const attestations = events.filter((event) =>
-        ["luna_job", "executor_assumption", "critic_output"].includes(event.type)
+      const attestations = events.filter((event) => ["luna_job", "executor_assumption", "critic_output"].includes(event.type)
         && event.data?.trusted === true && typeof event.data.status_sha256 === "string"
         && /^[0-9a-f]{64}$/i.test(event.data.status_sha256)).map((event) => ({
         v: 1, id: event.id, type: event.type, out: normaliseJobOut(event.data.out_path),

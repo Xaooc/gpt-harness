@@ -3,66 +3,117 @@
 > Project-level `CLAUDE.md`, explicit user requests, and any active project
 > workflow (e.g. GSD) take precedence over this file when they conflict.
 
+## Machines
+
+This Windows PC is the backup Claude/Codex host. **bro-server** is the primary host and runs Debian 13.
+**NucBox** is the separate Windows Docker host. Use the `bro-server-connect` and `personal-server-connect`
+skills for remote administration.
+
 ## Harness source
 
-How this Claude→Codex harness is built (scripts, daemon, skills, hooks, installer, learning loop) lives in the package
-repo `Xaooc/gpt-harness` (private), cloned at `C:/dev/luna-harness`. Read it to understand the design: `README.md`,
-`PACKAGE-SPEC.md`, `INSTALL.md`, `SELF-LEARNING.md`; `payload/` is what this machine runs, `payload-linux/` is the
-other platform's version, `codex-build/` is this PC's custom Codex build (Rust, busybox-shell patch; see `BUILD.md`, `LUNA-PATCH.md`).
-`~/.claude` is the installed copy: when you change a harness script or skill there, make the same change in
-`payload/` (and in `payload-linux/` unless it is platform-specific), update the payload `manifest.json` hashes, and
-commit and push (or tell the user it needs a push when this clone has no GitHub credentials).
+The harness package repo is `Xaooc/gpt-harness` (private), cloned at `C:/dev/luna-harness`. The GitHub CLI may
+pull and can push with the owner's yes. Read `README.md`, `PACKAGE-SPEC.md`, `INSTALL.md` and `SELF-LEARNING.md`
+for the design. This PC installs from `payload/`. Edit shared files only in `payload-linux/`, then run
+`node tools/sync-windows.mjs` to generate `payload/` and `node tools/manifest-sync.mjs` to refresh the Linux
+manifest and check Windows. `~/.claude` holds the installed copy. `codex-build/` holds this PC's custom Codex build
+(Rust, busybox-shell patch; see `BUILD.md` and `LUNA-PATCH.md`).
 
-## Division of labour: Claude orchestrates, Luna executes
+## Network
 
-**Executors = Codex, normal service tier, two levels** (user decisions 2026-10-26): **`-m gpt-6.1-terra -e max`**
-for everything that was Sol (any implementation more than simple; never Terra `medium`/`high`: they stop long jobs
-early), and **`gpt-6-luna`** — the wrapper's default model, unchanged («простое лучше вернуть как было») — for simple/
-mechanical work, scouts, critics and images, with Luna's effort chosen per task (see the `luna` skill). Pass
-`-m gpt-6.1-terra -e max` explicitly for complex jobs. The fast tier is OFF because it burns too much quota. Don't pass `-t fast` unless the user asks.
-It is always called through
-`bash ~/.claude/scripts/luna.sh` (`-w` write / `-r` read-only). The wrapper pins
-model and effort on the command line. Don't rely on `$CODEX_HOME/config.toml`,
-because the Codex desktop app rewrites it. Use it proactively, without waiting to be
-asked. Keep slices ≤ ~40 min, run independent slices in parallel, never discard the
-wrapper's output, and check `luna-status.sh` right after launching.
+Use the SSH host keys to identify bro-server and NucBox because their LAN addresses can change with DHCP.
+The server connection skills document how to find the hosts and verify their identities.
 
-**Any implementation that is more than simple goes to Terra at `max`** (user decisions 2026-10-21, 2026-10-26: formerly Sol 6.1 high): `luna.sh -w -m gpt-6.1-terra -e max`. In the rest of this paragraph «Sol» means this level and «Luna» means `gpt-6-luna`. That means every moderately complex or complex job: features (even single-module ones), non-trivial bug fixes, refactors, migrations, multi-file changes, new logic, anything touching data/API/auth/money/concurrency/security, debugging, and anything Luna failed at once. **Luna** keeps only simple, mechanical work (renames, reformatting, boilerplate, one-file trivial edits, pattern copy with no decisions), information gathering/scouts, critics and images. When in doubt, use Sol. Sol is literal (see the `luna` skill, "The executors are literal"), so a Sol brief must be exhaustive. Never use `gpt-6-astra`. See "Model routing" in the `luna` skill.
+## Process: Lauren Tan's pstack is the default (user decision 2026-11-16)
 
-**Priorities: quality of the final result > speed through parallelism > quota.** Codex
-quota is effectively unlimited (user, 2026-09-29), so never economise on Luna jobs. Fan out
-research scouts, use best-of-2 for the riskiest core pieces, use bigger critic panels, and
-run independent slices in parallel. Decompose by independence, never into pieces smaller
-than a coherent unit.
+Every session works in **poteto-mode** from pstack (MIT, vendored as the local plugin `pstack@luna-local`). The
+session-start hook prints the pstack path. Before the first task, read `<pstack>/docs/harness/claude-code.md`,
+then `<pstack>/docs/harness/bro-harness.md` (this harness's adapter; it wins over pstack), then follow
+`<pstack>/skills/poteto-mode/SKILL.md`: playbooks per task type, named principles read from their leaf skills,
+verification against the real artifact, lessons encoded as checks rather than prose. The adapter overrides
+pstack's "Autonomy": anything external (messages, tickets, PRs, push, merge, deploy) needs the user's yes.
+superpowers and GSD skills stay installed but are not the default process: use them only when the user asks for
+one by name or the project is a GSD project. The `luna` skill keeps the executor infrastructure details.
 
-### The loop (default for every non-trivial task)
+## Executors: Claude orchestrates, executors do the work (user decisions 2026-11-16)
 
-1. **Execute**: Claude briefs Luna, Luna does the work (skill `luna`).
-2. **Critique**: Luna critics with clean context and personas review the result (skill `luna-critics`).
-3. **Close the gaps**: Claude verifies the findings. Luna fixes the accepted ones. Re-run the
-   critics once if critical/high findings were fixed (at most 2 rounds).
-4. **Done**: Claude runs the checks, commits, and reports what the critics caught.
+Claude (Opus) orchestrates, designs and decides; implementation, research and review run on executors through one
+dispatcher, by **tier**, never by naming a tool:
 
-### 1. Clear tasks go to Luna (skill: `luna`)
+```
+node ~/.claude/scripts/conveyor/exec.mjs run --tier <complex|simple|review|scout> (-w|-r) -C <dir> -f <brief.md> -o <out.md>
+```
 
-Every clear, well-bounded job goes to Luna instead of being done inline or by a
-Claude/Sonnet subagent:
-- **Implementation**: features, fixes, refactors, tests, scripts, migrations.
-- **Information gathering**: exploring a codebase, tracing flows, finding usages,
-  reading logs/docs, summarising. Use Luna read-only (`-r`) instead of the
-  `Explore`/`general-purpose` subagents.
+| Tier | Use |
+| --- | --- |
+| `complex` | any implementation beyond simple: features, non-trivial fixes, refactors, migrations, multi-file, data/API/auth/money/concurrency/security, debugging |
+| `simple` | mechanical edits, summaries |
+| `review` / `scout` | critics and second opinions / information gathering |
+| `architect` | approach review of complex architecture (several subsystems, a new subsystem, data model, concurrency, money/security core, migrations) and of any problem that keeps coming back |
+| `approach` | approach review of a medium change (a feature or fix across a few files with a real design choice); also the independent review of a `planner` plan |
+| `planner` | the technical plan of a complex architecture, written from the scouts' facts within Claude's requirements |
 
-Claude writes a self-contained brief, verifies the result (diff, gates, spot-checks),
-and commits itself. Luna never commits.
+Which provider, model and effort serve each tier and panel is the owner's choice in the **Luna panel**; the
+session-start digest prints the current setting and `node ~/.claude/scripts/conveyor/exec.mjs status` shows it live.
+Never name a provider yourself: no direct `gem.sh`/`luna.sh` calls for delegated work (a PreToolUse guard blocks
+`gem.sh`; a diagnostic may prefix `CONVEYOR_DIRECT_PROVIDER=1`).
 
-**Design is done by Opus itself, NEVER delegated.** Opus is the main Claude model in this session, and it is far better than GPT with the visual side of websites and apps. Design means visual/UI/UX, layout, styling/CSS, look & feel, typography, colour, design tokens, component markup and artifact pages. Don't hand any of it to Luna, and don't hand it to Sonnet or other subagents either. Luna may do only the non-visual wiring (data, logic, API) around it, and may generate raster images on request (see the `luna` skill, "Image generation").
-Claude also keeps talking to the user and includes requested text directly in the reply when asked. Claude owns final decisions, synthesis of Luna/critic output, and trivial one-liners that are faster to do than to brief. For mixed tasks, split them: Luna does the
-logic/wiring, Claude does the visuals.
+- The chains, models, efforts, panels and pstack roles live in `~/.claude/conveyor/orchestration.json`; the user
+  edits them in the **Luna panel** (model and effort per task kind, presets). Do not hand-edit it.
+- Codex is skipped automatically at **80 %** usage (configurable in the panel; hysteresis), a provider that hit a
+  quota/region/auth error is skipped for its TTL, and a write job that already started is never re-run on
+  another provider. Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`; exit 5: no provider
+  available; exit 6: the project's checks stayed red after the fix rounds; exit 7: another write job already runs in
+  that repository, so start the slice in its own worktree (`wt-new.mjs`) or wait for it.
+- Never `gpt-6-astra`. `gpt-6.2-astra` is allowed (owner 2026-11-18) and serves the `architect` tier. Never `ultra` effort
+  (it delegates to sub-agents). Never the fast tier (`-t fast`) unless the user asks.
+- Briefs are self-contained and exhaustive: executors are literal and see only the brief (see the `luna` skill,
+  "The executors are literal"). Every write brief ends with "Edit files only. Do NOT run git add / commit / push".
+  Claude verifies every result (diff, gates, spot-checks) and commits itself.
+- After each launch check `luna-status.sh <out>` and arm `luna-watch.sh` with the Monitor tool; stop jobs with
+  `luna-stop.sh`. Keep slices ≤ ~40 min and run independent slices in parallel.
 
-This also applies to inline paths such as `/gsd-fast` or direct edits: the code is
-written through `luna.sh -w`, and Claude verifies and commits.
+**Priorities: quality of the final result > speed through parallelism > quota.** Fan out scouts, use best-of-2
+(pstack `arena`) for the riskiest core pieces, run independent slices in parallel; decompose by independence,
+never into pieces smaller than a coherent unit.
 
-**Images: Luna can generate raster images** (Codex imagegen) for sites and any other task: hero art, illustrations, icons, backgrounds, assets. Opus writes the prompt and judges the result, which is art direction and therefore design. Luna runs it as a `luna.sh -w` job and saves the file into the project. See the `luna` skill, "Image generation".
+**Approach review: a high-level critic before code and when stuck** (owner decision 2026-11-18, every repository).
+A trial on three real problems showed GPT-6.2 Astra and Sol at max find design flaws and better approaches that
+ordinary critics and fix rounds found only after two rounds or missed. So:
+- **Before implementing** anything beyond a small change, after the scouts and Claude's own plan: run the plan
+  through `--tier approach` (medium change) or `--tier architect` (complex architecture: several subsystems, a new
+  subsystem or data model, concurrency, money/security core, migrations). For the riskiest architecture use the
+  `architect` panel (Astra and Sol seats in parallel) for two independent views.
+- **Complex architecture, planned by Astra:** after the scouts, Claude writes the requirements and limits (the
+  owner's intent stays with Claude), `--tier planner` writes the technical plan from the facts (modules, order of
+  verifiable steps, risks), then `--tier approach` (a different model) reviews that plan; Claude merges, decides and
+  slices the work into briefs. The reviewer is never the plan's author.
+- **When a problem loops** (the same failure twice, `exec.mjs` exit 6, two fix rounds without convergence, or the
+  user correcting the same thing again): stop retrying and run `--tier architect` with the history.
+- **The brief** (Astra is literal and lazy, strong but without creative or directorial vision; OpenAI advises
+  outcome-first prompts with few rules): the goal and why; the facts the scouts found (short, pre-digested); the
+  current plan; one question. Ask for up to three options, the strongest first, each in 2–4 sentences with why it
+  works and the one fact or scenario that would kill it, then a pick. Read-only (`-r`), no code or patches, state
+  assumptions, "before you finish, check you answered the question and each option says how it fails". Point it at
+  the repository; do not paste the whole conversation.
+- **Never for** visual/UI/UX/product/game design (Opus), implementation, or line-by-line diff review (critics and
+  `interrogate`).
+- Claude judges the answer, verifies the claims it relies on by a run, and tells the user what it accepted and
+  rejected. Enforced at the point where the plan can still change: `exec.mjs run` refuses the first `complex` write
+  of a ledger task (exit 8) until an approach review has completed in that task, refuses a new attempt after a gate
+  failure until an `architect` review has completed, and refuses a write after a `planner` plan until `approach`
+  reviewed it; `--review-skip "<reason>"` is for a change with no design choice and is recorded. The stop gate's
+  check 10 audits the same rules (its own 7-day warn period); exit 6 prints the `architect` command.
+
+**Design is done by Opus itself, NEVER delegated.** Opus is the main Claude model in this session, and it is far
+better than GPT with the visual side of websites and apps. Design means visual/UI/UX, layout, styling/CSS, look &
+feel, typography, colour, design tokens, component markup and artifact pages. Don't hand any of it to executors or
+subagents. Executors may do only the non-visual wiring (data, logic, API) around it, and generate raster images on
+request (see the `luna` skill, "Image generation"). Claude also keeps talking to the user and includes requested
+text directly in the reply when asked. Claude owns final decisions, synthesis of executor and review output, and
+trivial one-liners that are faster to do than to brief.
+
+**Images: executors can generate raster images** (Codex imagegen) for sites and any other task. Opus writes the
+prompt and judges the result (art direction is design); the executor saves the file into the project.
 
 **Generate images proactively, without asking** (user rule, 2026-10-21). Whenever a deliverable would look or work
 better with real imagery, generate it as part of the work. That covers websites and landing pages (hero, section art,
@@ -73,34 +124,62 @@ ask permission first: the cost isn't a concern. Generate 2–4 variants for impo
 report what was generated. Limits: no text inside images (put it in HTML/CSS), no real people's likenesses or trademarked
 logos/brands, and optimise the files (size/format) before they ship.
 
-### 2. Critics for anything moderately complex (skill: `luna-critics`)
+### Acceptance ledger and gates (enforced by hooks)
 
-For any task that isn't trivial (multi-file, new feature/flow, user-facing,
-data/API change, auth/money/secrets, concurrency, infra, or a non-obvious
-decision), run a panel of 3–5 **clean-context role-play critics on Luna** via
-`luna-panel.sh`, which runs the whole panel as threads in ONE shared Codex process (`luna-pool.mjs`, ~16 MB per extra critic) (3–4 for internal code, 5–6 for user-facing, plus one per subsystem on large diffs; `high` effort by default,
-run in parallel with the next independent slice). They review statically, without running tests or scripts. Concurrency
-adapts to free RAM: `luna.sh` admits a job only while a reserve stays free; the Luna daemon defaults to max 12 jobs.
-Launch freely and the machine won't hang: рядовой пользователь, взломщик, дизайнер, проджект, мейнтейнер,
-тестировщик, эксплуатация, эксперт предметки. Run them after the plan (before
-implementing) and/or after implementing (before saying "done" or committing).
-Claude verifies every finding, fixes the accepted ones, and reports what was
-accepted and what was rejected.
+On every non-trivial task that changes code:
+1. `node ~/.claude/scripts/conveyor/ledger.mjs start`, then play back the user's requirements in your first message
+   (pstack trigger 1) and record them: `ledger.mjs add "<requirement>" --from <M3.c1,…>`. Every imperative sentence
+   of the user (`M<n>.c<k>`, captured automatically) must be linked to an item or `ledger.mjs link <clause> none
+   --reason "<why it is not a requirement>"`.
+2. Prove each item: `ledger.mjs evidence <L1> --cmd "<check command>"` (the command is run and must exit 0),
+   `--artifact <screenshot>` (a fresh file), `--check <out>.dispatch.json` (a passing gate); then
+   `ledger.mjs done <L1>`. Notes are context only and never prove an item.
+3. Before claiming done: `ledger.mjs crosscheck` (the scout tier compares the user's messages, the items and the diff;
+   if no scout is available, run it again later or `ledger.mjs waive crosscheck --quote "<the user's words>"`), and
+   end the final message with the block printed by `ledger.mjs checklist` (one `- L<n> ✓|✗|waived` line per item).
+The stop hook applies when the session's repositories really changed (git diff, staged, untracked or new commits
+since the session base) and blocks the turn until this holds and the session left no running jobs, registered temp
+paths or expired worktrees (warn-only during the first 7 days). Exceptions only in the user's own words:
+`ledger.mjs waive <item|gate> --quote "<the user's words>"` (verified against the transcript). Executor writes are
+gated by the dispatcher: project checks run after every write job, failures go back to the same executor (≤ 2
+rounds); exit 6 means the gate stayed red and the decision is yours. While your own executor jobs still run, the stop
+hook lets the turn end without a checklist (work in progress). A repository's own `.claude/conveyor.json` commands run
+only after you review it and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>`; trust covers the last
+five reviewed versions across all worktrees of the repository. Until then checks
+use the autodetected profile and default language hygiene counters. Repositories without a hygiene section also
+get default counters; their initial debt is seeded from the task base in
+`~/.claude/conveyor/baselines/<repo-identity-hash>.json`, shared by worktrees without adding repository files.
+On the first code task in a repository without a profile, run
+`node ~/.claude/scripts/conveyor/check.mjs init --dir <repo> --write`, review and adjust the generated checks,
+measure fast/turn on the change, tell the user, and propose committing `.claude/conveyor.json` and
+`.conveyor/hygiene-baseline.json`. Init seeds the local baseline from the external baseline, trusts its generated
+profile, refuses to overwrite an existing profile, and never commits.
+UI repositories without `.claude/skills/verify-*/SKILL.md` create a verify skill on their first UI task with pstack
+`create-verification-skill`: isolated launch on a free port with separate data, Playwright drive, retained desktop/mobile
+screenshots after cleanup (see kriminalist's `verify-kriminalist`). Stop reason 9 requires a fresh image artifact for
+UI changes: `ledger.mjs evidence <L> --artifact <screenshot>`. It uses the same calibration and user gate waiver as
+turn checks and cleanup.
 
-### 3. Stuck or uncertain
+### Review: pstack `interrogate` on diverse executors
 
-If you're looping or unsure, hand a fresh root-cause investigation to Luna (`-r`)
-with a clean brief instead of retrying the same approach.
+Review every non-trivial change before calling it done with pstack `interrogate`: its reviewers are the seats of
+the `review` panel (as configured in the Luna panel; `interrogate.mjs` runs them), each in a throwaway worktree, and a finding counts only with
+the command and output that prove it. For user-facing work add the `luna-critics` persona briefs that pstack does not
+cover (Рядовой пользователь on screenshots and flows, Дизайнер for visuals), and for Terra/Sol implementations a
+gap reviewer that reads the user's goal and the diff. Claude verifies every finding and reports accepted and
+rejected ones. Trivial edits and pure questions skip review.
 
-### 4. Fallback: never stall
+### Stuck, or an executor is down
 
-If Luna/Codex is unavailable (quota or rate limit, auth, CLI errors, repeated
-timeouts), do the work inline or via a Sonnet subagent (critics included), say in one
-line that Luna was skipped and why, and go back to Luna once it recovers.
+Looping or unsure: follow pstack "Attack the Premise" and hand a fresh root-cause investigation to the `scout` tier
+with a clean brief. If a whole chain is unavailable (`exec.mjs` exit 5), do the work inline, say in one line which
+providers were down, and return to the dispatcher once they recover.
 
-### 5. Always clean up after yourself (user rule, 2026-10-21)
+## Infrastructure rules
 
-A task isn't done until its garbage is gone. This applies to Claude itself AND to everything it launches (Luna/Terra jobs,
+### Always clean up after yourself (user rule, 2026-10-21)
+
+A task isn't done until its garbage is gone. This applies to Claude itself AND to everything it launches (Luna/Sol jobs,
 subagents, other sessions it starts: tell them in their brief). **Clean up as you go**: after each finished step, remove that
 step's leftovers right away, as soon as they've been verified and used. Don't let them pile up until the end. Anything still
 in use (a running job's files, a backup needed for a possible rollback) is cleaned as soon as it's free. Before the final
@@ -111,34 +190,44 @@ report of every task, in every project, make a last pass:
 - **Backups** (`*.bak-*`) you made: delete them once the change is verified, unless the user may want to roll back
   soon. Then keep only ONE pre-change backup per file and say so in the report.
 - **Processes**: stop the monitors, background jobs, dev servers and Codex processes you started; make sure no
-  `codex.exe` from your jobs is left running.
+  `codex` from your jobs is left running.
 - **Worktrees/branches** you created and no longer need: remove them (never the user's).
 - Never delete what you didn't create (the user's files, Codex desktop history, other sessions' artifacts).
 - Last line of the report: what was cleaned up and what was deliberately kept (and why).
 `~/.claude/scripts/luna-clean.mjs` (`--dry-run` to preview) removes the wrappers' own leftovers (old temp prompt files, stale lock dirs,
 luna-run job dirs older than 7 days, luna-made Codex sessions). It also runs automatically at session start.
 
-**Disk hygiene: worktrees and shared data (user rule, 2026-10-24).** The projects had grown to ~90 GB: 15 full worktrees,
+**Disk hygiene: worktrees and shared data (user rule, 2026-10-24).** The projects had grown to ~90 GB: 15 full
+worktrees,
 each with its own node_modules, `.next` and `public/`, nobody removing them, game data copied instead of linked.
-- **Create worktrees only with** `node ~/.claude/scripts/disk/wt-new.mjs --repo <repo> --path <dir> --new-branch <b> --base <ref>
-  --owner <session/task> --purpose "<why>" --until <date ≤ 30 days> --no-public`. It records owner/purpose/until in git's
-  worktree lock and links the shared `node_modules` instead of installing a copy. Never a bare `git worktree add` for work
+- **Create worktrees only with** `node ~/.claude/scripts/disk/wt-new.mjs --repo <repo> --path <dir> --new-branch <b>
+  --base <ref>
+  --owner <session/task> --purpose "<why>" --until <date ≤ 30 days> --no-public`. It records owner/purpose/until in
+  git's
+  worktree lock and links the shared `node_modules` instead of installing a copy. Never a bare `git worktree add` for
+  work
   that lives longer than one command. Session briefs say the same.
-- **Remove them with** `node ~/.claude/scripts/disk/wt-done.mjs <dir>` (`--archive` to commit + tag uncommitted work first).
-  It unlinks junctions before deleting, so a shared `node_modules` or data folder is never deleted through a link.
-- **One copy of big data.** Game sources, OCR, downloads live once; worktrees link to them (junction). Raw originals that
-  cannot be re-downloaded go to `%USERPROFILE%\dev\_sources\<game>\` (`DISK_SOURCES_ROOT`) with a README, never into `.tmp`.
-- **`.tmp` is temporary.** `node ~/.claude/scripts/disk/audit.mjs` lists worktrees (verdict: removable / dirty / in-use /
-  expired) and free space; `--apply` deletes only `.next` idle > 24 h, `.tmp` children older than 7 days (a `KEEP` file or a
-  `.tmp/.keep` entry protects one) and old test reports. The SessionStart hook `~/.claude/hooks/disk-audit-hook.mjs` shows a
+- **Remove them with** `node ~/.claude/scripts/disk/wt-done.mjs <dir>` (`--archive` to commit + tag uncommitted work
+  first).
+  It unlinks symlinks before deleting, so a shared `node_modules` or data folder is never deleted through a link.
+- **One copy of big data.** Game sources, OCR, downloads live once; worktrees link to them (symlink). Raw originals that
+  cannot be re-downloaded go to `~/dev/_sources/<game>/` with a README, never into `.tmp`.
+- **`.tmp` is temporary.** `node ~/.claude/scripts/disk/audit.mjs` lists worktrees (verdict: removable / dirty / in-use
+  /
+  expired) and free space; `--apply` deletes only `.next` idle > 24 h, `.tmp` children older than 7 days (a `KEEP` file
+  or a
+  `.tmp/.keep` entry protects one) and old test reports. The SessionStart hook `~/.claude/hooks/disk-audit-hook.mjs`
+  shows a
   short report when action is needed and runs `--apply` once a day. Act on what it reports before starting heavy work.
 
-### 6. Tests: a budget, not a free-for-all (user rule, 2026-10-24)
+### Tests: a budget, not a free-for-all (user rule, 2026-10-24)
 
 Test runs have killed this PC before: about 10 GB of RAM, about 20 GB of temp files on the SSD, and
-1.5–2 hours of waiting. A test run is a resource with a budget, in every project, for Claude and for
-everything it launches (put these rules into executor briefs):
-- **Every pytest run goes through `python ~/.claude/scripts/pytest_gate.py -n K -- <args>`.** The gate
+1.5–2 hours of waiting. That is Windows PC history; the limits below apply to bro-server now.
+A test run is a resource with a budget, in every project, for Claude and for
+everything it launches (put these rules into executor briefs). The shared heavy-gate defaults
+to 3 slots (`Bash` hooks; `HEAVY_GATE_MAX`):
+- **Every pytest run goes through `python3 ~/.claude/scripts/pytest_gate.py -n K -- <args>`.** The gate
   does the following:
   - caps workers per run (default 4) and shares ONE machine-wide worker pool sized to the CPU count
     (`PYTEST_GATE_POOL`), held by file locks, so all sessions and Codex jobs together never run more workers than
@@ -162,6 +251,11 @@ everything it launches (put these rules into executor briefs):
   write tests only for what could destroy work, lose data, break prod, or touch money/security —
   usually 1–3 test files per change. Everything else is checked by one real run (report, smoke,
   screenshot). Executor briefs list the exact few tests and say "No other tests".
+  **Enforced since 2026-11-17** (the prose alone was ignored: 6,139 tests added to rpg in 30 days): the executor
+  and subagent gates reject a change that adds more than 5 new test cases net (`budgets.new_tests` in the project
+  profile; a brief may raise it for one job with a line `Test budget: N`, which Claude writes only for lost-work,
+  data, production, money or security risks). The fix round then trims the job's own new tests. Executors run
+  only the tests the brief names plus affected tests, never the full suite.
 - **Writing tests:** a new test must be cheap by design.
   - Share heavy setup (session or module fixtures, prebuilt snapshots, hardlinks instead of copying
     big data).

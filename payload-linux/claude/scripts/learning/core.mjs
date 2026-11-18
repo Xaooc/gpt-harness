@@ -2,9 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { collectMetrics } from "../conveyor/metrics.mjs";
 import {
   HOME_CLAUDE, paths, ensureDirs, withLock, readJson, readJsonl, appendJsonl,
-  writeFileAtomic, writeJsonAtomic, loadEvents, sha256, nowIso, sanitizeQuote, isForeignPath,
+  writeFileAtomic, writeJsonAtomic, loadEvents, sha256, nowIso, sanitizeQuote, isForeignPath, canonicalRepo,
 } from "./common.mjs";
 
 export const TARGETS = Object.freeze(["CLAUDE.md", "skills/luna/SKILL.md", "skills/luna-critics/SKILL.md"]);
@@ -38,7 +39,7 @@ export function isCountingEvent(event) {
 
 const DEFAULTS = {
   min_new_events: 5, min_hours_between_runs: 24, retry_after_failure_hours: 6, report_days: 7,
-  max_edits_per_run: 3, max_edit_growth_chars: 700, candidate_expiry_days: 60,
+  max_edits_per_run: 3, max_checks_per_run: 3, max_edit_growth_chars: 700, candidate_expiry_days: 60,
   targets: {
     "CLAUDE.md": { max_bytes: 11500 },
     "skills/luna/SKILL.md": { max_bytes: 24000 },
@@ -63,15 +64,25 @@ const DENY_RE = [
   /skip(ping)?\s+(the\s+)?(critic|critics|review|confirmation|check|checks|tests?|gate)/gi,
   /\boptional(ly)?\b/gi, /\bauto-?approv/gi, /\bsilently\b/gi, /\bno longer\b/gi, /\bdisable/gi,
 ];
+// Checks may name the dangerous actions they detect, along with ordinary code locations and conditions.
+const CHECK_ALLOW = [
+  /hooks?\//gi, /\bunless\b/gi, /\bexcept(ion|ions)?\b/gi, /\boptional(ly)?\b/gi, /\bno longer\b/gi,
+  /\bdisable/gi, /no-verify/gi, /rm -rf/gi, /--yolo/gi, /skip-permissions/gi, /dangerously/gi, /bypass/gi,
+  /skip(ping)?\s+(the\s+)?(critic|critics|review|confirmation|check|checks|tests?|gate)/gi,
+];
+// Skipping tests or gates can be what a check detects; skipping reviews or confirmations stays denied.
+const CHECK_DENY = [...DENY_RE.filter((re) => !CHECK_ALLOW.some((allowed) => allowed.source === re.source)),
+  /skip(ping)?\s+(the\s+)?(critic|critics|review|confirmation)/gi];
 const rawTargets = new WeakMap();
 const DAY_MS = 86400000;
 const lf = (text) => text.replace(/\r/g, "");
 const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const collapse = (text) => typeof text === "string" ? text.replace(/\s+/g, " ").trim() : "";
 
-export function displayText(text, max = 200) {
+export function displayText(text, max = 200, { check = false } = {}) {
   let clean = sanitizeQuote(text, max);
-  for (const re of [...DENY_RE, ...PROTECT_RE, /=== (BEGIN|END) DATA/gi, /<\/?learning-loop-report>/gi]) {
+  const deny = check ? CHECK_DENY : DENY_RE;
+  for (const re of [...deny, ...PROTECT_RE, /=== (BEGIN|END) DATA/gi, /<\/?learning-loop-report>/gi]) {
     clean = clean.replace(new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g"), "…");
   }
   return clean;
@@ -97,7 +108,8 @@ function mergedConfig(overrides = {}) {
   const ranges = {
     min_new_events: [1, Infinity], min_hours_between_runs: [1, Infinity],
     retry_after_failure_hours: [1, Infinity], report_days: [1, Infinity],
-    max_edits_per_run: [0, 10], max_edit_growth_chars: [0, 2000], candidate_expiry_days: [1, Infinity],
+    max_edits_per_run: [0, 10], max_checks_per_run: [0, 10], max_edit_growth_chars: [0, 2000],
+    candidate_expiry_days: [1, Infinity],
   };
   const validNumber = (value, min, max) => Number.isFinite(value) && value >= min && value <= max;
   for (const [key, [min, max]] of Object.entries(ranges)) {
@@ -244,7 +256,7 @@ function adoptionList(adoptions) {
 function validateShape(p, failures) {
   if (typeof p.id !== "string") failures.push("id must be a string");
   if (p.rationale !== undefined && typeof p.rationale !== "string") failures.push("rationale must be a string");
-  if (!["edit", "log", "needs_user", "revert"].includes(p.kind)) failures.push("unknown kind");
+  if (!["edit", "log", "needs_user", "revert", "check"].includes(p.kind)) failures.push("unknown kind");
   if (typeof p.lesson !== "string" || !p.lesson.trim() || p.lesson.length > 300) {
     failures.push("lesson must be non-empty and at most 300 chars");
   }
@@ -254,6 +266,48 @@ function validateShape(p, failures) {
   }
   if (!Array.isArray(p.evidence) || p.evidence.length === 0 || p.evidence.length > 20) {
     failures.push("evidence must contain 1 to 20 items");
+  }
+  if (p.kind === "check") validateCheckShape(p, failures);
+}
+
+function validateCheckShape(p, failures) {
+  if (!["harness", "project"].includes(p.layer)) failures.push("check: layer must be harness or project");
+  if (p.layer === "project" && (typeof p.repo !== "string" || !/^[a-z0-9-]+$/.test(p.repo)
+    || !canonicalRepo(p.repo))) failures.push("check: repo must be a canonical project key");
+  if (p.layer === "harness" && p.repo !== undefined && p.repo !== "") {
+    failures.push("check: repo must be empty for harness");
+  }
+  if (!["command", "file", "test", "output"].includes(p.signal_type)) {
+    failures.push("check: signal_type must be command, file, test or output");
+  }
+  if (!["warn", "block"].includes(p.effect)) failures.push("check: effect must be warn or block");
+  for (const [field, min, max] of [
+    ["title", 8, 120], ["signal", 20, 400], ["where", 5, 200], ["message", 10, 300],
+    ["false_positive_risk", 5, 200],
+  ]) {
+    const value = p[field];
+    if (typeof value !== "string" || value.trim().length < min || value.length > max) {
+      failures.push(`check: ${field} must be ${min}-${max} chars`);
+      continue;
+    }
+    if (CHECK_DENY.some((re) => value.match(re))) failures.push(`check: ${field} contains denied text`);
+    if (PROTECT_RE.some((re) => re.test(value)) || /<!-- learning:protected/i.test(value)) {
+      failures.push(`check: ${field} contains protected content`);
+    }
+  }
+  if (typeof p.title === "string" && (!/[a-z]/i.test(p.title)
+    || [...p.title].some((char) => /\p{L}/u.test(char) && !/[a-z]/i.test(char)))) {
+    failures.push("check: title must be English");
+  }
+  if (typeof p.rationale !== "string" || !p.rationale.trim()) failures.push("check: rationale must be non-empty");
+  if (!["high", "medium", "low"].includes(p.confidence)) failures.push("check: invalid confidence");
+  if (p.candidate_keys !== undefined && (!Array.isArray(p.candidate_keys)
+    || p.candidate_keys.some((key) => typeof key !== "string"))) {
+    failures.push("check: candidate_keys must be an array of strings");
+  }
+  for (const field of ["target", "op", "old_text", "anchor", "new_text"]) {
+    if (p[field] !== undefined && p[field] !== null
+      && (typeof p[field] !== "string" || p[field].trim())) failures.push(`check: ${field} must be empty`);
   }
 }
 
@@ -362,9 +416,13 @@ export function validateProposal(p, ctx = {}) {
         failures.push("revert: observation window < 3 days");
       }
     }
-    if (["edit", "revert"].includes(p.kind)) {
+    if (["edit", "revert", "check"].includes(p.kind)) {
       const stats = evidenceStats(cited);
       if (stats.sessions < 2 && !stats.explicit) failures.push("evidence threshold not met");
+    }
+    if (p.kind === "check" && p.layer === "project"
+      && cited.filter(isCountingEvent).some((event) => canonicalRepo(event.project) !== p.repo)) {
+      failures.push("check: evidence from other repo");
     }
     if (p.kind === "edit") plan = validateEdit(p, ctx, failures);
   } catch (error) {
@@ -745,6 +803,142 @@ export function compactCandidates({ maxBytes = 2_000_000 } = {}) {
   });
 }
 
+export function compactChecks({ maxBytes = 1_000_000 } = {}) {
+  return checksLocked(() => {
+    if (!fs.existsSync(paths.checks) || fs.statSync(paths.checks).size <= maxBytes) return false;
+    const config = mergedConfig(readJson(paths.config, {}));
+    const records = loadChecks().filter((record) => !(
+      record.status === "expired"
+        && Date.now() - Date.parse(record.last_at) > 2 * config.candidate_expiry_days * DAY_MS
+    ));
+    writeFileAtomic(paths.checks, records.map((record) => JSON.stringify(record) + "\n").join(""));
+    renderChecks();
+    return true;
+  });
+}
+
+export function checkKey(p) {
+  const title = p.title.toLowerCase().replace(/[^\p{L}]/gu, "");
+  return sha256(`${p.layer}|${p.repo || ""}|${p.signal_type}|${title}`).slice(0, 12);
+}
+
+function checksLocked(fn) {
+  const result = withLock("checks", { waitMs: 5000 }, fn);
+  if (!result.locked) throw new Error("checks lock busy");
+  return result.value;
+}
+
+function foldChecks() {
+  const folded = new Map();
+  for (const record of readJsonl(paths.checks)) {
+    if (typeof record.key !== "string") continue;
+    const previous = folded.get(record.key);
+    const evidence = new Map();
+    for (const item of [...(previous?.evidence || []), ...(Array.isArray(record.evidence) ? record.evidence : [])]) {
+      if (object(item) && typeof item.event_id === "string" && !evidence.has(item.event_id)) {
+        evidence.set(item.event_id, item);
+      }
+    }
+    folded.set(record.key, { ...previous, ...record, evidence: [...evidence.values()] });
+  }
+  return [...folded.values()];
+}
+
+export function loadChecks({ openOnly = false } = {}) {
+  const config = mergedConfig(readJson(paths.config, {}));
+  return foldChecks().map((record) => (
+    record.status === "open" && Date.now() - Date.parse(record.last_at) > config.candidate_expiry_days * DAY_MS
+      ? { ...record, status: "expired" } : record
+  )).filter((record) => !openOnly || record.status === "open");
+}
+
+function renderChecks() {
+  const checks = loadChecks();
+  const lines = ["# Proposed checks (learning loop)", "",
+    "These are proposals; nothing is implemented automatically.", ""];
+  for (const check of checks.filter((item) => item.status === "open")) {
+    const clean = (value, max = 300) => displayText(String(value || ""), max);
+    const cleanCheck = (value, max = 300) => displayText(String(value || ""), max, { check: true });
+    const location = clean(check.layer) + (check.repo ? `/${clean(check.repo)}` : "");
+    lines.push(`## ${clean(check.id)} · ${location} · ${clean(check.effect)} · ${cleanCheck(check.title, 120)}`,
+      `- Signal (${clean(check.signal_type)}): ${cleanCheck(check.signal, 400)}`,
+      `- Where: ${cleanCheck(check.where, 200)}`, `- Message: ${cleanCheck(check.message)}`,
+      `- False-positive risk: ${cleanCheck(check.false_positive_risk, 200)}`,
+      `- Summary: ${clean(check.summary_ru)}`,
+      `- Evidence: ${(check.evidence || []).map((item) => clean(item.event_id, 100)).join(", ") || "—"}`,
+      `- First seen: ${clean(check.first_at)} · last seen: ${clean(check.last_at)}`, "");
+  }
+  lines.push("## Closed", "");
+  const closed = checks.filter((item) => ["done", "dismissed", "expired"].includes(item.status));
+  lines.push(...(closed.length ? closed.map((item) => (
+    `- ${displayText(item.id, 100)} · ${displayText(item.status, 30)}`
+      + ` · ${displayText(item.title, 120, { check: true })}`
+  )) : ["None."]));
+  writeFileAtomic(paths.checksMd, lines.join("\n") + "\n");
+}
+
+export function refreshChecks() {
+  return checksLocked(() => renderChecks());
+}
+
+export function enqueueCheck(p, { runId, verdict } = {}) {
+  return checksLocked(() => {
+    const key = checkKey(p);
+    const records = foldChecks();
+    const previous = records.find((record) => record.key === key);
+    if (previous && ["done", "dismissed"].includes(previous.status)) {
+      return { queued: false, reason: `suppressed: ${previous.status}` };
+    }
+    const at = nowIso();
+    const prefix = `CHK-${at.slice(0, 10).replaceAll("-", "")}-`;
+    const ids = new Set(records.map((record) => record.id));
+    let n = 1;
+    while (ids.has(`${prefix}${n}`)) n++;
+    const evidence = new Map();
+    for (const item of Array.isArray(previous?.evidence) ? previous.evidence : []) {
+      if (object(item) && typeof item.event_id === "string" && !evidence.has(item.event_id)) {
+        evidence.set(item.event_id, item);
+      }
+    }
+    for (const item of Array.isArray(p.evidence) ? p.evidence : []) {
+      if (object(item) && typeof item.event_id === "string" && !evidence.has(item.event_id)) {
+        evidence.set(item.event_id, { event_id: displayText(item.event_id, 100), quote: displayText(item.quote, 400) });
+      }
+    }
+    const clean = (field, max) => displayText(p[field], max, { check: true });
+    const record = previous ? {
+      ...previous, status: "open", at, last_at: at, run_id: displayText(runId, 100) || null,
+      evidence: [...evidence.values()], times_seen: (previous.times_seen || 0) + 1,
+    } : {
+      v: 1, id: `${prefix}${n}`, key, status: "open", at, last_at: at,
+      first_at: at, run_id: displayText(runId, 100) || null,
+      layer: p.layer, repo: p.repo || "", title: clean("title", 120), signal_type: p.signal_type,
+      signal: clean("signal", 400), where: clean("where", 200), effect: p.effect,
+      message: clean("message", 300), false_positive_risk: clean("false_positive_risk", 200),
+      lesson: displayText(p.lesson, 300), summary_ru: displayText(p.summary_ru, 300), evidence: [...evidence.values()],
+      detection_sketch: displayText(verdict?.detection_sketch, 300), times_seen: 1,
+    };
+    appendJsonl(paths.checks, record);
+    renderChecks();
+    return { queued: true, merged: !!previous, id: record.id };
+  });
+}
+
+export function setCheckStatus(id, status, reason = "") {
+  if (!["done", "dismissed", "open"].includes(status)) return { ok: false };
+  return checksLocked(() => {
+    const previous = foldChecks().find((record) => record.id === id);
+    if (!previous) return { ok: false };
+    const at = nowIso();
+    appendJsonl(paths.checks, {
+      ...previous, event: "status", status, at, last_at: status === "open" ? at : previous.last_at,
+      reason: displayText(reason, 300),
+    });
+    renderChecks();
+    return { ok: true, id, status };
+  });
+}
+
 export function openNeedsUser() {
   if (!fs.existsSync(paths.needsUser)) return [];
   return fs.readFileSync(paths.needsUser, "utf8").split(/\r?\n/).filter((line) => line.startsWith("- [ ]"))
@@ -784,10 +978,10 @@ function readLogDates() {
     .map((match) => match[1]).filter((date) => Number.isFinite(Date.parse(date)));
 }
 
-function reportSection(title, entries) {
+function reportSection(title, entries, limit = 5) {
   if (entries.length === 0) return [];
-  return [title, ...entries.slice(0, 5).map((entry) => `• ${entry}`),
-    ...(entries.length > 5 ? [`и ещё ${entries.length - 5}`] : [])];
+  return [title, ...entries.slice(0, limit).map((entry) => `• ${entry}`),
+    ...(entries.length > limit ? [`и ещё ${entries.length - limit}`] : [])];
 }
 
 export function russianPlural(count, forms) {
@@ -795,12 +989,76 @@ export function russianPlural(count, forms) {
   return forms[n >= 11 && n <= 14 ? 2 : n % 10 === 1 ? 0 : n % 10 >= 2 && n % 10 <= 4 ? 1 : 2];
 }
 
-function buildReport(config, start, now) {
+function conveyorReport(start, end) {
+  const metrics = collectMetrics({ start, end, home: HOME_CLAUDE });
+  const entries = [];
+  const repoName = (repo) => displayText(path.basename(repo), 40);
+  const taskCount = `${metrics.tasks} ${russianPlural(metrics.tasks, ["задача", "задачи", "задач"])}`;
+  if (metrics.corrections !== null) {
+    let line = `Поправок: ${metrics.corrections} (периодом раньше ${metrics.previousCorrections})`;
+    if (metrics.afterDone !== null) line += ` · после «готово»: ${metrics.afterDone}`;
+    if (metrics.correctionsPerTask !== null) {
+      line += ` · на задачу: ${metrics.correctionsPerTask.toFixed(1)} (${taskCount})`;
+    } else if (metrics.tasks !== null) line += ` · задач: ${metrics.tasks}`;
+    entries.push(line, `Прерываний: ${metrics.interrupts}`);
+    if (metrics.projects.length) entries.push("По проектам (поправки/прерывания): " + metrics.projects.map((item) => {
+      const project = displayText(canonicalRepo(path.basename(item.project)) || repoName(item.project), 40);
+      return `${project} ${item.corrections}/${item.interrupts}`;
+    }).join(", "));
+  } else if (metrics.tasks !== null) entries.push(`Задач: ${metrics.tasks}`);
+  if (metrics.executor !== null) {
+    const gate = metrics.executor;
+    const runs = `${gate.writeRuns} ${russianPlural(gate.writeRuns, ["запуск", "запуска", "запусков"])}`;
+    let line = `Гейт исполнителя: ${runs} · сразу зелёные ${gate.round0}`
+      + ` · после доработки ${gate.afterFix} · красные ${gate.red}`;
+    const extra = [[gate.handoffs, "передано Claude"], [gate.noProvider, "нет провайдера"],
+      [gate.writeLocked, "запись занята"], [gate.unknown ?? gate.missingDispatch, "нет результата"]];
+    for (const [count, label] of extra) if (count) line += ` · ${label} ${count}`;
+    entries.push(line);
+  }
+  if (metrics.stopGate !== null || metrics.waivers !== null) {
+    let line = "Стоп-гейт:";
+    if (metrics.stopGate !== null) {
+      line += ` сессий с блокировкой или предупреждением ${metrics.stopGate.sessions}`;
+      const reasons = Object.entries(metrics.stopGate.reasons).sort((a, b) => b[1] - a[1] || Number(a[0]) - Number(b[0]));
+      const labels = ["", "журнал не начат", "требования не связаны", "открытые пункты", "нет свежих доказательств",
+        "проверки красные", "нет перекрёстной проверки", "нет итогового списка", "уборка не завершена"];
+      if (reasons.length) line += ` (чаще всего: ${reasons[0][0]} — ${labels[Number(reasons[0][0])]})`;
+    }
+    if (metrics.waivers !== null) line += ` · исключений по словам пользователя ${metrics.waivers}`;
+    entries.push(line);
+  }
+  if (metrics.switches !== null) entries.push("Смены провайдера: " + (Object.entries(metrics.switches)
+    .map(([route, count]) => `${displayText(route, 80)} ${count}`).join(", ") || "0"));
+  if (metrics.checks !== null) {
+    entries.push(`Проверок построено: ${metrics.checks.built}`
+      + (metrics.checks.repos.length ? ` (${metrics.checks.repos.map((item) => repoName(item.repo)).join(", ")})` : ""));
+  }
+  if (metrics.hygiene !== null) entries.push(`Гигиена (последний отчёт): важных ${metrics.hygiene.high}`
+    + ` · средних ${metrics.hygiene.medium} · мелких ${metrics.hygiene.low}`);
+  return reportSection("Конвейер:", entries, entries.length);
+}
+
+function buildReport(config, start, now, { skipChecks = false } = {}) {
   const within = (date) => Date.parse(date) >= start && Date.parse(date) <= now.getTime();
   const records = readJsonl(paths.adoptedJsonl);
   const adopts = records.filter((item) => item.event === "adopt" && within(item.applied_at));
   const reverts = records.filter((item) => item.event === "revert" && within(item.reverted_at));
   const candidates = readJsonl(paths.candidates).filter((item) => within(item.at));
+  const queuedChecks = new Map();
+  const previousCounts = new Map();
+  for (const item of skipChecks ? [] : readJsonl(paths.checks)) {
+    const previous = previousCounts.get(item.key);
+    const queued = item.status === "open" && item.at === item.last_at && within(item.at)
+      && (item.event !== "status" || (previous !== undefined && item.times_seen > previous));
+    // A compacted status record retains the last time this check was seen in the queue.
+    const compacted = previous === undefined && item.event === "status" && within(item.last_at);
+    if (queued || compacted) {
+      queuedChecks.set(item.id, item);
+    }
+    previousCounts.set(item.key, item.times_seen);
+  }
+  const checks = [...queuedChecks.values()];
   const open = openNeedsUser();
   const date = (value) => new Date(value).toISOString().slice(5, 10).split("-").reverse().join(".");
   const lines = [
@@ -816,6 +1074,10 @@ function buildReport(config, start, now) {
       + ` Откат: bash ~/.claude/scripts/learning-revert.sh ${item.id}`
   ))));
   lines.push(...reportSection("Откаты:", reverts.map((item) => `${item.id}: ${displayText(item.reason)}`)));
+  lines.push(...reportSection("Предложенные проверки:", checks.map((item) => (
+    `${displayText(item.id, 100)}: ${displayText(item.title, 120, { check: true })}`
+      + ` — ${displayText(item.summary_ru, 300)}`
+  ))));
   lines.push("Размеры файлов:");
   for (const target of TARGETS) {
     let size = "нет файла";
@@ -826,11 +1088,12 @@ function buildReport(config, start, now) {
     }
     lines.push(`• ${target}: ${size} / ${config.targets[target]?.max_bytes ?? "—"}`);
   }
+  lines.push(...conveyorReport(start, now));
   lines.push("Журнал: ~/.claude/learning/adopted.md · пауза: создать файл ~/.claude/learning/PAUSED");
   return lines.join("\n") + "\n";
 }
 
-export function generateReport({ force = false, now = new Date() } = {}) {
+export function generateReport({ force = false, now = new Date(), skipChecks = false } = {}) {
   const result = withLock("state", { waitMs: 5000 }, () => {
     const state = readJson(paths.loopState, {});
     const config = mergedConfig(readJson(paths.config, {}));
@@ -845,9 +1108,12 @@ export function generateReport({ force = false, now = new Date() } = {}) {
       && now.getTime() - lastReport < config.report_days * DAY_MS))) return null;
     const firstAdopt = records.find((item) => item.event === "adopt")?.applied_at;
     const firstLog = readLogDates()[0];
-    const firstDate = [firstAdopt, firstLog].map(Date.parse).filter(Number.isFinite).sort((a, b) => a - b)[0];
+    const firstCheck = skipChecks ? undefined : readJsonl(paths.checks)
+      .find((item) => item.status === "open")?.first_at;
+    const firstDate = [firstAdopt, firstLog, firstCheck].map(Date.parse)
+      .filter(Number.isFinite).sort((a, b) => a - b)[0];
     const start = Number.isFinite(lastReport) ? lastReport : firstDate ?? now.getTime() - 7 * DAY_MS;
-    const text = buildReport(config, start, now);
+    const text = buildReport(config, start, now, { skipChecks });
     const base = now.toISOString().slice(0, 10);
     let reportPath = path.join(paths.reportsDir, `${base}.md`);
     for (let n = 2; fs.existsSync(reportPath); n++) reportPath = path.join(paths.reportsDir, `${base}-${n}.md`);

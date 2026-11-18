@@ -14,15 +14,15 @@ Stop / SessionEnd hook ──► extract.mjs (incremental, deterministic, no LLM
 SessionStart hook ───────► loop.mjs run --if-due (detached)        └─ also run by loop.mjs before every reflection
                            │
                            ├─ 1. extract (catch up)
-                           ├─ 2. digest of new events + open candidates + active adoptions + target files
+                           ├─ 2. digest of events + candidates + check queue + active adoptions + target files
                            ├─ 3. PROPOSER (Codex, read-only)  → JSON proposals with cited event ids + verbatim quotes
                            ├─ 4. deterministic gate (core.mjs validate): evidence real? threshold? allowlist?
                            │     protected lines untouched? denylist? size budget?
                            ├─ 5. ADVERSARIAL CRITIC (Codex, other model, read-only, clean context) → verdict per proposal
-                           ├─ 6. apply approved edits (backup + adopted.jsonl/.md + id) / log the rest / needs-user
+                           ├─ 6. apply approved edits / queue approved checks / log the rest / needs-user
                            ├─ 7. regression reverts (same evidence rules, events newer than the adoption)
                            └─ 8. log.md line ("nothing met the threshold" when nothing applied), weekly report
-SessionStart hook ───────► surfaces the pending weekly report (Russian) + open "needs user" items
+SessionStart hook ───────► surfaces reports, open "needs user" items and relevant proposed checks
 learning-revert.sh <id> ─► core.mjs revert (reverse patch; whole-file restore only if file unchanged since)
 ```
 
@@ -45,6 +45,8 @@ Data (`~/.claude/learning/`, override with `CLAUDE_LEARNING_DIR`; targets root `
 | `adopted.jsonl` | append-only records `{"event":"adopt",...}` / `{"event":"revert",...}`; status = fold |
 | `adopted.md` | human-readable journal of every applied edit (diff, evidence, rationale, revert command) |
 | `candidates.jsonl` | lessons that did not pass (below threshold / gate / critic) — evidence accumulates across runs |
+| `checks.jsonl` | append-only queue of proposed checks and their status changes |
+| `checks.md` | human-readable open and closed check proposals |
 | `needs-user.md` | conflicts with user decisions or safety; items `NU-…`, surfaced at session start |
 | `log.md` | one line per run |
 | `reports/YYYY-MM-DD.md` | weekly Russian report |
@@ -98,9 +100,43 @@ the session of its earliest event. Every cited event is re-verified against its 
 the transcript line at `data.byte` must still be a genuine human message containing the quote and re-classify the
 same way; status/out files must still say the same) — a forged row in events.jsonl fails the gate.
 When a job's status/output file is gone, a trusted event may use its captured `status_sha256` instead.
-This fallback requires `isTrustedJob(out)` and an exact `(out, status_sha256)` match in `jobs.jsonl`.
+This fallback requires a trusted job path or an absolute path outside the learning directory, plus an exact
+`(out, status_sha256)` match in `jobs.jsonl`. If the status still exists, it must pass `isTrustedJob(out)`.
 The event row itself must match a capture-time digest in `attest.jsonl` (all fields except `captured`), so edits to a row after its source is deleted fail.
 A regression revert needs the same threshold using events newer than the adoption.
+
+## Checks first
+
+The proposer prefers `kind: "check"` when a deterministic program could detect a correction. A check describes a
+`harness` or `project` layer, an English title, a `command` / `file` / `test` / `output` signal, where it would run,
+its `warn` / `block` effect, the message and the false-positive risk. Project checks require a canonical repo key;
+harness checks have no repo. Checks carry the same evidence threshold and provenance checks as edits, cannot carry
+edit fields, and never produce an edit plan. The check-specific denylist rejects URLs, downloads, secrets,
+permissions, settings, review-gate or learning-loop references and phrases such as `without asking` or
+`auto-approve`; protected user-decision text and markers are also forbidden. Hooks, commands, files and tests may be
+described in otherwise safe check fields; checks may name dangerous actions such as `git commit --no-verify`,
+`eslint-disable`, `rm -rf` or skipped tests to detect them; skipping a critic, review or confirmation stays denied.
+
+Canonical repo keys remove a trailing `--claude-worktrees-…` or `--worktrees-…`, then the Linux home, macOS user or
+Windows drive/user prefix, and lowercase the remainder. Empty keys, `luna-run` and scratch-workspace paths have no
+repo. Every counting event cited by a project check must resolve to that same non-empty canonical repo. The hook
+encodes its cwd by replacing non-alphanumeric characters with `-` before applying the same canonicalisation.
+
+The critic answers a fifth question, `enforceable_by_code`, and supplies a concrete `detection_sketch`. Check
+approval requires that sketch (at least 20 characters), the four existing answers, an approval and evidence map.
+When a gate-passed edit is flagged enforceable with a concrete sketch, it becomes an open candidate for a future
+check instead of an edit. Short or absent sketches do not reroute edits; needs-user and reverts ignore this flag.
+
+Approved checks are folded by layer, repo, signal type and normalised title into `checks.jsonl` and rendered in
+`checks.md`. Further evidence merges into an open check without replacing its description; done and dismissed checks
+suppress repeat proposals. Open checks expire after the candidate expiry period; compaction drops expired checks
+older than twice that period. At most `max_checks_per_run` (default 3) are queued per run. Use
+`node ~/.claude/scripts/learning/loop.mjs checks` or `checks all` to list them, `checks done <id> [reason…]`,
+`checks dismiss <id> [reason…]`, and `checks reopen <id>` to change status. Session start shows at most three
+relevant open checks (harness checks and checks for the current repo), each at most twice; decisions and failures
+have priority over checks, and checks have priority over report text. The hook displays only check ids and their
+validated layer, repo and effect; it skips oversized queues. The user must explicitly agree before a human session
+builds a proposed check.
 
 ## Protected content (read-only for the loop)
 
@@ -132,7 +168,8 @@ Apply rechecks the original byte hash immediately before writing; either journal
 and records a compensating revert if the adoption was already journaled.
 Candidate evidence merges by event id across observations; candidate appends and size-triggered atomic compaction
 share a lock. Compaction defaults to 2 MB and retains recent records while dropping expired or old closed keys.
-Nothing else (settings.json, hooks, scripts, memory) is ever edited by the loop.
+Nothing else (settings.json, hooks, scripts, memory) is ever edited by the loop. Checks are only queued; the loop
+never writes or installs a check.
 
 ## Prompt-injection stance
 

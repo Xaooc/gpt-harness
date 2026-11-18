@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Fake app-server used only by luna-daemon.mjs --self-test. argv[2] is its audit log.
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync } from 'node:fs';
 import readline from 'node:readline';
 
 let sequence = 0;
@@ -84,7 +84,15 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
       }
       if (prompt.startsWith('WAIT') || prompt.startsWith('SLOW_START') ||
           prompt.startsWith('FLOOD_WAIT') || thread.model === 'hang') return;
-      thread.timer = setTimeout(() => {
+      const complete = () => {
+        if (process.env.LUNA_STUB_FINISH_FILE && !existsSync(process.env.LUNA_STUB_FINISH_FILE)) {
+          thread.timer = setTimeout(complete, 25);
+          return;
+        }
+        const total = { inputTokens: 160 * thread.turns, cachedInputTokens: 40 * thread.turns,
+          outputTokens: 40 * thread.turns, reasoningOutputTokens: 10 * thread.turns, totalTokens: 200 * thread.turns };
+        notify('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: { total, last: total } });
+        notify('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: { total, last: total } });
         if (thread.failure && (thread.failure.mode === 'ALWAYS' || thread.turns === 1)) {
           notify('turn/completed', { threadId, turn: {
             id: turnId, status: 'failed', items: [], error: { message: thread.failure.error }
@@ -102,7 +110,8 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line
           id: turnId, status: prompt === 'FAIL' ? 'failed' : 'completed', items: [item],
           error: prompt === 'FAIL' ? { message: 'fake failure' } : null
         } });
-      }, Number(/^DELAY:(\d+)/.exec(prompt)?.[1] || process.env.LUNA_STUB_DELAY_MS || 80));
+      };
+      thread.timer = setTimeout(complete, Number(/^DELAY:(\d+)/.exec(prompt)?.[1] || process.env.LUNA_STUB_DELAY_MS || 80));
     };
     if (prompt.startsWith('SLOW_START')) thread.timer = setTimeout(started, 300);
     else started();

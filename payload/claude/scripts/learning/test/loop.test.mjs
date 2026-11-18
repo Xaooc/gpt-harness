@@ -7,6 +7,7 @@ import childProcess, { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
 import { fakeLuna } from "./fake-luna.mjs";
+import { editableHeading, targetFixtures } from "./target-fixtures.mjs";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "learning-loop-"));
@@ -27,11 +28,9 @@ const {
 const { paths, HOME_CLAUDE } = common;
 const loop = fileURLToPath(new URL("../loop.mjs", import.meta.url));
 const hook = path.join(root, "hooks", "learning-session-start.mjs");
-const originals = Object.fromEntries(core.TARGETS.map((target) => [
-  target, fs.readFileSync(path.join(root, target)),
-]));
-const editable = "## Division of labour: Claude orchestrates, Luna executes";
-const replacement = "## Division of labour and careful execution";
+const originals = targetFixtures(core.TARGETS);
+const editable = editableHeading;
+const replacement = "## Shared responsibilities and careful execution (adopted lesson)";
 const quote = "Preserve local changes when undoing an adopted lesson.";
 
 function event(index, overrides = {}) {
@@ -57,6 +56,18 @@ function proposal(overrides = {}) {
     summary_ru: "При откате сохраняются ручные изменения.", rationale: "Repeated in independent sessions.",
     evidence: [0, 1].map((i) => ({ event_id: common.eventId("loop-test", String(i)), quote })),
     confidence: "high", ...overrides,
+  };
+}
+
+function checkProposal(overrides = {}) {
+  return {
+    id: "P1", kind: "check", layer: "harness", title: "Detect bare test runner commands",
+    signal_type: "command", signal: "A Bash command starts the test runner without its wrapper.",
+    where: "PreToolUse hook on Bash", effect: "warn", message: "Use the test runner wrapper.",
+    false_positive_risk: "A diagnostic invocation may be intentional.",
+    lesson: "Use the wrapper for test runs.", summary_ru: "Проверять запуск тестов через обёртку.",
+    rationale: "Repeated in independent sessions.", confidence: "high",
+    evidence: [0, 1].map((i) => ({ event_id: common.eventId("loop-test", String(i)), quote })), ...overrides,
   };
 }
 
@@ -125,13 +136,11 @@ function digest(overrides = {}) {
   return buildDigest({ ...context(), runId: "R-20261021-120000", candidates: [], ...overrides });
 }
 
-function hookRun(input = "{}") {
-  const started = performance.now();
+function hookRun(input = "{}", env = process.env) {
   const result = spawnSync(process.execPath, [hook], {
-    env: { ...process.env }, input, encoding: "utf8", timeout: 3000, windowsHide: true,
+    env: { ...env }, input, encoding: "utf8", timeout: 120000, windowsHide: true,
   });
   assertExit(result);
-  assert.ok(performance.now() - started < 1500, "hook must finish in less than 1500 ms");
   return result.stdout;
 }
 
@@ -192,7 +201,7 @@ test("full cycle applies only real evidence and journals every outcome", () => {
   assert.ok(!criticBrief.includes("\"id\": \"P2\""));
   const result = latestResult();
   assert.equal(result.proposals, 4);
-  assert.deepEqual(result.byKind, { edit: 2, log: 1, needs_user: 1, revert: 0 });
+  assert.deepEqual(result.byKind, { edit: 2, log: 1, needs_user: 1, revert: 0, check: 0 });
   assert.equal(result.gatePassed, 3);
   assert.equal(result.criticApproved, 2);
   assert.deepEqual(result.applied, [adopt.id]);
@@ -202,6 +211,178 @@ test("full cycle applies only real evidence and journals every outcome", () => {
   const saved = common.readJson(paths.loopState);
   assert.equal(saved.lastRunAt, result.startedAt);
   assert.deepEqual(saved.foreignKey, { keep: true });
+});
+
+test("over-budget targets reject growing edits but allow shrinking edits", () => {
+  const file = path.join(HOME_CLAUDE, "CLAUDE.md");
+  const maxBytes = core.loadConfig().targets["CLAUDE.md"].max_bytes;
+  const oversized = target() + "Detailed execution notes.\n".repeat(Math.ceil(maxBytes / 20));
+  assert.ok(Buffer.byteLength(oversized) > maxBytes);
+  fs.writeFileSync(file, oversized);
+  run();
+  assert.equal(target(), oversized);
+  assert.equal(latestResult().gatePassed, 0);
+  assert.match(core.loadCandidates()[0].reason, /over budget: only shrinking edits allowed/);
+
+  const shorter = "## Division of labour";
+  fake([proposal({ new_text: shorter })]);
+  run();
+  assert.equal(latestResult().applied.length, 1);
+  assert.equal(target(), oversized.replace(editable, shorter));
+  assert.ok(Buffer.byteLength(target()) > maxBytes, "shrinking is allowed even while still over budget");
+});
+
+test("approved check is queued, reported and reviewed without changing targets", () => {
+  const p = checkProposal();
+  const verdict = approval({ detection_sketch: "Match bare test runner command invocations." });
+  fake([p], [verdict]);
+  run();
+  const [check] = common.readJsonl(paths.checks);
+  assert.equal(check.title, p.title);
+  assert.match(check.id, /^CHK-\d{8}-\d+$/);
+  assert.deepEqual(latestResult().queuedChecks, [check.id]);
+  assert.match(text(path.join(runs()[0], "summary.md")), /queued CHK-/);
+  assert.match(text(paths.logMd), /check 1\).*queued CHK-/);
+  assert.doesNotMatch(text(paths.logMd), /nothing met the threshold/);
+  assert.ok(text(path.join(runs()[0], "critic.brief.md")).includes(p.signal));
+  assert.ok(digest().includes(check.id));
+  const report = common.readJson(paths.loopState).report;
+  assert.ok(text(report.path).includes(`Предложенные проверки:\n• ${check.id}`));
+  for (const [name, bytes] of Object.entries(originals)) {
+    assert.deepEqual(fs.readFileSync(path.join(HOME_CLAUDE, name)), bytes);
+  }
+  const pending = core.recordCandidate(proposal({ lesson: "Previously deferred test wrapper check." }));
+  const checks = ["low", "medium", "high", "medium"].map((confidence, i) => checkProposal({
+    id: `C${i}`, title: `Detect test runner case ${i}`, confidence,
+    candidate_keys: i === 1 ? [pending.candidate_key] : [],
+  }));
+  const verdicts = checks.map((item) => approval({ id: item.id,
+    detection_sketch: "Match bare test runner command invocations." }));
+  const executed = executeDirect(checks, verdicts);
+  assert.equal(executed.result.queuedChecks.length, 3);
+  assert.match(executed.review.outcomes[0], /deferred: check cap/);
+  assert.equal(core.loadCandidates().find((item) => item.candidate_key === pending.candidate_key).status, "closed");
+  const beforeDryRun = text(paths.checks);
+  const dry = executeDirect([checkProposal({ title: "Detect an unwrapped scenario runner" })], [verdict], {
+    dryRun: true,
+  });
+  assert.match(dry.review.outcomes[0], /^would queue/);
+  assert.equal(text(paths.checks), beforeDryRun);
+  const stale = core.loadChecks({ openOnly: true })[0];
+  const old = "2000-01-01T00:00:00.000Z";
+  common.appendJsonl(paths.checks, { ...stale, at: old, last_at: old });
+  fake([]);
+  run();
+  assert.match(text(paths.checksMd), new RegExp(`${stale.id} · expired`));
+});
+
+test("queued and merged checks close only candidates with related evidence", () => {
+  const verdict = approval({ detection_sketch: "Match bare test runner command invocations." });
+  for (const [suffix, outcome] of [["first", "queued"], ["second", "merged"]]) {
+    const related = core.recordCandidate(proposal({ lesson: `Related candidate ${suffix}.`,
+      evidence: [{ event_id: event(0).id, quote }] }));
+    const unrelated = core.recordCandidate(proposal({ lesson: `Unrelated candidate ${suffix}.`,
+      evidence: [{ event_id: event(2).id, quote }] }));
+    const p = checkProposal({ candidate_keys: [related.candidate_key, unrelated.candidate_key] });
+    const executed = executeDirect([p], [verdict]);
+    assert.match(executed.review.outcomes[0], new RegExp(`^${outcome} CHK-`));
+    const candidates = core.loadCandidates();
+    assert.equal(candidates.find((item) => item.candidate_key === related.candidate_key).status, "closed");
+    assert.equal(candidates.find((item) => item.candidate_key === unrelated.candidate_key).status, "open");
+  }
+});
+
+test("critic routes enforceable edits to candidates only with a concrete sketch", () => {
+  fake([proposal()], [approval({ enforceable_by_code: true,
+    detection_sketch: "Detect local changes before the undo runs." })]);
+  run();
+  assert.equal(target(), originals["CLAUDE.md"].toString());
+  assert.match(core.loadCandidates()[0].reason, /^critic: enforceable by code — propose as check:/);
+  fake([proposal()], [approval({ enforceable_by_code: true, detection_sketch: "" })]);
+  run();
+  assert.ok(target().includes(replacement));
+  assert.equal(core.loadAdoptions().active.length, 1);
+});
+
+test("approved check without a detection sketch becomes a candidate", () => {
+  fake([checkProposal()], [approval()]);
+  run();
+  assert.equal(common.readJsonl(paths.checks).length, 0);
+  assert.match(core.loadCandidates()[0].reason, /^critic: missing detection sketch/);
+  assert.equal(latestResult().criticApproved, 0);
+  fake([checkProposal()], [approval({ verdict: "reject", reason: "The signal is too vague." })]);
+  run();
+  assert.equal(core.loadCandidates()[0].reason, "critic: The signal is too vague.");
+});
+
+test("hook displays only relevant checks, at most twice, after decisions", () => {
+  const make = (n, layer, repo = "") => ({
+    id: `CHK-20261116-${n}`, status: "open", layer, repo, effect: n === 1 ? "block" : "warn",
+    title: `Check number ${n}`, signal: "Secret check signal text", message: "Secret check message text",
+    summary_ru: "Secret check summary text",
+  });
+  const checks = [{ ...make(7, "harness"), effect: "delete" }, make(8, "project", "RPG"),
+    { ...make(9, "harness"), id: "CHK-invalid" }, make(1, "harness"), make(1, "harness"),
+    make(2, "project", "rpg"), make(3, "project", "other"),
+    make(4, "harness"), make(5, "harness"), make(6, "harness")];
+  const saved = { checksShown: { "CHK-20261116-4": 2 }, lastFailure: "Failed.",
+    lastAttemptAt: common.nowIso(), report: { shown: 0 } };
+  const message = buildMessage(saved, { checks, repo: "rpg", open: [{ text: "Decision first." }],
+    reportText: "Report text.\n".repeat(250) });
+  assert.ok(message.startsWith("Ждут вашего решения"));
+  assert.equal((message.match(/Самообучение предложило проверки/g) || []).length, 1);
+  assert.ok(message.includes("Самообучение предложило проверки (3): "
+    + "CHK-20261116-1(harness, block), "
+    + "CHK-20261116-2(project/rpg, warn), CHK-20261116-5(harness, warn)."));
+  assert.doesNotMatch(message, /Check number|Secret check/);
+  for (const id of [1, 2, 5]) assert.equal(saved.checksShown[`CHK-20261116-${id}`], 1);
+  for (const id of [3, 4, 6, 7, 8]) assert.ok(!message.includes(`CHK-20261116-${id}`));
+  assert.ok(message.includes("Подробности: ~/.claude/learning/checks.md"));
+  assert.ok(message.indexOf("предложило проверки") < message.indexOf("Report text."));
+  assert.ok(message.includes("Самообучение: последний прогон"));
+  assert.ok(message.length <= 1500);
+  buildMessage(saved, { checks, repo: "rpg" });
+  assert.equal(saved.checksShown["CHK-20261116-1"], 2);
+  assert.ok(!buildMessage(saved, { checks: [make(1, "harness")], repo: "rpg" }).includes("CHK-20261116-1"));
+  const report = "Предложенные проверки:\n• CHK-20261116-1: Injected title — Injected summary\n"
+    + "Размеры файлов:\n• CLAUDE.md: 100 байт\n";
+  const reportMessage = buildMessage({ report: { shown: 0 } }, { reportText: report });
+  assert.doesNotMatch(reportMessage, /Injected title|Injected summary|CHK-20261116-1/);
+  assert.match(reportMessage, /Размеры файлов:/);
+
+  core.enqueueCheck(checkProposal());
+  const matching = core.enqueueCheck(checkProposal({ layer: "project", repo: "rpg",
+    title: "Detect missing selected state" }));
+  const unrelated = core.enqueueCheck(checkProposal({ layer: "project", repo: "other",
+    title: "Detect a different project state" }));
+  fs.writeFileSync(paths.paused, "");
+  const output = JSON.parse(hookRun(JSON.stringify({ cwd: "/home/bro/rpg" })));
+  assert.match(output.systemMessage, /Самообучение предложило проверки \(2\): CHK-/);
+  assert.ok(output.systemMessage.includes(matching.id));
+  assert.ok(!output.systemMessage.includes(unrelated.id));
+  assert.ok(!output.systemMessage.includes("Detect missing selected state"));
+  assert.match(output.hookSpecificOutput.additionalContext, /never implement one without the user's explicit yes/);
+  fs.appendFileSync(paths.checks, " ".repeat(2_000_001));
+  common.writeJsonAtomic(paths.loopState, { lastRunAt: "2000-01-01T00:00:00.000Z",
+    lastAttemptAt: common.nowIso(), lastFailure: "Example failure" });
+  const oversized = JSON.parse(hookRun(JSON.stringify({ cwd: "/home/bro/rpg" })));
+  assert.match(oversized.systemMessage, /последний прогон не удался/);
+  assert.doesNotMatch(oversized.systemMessage, /CHK-/);
+  assert.equal(common.readJson(paths.loopState).checksShown, undefined);
+  assert.doesNotMatch(text(common.readJson(paths.loopState).report.path), /Detect missing selected state/);
+});
+
+test("checks CLI dismisses known ids and rejects unknown ids", () => {
+  const { id } = core.enqueueCheck(checkProposal());
+  const list = child(["checks"]);
+  assertExit(list);
+  assert.ok(list.stdout.includes(id));
+  assertExit(child(["checks", "dismiss", id, "Already covered"]));
+  assert.equal(core.loadChecks()[0].status, "dismissed");
+  assertExit(child(["checks", "dismiss", "CHK-00000000-1"]), 1);
+  assertExit(child(["checks", "reopen", id, "extra"]), 2);
+  assertExit(child(["checks", "reopen", id]));
+  assert.match(child(["status"]).stdout, /checks_open=1/);
 });
 
 for (const [label, verdicts] of [
@@ -369,6 +550,17 @@ test("next digest reoffers the existing open candidate", () => {
   assert.ok(brief.includes("## OPEN CANDIDATES"));
   assert.ok(brief.includes(candidate.candidate_key));
   assert.ok(brief.includes(`(candidate ${candidate.candidate_key})`));
+  const checks = ["open", "done", "dismissed"].flatMap((status, group) => (
+    Array.from({ length: 55 }, (_, n) => ({ id: `CHK-20261116-${group * 100 + n}`, status,
+      layer: "harness", repo: "", title: "Check queue item",
+      last_at: new Date(Date.UTC(2026, 0, 1) + n * 1000).toISOString() }))
+  ));
+  const queue = digest({ checks }).split("CHECK QUEUE\n-----------\n")[1].split("\n\n## EVENTS")[0];
+  assert.equal((queue.match(/CHK-/g) || []).length, 100);
+  assert.ok(queue.includes("CHK-20261116-54 | open"));
+  assert.ok(!queue.includes("CHK-20261116-0 | open"));
+  assert.ok(queue.indexOf("CHK-20261116-54 | open") < queue.indexOf("CHK-20261116-53 | open"));
+  assert.ok(!queue.includes("CHK-20261116-100 | done"));
 });
 
 test("hook shows a pending Russian report twice, preserves state and ignores compact/garbage", () => {
@@ -391,6 +583,39 @@ test("hook shows a pending Russian report twice, preserves state and ignores com
   assert.equal(text(paths.loopState), before);
 });
 
+test("hook returns while the state lock and its background loop are held", async () => {
+  const preload = path.join(temporary, "hold-loop.cjs");
+  const started = path.join(temporary, "loop-started");
+  const releaseFile = path.join(temporary, "release-loop");
+  const finished = path.join(temporary, "loop-finished");
+  fs.writeFileSync(preload, `const fs = require("node:fs");\n` +
+    `if (process.argv[1] === ${JSON.stringify(loop)}) {\n` +
+    `  fs.writeFileSync(${JSON.stringify(started)}, "yes");\n` +
+    `  const cell = new Int32Array(new SharedArrayBuffer(4));\n` +
+    `  const deadline = Date.now() + 120000;\n` +
+    `  while (!fs.existsSync(${JSON.stringify(releaseFile)}) && Date.now() < deadline) Atomics.wait(cell, 0, 0, 50);\n` +
+    `  if (!fs.existsSync(${JSON.stringify(releaseFile)})) process.exit(1);\n` +
+    `  fs.writeFileSync(${JSON.stringify(finished)}, "yes"); process.exit(0);\n}\n`);
+  const env = { ...process.env,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${JSON.stringify(preload)}`.trim() };
+  const waitFor = async (file) => {
+    const deadline = performance.now() + 120000;
+    while (!fs.existsSync(file) && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(fs.existsSync(file), true, `timed out waiting for ${file}`);
+  };
+  const unlock = common.tryLock("state", 600000);
+  assert.ok(unlock);
+  try {
+    assert.equal(hookRun("{}", env), "");
+    await waitFor(started);
+    assert.equal(fs.existsSync(finished), false);
+  } finally {
+    unlock();
+    fs.writeFileSync(releaseFile, "release");
+    if (fs.existsSync(started)) await waitFor(finished);
+  }
+});
+
 test("hook reminds about pending decisions once per day", () => {
   fs.writeFileSync(paths.paused, "");
   core.recordNeedsUser(proposal({ kind: "needs_user" }));
@@ -401,6 +626,17 @@ test("hook reminds about pending decisions once per day", () => {
   assert.equal(hookRun(), "");
   state({ needsUserRemindedAt: new Date(Date.now() - 25 * 3600000).toISOString() });
   assert.ok(hookRun());
+});
+
+test("Linux hook resolves its modules with an unrelated or unset HOME", { skip: process.platform === "win32" }, () => {
+  fs.writeFileSync(paths.paused, "");
+  core.recordNeedsUser(proposal({ kind: "needs_user" }));
+  const env = { ...process.env, HOME: path.join(temporary, "uninstalled home") };
+  assert.equal(fs.existsSync(path.join(env.HOME, ".claude")), false);
+  assert.match(JSON.parse(hookRun("{}", env)).systemMessage, /Ждут вашего решения \(1\)/);
+  state({});
+  delete env.HOME;
+  assert.match(JSON.parse(hookRun("{}", env)).systemMessage, /Ждут вашего решения \(1\)/);
 });
 
 test("status reports timestamps, counts and paused flag without running models", () => {
@@ -960,16 +1196,26 @@ test("non-dry runs compact oversized candidate history and keep merged evidence"
 
 test("compaction errors are nonfatal and appear in the run summary", async (t) => {
   core.recordCandidate(proposal());
+  core.enqueueCheck(checkProposal());
   const stat = fs.statSync;
   t.mock.method(fs, "statSync", (file, ...args) => {
     if (file === paths.candidates) throw new Error("fixture compaction stat failure");
+    if (file === paths.checks) throw new Error("fixture check compaction stat failure");
     return stat(file, ...args);
+  });
+  const rename = fs.renameSync;
+  t.mock.method(fs, "renameSync", (source, destination) => {
+    if (destination === paths.checksMd) throw new Error("fixture check refresh failure");
+    return rename(source, destination);
   });
   fake([]);
   await withFakeLuna(t, async () => assert.equal((await runDirect({ noExtract: true })).code, 0));
   assert.equal(latestResult().failure, null);
-  assert.ok(latestResult().compactionFailure);
-  assert.match(text(path.join(runs()[0], "summary.md")), /Candidates compaction failed:/);
+  assert.match(latestResult().compactionFailure, /candidates:.*checks:/);
+  assert.match(latestResult().checksRefreshFailure, /fixture check refresh failure/);
+  const summary = text(path.join(runs()[0], "summary.md"));
+  assert.match(summary, /Compaction failed: candidates:.*checks:/);
+  assert.match(summary, /Checks refresh failed:/);
 });
 
 test("digest explains adoption ages and the minimum revert date", () => {

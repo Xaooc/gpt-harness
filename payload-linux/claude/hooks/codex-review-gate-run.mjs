@@ -20,11 +20,13 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { codexPluginRoot } from "../scripts/lib/codex-plugin.mjs";
 
-import { loadProxyEnv } from "../scripts/lib/luna-runtime.mjs";
+import { loadProxyEnv, readProcess } from "../scripts/lib/luna-runtime.mjs";
+import { releaseLease, tryShared } from "../scripts/account-lease.mjs";
 
-function main() {
+async function main() {
   // Read the Stop event payload CC sends on stdin (cwd, last_assistant_message,
   // session_id, ...). Forward it verbatim to the plugin hook.
   let input = "";
@@ -45,26 +47,38 @@ function main() {
   const pluginData = path.join(home, ".claude", "plugins", "data", "codex-openai-codex");
   if (!fs.existsSync(gateHook)) return; // plugin source missing → no-op
 
-  loadProxyEnv();
-  const child = spawnSync(process.execPath, [gateHook], {
-    input,
-    // stdout/stderr inherited → the plugin hook's decision JSON reaches CC,
-    // its notes reach the transcript. 16-min cap matches the plugin's own.
-    stdio: ["pipe", "inherit", "inherit"],
-    timeout: 16 * 60 * 1000,
-    env: {
-      ...process.env,
-      CLAUDE_PLUGIN_ROOT: pluginRoot,
-      CLAUDE_PLUGIN_DATA: pluginData,
-    },
-  });
+  // Stop hooks must fail open immediately when an exclusive request is held or pending.
+  const account = tryShared({ purpose: "codex review gate" });
+  if (!account.lease) return;
+  try {
+    loadProxyEnv();
+    const leaseScript = fileURLToPath(new URL("../scripts/account-lease.mjs", import.meta.url));
+    const child = spawnSync(process.execPath, [leaseScript, "run", "--mode", "shared", "--purpose", "luna-review",
+      "--", process.execPath, gateHook], {
+      input,
+      // stdout/stderr inherited → the plugin hook's decision JSON reaches CC,
+      // its notes reach the transcript. 16-min cap matches the plugin's own.
+      stdio: ["pipe", "inherit", "inherit"],
+      timeout: 16 * 60 * 1000,
+      env: {
+        ...process.env,
+        CLAUDE_PLUGIN_ROOT: pluginRoot,
+        CLAUDE_PLUGIN_DATA: pluginData,
+        LUNA_LEASE_INHERIT_ID: account.lease.id,
+        LUNA_LEASE_WRAPPER_PID: String(process.pid),
+        LUNA_LEASE_WRAPPER_START: readProcess(process.pid)?.started || "",
+      },
+    });
 
-  // Forward the plugin hook's exit code so a non-JSON block path still works.
-  if (typeof child.status === "number") process.exitCode = child.status;
+    // Forward the plugin hook's exit code so a non-JSON block path still works.
+    if (typeof child.status === "number" && child.status !== 75) process.exitCode = child.status;
+  } finally {
+    await releaseLease(account.lease.id);
+  }
 }
 
 try {
-  main();
+  await main();
 } catch {
   process.exitCode = 0;
 }

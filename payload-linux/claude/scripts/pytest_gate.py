@@ -5,11 +5,12 @@ Usage (from the repo or worktree root, any shell):
 
 It waits until `n` worker slots are free in a shared pool (POOL_SIZE total across
 all runs on this machine) and until free RAM is above MIN_FREE_GB, then runs
-`python -m uv run pytest -n <n> <args>` in the current directory, releases the
+`uv run pytest -n <n> <args>` in the current directory (falling back to the uv module
+or pytest module when needed), releases the
 slots and exits with pytest's own exit code. The OS releases locks when their owner exits.
 
 Disk and garbage (owner rule 2026-10-24: test runs must not kill the SSD or leave files):
-- a run does not start while the temp drive has less than MIN_FREE_DISK_GB free (exit 75);
+- a run does not start while the run storage has less than MIN_FREE_DISK_GB free (exit 75);
 - `-n`/`--numprocesses` given after `--` count too: the cap and the slots are what pytest
   really starts;
 - every run gets its own --basetemp under RUNS_DIR (unless the caller passed one) and
@@ -17,18 +18,34 @@ Disk and garbage (owner rule 2026-10-24: test runs must not kill the SSD or leav
 - a green run deletes its directory; a red one keeps it for inspection, and runs older
   than KEEP_HOURS (or beyond the newest KEEP_FAILED) are deleted at the next start;
 - workers default to 4 and are capped at MAX_WORKERS (default 4) and POOL_SIZE.
+
+Queue: flocked tickets are served FIFO. A smaller run may backfill only while the
+oldest eligible ticket has been head for less than BACKFILL_SECONDS and no earlier
+waiter fits. After that, slots stay idle until the head fits; its extra delay is
+bounded by the window plus the runtime of runs admitted during it. With finite
+runs, active waiters each become head and do not starve. Ticket liveness uses
+flock, not PIDs, since PIDs differ between namespaces. Frozen tickets are skipped
+until they heartbeat. Use --status to inspect the pool. During a transition, old
+gates ignore tickets and queue.lock and compete with the head for slots; once old
+waiters drain, the head is served. A freed slot can remain idle for one poll
+interval. A stopped queue.lock holder is reported by waiters and by --status,
+which shows a read-only snapshot if it cannot acquire the lock.
 """
 
 from __future__ import annotations
 
 import errno
+import importlib.util
+import json
 import os
+import secrets
 import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 if sys.platform == "linux":
@@ -55,12 +72,56 @@ def default_slot_dir() -> Path:
     return Path("/tmp") / f"pytest-gate-{uid}"
 
 
+def _writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".probe-{os.getpid()}"
+        probe.touch()
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def default_runs_dir() -> Path:
+    """A disk-backed home for per-run temp dirs (/tmp is a small RAM tmpfs on this machine).
+
+    The user cache comes first; an executor sandbox can mount it read-only, so the project's own ignored `.tmp/`
+    (the harness convention) is the fallback, and the system temp dir the last resort.
+    """
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "pytest-gate-runs"
+    for candidate in (cache, Path.cwd() / ".tmp" / "pytest-gate-runs"):
+        if _writable_dir(candidate):
+            return candidate
+    return Path(tempfile.gettempdir()) / "pytest-gate-runs"
+
+
 SLOT_DIR = Path(os.environ.get("PYTEST_GATE_DIR") or default_slot_dir())
 POOL_IS_PRIVATE = False
-RUNS_DIR = Path(os.environ.get("PYTEST_GATE_RUNS", Path(tempfile.gettempdir()) / "pytest-gate-runs"))
-POLL_SECONDS = 5
+RUNS_DIR = Path(os.environ.get("PYTEST_GATE_RUNS", default_runs_dir()))
+POLL_SECONDS = float(os.environ.get("PYTEST_GATE_POLL_S", "5"))
+BACKFILL_SECONDS = float(os.environ.get("PYTEST_GATE_BACKFILL_S", "600"))
+FROZEN_SECONDS = float(os.environ.get("PYTEST_GATE_FROZEN_S", "120"))
 REFUSED_DISK = 75  # not a pytest exit code (pytest uses 0-5)
 GREEN = {0, 5}  # passed, or nothing collected: no failing test dir worth keeping
+RUN_SLOTS = ""
+RUN_PYTEST_WORKERS = ""
+
+
+def pytest_launcher() -> list[str]:
+    override = os.environ.get("PYTEST_GATE_LAUNCHER")
+    if override is not None:
+        prefix = json.loads(override)
+        if not isinstance(prefix, list) or not prefix or not all(isinstance(arg, str) and arg for arg in prefix):
+            raise ValueError("PYTEST_GATE_LAUNCHER must be a nonempty JSON array of argv strings")
+        return prefix
+    uv = shutil.which("uv")
+    if uv is not None:
+        return [uv, "run", "pytest"]
+    if importlib.util.find_spec("uv") is not None:
+        return [sys.executable, "-m", "uv", "run", "pytest"]
+    print("[pytest_gate] uv unavailable; using python -m pytest", flush=True)
+    return [sys.executable, "-m", "pytest"]
 
 
 def free_ram_gb() -> float:
@@ -134,11 +195,19 @@ def stop_group(pgid: int, start: str) -> None:
         time.sleep(0.05)
 
 
+def pid_namespace() -> str:
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+
+
 def slot_text(pgid: int = 0, child_start: str = "") -> str:
     start = process_identity(os.getpid())["start"]
     return (f"{os.getpid()} {os.getcwd()}\n" +
             f"pid_start={start}\npgid={pgid}\npgid_start={child_start}\n" +
-            f"time={time.time():.6f}\n")
+            f"time={time.time():.6f}\nslots={RUN_SLOTS}\n" +
+            f"pytest_workers={RUN_PYTEST_WORKERS}\npidns={pid_namespace()}\n")
 
 
 def _owner_pids(run: Path) -> list[int]:
@@ -152,8 +221,9 @@ def _owner_pids(run: Path) -> list[int]:
         live = []
         for index, pid in enumerate(pids):
             start = starts.get(f"start_{pid}", "")
-            pattern = "pytest_gate.py" if index == 0 else "-m uv"
-            if same_process(pid, start, pattern) or (index > 0 and same_process(pid, start, "pytest")):
+            # All launchers carry pytest; retain recognition of legacy uv module owners.
+            patterns = ("pytest_gate.py",) if index == 0 else ("pytest", "-m uv")
+            if any(same_process(pid, start, pattern) for pattern in patterns):
                 live.append(pid)
         return live
     except (OSError, ValueError, IndexError):
@@ -332,9 +402,10 @@ def prepare_pool() -> None:
         use_private_pool(exc)
 
 
-def _open_slot(index: int) -> int | None:
+def _open_slot(index: int | str, create: bool = True) -> int | None:
     path = SLOT_DIR / f"slot-{index}.lock"
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600)
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags | (os.O_CREAT if create else 0), 0o600)
     try:
         os.set_inheritable(fd, False)
         try:
@@ -393,7 +464,396 @@ def busy_slots() -> int:
     return busy
 
 
+def _lock_holder(pool: Path) -> tuple[str, str]:
+    try:
+        lines = (pool / "queue.lock").read_text(errors="replace").splitlines()
+        fields = dict(line.split("=", 1) for line in lines if "=" in line)
+    except OSError:
+        fields = {}
+    namespace = fields.get("pidns", "")
+    label = " (other pid ns)" if namespace and namespace != pid_namespace() else ""
+    holder = f"pid {fields.get('pid') or '?'}{label} ({fields.get('cwd') or '?'})"
+    return holder, fields.get("since", "")
+
+
+@contextmanager
+def queue_lock(pool: Path | None = None, timeout: float | None = None):
+    pool = SLOT_DIR if pool is None else pool
+    fd = os.open(pool / "queue.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        started = time.monotonic()
+        warned = False
+        while not _try_ticket_lock(fd):
+            waited = time.monotonic() - started
+            if timeout is not None and waited >= timeout:
+                yield False
+                return
+            if timeout is None and waited > 30 and not warned:
+                holder, _ = _lock_holder(pool)
+                print(f"[pytest_gate] queue.lock held for 30s+ by {holder}; "
+                      "a gate may be stopped mid-decision", flush=True)
+                warned = True
+            time.sleep(0.05)
+        try:
+            holder = (f"pid={os.getpid()}\npidns={pid_namespace()}\n"
+                      f"cwd={os.getcwd()}\nsince={time.time()}\n")
+            os.ftruncate(fd, 0)
+            os.write(fd, holder.encode("utf-8", errors="replace"))
+        except OSError:
+            pass
+        (pool / "queue").mkdir(exist_ok=True)
+        yield True
+    finally:
+        os.close(fd)
+
+
+def _same_file(path: Path, fd: int) -> bool:
+    try:
+        named, opened = path.stat(), os.fstat(fd)
+        return (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino)
+    except FileNotFoundError:
+        return False
+
+
+class Ticket:
+    def __init__(self, workers: int, pytest_workers: int, argv: list[str]):
+        self.name = f"{time.monotonic_ns():020d}-{os.getpid()}-{secrets.token_hex(4)}.ticket"
+        self.path = SLOT_DIR / "queue" / self.name
+        self.fd = None
+        identity = process_identity(os.getpid()) or {}
+        args = " ".join(argv).replace("\n", " ").replace("\r", " ")[:300]
+        self.content = (f"pid={os.getpid()}\npid_start={identity.get('start', '')}\n"
+                        f"pidns={pid_namespace()}\ncwd={os.getcwd()}\nslots={workers}\n"
+                        f"pytest_workers={pytest_workers}\narrived={time.time():.6f}\nargs={args}\n")
+
+    def create(self) -> None:
+        self.path.parent.mkdir(exist_ok=True)
+        pending = self.path.with_name(f".{self.name}.new")
+        fd = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            data = self.content.encode("utf-8", errors="replace")
+            while data:
+                data = data[os.write(fd, data):]
+            os.rename(pending, self.path)
+        except BaseException:
+            try:
+                if _same_file(self.path, fd):
+                    self.path.unlink(missing_ok=True)
+                if _same_file(pending, fd):
+                    pending.unlink(missing_ok=True)
+            finally:
+                os.close(fd)
+            raise
+        old_fd, self.fd = self.fd, fd
+        if old_fd is not None:
+            os.close(old_fd)
+
+    def heartbeat(self) -> None:
+        os.utime(self.fd)
+        if os.fstat(self.fd).st_nlink == 0:
+            self.create()
+
+    def remove(self) -> None:
+        if self.fd is not None:
+            try:
+                if _same_file(self.path, self.fd):
+                    self.path.unlink(missing_ok=True)
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+def cleanup_ticket(ticket: Ticket | None) -> None:
+    if ticket is None or ticket.fd is None:
+        return
+    try:
+        with queue_lock(ticket.path.parent.parent):
+            ticket.remove()
+    except OSError:
+        # If the pool cannot be locked, closing makes the ticket prunable.
+        if ticket.fd is not None:
+            os.close(ticket.fd)
+            ticket.fd = None
+
+
+def _try_ticket_lock(fd: int) -> bool:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+            return False
+        raise
+
+
+def _ticket_data(fd: int) -> dict:
+    text = os.pread(fd, 65536, 0).decode("utf-8", errors="replace")
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def queue_entries(own: Ticket | None = None, prune: bool = True) -> list[dict]:
+    queue_dir = SLOT_DIR / "queue"
+    now = time.time()
+    if prune:
+        for path in queue_dir.glob(".*.new"):
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except FileNotFoundError:
+                continue
+            try:
+                if _try_ticket_lock(fd) and now - os.fstat(fd).st_mtime > 60 and _same_file(path, fd):
+                    path.unlink(missing_ok=True)
+            finally:
+                os.close(fd)
+    entries = []
+    for path in sorted(queue_dir.glob("*.ticket")):
+        is_own = own is not None and path.name == own.name
+        if is_own:
+            fd = own.fd
+        else:
+            try:
+                fd = os.open(path, os.O_RDWR if prune else os.O_RDONLY)
+            except FileNotFoundError:
+                continue
+        try:
+            dead = not is_own and _try_ticket_lock(fd)
+            if dead and prune:
+                if _same_file(path, fd):
+                    path.unlink(missing_ok=True)
+                continue
+            row = _ticket_data(fd)
+            row["name"] = path.name
+            row["dead"] = dead
+            row["frozen"] = not dead and not is_own and now - os.fstat(fd).st_mtime > FROZEN_SECONDS
+            entries.append(row)
+        finally:
+            if not is_own:
+                os.close(fd)
+    return entries
+
+
+def _head_since(name: str, now: int, write: bool) -> int:
+    path = SLOT_DIR / "queue-head"
+    try:
+        old_name, value = path.read_text().split()
+        since = int(value)
+        if old_name == name and 0 <= since <= now:
+            return since
+    except (OSError, ValueError):
+        pass
+    if write:
+        fd, temporary = tempfile.mkstemp(prefix=".queue-head-", dir=SLOT_DIR)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                stream.write(f"{name} {now}\n")
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    return now
+
+
+def may_start(position: int, slots_needed: list[int], free: int, head_age: float) -> bool:
+    if free < slots_needed[position]:
+        return False
+    if position == 0:
+        return True
+    return head_age < BACKFILL_SECONDS and all(free < needed for needed in slots_needed[:position])
+
+
+def _needed(row: dict) -> int:
+    try:
+        needed = int(row["slots"])
+        return needed if needed > 0 else POOL_SIZE
+    except (KeyError, ValueError):
+        return POOL_SIZE
+
+
+def decide(ticket: Ticket, workers: int, report_busy: bool) -> tuple[list[int], int, int, int]:
+    with queue_lock():
+        ticket.heartbeat()
+        queue = [row for row in queue_entries(ticket) if not row["frozen"]]
+        if not any(row["name"] == ticket.name for row in queue) and os.fstat(ticket.fd).st_nlink == 0:
+            ticket.create()
+            queue = [row for row in queue_entries(ticket) if not row["frozen"]]
+        position = next(index for index, row in enumerate(queue) if row["name"] == ticket.name)
+        now = time.monotonic_ns()
+        head_age = (now - _head_since(queue[0]["name"], now, True)) / 1e9
+        if free_ram_gb() < MIN_FREE_GB:
+            return [], position, len(queue), busy_slots() if report_busy else 0
+        taken = []
+        try:
+            for index in range(POOL_SIZE):
+                fd = _open_slot(index)
+                if fd is not None:
+                    taken.append(fd)
+            busy = POOL_SIZE - len(taken)
+            if may_start(position, [_needed(row) for row in queue], len(taken), head_age):
+                release_slots(taken[workers:])
+                del taken[workers:]
+                for fd in taken:
+                    write_slot(fd)
+                ticket.remove()
+                slots, taken = taken, []
+                return slots, position, len(queue), busy
+            return [], position, len(queue), busy
+        finally:
+            release_slots(taken)
+
+
+def wait_for_slots(workers: int, pytest_workers: int, argv: list[str]) -> list[int]:
+    ticket = None
+    started = time.monotonic()
+    announced = False
+    announced_head = False
+    try:
+        while True:
+            try:
+                if ticket is None:
+                    with queue_lock():
+                        ticket = Ticket(workers, pytest_workers, argv)
+                        ticket.create()
+                slots, position, count, busy = decide(ticket, workers, not announced)
+            except OSError as exc:
+                use_private_pool(exc)
+                cleanup_ticket(ticket)
+                ticket = None
+                continue
+            try:
+                if announced and position == 0 and not announced_head:
+                    print("[pytest_gate] first in queue", flush=True)
+                    announced_head = True
+                if slots:
+                    if announced:
+                        print(f"[pytest_gate] acquired after {time.monotonic() - started:.0f}s", flush=True)
+                    return slots
+                if not announced:
+                    print(f"[pytest_gate] waiting for {workers} of {POOL_SIZE} slots ({busy} busy) / "
+                          f"{MIN_FREE_GB} GB free RAM; queue position {position + 1} of {count}", flush=True)
+                    announced = True
+            except BaseException:
+                release_slots(slots)
+                raise
+            time.sleep(POLL_SECONDS)
+    finally:
+        cleanup_ticket(ticket)
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _elapsed(value: str, now: float) -> str:
+    try:
+        return _duration(now - float(value))
+    except (ValueError, OverflowError):
+        return "?"
+
+
+def _namespace_label(namespace: str, own: str, pid: str, start: str) -> str:
+    if namespace:
+        return " (other pid ns)" if namespace != own else ""
+    try:
+        local = same_process(int(pid), start, "pytest_gate.py")
+    except ValueError:
+        local = False
+    return "" if local else " (other pid ns)"
+
+
+def status() -> int:
+    if not SLOT_DIR.is_dir():
+        print(f"[pytest_gate] no pool at {SLOT_DIR}")
+        return 0
+    with queue_lock(timeout=3) as locked:
+        if not locked:
+            holder, since = _lock_holder(SLOT_DIR)
+            print(f"[pytest_gate] queue.lock busy for 3s+: held by {holder} "
+                  f"since {_elapsed(since, time.time())} ago")
+        configured = {str(index) for index in range(POOL_SIZE)}
+        indexes = configured | {path.name[5:-5] for path in SLOT_DIR.glob("slot-*.lock")}
+        indexes = sorted(indexes, key=lambda value: (not value.isdigit(), int(value) if value.isdigit() else value))
+        holders, unknown = {}, []
+        free = 0
+        now = time.time()
+        namespace = pid_namespace()
+        for index in indexes:
+            try:
+                fd = _open_slot(index, create=False)
+            except FileNotFoundError:
+                fd = -1
+            if fd is not None:
+                if fd != -1:
+                    os.close(fd)
+                if index in configured:
+                    free += 1
+                continue
+            try:
+                lines = (SLOT_DIR / f"slot-{index}.lock").read_text(errors="replace").splitlines()
+                pid, cwd = lines[0].split(maxsplit=1)
+                if not pid.isdigit() or int(pid) <= 0:
+                    raise ValueError("invalid pid")
+                fields = dict(line.split("=", 1) for line in lines[1:] if "=" in line)
+            except (OSError, ValueError, IndexError):
+                unknown.append(index)
+                continue
+            outside = index not in configured
+            key = pid, fields.get("pid_start", ""), outside
+            if key not in holders:
+                holders[key] = {"pid": pid, "cwd": cwd, "count": 0, "outside": outside, **fields}
+            holders[key]["count"] += 1
+        queue = queue_entries(prune=locked)
+        active = [row for row in queue if not row["frozen"] and not row["dead"]]
+        if active:
+            monotonic = time.monotonic_ns()
+            age = (monotonic - _head_since(active[0]["name"], monotonic, False)) / 1e9
+            backfill = (f"backfill open {_duration(BACKFILL_SECONDS - age)} more"
+                        if age < BACKFILL_SECONDS else "backfill closed")
+            detail = f"head for {_duration(age)}, {backfill}"
+        elif any(not row["dead"] for row in queue):
+            detail = "all frozen"
+        else:
+            detail = "no live waiters"
+    busy = POOL_SIZE - free
+    print(f"[pytest_gate] pool {SLOT_DIR}: {POOL_SIZE} slots, {busy} busy, {free} free; "
+          f"RAM {free_ram_gb():.1f} GB free (min {MIN_FREE_GB:.1f})")
+    if not holders and not unknown:
+        print("holders: none")
+    else:
+        print("holders:")
+        for row in holders.values():
+            label = _namespace_label(row.get("pidns", ""), namespace, row["pid"], row.get("pid_start", ""))
+            workers = row.get("pytest_workers") or "?"
+            duration = _elapsed(row.get("time", ""), now)
+            outside = f" (outside pool of {POOL_SIZE})" if row["outside"] else ""
+            print(f"  pid {row['pid']}{label}  -n {workers}  slots {row['count']}  "
+                  f"{duration}  {row['cwd']}{outside}")
+        for index in unknown:
+            outside = f" (outside pool of {POOL_SIZE})" if index not in configured else ""
+            print(f"  busy slot {index} (unknown holder){outside}")
+    if not queue:
+        print("queue: empty")
+        return 0
+    print(f"queue ({len(queue)} waiting; {detail}):")
+    for index, row in enumerate(queue, 1):
+        label = _namespace_label(row.get("pidns", ""), namespace, row.get("pid", ""), row.get("pid_start", ""))
+        duration = _elapsed(row.get("arrived", ""), now)
+        frozen = " [frozen]" if row["frozen"] else ""
+        dead = " [dead]" if row["dead"] else ""
+        print(f"  {index}. pid {row.get('pid') or '?'}{label}  -n {row.get('pytest_workers') or '?'}"
+              f"  slots {row.get('slots') or '?'}  waited {duration}  {row.get('cwd', '?')}"
+              f"  {row.get('args', '')}{frozen}{dead}")
+    return 0
+
+
 def main() -> int:
+    global RUN_SLOTS, RUN_PYTEST_WORKERS
     argv = sys.argv[1:]
     workers = 4
     if len(argv) >= 2 and argv[0] == "-n":
@@ -401,37 +861,19 @@ def main() -> int:
         argv = argv[2:]
     if argv and argv[0] == "--":
         argv = argv[1:]
+    ticket_args = argv[:]
     argv, workers, pytest_workers, serial_count = select_workers(argv, workers)
+    RUN_SLOTS, RUN_PYTEST_WORKERS = workers, pytest_workers
     if serial_count:
         print(f"[pytest_gate] {serial_count} test ids: running without xdist workers", flush=True)
     prepare_pool()
     prune_runs()
     disk = free_disk_gb(RUNS_DIR)
     if disk < MIN_FREE_DISK_GB:
-        print(f"[pytest_gate] refused: {disk:.1f} GB free on the temp drive, need "
+        print(f"[pytest_gate] refused: {disk:.1f} GB free on the run storage, need "
               f"{MIN_FREE_DISK_GB:.0f} GB. Clean up before testing.", flush=True)
         return REFUSED_DISK
-    started = time.monotonic()
-    announced = False
-    while True:
-        enough_ram = free_ram_gb() >= MIN_FREE_GB
-        try:
-            if enough_ram:
-                slots = try_acquire(workers)
-                if slots:
-                    break
-            if not announced:
-                busy = busy_slots()
-                print(f"[pytest_gate] waiting for {workers} of {POOL_SIZE} slots ({busy} busy) / "
-                      f"{MIN_FREE_GB} GB free RAM", flush=True)
-                announced = True
-        except OSError as exc:
-            use_private_pool(exc)
-            continue
-        time.sleep(POLL_SECONDS)
-    waited = time.monotonic() - started
-    if announced:
-        print(f"[pytest_gate] acquired after {waited:.0f}s", flush=True)
+    slots = wait_for_slots(workers, pytest_workers, ticket_args)
     own_temp = None
     if not any(arg == "--basetemp" or arg.startswith("--basetemp=") for arg in argv):
         own_temp = RUNS_DIR / f"run-{os.getpid()}-{int(time.time())}"
@@ -450,7 +892,7 @@ def main() -> int:
     try:
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             previous[sig] = signal.signal(sig, forward)
-        command = [sys.executable, "-m", "uv", "run", "pytest", "-n", str(pytest_workers), *argv]
+        command = [*pytest_launcher(), "-n", str(pytest_workers), *argv]
         # Block termination until the child's identity and slot reservations are durable.
         signals = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
@@ -490,6 +932,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--status":
+        sys.exit(status())
     if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
         if sys.platform != "linux":
             print("[pytest_gate] Linux self-test skipped: requires Linux", flush=True)

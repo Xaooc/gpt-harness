@@ -11,21 +11,27 @@ actually happened in past sessions, automatically, with deterministic guards. Fu
 | `hooks/learning-capture.mjs` | Stop / SessionEnd hook. Starts transcript extraction in the background. |
 | `hooks/learning-session-start.mjs` | SessionStart hook. Starts a due run, shows a short report and decisions awaiting the user. |
 | `scripts/learning/extract.mjs` | Turns transcripts into events: corrections, interrupts, Luna jobs, executor assumptions, critic outputs. |
-| `scripts/learning/loop.mjs` | One run: proposer → code gates → critic → apply/log. CLI: `run`, `status`, `list`, `report`, `revert`. |
+| `scripts/learning/loop.mjs` | Runs the loop; CLI: `run`, `status`, `checks`, `list`, `report`, `revert`. |
 | `scripts/learning/core.mjs` | Validation, application and reversal of edits (the guards live here, not in prompts). |
 | `scripts/learning/registry.mjs` | Registry of Luna jobs. `luna.sh` records every finished job. |
 | `scripts/learning/prompts/` | Proposer (Luna, effort max) and adversarial critic (Sol, effort high) prompts. |
 | `scripts/learning-revert.sh <id>` | Reverts one adopted edit. |
 | `learning/config.json` | Thresholds and budgets. Installed only if absent. |
 
-Data accumulates in `~/.claude/learning/` (`events.jsonl`, `adopted.md`, `candidates.jsonl`, `runs/`,
-`reports/`, `backups/`). It is never shipped in this repo.
+Data accumulates in `~/.claude/learning/` (`events.jsonl`, `adopted.md`, `candidates.jsonl`, `checks.jsonl`,
+`checks.md`, `runs/`, `reports/`, `backups/`). It is never shipped in this repo.
+
+## Checks first
+When a correction can be detected by code, the loop proposes a harness or project check. It queues the proposal;
+it never implements the check automatically. List checks with `node ~/.claude/scripts/learning/loop.mjs checks`,
+or close one with `node ~/.claude/scripts/learning/loop.mjs checks done <id>` or
+`node ~/.claude/scripts/learning/loop.mjs checks dismiss <id>`.
 
 ## How a run works
 1. **Trigger.** At session start, if more than 24 h passed since the last run and there are at least 5 new events.
    A failed run is retried after 6 h.
-2. **Proposer.** Luna reads the new events and suggests at most 3 edits to `CLAUDE.md`, `skills/luna/SKILL.md` or
-   `skills/luna-critics/SKILL.md`. Each edit cites events with verbatim quotes.
+2. **Proposer.** Luna reads the new events and suggests at most 3 checks and 3 edits to `CLAUDE.md`,
+   `skills/luna/SKILL.md` or `skills/luna-critics/SKILL.md`. Each proposal cites events with verbatim quotes.
 3. **Code gates.** An edit passes only if:
    - its evidence comes from **≥ 2 different sessions** or includes **an explicit correction by the user**, and every
      quote is re-checked against the source transcript;
@@ -33,11 +39,11 @@ Data accumulates in `~/.claude/learning/` (`events.jsonl`, `adopted.md`, `candid
    - it touches no protected line. Protected lines are user decisions, `NEVER`, safety and confirmation rules, the
      `learning:protected` block, and frontmatter;
    - it adds no wording that weakens safeguards.
-4. **Critic.** Sol checks each edit: is the evidence real, is the rule over-generalised, does it conflict with a
-   user decision, does it weaken safety. Its default answer is reject.
-5. **Apply or log.** Approved edits are applied with a backup, an `adopted.md` entry and an id. Everything else
-   goes to `candidates.jsonl` and is re-offered when more evidence arrives. Questions only the user can decide
-   appear at session start as "needs your decision".
+4. **Critic.** Sol checks each proposal: is the evidence real, is it over-generalised, does it conflict with a
+   user decision, does it weaken safety, and could code enforce it. Its default answer is reject.
+5. **Apply, queue or log.** Approved checks are queued for the user to consider. Approved edits are applied with a
+   backup, an `adopted.md` entry and an id; edits the critic can enforce in code become check candidates instead.
+   Other lessons go to `candidates.jsonl`. Questions only the user can decide appear at session start.
 6. **Regression revert.** If failures tied to an adopted edit grow afterwards, the edit is reverted automatically.
    This needs a 3-day window or an explicit user correction.
 

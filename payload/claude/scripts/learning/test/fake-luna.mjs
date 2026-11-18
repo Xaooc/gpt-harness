@@ -15,6 +15,6 @@ export function fakeLuna(role, briefPath, outPath) {
   return { status: 0, stdout: "", stderr: "" };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv.length >= 5 && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   process.exitCode = fakeLuna(...process.argv.slice(2)).status;
 }

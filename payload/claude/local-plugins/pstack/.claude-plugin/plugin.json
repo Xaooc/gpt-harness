@@ -1,0 +1,8 @@
+{
+  "name": "pstack",
+  "version": "0.15.42-bro.7",
+  "description": "Lauren Tan's pstack (MIT): poteto-mode playbooks, principles and verification skills, adapted to the bro harness (docs/harness/bro-harness.md).",
+  "author": { "name": "Lauren Tan" },
+  "license": "MIT",
+  "homepage": "https://github.com/cursor/plugins/tree/main/pstack"
+}

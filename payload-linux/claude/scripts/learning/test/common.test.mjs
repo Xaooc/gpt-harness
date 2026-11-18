@@ -25,7 +25,8 @@ test("paths stay under the temporary learning directory and ensureDirs creates d
     events: "events.jsonl", eventsOld: "events.1.jsonl", jobs: "jobs.jsonl", attest: "attest.jsonl",
     attestOld: "attest.1.jsonl", extractState: "extract-state.json",
     loopState: "loop-state.json", config: "config.json", adoptedJsonl: "adopted.jsonl",
-    adoptedMd: "adopted.md", candidates: "candidates.jsonl", needsUser: "needs-user.md", logMd: "log.md",
+    adoptedMd: "adopted.md", candidates: "candidates.jsonl", checks: "checks.jsonl", checksMd: "checks.md",
+    needsUser: "needs-user.md", logMd: "log.md",
     reportsDir: "reports", runsDir: "runs", backupsDir: "backups", locksDir: "locks",
     paused: "PAUSED", captureOff: "CAPTURE_OFF",
   };
@@ -336,4 +337,32 @@ test("home expansion falls back to os.homedir when HOME is unset", () => {
      if (toWinPath("~/a b") !== path.join(os.homedir(), "a b")) process.exit(2);`
   ], { env, encoding: "utf8" });
   assert.equal(output, "");
+});
+
+
+test("registry preserves terminal provider usage after scratch status deletion", async () => {
+  const { recordJob } = await import("../registry.mjs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-usage-test-"));
+  try {
+    const registry = path.join(root, "jobs.jsonl");
+    for (const [name, provider, extra, model] of [
+      ["gem", "gemini", "acp_model=gemini-resolved\n", "gemini-resolved"],
+      ["explicit-gem", "gemini", "provider=gemini\n", "alias"],
+      ["codex", "codex", "thread=thread-1\n", "alias"]
+    ]) {
+      const out = path.join(root, name);
+      fs.writeFileSync(`${out}.status`, "state=done\nmodel=alias\neffort=high\ndir=/tmp/repo\n" + extra +
+        "usage_input=100\nusage_cached=20\nusage_output=10\nusage_total=110\n");
+      assert.equal(recordJob(out, { registry }), true);
+      fs.rmSync(`${out}.status`);
+      const record = JSON.parse(fs.readFileSync(registry, "utf8").trim().split("\n").at(-1));
+      assert.equal(record.provider, provider);
+      assert.equal(record.model, model);
+      assert.equal(record.effort, "high");
+      assert.equal(record.dir, "/tmp/repo");
+      for (const [key, value] of Object.entries({ usage_input: 100, usage_cached: 20, usage_output: 10, usage_total: 110 })) {
+        assert.equal(record[key], value);
+      }
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

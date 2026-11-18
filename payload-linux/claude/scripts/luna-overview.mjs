@@ -10,12 +10,17 @@ import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import {
+  loadConfigWithSource, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
+} from './conveyor/lib/orchestration.mjs';
+import { summarizeUsage, usagePaths } from './conveyor/usage.mjs';
+import { quotaPaths, quotaRefreshLocked } from './conveyor/gemini-quota.mjs';
 
 const DEADLINE_MS = 1750;
 const TAIL_BYTES = 64 * 1024;
 const ACTIVE_LIMIT = 200;
 const LEGACY_MAX_AGE_MS = 10 * 60 * 1000;
-const terminal = new Set(['done', 'failed', 'incomplete', 'stalled', 'completed', 'cancelled']);
+const terminal = new Set(['done', 'failed', 'incomplete', 'stalled', 'completed', 'cancelled', 'unavailable', 'stopped']);
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const string = (value) => typeof value === 'string' ? value : '';
 const number = (value) => typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -31,10 +36,12 @@ const localPath = (value) => typeof value === 'string' && path.isAbsolute(value)
 
 function configuration() {
   const home = path.resolve(process.env.HOME || homedir());
-  const run = path.resolve(process.env.LUNA_OVERVIEW_HOME || path.join(home, '.claude', 'luna-run'));
+  const run = path.resolve(process.env.LUNA_OVERVIEW_HOME || process.env.LUNA_RUN_DIR || path.join(home, '.claude', 'luna-run'));
   return {
-    run,
-    daemon: path.resolve(process.env.LUNA_DAEMON_HOME || run)
+    run, daemon: path.resolve(process.env.LUNA_DAEMON_HOME || run),
+    registry: path.join(home, '.claude', 'learning', 'jobs.jsonl'),
+    codexConfig: path.join(home, '.codex', 'config.toml'),
+    geminiStatus: '/srv/docker/compose/antigravity-parallel/data/status.json'
   };
 }
 
@@ -43,7 +50,11 @@ function empty(now = Date.now()) {
     v: 1, at: new Date(now).toISOString(),
     ram: { freeMb: null, totalMb: null },
     daemon: { running: false, appServer: null, healthy: false }, jobs: [], codexLimits: null, build: null,
-    sessions: []
+    sessions: [],
+    orchestration: { source: null, chains: {}, panels: {}, threshold: null, marks: {}, presets: [], catalog: {}, configError: null },
+    switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null,
+      quota: { available: false, buckets: [], at: null } },
+    usage: { ...summarizeUsage(null, now), stale: true }
   };
 }
 
@@ -65,6 +76,75 @@ async function readJson(file) {
     const value = JSON.parse(await readText(file));
     return object(value) ? value : null;
   } catch { return null; }
+}
+
+async function usageStatus(now) {
+  const paths = usagePaths(), cache = await readJson(paths.cache);
+  const usage = summarizeUsage(cache?.v === 1 ? cache : null, now);
+  usage.stale = !Number.isFinite(Date.parse(usage.at)) || now - Date.parse(usage.at) > 120_000;
+  if (usage.stale) {
+    const owner = await readJson(path.join(paths.lock, 'owner.json'));
+    if (!owner || !matchingProcess(owner.pid, owner.start)) {
+      try {
+        // Override supports an isolated fake collector; real collectors serialize on usage-state.json.lock.
+        const collector = process.env.LUNA_USAGE_COLLECTOR || fileURLToPath(new URL('./conveyor/usage.mjs', import.meta.url));
+        const child = spawn(process.execPath, [collector, 'collect'], { detached: true, stdio: 'ignore', windowsHide: true });
+        child.on('error', () => {});
+        child.unref();
+      } catch {}
+    }
+  }
+  return usage;
+}
+
+async function geminiQuotaStatus(now) {
+  const cache = await readJson(quotaPaths().cache);
+  const age = now - Date.parse(cache?.at);
+  const quota = {
+    available: cache?.available === true, buckets: Array.isArray(cache?.buckets) ? cache.buckets.map((bucket) => ({
+      name: string(bucket.name),
+      ...(number(bucket.remainingFraction) !== null ? { remainingFraction: bucket.remainingFraction } : {}),
+      ...(number(bucket.usedPercent) !== null ? { usedPercent: bucket.usedPercent } : {}),
+      ...(string(bucket.resetAt) ? { resetAt: bucket.resetAt } : {})
+    })) : [], at: string(cache?.at) || null,
+    ...(string(cache?.reason) ? { reason: cache.reason } : {}),
+    ...(string(cache?.lastExhaustedAt || cache?.proxy?.lastExhaustedAt)
+      ? { lastExhaustedAt: cache.lastExhaustedAt || cache.proxy.lastExhaustedAt } : {})
+  };
+  if ((!Number.isFinite(age) || age < 0 || age > 600_000) && !quotaRefreshLocked()) {
+    try {
+      const refresher = process.env.LUNA_GEMINI_QUOTA_CMD ||
+        fileURLToPath(new URL('./conveyor/gemini-quota.mjs', import.meta.url));
+      const child = spawn(process.execPath, [refresher, '--json', '--refresh'], {
+        detached: true, stdio: 'ignore', windowsHide: true
+      });
+      child.on('error', () => {});
+      child.unref();
+    } catch {}
+  }
+  return quota;
+}
+
+async function readTail(file, limit = TAIL_BYTES) {
+  let handle;
+  try {
+    handle = await fs.open(file, 'r');
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
+    const start = Math.max(0, stat.size - limit);
+    const buffer = Buffer.alloc(Math.min(stat.size, limit));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    const text = buffer.subarray(0, bytesRead).toString('utf8').replace(/^\uFEFF/, '');
+    return start ? (text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '') : text;
+  } catch { return null; }
+  finally { if (handle) await handle.close().catch(() => {}); }
+}
+
+function jsonLines(text) {
+  return (text || '').trimEnd().split(/\r?\n/).flatMap((line) => {
+    try { const value = JSON.parse(line); return object(value) ? [value] : []; }
+    catch { return []; }
+  });
 }
 
 function statusValues(text) {
@@ -136,12 +216,131 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
         sandbox: values.sandbox || '', engine: values.engine || '', ageS: seconds(values.started, now),
         dir: values.dir || '', error: values.error || '',
         queuePos: /^\d+$/.test(queue || '') && Number.isSafeInteger(Number(queue)) ? Number(queue) : null,
-        owner: values.owner || '', idleS: activity.idleS, activity: activity.activity,
+        owner: values.owner || '', idleS: activity.idleS, activity: activity.activity, provider: 'codex',
         ...(values.daemon_profile ? { daemonProfile: values.daemon_profile } : {})
       });
     }
   }));
   return jobs.sort(newest).slice(0, 40);
+}
+
+async function geminiActiveJobs(run, now) {
+  const directory = path.join(run, 'gem-active');
+  let names;
+  try { names = (await fs.readdir(directory)).filter((name) => name.endsWith('.json')).slice(0, ACTIVE_LIMIT); }
+  catch { return { jobs: [], statuses: new Map() }; }
+  const jobs = [], statuses = new Map();
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(8, names.length) }, async () => {
+    while (cursor < names.length) {
+      const file = path.join(directory, names[cursor++]);
+      const pointer = await readJson(file);
+      if (!pointer || pointer.v !== 1 || !localPath(pointer.out)) continue;
+      const wrapper = readProcess(pointer.wrapper_pid);
+      if (!wrapper || wrapper.state === 'Z') {
+        await fs.unlink(file).catch(() => {});
+        continue;
+      }
+      const text = await readText(`${pointer.out}.status`, TAIL_BYTES);
+      if (text === null) continue;
+      const values = statusValues(text);
+      if (values.wrapper_start && values.wrapper_start !== wrapper.started) {
+        await fs.unlink(file).catch(() => {});
+        continue;
+      }
+      if (values.provider !== 'gemini') continue;
+      statuses.set(pointer.out, values);
+      if (terminal.has(values.state)) continue;
+      const stat = await fs.stat(`${pointer.out}.log`).catch(() => null);
+      const idleS = stat?.isFile() ? Math.max(0, Math.floor((now - stat.mtimeMs) / 1000)) : null;
+      const queued = values.state === 'queued' || string(values.state).startsWith('waiting-');
+      const note = cleanText(values.last_note || '', 200);
+      jobs.push({
+        out: pointer.out, state: values.state || '', model: values.acp_model || '', effort: values.effort || '',
+        sandbox: values.sandbox || '', engine: values.engine || '', ageS: seconds(values.started || pointer.started, now),
+        dir: values.dir || '', error: values.error || '', queuePos: null, owner: values.owner || string(pointer.owner),
+        idleS, activity: { kind: queued ? 'queued' : values.state === 'starting' ? 'starting' : note ? 'writing' : 'unknown',
+          text: note, sinceS: idleS }, provider: 'gemini'
+      });
+    }
+  }));
+  return { jobs: jobs.sort(newest).slice(0, 40), statuses };
+}
+
+async function geminiUsage(config, now, active) {
+  const midnight = new Date(now);
+  midnight.setHours(0, 0, 0, 0);
+  const statuses = new Map((await active).statuses);
+  const records = jsonLines(await readTail(config.registry, 64 * 1024 * 1024));
+  const outputs = [...new Set(records.filter((record) => localPath(record.out) &&
+    !(Date.parse(record.finished) < midnight.getTime())).map((record) => record.out))];
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(8, outputs.length) }, async () => {
+    while (cursor < outputs.length) {
+      const out = outputs[cursor++];
+      if (statuses.has(out)) continue;
+      const text = await readText(`${out}.status`, TAIL_BYTES);
+      if (text !== null) statuses.set(out, statusValues(text));
+    }
+  }));
+  let tokensToday = 0, jobsToday = 0;
+  for (const values of statuses.values()) {
+    const finished = Date.parse(values.finished);
+    if (values.provider !== 'gemini' || !terminal.has(values.state) ||
+        !Number.isFinite(finished) || finished < midnight.getTime() || finished > now) continue;
+    jobsToday++;
+    tokensToday += Math.max(0, number(Number(values.usage_total)) ?? 0);
+  }
+  return { tokensToday, jobsToday };
+}
+
+async function geminiMcp(config) {
+  const [status, toml] = await Promise.all([readJson(config.geminiStatus), readText(config.codexConfig)]);
+  if (!status) return null;
+  return {
+    configured: /^[ \t]*\[[ \t]*mcp_servers\.(?:antigravity-parallel|"antigravity-parallel"|'antigravity-parallel')[ \t]*\]/m
+      .test(toml || ''),
+    activeItems: number(status.activeItems), adaptiveLimit: number(status.adaptiveLimit),
+    configuredLimit: number(status.configuredLimit), at: string(status.at) || null
+  };
+}
+
+async function orchestrationStatus(snapshot, now) {
+  try {
+    const { config, source } = await loadConfigWithSource();
+    const state = await providerState(config, { now, persist: false });
+    const chains = Object.create(null), panels = Object.create(null);
+    for (const tier of Object.keys(config.tiers)) {
+      const resolved = await resolveChain(tier, { config, state, now });
+      chains[tier] = resolved.chain.map((entry) => ({ ...entry, selected: entry === resolved.selected }));
+    }
+    for (const panel of Object.keys(config.panels)) {
+      panels[panel] = (await resolvePanel(panel, { config, state, now })).seats;
+    }
+    const marks = Object.fromEntries(Object.entries(state.providers).map(([provider, mark]) => [provider, {
+      until: string(mark.until) || null, reason: string(mark.reason) || null
+    }]));
+    snapshot.orchestration = {
+      source, chains, panels, threshold: { ...config.thresholds.codex, switched: state.threshold.switched }, marks,
+      presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
+      catalog: config.catalog, configError: null
+    };
+    // Resolve an availability probe even when no configured tier or panel currently uses Gemini.
+    const model = config.catalog.gemini[0];
+    const probe = { tiers: { gemini: [{ provider: 'gemini', model: model.model, effort: model.efforts[0] }] } };
+    const entry = (await resolveChain('gemini', { config: probe, state, now })).chain[0];
+    Object.assign(snapshot.gemini, { available: entry.available, reason: entry.reason });
+  } catch (error) {
+    snapshot.orchestration.configError = cleanText(String(error.message), 500);
+    snapshot.gemini.reason = snapshot.orchestration.configError;
+  }
+}
+
+async function switches() {
+  const text = await readTail(orchestrationPaths().switches);
+  const lines = (text || '').trimEnd().split(/\r?\n/).slice(-8).reverse().join('\n');
+  return jsonLines(lines).filter((event) => ['at', 'tier', 'from', 'to', 'reason']
+    .every((key) => typeof event[key] === 'string')).map(({ at, tier, from, to, reason }) => ({ at, tier, from, to, reason }));
 }
 
 async function logActivity(file, now, state = '') {
@@ -229,7 +428,7 @@ function daemonJobs(list, now, profile) {
       ageS: seconds(job.queuedAt, now) ?? number(job.ageS), cwd: string(job.cwd), reason: string(job.reason),
       idleS: null, activity: { kind: job.state === 'queued' || string(job.state).startsWith('waiting-')
         ? 'queued' : 'unknown', text: job.state === 'queued' || string(job.state).startsWith('waiting-')
-          ? string(job.state) : '', sinceS: null },
+          ? string(job.state) : '', sinceS: null }, provider: 'codex',
       ...(profile ? { daemonProfile: profile } : {})
     })).sort(newest).slice(0, 30);
 }
@@ -322,9 +521,12 @@ async function collect(config, snapshot, now) {
   try {
     snapshot.ram = { freeMb: Math.round(availableMemory() / 1048576), totalMb: Math.round(totalmem() / 1048576) };
   } catch {}
+  const gemini = geminiActiveJobs(config.run, now);
   await Promise.allSettled([
     daemonProfiles(config.daemon, now, snapshot),
-    activeJobs(config.run, now).then((jobs) => { snapshot.jobs = jobs; }),
+    Promise.all([activeJobs(config.run, now), gemini]).then(([jobs, active]) => {
+      snapshot.jobs = [...jobs, ...active.jobs].sort(newest).slice(0, 40);
+    }),
     Promise.all([
       readJson(path.join(config.run, 'codex-limits.json')),
       readJson(path.join(config.daemon, 'daemon-net', 'codex-limits.json'))
@@ -332,7 +534,13 @@ async function collect(config, snapshot, now) {
       const limits = candidates.filter(Boolean).sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0))[0];
       snapshot.codexLimits = limits ? { ...limits, ageS: seconds(limits.at, now) } : null;
     }),
-    sessionBeats(config.run, now).then((sessions) => { snapshot.sessions = sessions; })
+    sessionBeats(config.run, now).then((sessions) => { snapshot.sessions = sessions; }),
+    orchestrationStatus(snapshot, now),
+    switches().then((events) => { snapshot.switches = events; }),
+    geminiUsage(config, now, gemini).then((usage) => { Object.assign(snapshot.gemini, usage); }),
+    geminiMcp(config).then((mcp) => { snapshot.gemini.mcp = mcp; }),
+    geminiQuotaStatus(now).then((quota) => { snapshot.gemini.quota = quota; }),
+    usageStatus(now).then((usage) => { snapshot.usage = usage; })
   ]);
   return snapshot;
 }
@@ -351,7 +559,9 @@ function human(snapshot) {
 }
 
 async function selfTest() {
-  const saved = Object.fromEntries(['LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME'].map((key) => [key, process.env[key]]));
+  const envKeys = ['LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME', 'LUNA_RUN_DIR', 'CONVEYOR_HOME',
+    'CONVEYOR_LUNA_SH', 'CONVEYOR_GEM_SH', 'LUNA_USAGE_COLLECTOR', 'LUNA_GEMINI_QUOTA_CMD'];
+  const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   const directory = await fs.mkdtemp(path.join(tmpdir(), 'luna-overview-test-'));
   const now = Date.now();
   const result = { passed: 0, failed: 0, errors: [] };
@@ -362,7 +572,42 @@ async function selfTest() {
   try {
     process.env.LUNA_OVERVIEW_HOME = directory;
     process.env.LUNA_DAEMON_HOME = path.join(directory, 'daemon');
+    process.env.LUNA_RUN_DIR = directory;
+    process.env.CONVEYOR_HOME = path.join(directory, 'conveyor');
+    process.env.CONVEYOR_LUNA_SH = fileURLToPath(import.meta.url);
+    process.env.CONVEYOR_GEM_SH = fileURLToPath(import.meta.url);
+    process.env.LUNA_USAGE_COLLECTOR = path.join(directory, 'missing-collector.mjs');
+    process.env.LUNA_GEMINI_QUOTA_CMD = path.join(directory, 'missing-quota.mjs');
     const config = configuration();
+    config.registry = path.join(directory, 'jobs.jsonl');
+    config.codexConfig = path.join(directory, 'config.toml');
+    config.geminiStatus = path.join(directory, 'gateway-status.json');
+    const fixture = new URL('./conveyor/test/fixtures/orchestration.json', import.meta.url);
+    const orchestration = JSON.parse(await fs.readFile(fixture, 'utf8'));
+    await fs.mkdir(orchestrationPaths().home);
+    const usageCache = { v: 1, at: new Date(now).toISOString(), days: {}, topJobs: [] };
+    await fs.writeFile(usagePaths().cache, JSON.stringify(usageCache));
+    const quotaCache = { available: true, source: 'agy-statusline', at: new Date(now).toISOString(),
+      buckets: [{ name: 'gemini-5h', remainingFraction: 0.75, resetAt: new Date(now + 60_000).toISOString() }] };
+    const quotaMarker = path.join(directory, 'quota-refresh.jsonl'), quotaStop = path.join(directory, 'quota-stop');
+    const quotaDone = path.join(directory, 'quota-done'), quotaFake = path.join(directory, 'fake-quota.mjs');
+    await fs.writeFile(quotaFake, [
+      "import fs from 'node:fs';",
+      `import { acquireQuotaRefreshLock } from ${JSON.stringify(new URL('./conveyor/gemini-quota.mjs', import.meta.url).href)};`,
+      'const release = acquireQuotaRefreshLock();',
+      'if (release) {',
+      `  fs.appendFileSync(${JSON.stringify(quotaMarker)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+      '  const timer = setInterval(() => {',
+      `    if (!fs.existsSync(${JSON.stringify(quotaStop)})) return;`,
+      `    release(); fs.writeFileSync(${JSON.stringify(quotaDone)}, 'done'); clearInterval(timer);`,
+      '  }, 20);',
+      '  setTimeout(() => { release(); process.exit(1); }, 60_000).unref();',
+      '}'
+    ].join('\n'));
+    process.env.LUNA_GEMINI_QUOTA_CMD = quotaFake;
+    await fs.writeFile(quotaPaths().cache, JSON.stringify(quotaCache));
+
+    await fs.writeFile(orchestrationPaths().config, JSON.stringify(orchestration));
     await fs.mkdir(path.join(directory, 'active'));
     await fs.mkdir(config.daemon);
     await fs.writeFile(path.join(config.daemon, 'daemon.json'), JSON.stringify({
@@ -371,7 +616,7 @@ async function selfTest() {
     const limits = { v: 1, at: new Date(now - 5000).toISOString(), source: 'test', planType: 'pro',
       ordinaryUsageAllowed: true, reached: false, primary: null, secondary: null, byLimitId: {} };
     await fs.writeFile(path.join(directory, 'codex-limits.json'), JSON.stringify(limits));
-    const states = ['running', 'queued', 'waiting-capacity', 'done', 'failed', 'incomplete', 'stalled'];
+    const states = ['running', 'queued', 'waiting-capacity', 'done', 'failed', 'incomplete', 'stalled', 'unavailable'];
     for (const [index, state] of states.entries()) {
       const out = path.join(directory, `job-${index}`);
       await fs.writeFile(path.join(directory, 'active', `${index + 100}`),
@@ -391,7 +636,9 @@ async function selfTest() {
       assert.equal(configuration().daemon, directory);
     });
     check('JSON shape', () => {
-      assert.deepEqual(Object.keys(snapshot), ['v', 'at', 'ram', 'daemon', 'jobs', 'codexLimits', 'build', 'sessions']);
+      assert.deepEqual(Object.keys(snapshot), [
+        'v', 'at', 'ram', 'daemon', 'jobs', 'codexLimits', 'build', 'sessions', 'orchestration', 'switches', 'gemini', 'usage'
+      ]);
       assert.equal(snapshot.v, 1);
       assert.equal(snapshot.at, new Date(now).toISOString());
       assert.deepEqual(Object.keys(snapshot.ram), ['freeMb', 'totalMb']);
@@ -399,10 +646,46 @@ async function selfTest() {
       assert.deepEqual(snapshot.daemon, { running: false, appServer: null, healthy: false });
       assert.deepEqual(Object.keys(snapshot.jobs[0]), [
         'out', 'state', 'model', 'effort', 'sandbox', 'engine', 'ageS', 'dir', 'error', 'queuePos',
-        'owner', 'idleS', 'activity'
+        'owner', 'idleS', 'activity', 'provider'
       ]);
+      assert.ok(snapshot.jobs.every((job) => job.provider === 'codex'));
       assert.equal(snapshot.build, null);
     });
+    check('usage summary comes from the cache', () => {
+      assert.deepEqual(snapshot.usage, { ...summarizeUsage(usageCache, now), stale: false });
+      assert.equal(snapshot.usage.days.length, 7);
+    });
+    check('fresh Gemini quota appears in the snapshot without spawning a refresh', () => {
+      assert.deepEqual(snapshot.gemini.quota, {
+        available: true, buckets: quotaCache.buckets, at: quotaCache.at
+      });
+      assert.equal(statSync(quotaMarker, { throwIfNoEntry: false }), undefined);
+    });
+    const waitForQuota = async (file) => {
+      const deadline = Date.now() + 15_000;
+      while (!statSync(file, { throwIfNoEntry: false }) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(statSync(file, { throwIfNoEntry: false }), `missing ${path.basename(file)}`);
+    };
+    try {
+      await fs.writeFile(quotaPaths().cache, JSON.stringify({ ...quotaCache,
+        at: new Date(now - 600_001).toISOString() }));
+      await geminiQuotaStatus(now);
+      await waitForQuota(quotaMarker);
+      await Promise.all(Array.from({ length: 5 }, () => geminiQuotaStatus(now)));
+      check('stale Gemini quota spawns exactly one detached refresh while the lock is held', () => {
+        assert.equal(quotaRefreshLocked(), true);
+      });
+      const calls = (await fs.readFile(quotaMarker, 'utf8')).trim().split('\n').map(JSON.parse);
+      check('quota refresher receives the CLI refresh flags once', () => {
+        assert.deepEqual(calls, [['--json', '--refresh']]);
+      });
+    } finally {
+      await fs.writeFile(quotaStop, '');
+      await waitForQuota(quotaDone);
+      await fs.writeFile(quotaPaths().cache, JSON.stringify(quotaCache));
+    }
     check('terminal filtering and newest first', () => {
       assert.deepEqual(snapshot.jobs.map((job) => job.state), states.slice(0, 3));
       assert.deepEqual(snapshot.jobs.map((job) => job.ageS), [1, 2, 3]);
@@ -415,6 +698,95 @@ async function selfTest() {
       assert.equal(snapshot.jobs.length, 3);
       assert.ok(localPath(snapshot.jobs[0].out));
     });
+    check('orchestration uses shared resolution', () => {
+      assert.equal(snapshot.orchestration.source, 'user');
+      assert.equal(snapshot.orchestration.configError, null);
+      assert.equal(snapshot.orchestration.chains.complex[0].selected, true);
+      assert.equal(snapshot.orchestration.chains.complex[1].selected, false);
+      assert.deepEqual(snapshot.orchestration.panels.design.map((entry) => entry.seat), [0, 1, 2]);
+      assert.deepEqual(snapshot.orchestration.threshold, { ...orchestration.thresholds.codex, switched: false });
+      assert.deepEqual(snapshot.orchestration.catalog, orchestration.catalog);
+      assert.equal(snapshot.orchestration.presets[0].label, orchestration.presets['max-quality'].label);
+      assert.equal(snapshot.gemini.available, true);
+      assert.equal(snapshot.gemini.mcp, null);
+    });
+    const gemOut = path.join(directory, 'gem-job');
+    const gemDir = path.join(directory, 'gem-active');
+    await fs.mkdir(gemDir);
+    const gemPointer = { v: 1, id: '0123456789abcdef', out: gemOut, owner: 'owner-gem',
+      started: new Date(now - 4000).toISOString(), pid: process.pid, wrapper_pid: process.pid };
+    await fs.writeFile(path.join(gemDir, `${gemPointer.id}.json`), JSON.stringify(gemPointer));
+    await fs.writeFile(path.join(gemDir, 'dead.json'), JSON.stringify({ ...gemPointer, wrapper_pid: 2147483647 }));
+    await fs.writeFile(`${gemOut}.status`, [
+      'provider=gemini', 'state=running', `started=${gemPointer.started}`, 'model=gemini-3.8-flash',
+      'acp_model=gemini-3.8-flash-medium', 'effort=medium', 'engine=acp', 'sandbox=read-only',
+      `wrapper_start=${readProcess(process.pid).started}`, 'owner=owner-gem', 'last_note=Read greeting.txt'
+    ].join('\n'));
+    await fs.writeFile(`${gemOut}.log`, 'latest update\n');
+    await fs.utimes(`${gemOut}.log`, new Date(now - 2000), new Date(now - 2000));
+    const doneOut = path.join(directory, 'gem-done'), finishingOut = path.join(directory, 'gem-finishing');
+    const finished = new Date(now).toISOString();
+    for (const [out, total] of [[doneOut, 192], [finishingOut, 17]]) {
+      await fs.writeFile(`${out}.status`, `provider=gemini\nstate=done\nfinished=${finished}\nusage_total=${total}\n`);
+    }
+    await fs.writeFile(path.join(gemDir, 'finishing.json'), JSON.stringify({ ...gemPointer, out: finishingOut }));
+    await fs.writeFile(config.registry, [
+      JSON.stringify({ out: doneOut, finished }), '{broken', JSON.stringify({ out: doneOut, finished })
+    ].join('\n') + '\n');
+    await fs.writeFile(config.geminiStatus, JSON.stringify({
+      activeItems: 2, adaptiveLimit: 3, configuredLimit: 4, at: finished
+    }));
+    await fs.writeFile(config.codexConfig, '# [mcp_servers.unrelated]\n[mcp_servers.antigravity-parallel]\n');
+    const switchEvents = Array.from({ length: 9 }, (_, index) => ({
+      at: new Date(now - (9 - index) * 1000).toISOString(), tier: 'simple', from: 'gemini', to: 'codex', reason: String(index)
+    }));
+    await fs.writeFile(orchestrationPaths().switches,
+      switchEvents.map((event) => JSON.stringify(event)).join('\n') + '\n{broken\n');
+    const withGemini = await collect(config, empty(now), now);
+    check('gem-active job shown with provider gemini and last_note activity', () => {
+      const job = withGemini.jobs.find((entry) => entry.provider === 'gemini');
+      assert.equal(job.out, gemOut);
+      assert.equal(job.model, 'gemini-3.8-flash-medium');
+      assert.equal(job.owner, 'owner-gem');
+      assert.equal(job.idleS, 2);
+      assert.equal(job.activity.text, 'Read greeting.txt');
+      assert.equal(withGemini.jobs.length, 4);
+    });
+    check('dead Gemini pointer cleaned and finished job hidden', () => {
+      assert.ok(!withGemini.jobs.some((job) => job.out === finishingOut));
+    });
+    check('Gemini usage deduplicates registry and includes finishing active jobs', () => {
+      assert.equal(withGemini.gemini.tokensToday, 209);
+      assert.equal(withGemini.gemini.jobsToday, 2);
+      assert.deepEqual(withGemini.gemini.mcp, {
+        configured: true, activeItems: 2, adaptiveLimit: 3, configuredLimit: 4, at: finished
+      });
+    });
+    check('corrupt switches line skipped; last eight lines newest first', () => {
+      assert.deepEqual(withGemini.switches, switchEvents.slice(-7).reverse());
+    });
+    const pointers = await fs.readdir(gemDir);
+    check('dead Gemini pointer removed from disk', () => assert.ok(!pointers.includes('dead.json')));
+    await fs.unlink(orchestrationPaths().config);
+    const noOrchestration = await collect(config, empty(now), now);
+    check('missing orchestration config uses shipped defaults and preserves other sections', () => {
+      assert.equal(noOrchestration.orchestration.source, 'default');
+      assert.equal(noOrchestration.orchestration.configError, null);
+      assert.ok(noOrchestration.orchestration.chains.complex.length > 0);
+      assert.deepEqual(noOrchestration.jobs, withGemini.jobs);
+      assert.deepEqual(noOrchestration.codexLimits, withGemini.codexLimits);
+      assert.deepEqual(noOrchestration.switches, withGemini.switches);
+      assert.equal(noOrchestration.gemini.tokensToday, 209);
+    });
+    await fs.writeFile(orchestrationPaths().config, '{broken');
+    await fs.writeFile(config.geminiStatus, '{broken');
+    const corruptOrchestration = await collect(config, empty(now), now);
+    check('corrupt orchestration and gateway status degrade independently', () => {
+      assert.ok(corruptOrchestration.orchestration.configError);
+      assert.equal(corruptOrchestration.gemini.mcp, null);
+      assert.equal(corruptOrchestration.jobs.length, 4);
+    });
+    await fs.writeFile(orchestrationPaths().config, JSON.stringify(orchestration));
     check('Linux absolute paths including spaces', () => {
       for (const value of ['/tmp/job', `${directory}/some path/job`]) assert.equal(localPath(value), true);
       for (const value of ['//server/share/job', 'job', '']) assert.equal(localPath(value), false);
@@ -587,7 +959,7 @@ async function selfTest() {
     });
     check('token absent', () => {
       assert.ok(!JSON.stringify(snapshot).includes('SECRET-NEVER-PRINT'));
-      assert.ok(!JSON.stringify(snapshot).includes('token'));
+      assert.ok(!JSON.stringify(snapshot).includes('"token"'));
     });
     check('limits pass through', () => assert.deepEqual(snapshot.codexLimits, { ...limits, ageS: 5 }));
     await Promise.all(Array.from({ length: 45 }, async (_, index) => {
@@ -621,7 +993,7 @@ async function selfTest() {
       assert.ok(!JSON.stringify(jobs).includes('token'));
       assert.deepEqual(Object.keys(jobs[0]), [
         'id', 'state', 'model', 'effort', 'sandbox', 'owner', 'ageS', 'cwd', 'reason', 'idleS',
-        'activity'
+        'activity', 'provider'
       ]);
     });
     check('human summary', () => assert.ok(human(snapshot).includes('Daemon stopped')));

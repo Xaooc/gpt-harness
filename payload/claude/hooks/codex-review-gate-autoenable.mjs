@@ -27,6 +27,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+import { codexPluginRoot } from "../scripts/lib/codex-plugin.mjs";
 
 const PAUSE_SENTINEL = path.join(os.homedir(), ".claude", "codex-gate-paused");
 
@@ -55,7 +56,6 @@ async function main() {
 
   // 3. Import the plugin's own state helpers so slug/hash math stays identical
   //    to what the Stop hook uses when it reads the flag back.
-  const { codexPluginRoot } = await import("../scripts/lib/codex-plugin.mjs");
   const installedRoot = codexPluginRoot();
   if (!installedRoot) return;
   const pluginRoot = path.join(installedRoot, "scripts", "lib");

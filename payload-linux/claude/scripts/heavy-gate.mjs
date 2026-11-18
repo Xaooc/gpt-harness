@@ -15,7 +15,8 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
 const MB = 1024 * 1024;
-const DEFAULTS = { max: 2, minFreeMb: 2500, maxWaitS: 600, devMaxWaitS: 180 };
+// Release 2026-10-27 (owner): 3 heavy slots; restore from heavy-gate.mjs.bak-20261027-release after the release.
+const DEFAULTS = { max: 3, minFreeMb: 2500, maxWaitS: 600, devMaxWaitS: 180 };
 const SHELL_PREFIXES = new Set('if then else elif fi do done while until for case esac ! { } ( ) time'.split(' '));
 
 function commandSegments(command) {
@@ -667,8 +668,8 @@ async function selfTest(out) {
     if (process.platform !== 'win32' && /[A-Z]:|\.(exe|cmd|ps1)\b/i.test(command)) continue;
     test(`heavy: ${command}`, () => assert.equal(isHeavy(command), true));
   }
-  test('Linux default is two heavy slots with a positive MemAvailable probe', () => {
-    assert.equal(runtime().max, 2);
+  test('Linux default is three heavy slots with a positive MemAvailable probe', () => {
+    assert.equal(runtime().max, 3);
     assert.ok(availableMemory() > 0);
   });
   for (const command of lightCommands) test(`light: ${command}`, () => assert.equal(isHeavy(command), false));

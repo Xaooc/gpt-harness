@@ -1,6 +1,6 @@
 {
   "name": "luna-panel",
-  "version": "0.5.1",
-  "description": "Live pane: RAM, Claude and Codex limits, Luna daemon, running Codex jobs",
+  "version": "0.6.7",
+  "description": "Live pane: limits of Claude, Codex and Gemini, executor chains and settings, every executor job, token usage, CLI updates",
   "types": "./types/index.d.ts"
 }

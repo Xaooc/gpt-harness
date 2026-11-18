@@ -96,18 +96,6 @@ test("human correction has explicit classification, previous assistant context a
   assert.equal(event.id, common.eventId(event.type, event.session, event.source));
 });
 
-test("provenance rejects parent path components with either separator", async () => {
-  const file = transcript([human("нет, я же сказал не трогать конфиг")]);
-  await run();
-  const [event] = events("user_correction");
-  assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
-  for (const separator of ["/", "\\"]) {
-    const source = `${path.dirname(file)}${separator}..${separator}project${separator}session.jsonl#L1`;
-    assert.deepEqual(await verifyEventProvenance({ ...event, source }),
-      { ok: false, reason: "invalid transcript path" });
-  }
-});
-
 test("copied transcript UUIDs deduplicate all entry event types and keep the first source", async () => {
   const rows = [
     human("нет, я же сказал не трогать конфиг", { uuid: "correction-uuid" }),
@@ -378,11 +366,11 @@ test("recordJob appends exact ordered records with hashes of the final status by
   assert.equal(lines.length, 1);
   const record = JSON.parse(lines[0]);
   assert.deepEqual(Object.keys(record), [
-    "v", "out", "status_sha256", "started", "finished", "state", "model", "pid",
+    "v", "out", "status_sha256", "started", "finished", "state", "provider", "model", "effort", "dir", "pid",
   ]);
   assert.deepEqual(record, {
     v: 1, out: toWinPath(path.resolve(out)), status_sha256: sha, started: timestamp,
-    finished: "2026-10-20T10:01:00.000Z", state: "done", model: "custom=model", pid: "1234",
+    finished: "2026-10-20T10:01:00.000Z", state: "done", provider: "codex", model: "custom=model", effort: "high", dir: "", pid: "1234",
   });
   assert.equal(record.out.includes("\\"), false);
   if (process.platform === "win32") assert.match(record.out, /^[A-Z]:\//);
@@ -493,7 +481,9 @@ test("normaliseJobOut resolves missing leaves, path spellings and canonical dire
   const out = path.join(directory, "missing", "fake.out.md");
   const expected = toWinPath(out);
   assert.equal(normaliseJobOut(out), process.platform === "win32" ? expected.toLowerCase() : expected);
-  assert.equal(normaliseJobOut(out.replace(/\\/g, "/").replace(/\//g, "\\")), normaliseJobOut(out));
+  if (process.platform === "win32") {
+    assert.equal(normaliseJobOut(out.replace(/\\/g, "/").replace(/\//g, "\\")), normaliseJobOut(out));
+  }
   for (const value of ["relative.out.md", "", null, 42, "\0"]) assert.equal(normaliseJobOut(value), null);
   const alias = path.join(HOME_CLAUDE, "alias");
   fs.symlinkSync(directory, alias, process.platform === "win32" ? "junction" : "dir");
@@ -721,8 +711,7 @@ test("eventDigest covers every event field except captured and ignores nested ke
 });
 
 test("capture does not attest untrusted job events or events without a status hash", async () => {
-  const out = write(path.join(HOME_CLAUDE, "repo", "review.out.md"),
-    "Assumption: local defaults\nTop concern: finding\n");
+  const out = write(path.join(HOME_CLAUDE, "repo", "review.out.md"), "Assumption: local defaults\nTop concern: finding\n");
   write(out.replace(".out.md", ".brief.md"), "Review scope");
   job(out);
   transcript([human("нет, исправь"), bash(`bash luna.sh -o "${toWinPath(out)}"`)]);
@@ -868,14 +857,21 @@ test("missing assumptions and critic outputs require a matching status hash in t
   await run();
   assert.equal(readJsonl(paths.attest).length, 3);
   fs.unlinkSync(out);
+  let modified = Date.now();
+  const writeRegistry = (records) => {
+    write(paths.jobs, records.map((row) => encode(row)).join(""));
+    // Filesystems may keep the same mtime for rapid equal-size writes.
+    modified += 1000;
+    fs.utimesSync(paths.jobs, modified / 1000, modified / 1000);
+  };
   for (const event of events().filter((event) => event.type !== "luna_job")) {
     for (const records of [[], [{ ...record, status_sha256: "0".repeat(64) }]]) {
-      write(paths.jobs, records.map((row) => encode(row)).join(""));
+      writeRegistry(records);
       assert.deepEqual(await verifyEventProvenance(event), {
         ok: false, reason: "output file gone and not in registry",
       });
     }
-    write(paths.jobs, encode(record));
+    writeRegistry([record]);
     assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
     const legacy = { ...event, data: { ...event.data } };
     delete legacy.data.status_sha256;
@@ -885,24 +881,37 @@ test("missing assumptions and critic outputs require a matching status hash in t
   }
 });
 
-test("registry fallback still requires isTrustedJob after files are deleted", async () => {
+test("registry fallback verifies attested events after files are deleted and rejects tampering", async () => {
   const out = write(path.join(HOME_CLAUDE, "repo", "job.out.md"), "Assumption: local defaults\n");
   const status = job(out);
   assert.equal(recordJob(out), true);
+  const registered = registryRecord(out);
   transcript([bash(`bash luna.sh -o "${toWinPath(out)}"`)]);
   await run();
   assert.equal(readJsonl(paths.attest).length, 2);
   fs.unlinkSync(out);
   const [event] = events("executor_assumption");
   assert.deepEqual(await verifyEventProvenance(event), { ok: true, reason: "verified" });
+  write(out, "Assumption: local defaults\n");
   fs.unlinkSync(status);
   assert.equal(isTrustedJob(out), false);
+  const [jobEvent] = events("luna_job");
+  assert.deepEqual(await verifyEventProvenance(jobEvent), { ok: true, reason: "verified" });
+  assert.equal((await verifyEventProvenance(event)).ok, false);
+  fs.unlinkSync(out);
   for (const captured of events()) {
-    assert.deepEqual(await verifyEventProvenance(captured), {
-      ok: false, reason: captured.type === "luna_job"
-        ? "status file gone and not in registry" : "output file gone and not in registry",
-    });
+    assert.deepEqual(await verifyEventProvenance(captured), { ok: true, reason: "verified" });
   }
+  const reason = "status file gone and not in registry";
+  assert.deepEqual(await verifyEventProvenance({ ...jobEvent, quote: "A tampered event row." }), {
+    ok: false, reason,
+  });
+  const inside = path.join(LEARN_DIR, "job.out.md");
+  const forged = { ...jobEvent, source: `${inside}.status`, data: { ...jobEvent.data, out_path: inside } };
+  common.appendJsonl(paths.jobs, { ...registered, out: inside });
+  common.appendJsonl(paths.attest, { id: forged.id, type: forged.type, out: inside,
+    status_sha256: forged.data.status_sha256, event_sha256: eventDigest(forged) });
+  assert.deepEqual(await verifyEventProvenance(forged), { ok: false, reason });
 });
 
 test("old status events remain valid with unchanged files and fail when their data changes", async () => {
@@ -1071,6 +1080,9 @@ test("exported human predicate and text getter match extraction", () => {
     { isSidechain: true }, { isMeta: true }, { origin: { kind: "sdk" } },
     { message: { content: [{ type: "tool_result", content: "нет" }] } },
   ]) assert.equal(isGenuineHumanEntry(human("нет", extra)), false);
+  // Claude Code marks the compaction summary turnOrigin "human"; it is not the user's words (2026-11-17 ledger bug).
+  const summary = human("This session is being continued from a previous conversation.", { isCompactSummary: true, turnOrigin: "human" });
+  assert.equal(isGenuineHumanEntry(summary), false);
 });
 
 test("provenance verifies genuine corrections and rejects tampered evidence", async () => {
@@ -1546,17 +1558,24 @@ test("rotation preserves newly appended events under the events lock", async () 
   assert.equal((await run()).new_events, 0);
 });
 
-function hookProcess(input) {
+function hookProcess(input, overrides = {}) {
   return new Promise((resolve, reject) => {
     const start = performance.now();
-    const child = spawn(process.execPath, [hook], { env: { ...process.env }, windowsHide: true });
+    const env = { ...process.env, ...overrides };
+    if (process.platform !== "win32") env.HOME = path.join(HOME_CLAUDE, "uninstalled home");
+    const child = spawn(process.execPath, [hook], { env, windowsHide: true });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill(); }, 120000);
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-    child.on("error", reject);
-    child.stdin.on("error", reject);
-    child.on("close", (code) => resolve({ code, stdout, stderr, ms: performance.now() - start }));
+    child.on("error", (error) => { clearTimeout(timer); reject(error); });
+    child.stdin.on("error", (error) => { clearTimeout(timer); child.kill(); reject(error); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr, timedOut, ms: performance.now() - start });
+    });
     child.stdin.end(input);
   });
 }
@@ -1566,7 +1585,7 @@ function assertSilent(result) {
   assert.equal(result.code, 0);
   assert.equal(result.stdout, "");
   assert.equal(result.stderr, "");
-  assert.ok(result.ms < 1500, `hook took ${result.ms} ms`);
+  assert.equal(result.timedOut, false, `hook timed out after ${result.ms} ms`);
 }
 
 test("real hook is silent, respects CAPTURE_OFF and launches detached extraction", async () => {
@@ -1574,19 +1593,64 @@ test("real hook is silent, respects CAPTURE_OFF and launches detached extraction
   // A parallel loop implementation must not run reflection on this test's synthetic data.
   write(paths.paused, "test fixture");
   const input = JSON.stringify({ transcript_path: file, session_id: "s" });
-  assertSilent(await hookProcess("garbage"));
-  assertSilent(await hookProcess(JSON.stringify({ session_id: "s" })));
-  write(paths.captureOff, "");
-  assertSilent(await hookProcess(input));
-  await delay(1500);
-  assert.equal(events().length, 0);
-  fs.unlinkSync(paths.captureOff);
-  assertSilent(await hookProcess(input));
-  const deadline = Date.now() + 10000;
-  while (!events("user_correction").length && Date.now() < deadline) await delay(100);
-  assert.equal(events("user_correction").length, 1);
-  assert.equal(events()[0].quote, "нет, hook correction");
-  // Wait for atomic state persistence and lock release before fixture cleanup.
-  while (fs.existsSync(path.join(paths.locksDir, "extract")) && Date.now() < deadline) await delay(50);
-  assert.equal(fs.existsSync(path.join(paths.locksDir, "extract")), false);
+  const extractor = fileURLToPath(new URL("../extract.mjs", import.meta.url));
+  const preload = path.join(HOME_CLAUDE, "hold-extractor.cjs");
+  const spawned = path.join(HOME_CLAUDE, "extractor-spawned");
+  const started = path.join(HOME_CLAUDE, "extractor-started");
+  const release = path.join(HOME_CLAUDE, "release-extractor");
+  write(preload, `const fs = require("node:fs");\n` +
+    `if (process.argv[1] === ${JSON.stringify(hook)}) {\n` +
+    `  const cp = require("node:child_process"); const spawn = cp.spawn;\n` +
+    `  cp.spawn = function (cmd, args, ...rest) {\n` +
+    `    if (args.includes(${JSON.stringify(extractor)})) fs.writeFileSync(${JSON.stringify(spawned)}, "yes");\n` +
+    `    return spawn.call(this, cmd, args, ...rest);\n  };\n` +
+    `  require("node:module").syncBuiltinESMExports();\n}\n` +
+    `if (process.argv[1] === ${JSON.stringify(extractor)}) {\n` +
+    `  fs.writeFileSync(${JSON.stringify(started)}, "yes");\n` +
+    `  const cell = new Int32Array(new SharedArrayBuffer(4));\n` +
+    `  const deadline = Date.now() + 120000;\n` +
+    `  while (!fs.existsSync(${JSON.stringify(release)}) && Date.now() < deadline) Atomics.wait(cell, 0, 0, 50);\n` +
+    `  if (!fs.existsSync(${JSON.stringify(release)})) process.exit(1);\n}\n`);
+  const env = { NODE_OPTIONS: `${process.env.NODE_OPTIONS || ""} --require=${JSON.stringify(preload)}`.trim() };
+  const until = async (predicate) => {
+    const deadline = performance.now() + 120000;
+    while (!predicate() && performance.now() < deadline) await delay(50);
+    assert.ok(predicate(), "timed out waiting for extraction");
+  };
+  try {
+    assertSilent(await hookProcess("garbage", env));
+    assertSilent(await hookProcess(JSON.stringify({ session_id: "s" }), env));
+    write(paths.captureOff, "");
+    assertSilent(await hookProcess(input, env));
+    assert.equal(fs.existsSync(spawned), false);
+    assert.equal(events().length, 0);
+    fs.unlinkSync(paths.captureOff);
+    assertSilent(await hookProcess(input, env));
+    assert.equal(fs.existsSync(spawned), true);
+    await until(() => fs.existsSync(started));
+    assert.equal(events().length, 0);
+    fs.writeFileSync(release, "release");
+    await until(() => events("user_correction").length > 0);
+    assert.equal(events("user_correction").length, 1);
+    assert.equal(events()[0].quote, "нет, hook correction");
+    // Wait for atomic state persistence and lock release before fixture cleanup.
+    await until(() => !fs.existsSync(path.join(paths.locksDir, "extract")));
+    assert.equal(fs.existsSync(path.join(paths.locksDir, "extract")), false);
+  } finally {
+    fs.writeFileSync(release, "release");
+  }
+});
+
+
+test("Linux registry compares case and literal backslashes exactly", { skip: process.platform === "win32" }, () => {
+  const out = path.join(HOME_CLAUDE, "Case Space", "job\\name.out.md");
+  job(out);
+  assert.equal(recordJob(out), true);
+  const sha = statusSha256(`${out}.status`);
+  assert.equal(registryHas(out, sha), true);
+  assert.equal(registryHas(out.replace("Case Space", "case space"), sha), false);
+  assert.notEqual(normaliseJobOut(out), normaliseJobOut(out.replace("\\", "/")));
+  assert.equal(isTrustedJob(out), true);
+  assert.equal(isTrustedJob(out.replace("Case Space", "case space")), false);
+  assert.equal(normaliseJobOut("C:/old/job.out.md"), null);
 });

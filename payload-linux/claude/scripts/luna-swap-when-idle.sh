@@ -39,7 +39,11 @@ done
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i += 2)); do
   next=${args[i]}; live=${args[i+1]}
-  if bash -n "$next" 2>>"$LOG"; then mv -f "$next" "$live" && log "swapped $next -> $live"; else log "syntax error, NOT swapped: $next"; fi
+  case "$live" in
+    *.mjs|*.js) check() { local tmp; tmp=$(mktemp --suffix=.mjs) && cp "$1" "$tmp" && node --check "$tmp"; local rc=$?; rm -f "$tmp"; return $rc; } ;;
+    *) check() { bash -n "$1"; } ;;
+  esac
+  if check "$next" 2>>"$LOG"; then mv -f "$next" "$live" && log "swapped $next -> $live"; else log "syntax error, NOT swapped: $next"; fi
 done
 exit 0
 }

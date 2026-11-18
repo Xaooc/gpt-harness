@@ -21,6 +21,8 @@ export const paths = Object.freeze({
   adoptedJsonl: path.resolve(LEARN_DIR, "adopted.jsonl"),
   adoptedMd: path.resolve(LEARN_DIR, "adopted.md"),
   candidates: path.resolve(LEARN_DIR, "candidates.jsonl"),
+  checks: path.resolve(LEARN_DIR, "checks.jsonl"),
+  checksMd: path.resolve(LEARN_DIR, "checks.md"),
   needsUser: path.resolve(LEARN_DIR, "needs-user.md"),
   logMd: path.resolve(LEARN_DIR, "log.md"),
   reportsDir: path.resolve(LEARN_DIR, "reports"),
@@ -39,6 +41,21 @@ export function ensureDirs() {
 
 export function nowIso() {
   return new Date().toISOString();
+}
+
+export function canonicalRepo(projectKey) {
+  if (typeof projectKey !== "string" || !projectKey || projectKey === "luna-run"
+    || /scratch-workspaces/i.test(projectKey)) return "";
+  return projectKey.replace(/--(?:claude-)?worktrees-.*$/i, "")
+    .replace(/^-home-[^-]+-/i, "")
+    .replace(/^-Users-[^-]+-/i, "")
+    .replace(/^[A-Za-z]--Users-[^-]+-/i, "")
+    .replace(/^[A-Za-z]--/, "")
+    .toLowerCase();
+}
+
+export function projectKeyForCwd(cwd) {
+  return typeof cwd === "string" ? cwd.replace(/[^A-Za-z0-9]/g, "-") : "";
 }
 
 function sleep(ms) {
@@ -247,20 +264,32 @@ export function canonicalJson(value) {
   return encode(JSON.parse(json));
 }
 
+// Keep the export name for existing callers; historical paths are never migrated here.
 export function toWinPath(p) {
   if (typeof p !== "string" || !p) return "";
-  let result = p.replace(/^(["'])([\s\S]*)\1$/, "$2").replace(/\\/g, "/");
+  let result = p.replace(/^(["'])([\s\S]*)\1$/, "$2");
+  if (process.platform === "win32") result = result.replace(/\\/g, "/");
   if (result === "~" || result.startsWith("~/")) {
-    result = os.homedir().replace(/\\/g, "/") + result.slice(1);
+    result = os.homedir() + result.slice(1);
   } else if (result.startsWith("$HOME/") || result.startsWith("${HOME}/")) {
-    result = os.homedir().replace(/\\/g, "/") + result.replace(/^\$(?:HOME|\{HOME\})/, "");
+    result = os.homedir() + result.replace(/^\$(?:HOME|\{HOME\})/, "");
   }
-  return result.replace(/^\/([a-z])(?=\/|$)/i, (_, drive) => `${drive.toUpperCase()}:`);
+  if (process.platform === "win32") {
+    return result.replace(/\\/g, "/").replace(/^\/([a-z])(?=\/|$)/i, (_, drive) => `${drive.toUpperCase()}:`);
+  }
+  if (isForeignPath(result)) return result;
+  return path.normalize(result);
+}
+
+export function isForeignPath(p) {
+  return process.platform !== "win32" && typeof p === "string" && /^(?:[a-z]:[/\\]|\\\\)/i.test(p);
 }
 
 export function findBash() {
-  for (const file of ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"]) {
-    if (fs.existsSync(file)) return file;
+  if (process.platform === "win32") {
+    for (const file of ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"]) {
+      if (fs.existsSync(file)) return file;
+    }
   }
   return "bash";
 }

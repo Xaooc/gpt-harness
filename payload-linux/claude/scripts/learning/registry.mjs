@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { paths, toWinPath } from "./common.mjs";
 
-export const TERMINAL_JOB_STATES = /^(?:done|incomplete|failed|stalled|killed|timeout)$/;
+export const TERMINAL_JOB_STATES = /^(?:done|incomplete|failed|stalled|killed|timeout|unavailable)$/;
 const MAX_STATUS_BYTES = 64 * 1024;
 const MAX_REGISTRY_BYTES = 64 * 1024 * 1024;
 const registryCache = new Map();
@@ -51,9 +51,18 @@ export function recordJob(out, opts = {}) {
       started: values.started ?? "",
       finished: values.finished ?? "",
       state: values.state,
-      model: values.model ?? "",
+      provider: values.provider === "gemini" || Object.hasOwn(values, "acp_model") ? "gemini" : "codex",
+      model: values.acp_model || values.model || "",
+      effort: values.effort ?? "",
+      dir: values.dir ?? "",
+      ...(values.thread ? { thread: values.thread } : {}),
       pid: values.pid ?? "",
     };
+    for (const key of ["usage_input", "usage_cached", "usage_output", "usage_total"]) {
+      if (values[key] !== undefined && values[key] !== "" && Number.isFinite(Number(values[key]))) {
+        record[key] = Math.max(0, Number(values[key]));
+      }
+    }
     fs.appendFileSync(registry, JSON.stringify(record) + "\n");
     return true;
   } catch { return false; }

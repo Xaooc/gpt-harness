@@ -1,9 +1,16 @@
 ---
 name: luna-critics
-description: Run a panel of clean-context role-play critics on Codex gpt-6-luna (high effort by default, max for attackers on auth/money) - ordinary user, attacker, designer, project manager, maintainer, QA, ops, domain expert - to surface what the main model missed. Use for ANY moderately complex task - after drafting a plan/spec (before implementing) and after implementing (before claiming done or committing). Skip only for trivial edits and pure Q&A.
+description: Persona critics that complement pstack interrogate - clean-context role-play reviewers (ordinary user, attacker, designer, project manager, maintainer, QA, ops, domain expert, gap reviewer) run as a panel on Codex Luna. The default review is pstack interrogate on the review panel (findings proven by a run); add these personas for user-facing flows and visuals (ordinary user, designer, on screenshots), for security-sensitive code (attacker), and a gap reviewer after complex-tier implementations. Skip only for trivial edits and pure Q&A.
 ---
 
 # Luna critics — independent role-play review
+
+**Place in the process (user decision 2026-11-16):** the default review of a change is pstack `interrogate`
+(`<pstack>/skills/interrogate/SKILL.md`) with reviewers from the `review` panel (as configured in the Luna panel;
+`interrogate.mjs` runs every seat), where a finding counts only with the command and output that prove it.
+Use this skill on top of it for what interrogate does not cover: Рядовой пользователь and Дизайнер on screenshots
+and user flows, Взломщик on auth/money/secrets/sandbox code, Ревизор пробелов after complex-tier implementations,
+domain experts on rules-heavy flows.
 
 **Why this works:** each critic runs in a **fresh Codex context**. It has no access to
 Claude's reasoning or the conversation, and it is locked into one concrete persona.
@@ -44,14 +51,14 @@ Adding more critics is limited by Claude's synthesis, not by quota. Every findin
 
 | Persona | Hunts for |
 |---|---|
-| **Рядовой пользователь** — non-technical, impatient, first time using it | Confusing flows, unclear texts/errors, dead ends, "what do I click now", things that break with normal-but-unexpected input |
+| **Рядовой пользователь** — non-technical, impatient, first time using it | Confusing user-facing flows: state, choices, purpose or processing order; text/errors, dead ends, normal-but-unexpected input; hard-to-use actions; controls that obscure content or choices |
 | **Взломщик** — hostile attacker / pentester | Injection, authz/authn gaps, IDOR, secrets in code/logs, unsafe defaults, abuse & DoS vectors, supply chain, trust boundaries |
 | **Дизайнер** — senior product/UX designer | Visual inconsistency, hierarchy, spacing, states (empty/loading/error), accessibility, mobile, dark mode (critique only — fixes are done by Claude) |
 | **Проджект** — PM who owns the outcome | Does it solve the real request? Missing requirements, scope creep, unclear acceptance, rollout/migration for existing users, what to tell stakeholders |
 | **Мейнтейнер** — senior engineer who'll own this in a year | Architecture fit, needless complexity, duplication, naming, hidden coupling, missing/weak tests, breaking changes |
 | **Тестировщик** — QA trying to break it | Edge cases, boundaries, null/empty/huge input, error paths, races, idempotency, time zones/encodings, regressions |
 | **Эксплуатация** — SRE on call at 3am | Deploy/rollback, config & env, perf/cost, resource leaks, logging/observability, failure recovery, backups |
-| **Эксперт предметки** — domain specialist (game designer, accountant, lawyer, etc.) | Domain rules and conventions the builder didn't know |
+| **Эксперт предметки** — domain specialist (game designer, accountant, lawyer, etc.) | Include for user-facing flows shaped by domain rules; check that visible phases, choices, transitions and outcomes match those rules |
 | **Ревизор пробелов** — reviewer who reads the user's goal, then the diff, and asks "what wasn't done?" | Ripples the executor skipped (other callers, docs, config, migrations, tests that should have moved with the change), cases the brief never mentioned, silent assumptions, places where the code does what was literally asked but not what was meant |
 
 Defaults: always include **Рядовой пользователь** for anything user-facing; include **Дизайнер** for user-facing interfaces or visual changes and **Взломщик** for anything that touches input, network, auth, files, or secrets. Add other relevant personas, or invent a sharper one that fits the task.
@@ -110,6 +117,10 @@ Engine: each critic runs through `luna.sh` in the shared daemon (default `LUNA_D
 with fair scheduling across sessions. `LUNA_POOL=1` opts into one `codex app-server` per panel;
 `LUNA_TURN_TIMEOUT_S` defaults to 2400 there. A pool startup failure falls back to the shared daemon.
 `LUNA_POOL_DRY_RUN=1` prints the pool plan and starts nothing (use with `LUNA_POOL=1`).
+Linux: 4 cores, 15 GB RAM; GTNH and Claude work never run at the same time on this box.
+Admission uses `/proc/meminfo` (`MemAvailable`). Heavy commands have two slots by default; pytest defaults to 4 workers.
+Proxy environment comes from `~/.config/bro-env.sh` when `HTTPS_PROXY` is missing.
+Stop jobs with `luna-stop.sh <out.md>`.
 
 Effort: critics run at `high` by default (`LUNA_PANEL_EFFORT` changes the default). Give one
 critic its own effort through the file name: `attacker.max.brief.md` → `max`. Use `max` only

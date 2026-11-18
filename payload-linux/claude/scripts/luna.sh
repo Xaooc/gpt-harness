@@ -87,6 +87,10 @@ EXEC_LAST_ERROR=""
 EXEC_ERROR=""
 RETRY_SLEEP_PID=""
 DAEMON_SCRIPT="$(cd "$(dirname "$0")" && pwd)/luna-daemon.mjs"
+LEASE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/account-lease.mjs"
+LEASE_ID=""
+LEASE_HEARTBEAT=""
+ACCOUNT_NOTE=""
 DAEMON_BASE="${LUNA_DAEMON_HOME:-$HOME/.claude/luna-run}"
 DAEMON_HOME="$DAEMON_BASE"
 DAEMON_PROFILE=default
@@ -236,6 +240,14 @@ resolve_codex() {
 }
 
 now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+monotonic_s() {
+  local uptime unused
+  if [ -r /proc/uptime ] && read -r uptime unused < /proc/uptime; then
+    printf '%s\n' "${uptime%%.*}"
+  else
+    date +%s
+  fi
+}
 STARTED="$(now)"
 status() { # status <state> [extra key=value lines...]
   local state="$1"; shift
@@ -255,6 +267,13 @@ status() { # status <state> [extra key=value lines...]
     echo "codex_bin=$CODEX_BIN"
     echo "shell=bash"
     echo "engine=$ENGINE"
+    if [ -n "${USAGE_TOTAL:-}" ]; then
+      echo "usage_input=${USAGE_INPUT:-0}"
+      echo "usage_cached=${USAGE_CACHED:-0}"
+      echo "usage_output=${USAGE_OUTPUT:-0}"
+      echo "usage_total=$USAGE_TOTAL"
+    fi
+    if [ -n "${USAGE_THREAD:-}" ]; then echo "thread=$USAGE_THREAD"; fi
     echo "daemon_profile=$DAEMON_PROFILE"
     if [ "$ENGINE" = daemon ] && [ -n "$DAEMON_JOB" ]; then echo "daemon_job=$DAEMON_JOB"; fi
     if [ -n "$RETRY_EFFORT" ]; then
@@ -326,8 +345,13 @@ of RAM)."
       echo "- Match the style of neighbouring files (line length, formatting, naming). Never leave lines \
 longer than ~140 characters."
       echo "- Never loosen tests, tolerances or acceptance criteria to make them pass; report the conflict instead."
-      echo "- Tests may take minutes and the sandbox allows local sockets: run the project's tests yourself. Give \
-every test or build command a tool timeout of at least 300 seconds and do not call a slow test hung before that."
+      echo "- Tests: add only the test cases the brief lists (none when it lists none). Prefer extending an existing \
+test or one parametrized test over new tests and new files. The project gate rejects a job that adds more new test \
+cases than its budget (5 unless the brief says 'Test budget: N')."
+      echo "- Run only the tests the brief names and the tests of the files you changed (the project's affected-tests \
+command when it has one), never the whole suite unless the brief asks for it: the orchestrator runs full suites. \
+Tests may take minutes and the sandbox allows local sockets. Give every test or build command a tool timeout of at \
+least 300 seconds and do not call a slow test hung before that."
       echo "- Where the brief is silent and you must decide, pick the most conservative option consistent with \
 neighbouring code and list each such decision under ## Deviations as 'Assumption: ...'."
       echo "- Before finishing, search the repo (rg) for other usages of anything whose name, signature or \
@@ -383,7 +407,7 @@ fi
 #   LUNA_TIMEOUT_S       hard cap on attempt duration (default 28800 = 8 h; 0 disables). A working job is never cut
 #                       short: stalls are caught by LUNA_IDLE_MAX_S (no log growth), this only stops runaway loops.
 #                       The pool uses LUNA_IDLE_MAX_S for events and LUNA_TURN_TIMEOUT_S (2400).
-#   LUNA_NO_GATE=1       skip admission entirely
+#   LUNA_NO_GATE=1       skip RAM admission; the account lease remains enforced
 #   LUNA_CODEX_BIN       executable override; otherwise prefer the npm native binary.
 mem_mb() { awk -v k="$1:" '$1==k{print int($2/1024)}' /proc/meminfo; }
 free_mb() { mem_mb MemAvailable; }
@@ -522,7 +546,43 @@ lock_release() {
   LOCK_TOKEN=""
 }
 release() { lock_release; }
-trap 'release; cleanup_session; cleanup_prompts; unmark_active; record_job' EXIT
+release_account() {
+  if [ -n "$LEASE_HEARTBEAT" ]; then
+    kill "$LEASE_HEARTBEAT" 2>/dev/null || true
+    wait "$LEASE_HEARTBEAT" 2>/dev/null || true
+    LEASE_HEARTBEAT=""
+  fi
+  if [ -n "$LEASE_ID" ]; then
+    node "$LEASE_SCRIPT" release "$LEASE_ID" >/dev/null 2>&1 || true
+    LEASE_ID=""
+  fi
+}
+try_account() {
+  local account_rc
+  LEASE_ID=$(LUNA_LEASE_HOLDER_PID="$LOCK_PID" LUNA_LEASE_WAIT_NOTE=1 node "$LEASE_SCRIPT" acquire \
+    --mode shared --purpose "luna exec $OUT" --owner "$OWNER" --wait 0)
+  account_rc=$?
+  if [ "$account_rc" = 0 ]; then
+    node "$LEASE_SCRIPT" maintain "$LEASE_ID" "$LOCK_PID" "$WRAPPER_START" >/dev/null 2>&1 &
+    LEASE_HEARTBEAT=$!
+    return 0
+  fi
+  [ "$account_rc" = 75 ] || die 2 "account lease admission failed"
+  ACCOUNT_NOTE="$LEASE_ID"
+  LEASE_ID=""
+  return 1
+}
+wait_account() {
+  local account_started account_waited
+  account_started=$(monotonic_s)
+  while ! try_account; do
+    status queued "reason=$ACCOUNT_NOTE" "last_note=$ACCOUNT_NOTE"
+    account_waited=$(( $(monotonic_s) - account_started ))
+    [ "$account_waited" -lt "$WAIT_MAX_S" ] || die 75 "gave up $ACCOUNT_NOTE after ${account_waited}s"
+    sleep 1
+  done
+}
+trap 'release; release_account; cleanup_session; cleanup_prompts; unmark_active; record_job' EXIT
 kill_child_tree() {
   [ -z "${CPID:-}" ] || luna_stop_group "$CPID" "${CSTART:-}" >/dev/null 2>&1 || true
 }
@@ -534,6 +594,7 @@ interrupt() {
   if [ "$ENGINE" = daemon ]; then daemon_cancel; else kill_child_tree; fi
   status failed "rc=130" "finished=$(now)" "error=interrupted"
   release
+  release_account
   exit 130
 }
 trap interrupt INT TERM HUP
@@ -675,8 +736,8 @@ daemon_ensure() {
     child.on("error", () => { process.exitCode = 1; });
     child.unref();
   ' "$(native_path "$DAEMON_SCRIPT")" "$(native_path "$DAEMON_HOME")" 2>/dev/null || return 1
-  local deadline=$(( $(date +%s) + 30 ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
+  local deadline=$(( $(monotonic_s) + 30 ))
+  while [ "$(monotonic_s)" -lt "$deadline" ]; do
     if daemon_health; then
       [ "$DAEMON_MISMATCH" = 0 ] && return 0
       return 1
@@ -762,7 +823,7 @@ daemon_recover_submission() {
 daemon_submit_wait() {
   local submitted waiting=0 remaining pause
   while :; do
-    if [ "$waiting" = 1 ] && [ $(( $(date +%s) - DAEMON_WAIT_STARTED )) -ge "$WAIT_MAX_S" ]; then
+    if [ "$waiting" = 1 ] && [ $(( $(monotonic_s) - DAEMON_WAIT_STARTED )) -ge "$WAIT_MAX_S" ]; then
       DAEMON_ERROR="daemon queue full"; rc=75
       return 75
     fi
@@ -770,12 +831,12 @@ daemon_submit_wait() {
     [ "$submitted" = 75 ] || return "$submitted"
     waiting=1
     release
-    status waiting-daemon "reason=queue-full" "waited_s=$(( $(date +%s) - DAEMON_WAIT_STARTED ))"
-    if [ $(( $(date +%s) - DAEMON_WAIT_STARTED )) -ge "$WAIT_MAX_S" ]; then
+    status waiting-daemon "reason=queue-full" "waited_s=$(( $(monotonic_s) - DAEMON_WAIT_STARTED ))"
+    if [ $(( $(monotonic_s) - DAEMON_WAIT_STARTED )) -ge "$WAIT_MAX_S" ]; then
       DAEMON_ERROR="daemon queue full"; rc=75
       return 75
     fi
-    remaining=$(( WAIT_MAX_S - $(date +%s) + DAEMON_WAIT_STARTED ))
+    remaining=$(( WAIT_MAX_S - $(monotonic_s) + DAEMON_WAIT_STARTED ))
     [ "$remaining" -gt 0 ] || continue
     pause=$DAEMON_RETRY_AFTER
     [ "$pause" -le "$remaining" ] || pause=$remaining
@@ -785,7 +846,7 @@ daemon_submit_wait() {
 
 daemon_marker() {
   DAEMON_STATE=""; DAEMON_RC=""; DAEMON_ERROR=""; DAEMON_QUEUE_POS=""; DAEMON_QUEUE_REASON=""; DAEMON_STARTED=""
-  DAEMON_RETRY_WAITING=0
+  DAEMON_RETRY_WAITING=0; DAEMON_NOTE=""
   local key value
   [ -r "$OUT.daemon" ] || return 1
   while IFS='=' read -r key value; do
@@ -793,6 +854,17 @@ daemon_marker() {
       state) DAEMON_STATE="$value" ;; rc) DAEMON_RC="$value" ;; error) DAEMON_ERROR="$value" ;;
       queue_pos) DAEMON_QUEUE_POS="$value" ;; reason) DAEMON_QUEUE_REASON="$value" ;;
       started) DAEMON_STARTED="$value" ;;
+      last_note) DAEMON_NOTE="$value" ;;
+      thread) USAGE_THREAD="$value" ;;
+      usage_input|usage_cached|usage_output|usage_total)
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+          case "$key" in
+            usage_input) USAGE_INPUT=$(( ${USAGE_BASE_INPUT:-0} + value )) ;;
+            usage_cached) USAGE_CACHED=$(( ${USAGE_BASE_CACHED:-0} + value )) ;;
+            usage_output) USAGE_OUTPUT=$(( ${USAGE_BASE_OUTPUT:-0} + value )) ;;
+            usage_total) USAGE_TOTAL=$(( ${USAGE_BASE_TOTAL:-0} + value )) ;;
+          esac
+        fi ;;
       retry_waiting) [ "$value" != 1 ] || DAEMON_RETRY_WAITING=1 ;;
       model_retry_delay_s) MODEL_RETRY_DELAY_ACTUAL="$value" ;;
       model_retry)
@@ -805,7 +877,7 @@ daemon_marker() {
 }
 
 daemon_wait() {
-  local failures=0 epoch current_size busy_since=0 busy_note=0 busy_elapsed
+  local failures=0 epoch current_size busy_since=0 busy_note=0 busy_elapsed health_started
   local discovery_pid discovery_token
   attempt_started=0; last_output=0
   log_size=$(wc -c < "$OUT.log")
@@ -818,10 +890,10 @@ daemon_wait() {
       if [ "$DAEMON_STATE" = stalled ]; then STALL_REASON="$DAEMON_ERROR"; DAEMON_ERROR=""; fi
       return
     fi
-    epoch=$(date +%s); current_size=$(wc -c < "$OUT.log")
+    epoch=$(monotonic_s); current_size=$(wc -c < "$OUT.log")
     if [ "$DAEMON_STATE" = queued ]; then
       status queued ${DAEMON_QUEUE_POS:+"queue_pos=$DAEMON_QUEUE_POS"} \
-        ${DAEMON_QUEUE_REASON:+"reason=$DAEMON_QUEUE_REASON"}
+        ${DAEMON_QUEUE_REASON:+"reason=$DAEMON_QUEUE_REASON"} ${DAEMON_NOTE:+"last_note=$DAEMON_NOTE"}
       if [ $(( epoch - DAEMON_WAIT_STARTED )) -ge "$WAIT_MAX_S" ]; then
         daemon_cancel
         DAEMON_ERROR="gave up waiting in daemon queue"; rc=75
@@ -829,10 +901,11 @@ daemon_wait() {
       fi
     elif [ "$DAEMON_STATE" = running ]; then
       if [ "$attempt_started" = 0 ]; then
-        attempt_started=$(date -d "$DAEMON_STARTED" +%s 2>/dev/null || echo "$epoch")
+        # The daemon enforces its own exact start time; this client observes it on the first running marker.
+        attempt_started=$epoch
         last_output=$epoch
       fi
-      status running
+      status running ${DAEMON_NOTE:+"last_note=$DAEMON_NOTE"}
       if [ "$current_size" != "$log_size" ]; then last_output=$epoch; log_size=$current_size; fi
       if [ "$TIMEOUT_S" -gt 0 ] && [ $(( epoch - attempt_started )) -gt "$TIMEOUT_S" ]; then
         STALL_REASON="exceeded total timeout ${TIMEOUT_S}s"
@@ -851,6 +924,7 @@ daemon_wait() {
     fi
     # Keep the original connection identity for cancellation, even if discovery is replaced.
     local saved_start="$DAEMON_START" saved_pid="$DAEMON_PID" saved_port="$DAEMON_PORT" saved_token="$DAEMON_TOKEN"
+    health_started=$(monotonic_s)
     # A TERM trap must never see the cleared or replaced globals while health reads discovery.
     if (daemon_health && [ "$DAEMON_PID" = "$saved_pid" ] && [ "$DAEMON_START" = "$saved_start" ] &&
         [ "$DAEMON_TOKEN" = "$saved_token" ]); then
@@ -869,8 +943,8 @@ daemon_wait() {
       ' "$(native_path "$DAEMON_HOME/daemon.json")" 2>/dev/null)
       if [ -n "$discovery_pid" ] && [ "$discovery_pid" = "$saved_pid" ] &&
           [ "$discovery_token" = "$saved_token" ] && daemon_process_alive "$saved_pid" "$saved_start"; then
-        epoch=$(date +%s)
-        [ "$busy_since" != 0 ] || busy_since=$epoch
+        epoch=$(monotonic_s)
+        [ "$busy_since" != 0 ] || busy_since=$health_started
         busy_elapsed=$(( epoch - busy_since ))
         if [ "$busy_note" = 0 ] || [ $(( epoch - busy_note )) -ge 30 ]; then
           echo "luna.sh: daemon not responding for ${busy_elapsed}s (process alive); waiting" >&2
@@ -894,11 +968,16 @@ daemon_wait() {
 
 run_exec_attempt() {
   local mode="$1"
+  if ! kill -0 "$LEASE_HEARTBEAT" 2>/dev/null; then
+    EXEC_ERROR="account lease heartbeat lost"; rc=1; return
+  fi
   EXEC_LOG_OFFSET=$(wc -c < "$OUT.log")
   if [ "$mode" = first ]; then
     EXEC_SESSION_OFFSET="$EXEC_LOG_OFFSET"
     # Prompt goes via stdin ("-"): no arg-length limits or inherited stdin.
-    luna_start_group "${CODEX_CMD[@]}" exec \
+    luna_start_group env "LUNA_LEASE_INHERIT_ID=$LEASE_ID" "LUNA_LEASE_WRAPPER_PID=$LOCK_PID" \
+      "LUNA_LEASE_WRAPPER_START=$WRAPPER_START" node "$LEASE_SCRIPT" run --mode shared --purpose "luna-exec $OUT" -- \
+      "${CODEX_CMD[@]}" exec \
       ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
       -m "$MODEL" \
       -c "model_reasoning_effort=\"${RETRY_EFFORT:-$EFFORT}\"" \
@@ -910,14 +989,16 @@ run_exec_attempt() {
       -o "$OUT" \
       - < <(attempt_prompt) >> "$OUT.log" 2>&1
   else
-    luna_start_group bash -c 'cd -- "$1" || exit 2; shift; exec "$@"' luna-resume "$DIR" \
+    luna_start_group env "LUNA_LEASE_INHERIT_ID=$LEASE_ID" "LUNA_LEASE_WRAPPER_PID=$LOCK_PID" \
+      "LUNA_LEASE_WRAPPER_START=$WRAPPER_START" node "$LEASE_SCRIPT" run --mode shared --purpose "luna-exec $OUT" -- \
+      bash -c 'cd -- "$1" || exit 2; shift; exec "$@"' luna-resume "$DIR" \
       "${CODEX_CMD[@]}" exec resume -m "$MODEL" \
       -c "model_reasoning_effort=\"${RETRY_EFFORT:-$EFFORT}\"" \
       -c "service_tier=\"$TIER\"" -c "sandbox_mode=\"$SANDBOX\"" \
       --skip-git-repo-check "${LEAN[@]}" -o "$OUT" "$EXEC_SESSION_ID" \
       - < <(continue_prompt) >> "$OUT.log" 2>&1
   fi
-  attempt_started=$(date +%s); last_output=$attempt_started
+  attempt_started=$(monotonic_s); last_output=$attempt_started
   log_size=$(wc -c < "$OUT.log")
   status running
   # hold the start lock while the new process ramps up, then let the next job in
@@ -926,7 +1007,14 @@ run_exec_attempt() {
   while kill -0 "$CPID" 2>/dev/null; do
     sleep 5
     kill -0 "$CPID" 2>/dev/null || break
-    epoch=$(date +%s); current_size=$(wc -c < "$OUT.log")
+    if ! kill -0 "$LEASE_HEARTBEAT" 2>/dev/null; then
+      EXEC_ERROR="account lease heartbeat lost"
+      kill_child_tree
+      wait "$CPID" 2>/dev/null || true
+      rc=1
+      return
+    fi
+    epoch=$(monotonic_s); current_size=$(wc -c < "$OUT.log")
     if [ "$current_size" != "$log_size" ]; then last_output=$epoch; log_size=$current_size; fi
     if [ "$TIMEOUT_S" -gt 0 ] && [ $(( epoch - attempt_started )) -gt "$TIMEOUT_S" ]; then
       STALL_REASON="exceeded total timeout ${TIMEOUT_S}s"
@@ -958,43 +1046,53 @@ run_attempt() {
     esac
     JOB_MB="${LUNA_DAEMON_START_MB:-150}"
   fi
-  if [ "${LUNA_NO_GATE:-0}" != "1" ]; then
-    waited=0; last_note=0; last_lock_note=0
-    while :; do
-      if [ "$ENGINE" = daemon ] && daemon_health; then release; break; fi
-      short=0
-      if lock_acquire; then
-        if [ "$ENGINE" = daemon ]; then
-          # Only starting the shared daemon consumes client-side admission RAM.
-          if daemon_health; then release; break; fi
-          JOB_MB="${LUNA_DAEMON_START_MB:-150}"
+  account_wait_started=$(monotonic_s)
+  while :; do
+    if [ "${LUNA_NO_GATE:-0}" != "1" ]; then
+      waited=0; last_note=0; last_lock_note=0
+      while :; do
+        if [ "$ENGINE" = daemon ] && daemon_health; then release; break; fi
+        short=0
+        if lock_acquire; then
+          if [ "$ENGINE" = daemon ]; then
+            # Only starting the shared daemon consumes client-side admission RAM.
+            if daemon_health; then release; break; fi
+            JOB_MB="${LUNA_DAEMON_START_MB:-150}"
+          fi
+          [ -r /proc/meminfo ] || break   # macOS: skip only the RAM comparison
+          free=$(free_mb)
+          [ $(( free - JOB_MB )) -ge "$RESERVE_MB" ] && break
+          release; short=1
         fi
-        [ -r /proc/meminfo ] || break   # macOS: skip only the RAM comparison
-        free=$(free_mb)
-        [ $(( free - JOB_MB )) -ge "$RESERVE_MB" ] && break
-        release; short=1
-      fi
-      if [ "$short" = 1 ]; then
-        status waiting-ram "free_mb=${free}" "need_mb=${JOB_MB}" "reserve_mb=${RESERVE_MB}" "waited_s=${waited}"
-        if [ $(( waited - last_note )) -ge 60 ] || [ "$last_note" = 0 ]; then
-          echo "luna.sh: waiting for RAM (free ${free} MB, need ${JOB_MB} + reserve ${RESERVE_MB})" >&2
-          last_note=$(( waited > 0 ? waited : 1 ))
+        if [ "$short" = 1 ]; then
+          status waiting-ram "free_mb=${free}" "need_mb=${JOB_MB}" "reserve_mb=${RESERVE_MB}" "waited_s=${waited}"
+          if [ $(( waited - last_note )) -ge 60 ] || [ "$last_note" = 0 ]; then
+            echo "luna.sh: waiting for RAM (free ${free} MB, need ${JOB_MB} + reserve ${RESERVE_MB})" >&2
+            last_note=$(( waited > 0 ? waited : 1 ))
+          fi
+          cause="RAM"
+        else
+          lock_details
+          status waiting-lock "waited_s=$waited" "lock_kind=$LOCK_KIND" "lock_age_s=$LOCK_AGE_S"
+          if [ $(( waited - last_lock_note )) -ge 60 ] || [ "$last_lock_note" = 0 ]; then
+            echo "luna.sh: waiting for admission lock (kind=$LOCK_KIND age=${LOCK_AGE_S}s waited=${waited}s)" >&2
+            last_lock_note=$(( waited > 0 ? waited : 1 ))
+          fi
+          cause="admission lock"
         fi
-        cause="RAM"
-      else
-        lock_details
-        status waiting-lock "waited_s=$waited" "lock_kind=$LOCK_KIND" "lock_age_s=$LOCK_AGE_S"
-        if [ $(( waited - last_lock_note )) -ge 60 ] || [ "$last_lock_note" = 0 ]; then
-          echo "luna.sh: waiting for admission lock (kind=$LOCK_KIND age=${LOCK_AGE_S}s waited=${waited}s)" >&2
-          last_lock_note=$(( waited > 0 ? waited : 1 ))
-        fi
-        cause="admission lock"
-      fi
-      [ "$waited" -ge "$WAIT_MAX_S" ] && die 75 "gave up waiting for $cause after ${waited}s"
-      if [ "$short" = 1 ]; then sleep 3; waited=$(( waited + 3 )); else sleep 1; waited=$(( waited + 1 )); fi
-      if [ "$ENGINE" = daemon ]; then waited=$(( $(date +%s) - DAEMON_WAIT_STARTED )); fi
-    done
-  fi
+        [ "$waited" -ge "$WAIT_MAX_S" ] && die 75 "gave up waiting for $cause after ${waited}s"
+        if [ "$short" = 1 ]; then sleep 3; waited=$(( waited + 3 )); else sleep 1; waited=$(( waited + 1 )); fi
+        if [ "$ENGINE" = daemon ]; then waited=$(( $(monotonic_s) - DAEMON_WAIT_STARTED )); fi
+      done
+    fi
+    if [ "$ENGINE" = daemon ] || try_account; then break; fi
+    release
+    note="$ACCOUNT_NOTE"
+    status queued "reason=$note" "last_note=$note"
+    waited=$(( $(monotonic_s) - account_wait_started ))
+    [ "$waited" -lt "$WAIT_MAX_S" ] || die 75 "gave up $note after ${waited}s"
+    sleep 1
+  done
 
   if [ "$ENGINE" = daemon ]; then
     if daemon_ensure; then
@@ -1042,7 +1140,7 @@ run_attempt() {
   EXEC_ERROR=""; EXEC_LAST_ERROR=""
   run_exec_attempt first
   if [ "$MODEL_RETRIES" -gt 0 ]; then capture_session; fi
-  while [ "$rc" != 0 ] && [ "$rc" != 124 ] && [ -z "$STALL_REASON" ] &&
+  while [ "$rc" != 0 ] && [ "$rc" != 124 ] && [ -z "$STALL_REASON" ] && [ -z "$EXEC_ERROR" ] &&
       [ "$MODEL_RETRY_COUNT" -lt "$MODEL_RETRIES" ]; do
     EXEC_LAST_ERROR=$(last_exec_error)
     [ -n "$EXEC_LAST_ERROR" ] && retryable_model_error "$EXEC_LAST_ERROR" || break
@@ -1062,15 +1160,20 @@ run_attempt() {
     printf 'luna: model error: %s; retry %s/%s on the same session in %ss\n' \
       "$EXEC_LAST_ERROR" "$MODEL_RETRY_COUNT" "$MODEL_RETRIES" "$MODEL_RETRY_DELAY_ACTUAL" >> "$OUT.log"
     CPID=""; CSTART=""
+    release_account
     status running
     retry_pause "$pause"
     if ! : > "$OUT"; then EXEC_ERROR="final output write failed"; rc=1; break; fi
+    wait_account
     run_exec_attempt resume
   done
   if [ "$rc" != 0 ] && [ "$MODEL_RETRY_COUNT" -gt 0 ] && [ -z "$STALL_REASON" ]; then
     EXEC_LAST_ERROR=$(last_exec_error)
   fi
+  capture_session
+  if [ -n "$EXEC_SESSION_ID" ]; then USAGE_THREAD="$EXEC_SESSION_ID"; fi
   cleanup_session
+  release_account
 }
 
 # Real codex exec logs use a standalone "exec" line before each command.
@@ -1079,8 +1182,20 @@ command_count() { awk '/^exec\r?$/{n++} END{print n+0}' "$OUT.log"; }
 STALL_REASON=""
 while :; do
   commands_before=$(command_count)
-  if [ "$ENGINE" = daemon ]; then DAEMON_WAIT_STARTED=$(date +%s); fi
+  if [ "$ENGINE" = daemon ]; then DAEMON_WAIT_STARTED=$(monotonic_s); fi
+  USAGE_BASE_INPUT=${USAGE_INPUT:-0}; USAGE_BASE_CACHED=${USAGE_CACHED:-0}
+  USAGE_BASE_OUTPUT=${USAGE_OUTPUT:-0}; USAGE_BASE_TOTAL=${USAGE_TOTAL:-0}
   run_attempt
+  if [ "$ENGINE" = exec ]; then
+    exec_total=$(awk '
+      footer && /^[0-9,]+[[:space:]]*$/ { gsub(/,/, ""); total=$0; found=1 }
+      { footer=($0 == "tokens used") }
+      END { if (found) print total+0 }
+    ' "$OUT.log")
+    if [ -n "$exec_total" ]; then
+      USAGE_TOTAL=$exec_total; USAGE_INPUT=0; USAGE_CACHED=0; USAGE_OUTPUT=0
+    fi
+  fi
   if [ "$DAEMON_DIED" = 1 ]; then
     if [ "$SANDBOX" = read-only ] && [ "$DAEMON_FALLBACK_USED" = 0 ]; then
       DAEMON_FALLBACK_USED=1

@@ -61,7 +61,8 @@ function main() {
     const cmd = (payload.tool_input && payload.tool_input.command) || "";
     if (typeof cmd !== "string" || !cmd) return;
     // Never block the Codex invocation itself (its prompt may contain '>' / code paths).
-    if (/\bcodex\s+exec\b/.test(cmd) || /\bcodex-companion(\.mjs)?\b/.test(cmd)) return;
+    if (/\bcodex\s+exec\b/.test(cmd) || /\bcodex-companion(\.mjs)?\b/.test(cmd) ||
+        /\bluna\.sh(?:\s|$)/.test(cmd)) return;
     const cwd = payload.cwd || process.cwd();
     if (!hasPlanningAncestor(path.join(cwd, "_"))) return; // only inside GSD projects
     const exts = [...CODE_EXT].join("|");
@@ -72,7 +73,8 @@ function main() {
     if (writeRe.test(cmd) || sedRe.test(cmd)) {
       process.stderr.write(
         `⛔ Writing code files via Bash (redirect/tee/sed -i/dd) is disabled in this project — code MUST be written by Codex.\n` +
-        `Use instead:  codex exec -s workspace-write --skip-git-repo-check "<self-contained task incl. 'Edit files only. Do NOT run git add or git commit.'>"\n` +
+        `Use instead: bash ~/.claude/scripts/luna.sh -w "<self-contained task incl. ` +
+        `'Edit files only. Do NOT run git add or git commit.'>"\n` +
         `Reading/running code, and writing non-code (.md/.json/logs), is fine.\n` +
         `Codex outage bypass: create ~/.claude/codex-codeblock-paused (remove when Codex is back).\n`
       );
@@ -98,7 +100,8 @@ function main() {
   process.stderr.write(
     `⛔ Direct Edit/Write of code is disabled in this project — code MUST be written by Codex.\n` +
     `Implement this change via Bash instead (from the repo root):\n` +
-    `  codex exec -s workspace-write --skip-git-repo-check "<self-contained task: the exact change to ${path.basename(norm)}, the acceptance criteria, and the line 'Edit files only. Do NOT run git add or git commit.'>"\n` +
+    `  bash ~/.claude/scripts/luna.sh -w "<self-contained task: the exact change to ${path.basename(norm)}, ` +
+    `the acceptance criteria, and the line 'Edit files only. Do NOT run git add or git commit.'>"\n` +
     `Then review the diff, run the project's checks, and commit. Non-code files (.md/.json/config) may be edited directly.\n` +
     `If Codex is unavailable (quota/outage), bypass temporarily: create the file ~/.claude/codex-codeblock-paused (remove it when Codex is back).\n`
   );

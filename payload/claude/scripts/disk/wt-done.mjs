@@ -22,9 +22,7 @@ export function removeWorktree(target, { archive = false, dryRun = false, config
   }
   if (dirty.length && !entry.branch) throw Error('cannot archive a detached worktree');
   const deps = dependents(target, entries);
-  if (deps.length) {
-    throw Error(`worktree has dependents:\n${deps.map((item) => `${item.link} -> ${item.target}`).join('\n')}`);
-  }
+  if (deps.length) throw Error(`worktree has dependents:\n${deps.map((item) => `${item.link} -> ${item.target}`).join('\n')}`);
   const bytes = treeInfo(target).bytes;
   const tag = `archive/${entry.branch?.replaceAll('/', '-')}-${localDate().replaceAll('-', '')}`;
   if (dirty.length) {
@@ -66,9 +64,7 @@ function main() {
     throw Error('usage: wt-done.mjs <path> [--archive] [--dry-run]');
   }
   const result = removeWorktree(args[0], { archive: args.includes('--archive'), dryRun: args.includes('--dry-run') });
-  if (result.archiveTag) {
-    process.stdout.write(`${result.dryRun ? 'Would archive' : 'Archived'} as ${result.archiveTag}\n`);
-  }
+  if (result.archiveTag) process.stdout.write(`${result.dryRun ? 'Would archive' : 'Archived'} as ${result.archiveTag}\n`);
   process.stdout.write(`${result.dryRun ? 'Would remove' : 'Removed'} ${result.path}; ` +
     `${result.dryRun ? 'would free' : 'freed'} ${(result.bytes / MB).toFixed(1)} MB; branch retained\n`);
 }
