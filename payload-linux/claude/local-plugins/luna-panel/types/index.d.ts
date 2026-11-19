@@ -53,6 +53,16 @@ export type SessionBeat = {
   turnSince: number
   idleSince: number
   agents: { id: string; description: string; since: number }[]
+  /** The session's step list (desktop update_plan / CLI TodoWrite), when it has one. */
+  plan?: {
+    total: number
+    done: number
+    current: string | null
+    items: { content: string; status: 'pending' | 'in_progress' | 'completed' }[]
+    updatedAt: number
+  } | null
+  /** Background shell commands and monitors still running in the session. */
+  background?: { id: string; kind: 'command' | 'monitor' | 'executor'; text: string; since: number }[]
   limits?: ClaudeLimit[]
 }
 

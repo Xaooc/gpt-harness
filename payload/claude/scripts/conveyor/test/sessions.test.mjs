@@ -49,7 +49,7 @@ test('a busy session shows its Bash tool until the tool result arrives', async (
   assert.deepEqual(open.sessions, [{
     v: 1, sessionId: 'live', name: 'example', cwd: f.cwd, updatedAt: now, state: 'tool',
     tool: { name: 'Bash', detail: 'echo café', since: toolSince },
-    turnSince: statusUpdatedAt, idleSince: 0, agents: []
+    turnSince: statusUpdatedAt, idleSince: 0, agents: [], plan: null, background: []
   }]);
 
   const result = entry('user', { type: 'tool_result', tool_use_id: 'bash', content: 'done' }, now);
@@ -68,7 +68,7 @@ test('an idle session is listed and registry entries for dead processes are skip
   const { sessions, cursors } = await f.read({ dead: {} });
   assert.deepEqual(sessions, [{
     v: 1, sessionId: 'live', name: 'example', cwd: f.cwd, updatedAt: statusUpdatedAt, state: 'idle',
-    tool: null, turnSince: 0, idleSince: statusUpdatedAt, agents: []
+    tool: null, turnSince: 0, idleSince: statusUpdatedAt, agents: [], plan: null, background: []
   }]);
   assert.equal(Object.hasOwn(cursors, 'dead'), false);
 });
@@ -138,4 +138,63 @@ test('the newest overlapping tool is displayed and an open Agent is listed', asy
   assert.equal(sessions[0].state, 'tool');
   assert.deepEqual(sessions[0].tool, { name: 'Grep', detail: 'readSessions', since: now });
   assert.deepEqual(sessions[0].agents, [{ id: 'agent', description: 'Check the inputs', since: toolSince }]);
+});
+
+test('desktop plan operations update the plan across passes and on a fresh cursor', async (t) => {
+  const f = fixture(t);
+  const name = 'mcp__ccd_turn__update_plan';
+  const items = [
+    { content: 'Read the fixture', status: 'in_progress' },
+    { content: 'Fix the gate', status: 'pending' },
+    { content: 'Verify the change', status: 'pending' },
+    { content: 'Summarize the work', status: 'pending' }
+  ];
+  writeFileSync(f.transcript, tool('plan', name, { items }));
+  let result = await f.read();
+  assert.deepEqual(result.sessions[0].plan, { total: 4, done: 0, current: items[0].content, items, updatedAt: toolSince });
+
+  for (const [index, operation] of [
+    [1, { input: { advance: true }, done: 1, current: items[1].content }],
+    [2, { input: { done: [2, 3], start: 4 }, done: 3, current: items[3].content }],
+    [3, { name: 'mcp__ccd_turn__wrap_up', input: {}, done: 4, current: null }]
+  ]) {
+    const time = toolSince + index;
+    if (index === 2) appendFileSync(f.transcript, entry('user', { type: 'text', text: 'x'.repeat(256 * 1024) }));
+    appendFileSync(f.transcript, tool(`plan-${index}`, operation.name ?? name, operation.input, time));
+    result = await f.read(result.cursors);
+    // The incremental cursor may need another pass to read through the padding.
+    result = await f.read(result.cursors);
+    const { total, done, current, updatedAt } = result.sessions[0].plan;
+    assert.deepEqual({ total, done, current, updatedAt }, { total: 4, done: operation.done, current: operation.current, updatedAt: time });
+  }
+
+  assert.deepEqual((await f.read()).sessions[0].plan, result.sessions[0].plan);
+});
+
+test('completed background commands disappear while monitors and executors remain visible', async (t) => {
+  const f = fixture(t);
+  const result = (id, content) => entry('user', { type: 'tool_result', tool_use_id: id, content }, now);
+  const bash = { id: 'shell-1', kind: 'command', text: 'Run the build', since: toolSince };
+  const monitor = { id: 'monitor-1', kind: 'monitor', text: 'Watch the build', since: toolSince + 1 };
+  writeFileSync(f.transcript,
+    tool('bash', 'Bash', { command: 'make', description: bash.text, run_in_background: true }) +
+    result('bash', `Command running in background with ID: ${bash.id}.`) +
+    tool('monitor', 'Monitor', { description: monitor.text }, monitor.since) +
+    result('monitor', [{ type: 'text', text: `Monitor started (task ${monitor.id}, expires in 30m).` }]));
+  const started = await f.read();
+  assert.deepEqual(started.sessions[0].background, [monitor, bash]);
+
+  appendFileSync(f.transcript, JSON.stringify({
+    type: 'user', timestamp: new Date(now).toISOString(), origin: { kind: 'task-notification' },
+    message: { content: `<task-notification><task-id>${bash.id}</task-id><status>completed</status></task-notification>` }
+  }) + '\n');
+  const completed = await f.read(started.cursors);
+  assert.deepEqual(completed.sessions[0].background, [monitor]);
+
+  const command = 'node ~/.claude/scripts/conveyor/exec.mjs run';
+  appendFileSync(f.transcript, tool('exec', 'Bash', { command, run_in_background: true }, toolSince + 2) +
+    result('exec', 'Command running in background with ID: shell-2.'));
+  assert.deepEqual((await f.read(completed.cursors)).sessions[0].background, [
+    { id: 'shell-2', kind: 'executor', text: command, since: toolSince + 2 }, monitor
+  ]);
 });

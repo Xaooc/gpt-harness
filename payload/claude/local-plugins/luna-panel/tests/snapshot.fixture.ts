@@ -306,6 +306,19 @@ const snapshot = {
       turnSince: 0,
       idleSince: 1794841657460,
       agents: [],
+      plan: {
+        total: 4, done: 1, current: "Чиню гейт", updatedAt: 1794842233056,
+        items: [
+          {content: "Найти причину", status: "completed"},
+          {content: "Чиню гейт", status: "in_progress"},
+          {content: "Прогнать тесты", status: "pending"},
+          {content: "Запушить", status: "pending"},
+        ],
+      },
+      background: [
+        {id: "b1", kind: "command", text: "Прогон затронутых тестов", since: 1794842200000},
+        {id: "b2", kind: "monitor", text: "Ревью Astra: зависание или конец", since: 1794842100000},
+      ],
       limits: [
         {"kind": "five_hour", "percentUsed": 47, "resetsAt": "2026-11-16T18:00:00.000Z"},
         {"kind": "seven_day", "percentUsed": 72, "resetsAt": "2026-11-19T22:00:00.000Z"},

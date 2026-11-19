@@ -112,6 +112,12 @@ test('overview: every limit window, the active executor per tier, on every surfa
     await ui.press({ key: 'fold-exec' })
     expect(await ui.find({ type: 'Text', text: /все места работают одновременно/ })).toBeTruthy()
     await ui.press({ key: 'fold-exec' })
+    // A session row shows its plan (progress, current step, next step) and its background work.
+    expect(await ui.find({ type: 'Text', text: /^Чиню гейт$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^1\/4$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /дальше: Прогнать тесты/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Прогон затронутых тестов/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Ревью Astra/ })).toBeTruthy()
     await ui.unmount()
   }
 })

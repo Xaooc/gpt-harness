@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type {
-  ChainEntry, ClaudeLimit, CliStatus, Collapsed, Job, PanelData, Snapshot, View,
+  ChainEntry, ClaudeLimit, CliStatus, Collapsed, Job, PanelData, SessionBeat, Snapshot, View,
 } from '../types'
 
 // The Luna pane, conveyor edition: limits of every provider, the executor chains with the active one marked, every
@@ -934,11 +934,32 @@ export const register: Register = on => {
       )
     }
 
+    const background = (b?: SessionBeat) => b?.background ?? []
+
+    // The session's plan: progress, the step in work, and what is left, in one or two quiet lines.
+    const PlanLine = ({ plan }: { plan: NonNullable<SessionBeat['plan']> }) => {
+      const finished = plan.done >= plan.total
+      const next = plan.items.find(i => i.status === 'pending')
+      return (
+        <Box flexDirection="column">
+          <Box flexDirection="row" gap={1}>
+            <Text size="caption" color={finished ? 'success' : 'subtle'} tabular>{`${plan.done}/${plan.total}`}</Text>
+            <Text size="footnote" wrap="truncate-end" dimColor={finished}>
+              {finished ? 'план выполнен' : plan.current ?? (next ? `дальше: ${next.content}` : 'план')}
+            </Text>
+          </Box>
+          {!finished && plan.current && next ? (
+            <Box paddingLeft={4}><Text size="caption" color="subtle" wrap="truncate-end">{`дальше: ${next.content}`}</Text></Box>
+          ) : null}
+        </Box>
+      )
+    }
+
     const Jobs = () => {
       const beats = snap.sessions ?? []
       const counts = {
         codex: jobs.filter(j => providerOf(j) === 'codex' && j.state === 'running').length,
-        claude: beats.reduce((n, b) => n + (b.agents?.length ?? 0), 0),
+        claude: beats.reduce((n, b) => n + (b.agents?.length ?? 0) + background(b).length, 0),
       }
       const filter = v.filter === 'gemini' ? 'all' : v.filter
       const showJob = (j: Job) => filter === 'all' || filter === providerOf(j)
@@ -946,8 +967,11 @@ export const register: Register = on => {
       const visible = jobs.filter(showJob)
       const ids = [...new Set([...beats.map(b => b.sessionId), ...visible.map(j => j.owner).filter(Boolean)])]
       const all = ids.map(id => ({ id, beat: beats.find(b => b.sessionId === id), jobs: visible.filter(j => j.owner === id) }))
-      const busyNow = (g: (typeof all)[number]) => !!g.beat && now - g.beat.updatedAt <= 60_000 && g.beat.state !== 'idle'
-      const withWork = all.filter(g => g.jobs.length || (showAgents && (g.beat?.agents?.length ?? 0) > 0) || busyNow(g) || g.id === d.sessionId)
+      // Sessions in the snapshot are verified live by the collector: a quiet one is waiting, not gone.
+      const busyNow = (g: (typeof all)[number]) => !!g.beat && g.beat.state !== 'idle'
+      const planOpen = (b?: SessionBeat) => !!b?.plan && b.plan.total > 0 && b.plan.done < b.plan.total
+      const withWork = all.filter(g => g.jobs.length || (showAgents && ((g.beat?.agents?.length ?? 0) > 0 || background(g.beat).length > 0))
+        || (filter !== 'codex' && planOpen(g.beat)) || busyNow(g) || g.id === d.sessionId)
         .sort((a, b) => (a.id === d.sessionId ? -1 : b.id === d.sessionId ? 1 : 0) || (b.jobs.length - a.jobs.length))
       const idle = all.filter(g => !withWork.includes(g) && g.beat && now - g.beat.updatedAt <= 15 * 60_000)
       const orphans = visible.filter(j => !j.owner)
@@ -966,24 +990,35 @@ export const register: Register = on => {
           {withWork.map(g => {
             const b = g.beat
             const isMe = g.id === d.sessionId
-            const stale = !b || now - b.updatedAt > 60_000
             const name = b?.name || projectOfJobs(g.jobs) || (isMe ? 'эта сессия' : 'без папки')
-            const state = !b ? '' : stale ? 'неактивна' : b.state === 'thinking' ? 'думает' : b.state === 'tool' && b.tool ? b.tool.name : 'ждёт вас'
-            const stateColor = !stale && b?.state === 'thinking' ? 'claude' : !stale && b?.state === 'idle' ? 'warning' : 'subtle'
+            const state = !b ? '' : b.state === 'thinking' ? 'думает' : b.state === 'tool' && b.tool ? b.tool.name : 'ждёт вас'
+            const stateColor = b?.state === 'thinking' ? 'claude' : b?.state === 'idle' ? 'warning' : 'subtle'
             const id = `s-${g.id}`
             const open = !folded[id]
+            const plan = filter !== 'codex' && b?.plan && b.plan.total > 0 ? b.plan : null
+            // Executor launches already have their own Codex row; the shell that waits for them adds nothing.
+            const bg = showAgents ? background(b).filter(x => x.kind !== 'executor' || g.jobs.length === 0) : []
+            const work = g.jobs.length + (showAgents ? b?.agents?.length ?? 0 : 0) + bg.length
+            const summary = [plan ? `${plan.done}/${plan.total}` : '', work ? `${work} в работе` : ''].filter(Boolean).join(' · ')
             return (
               <Card>
                 <Box flexDirection="row" justifyContent="space-between" gap={1}>
                   <Button key={`fold-${id}`} plain onPress={toggle(id)}>
                     <Text size="footnote" weight="semibold" wrap="truncate-end">{name}
-                      <Text size="caption" weight="regular" color="subtle">{isMe ? '  эта' : ''}{open ? '' : `  ${g.jobs.length} ›`}</Text>
+                      <Text size="caption" weight="regular" color="subtle">{isMe ? '  эта' : ''}{open ? '' : `  ${summary || 'нет задач'} ›`}</Text>
                     </Text>
                   </Button>
                   <Text size="caption" color={stateColor}>{state}</Text>
                 </Box>
                 {open ? (
                   <Box flexDirection="column" paddingLeft={1}>
+                    {plan ? <PlanLine plan={plan} /> : null}
+                    {bg.map(x => (
+                      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+                        <Text size="footnote" wrap="truncate-end"><Text color="subtle">{x.kind === 'monitor' ? '◉ монитор ' : '⟳ фон '}</Text>{x.text || 'команда'}</Text>
+                        <Text size="caption" color="subtle" tabular>{duration((now - x.since) / 1000)}</Text>
+                      </Box>
+                    ))}
                     {showAgents ? (b?.agents ?? []).map(a => (
                       <Box flexDirection="row" justifyContent="space-between" gap={1}>
                         <Text size="footnote" wrap="truncate-end"><Text color="claude">◇ Claude </Text>{a.description || 'агент'}</Text>
