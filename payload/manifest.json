@@ -5317,7 +5317,7 @@
       "src": "claude/scripts/luna-collector.mjs",
       "dest": "scripts/luna-collector.mjs",
       "kind": "file",
-      "sha256": "63dcc3eb03080878946b54a602e34b6ef41da7a830a95ada8dd26351fc095181",
+      "sha256": "bb1f52886cbdfdb57d4bc094b16a0417256783a24940f76f6240732b2568bfd9",
       "executable": true
     }
   ],

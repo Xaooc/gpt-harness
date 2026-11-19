@@ -566,7 +566,9 @@ async function main(command) {
       const data = readJson(config.snapshot, MAX_SNAPSHOT);
       const snapshot = data && { version: data.version, at: data.at, collector: data.collector, sections: data.sections,
         ...(data.truncated ? { truncated: true } : {}) };
-      print({ discovery: readJson(config.discovery), snapshot });
+      // The discovery token authenticates /beat and /stop: never print it.
+      const { token, ...discovery } = readJson(config.discovery) ?? {};
+      print({ discovery: Object.keys(discovery).length ? { ...discovery, token: token ? 'hidden' : null } : null, snapshot });
       break;
     }
     case 'stop': {
