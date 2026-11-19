@@ -1,5 +1,5 @@
 // LunaWidget — tray icon + flyout (or pinned desktop widget) for the Luna / Codex orchestration.
-// Data: `node %USERPROFILE%\.claude\scripts\luna-overview.mjs` (one JSON snapshot), polled every 5 s while visible,
+// Data: the Luna collector snapshot, read every 5 s while visible,
 // every 30 s otherwise. Built with the C# 5 compiler that ships with .NET Framework 4.x (see build-widget.cmd).
 using System;
 using System.Collections;
@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -49,7 +50,8 @@ namespace LunaWidget
                 try { SetProcessDPIAware(); } catch { }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new TrayApp());
+                try { Application.Run(new TrayApp()); }
+                finally { Collector.RemoveLease(); }
             }
         }
     }
@@ -74,7 +76,7 @@ namespace LunaWidget
 
     class Snapshot
     {
-        public bool Ok; public string Error;
+        public bool Ok, Stale; public string Error;
         public double FreeMb, TotalMb;
         public bool DaemonRunning, DaemonHealthy = true, AppServerDown; public int DaemonRunningJobs, DaemonQueued, DaemonMax;
         public double DaemonUptimeS;
@@ -84,10 +86,28 @@ namespace LunaWidget
         public List<Alert> Alerts = new List<Alert>();
         public int Running, Waiting;
         public DateTime At = DateTime.Now;
+
+        public Snapshot WithReadError(string error)
+        {
+            var copy = (Snapshot)MemberwiseClone();
+            copy.Stale = true; copy.Error = error;
+            copy.Alerts = new List<Alert>();
+            return copy;
+        }
     }
 
     static class Collector
     {
+        const int MaxSnapshotBytes = 3 * 1024 * 1024;
+        static readonly string ClaudeHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
+        static string CollectorDirectory()
+        {
+            var run = Environment.GetEnvironmentVariable("LUNA_RUN_DIR");
+            return Path.GetFullPath(Path.Combine(string.IsNullOrEmpty(run) ? Path.Combine(ClaudeHome, "luna-run") : run, "collector"));
+        }
+
+        static string LeaseFile() { return Path.Combine(CollectorDirectory(), "leases", "widget.json"); }
+
         static string NodePath()
         {
             foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
@@ -98,36 +118,83 @@ namespace LunaWidget
             return Path.Combine(pf, "nodejs", "node.exe");
         }
 
-        // Every path, including a missing script and a collector timeout, ends in Analyse: a failed poll must surface as
-        // a warning, never as a green "всё в порядке".
-        public static Snapshot Poll()
+        public static Snapshot Poll(Snapshot last = null)
         {
             var snap = new Snapshot();
-            try { PollInto(snap); }
-            catch (Exception ex) { snap.Ok = false; snap.Error = ex.Message.Length > 80 ? ex.Message.Substring(0, 80) : ex.Message; }
+            try
+            {
+                Parse(ReadSnapshot(), snap);
+                snap.Ok = true;
+            }
+            catch (Exception ex)
+            {
+                var error = ex is FileNotFoundException || ex is DirectoryNotFoundException ? "нет snapshot.json" : ex.Message;
+                if (error.Length > 80) error = error.Substring(0, 80);
+                snap = last != null && last.Ok ? last.WithReadError(error) : new Snapshot { Error = error };
+            }
             Analyse(snap);
             return snap;
         }
 
-        static void PollInto(Snapshot snap)
+        static string ReadSnapshot()
         {
-            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            var script = Path.Combine(home, ".claude", "scripts", "luna-overview.mjs");
-            if (!File.Exists(script)) { snap.Error = "нет luna-overview.mjs"; return; }
-            var psi = new ProcessStartInfo(NodePath(), "\"" + script + "\"")
+            var file = Path.Combine(CollectorDirectory(), "snapshot.json");
+            for (int attempt = 0; ; attempt++)
             {
-                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true,
-                RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8
-            };
-            string json;
-            using (var p = Process.Start(psi))
-            {
-                var read = p.StandardOutput.ReadToEndAsync();
-                if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } snap.Error = "сборщик не ответил за 15 с"; return; }
-                json = read.Result;
+                try
+                {
+                    using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    using (var reader = new StreamReader(stream, Encoding.UTF8))
+                    {
+                        if (stream.Length > MaxSnapshotBytes) throw new InvalidDataException("snapshot.json слишком большой");
+                        return reader.ReadToEnd();
+                    }
+                }
+                catch (IOException ex)
+                {
+                    if (attempt != 0 || (ex.HResult & 0xffff) != 32) throw;
+                    Thread.Sleep(50);
+                }
             }
-            Parse(json, snap);
-            snap.Ok = true;
+        }
+
+        public static void Ensure()
+        {
+            try
+            {
+                var script = Path.Combine(ClaudeHome, "scripts", "luna-collector.mjs");
+                if (!File.Exists(script)) return;
+                var psi = new ProcessStartInfo(NodePath(), "\"" + script + "\" ensure")
+                {
+                    UseShellExecute = false, CreateNoWindow = true
+                };
+                using (var p = Process.Start(psi))
+                    if (!p.WaitForExit(8000)) p.Kill();
+            }
+            catch { /* The snapshot warning stays visible until a subsequent poll succeeds. */ }
+        }
+
+        public static void RenewLease()
+        {
+            string temp = null;
+            try
+            {
+                var lease = LeaseFile();
+                Directory.CreateDirectory(Path.GetDirectoryName(lease));
+                temp = lease + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                var at = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+                File.WriteAllText(temp, "{\"at\":\"" + at + "\"}\n");
+                if (File.Exists(lease)) File.Replace(temp, lease, null);
+                else File.Move(temp, lease);
+                temp = null;
+            }
+            catch { /* The next lease refresh can retry. */ }
+            finally { if (temp != null) { try { File.Delete(temp); } catch { } } }
+        }
+
+        public static void RemoveLease()
+        {
+            try { File.Delete(LeaseFile()); } catch { }
         }
 
         static Dictionary<string, object> Obj(object o) { return o as Dictionary<string, object>; }
@@ -160,7 +227,15 @@ namespace LunaWidget
 
         static void Parse(string json, Snapshot s)
         {
-            var root = Obj(new JavaScriptSerializer { MaxJsonLength = 16 * 1024 * 1024 }.DeserializeObject(json));
+            var root = Obj(new JavaScriptSerializer { MaxJsonLength = MaxSnapshotBytes }.DeserializeObject(json));
+            object collector;
+            DateTime published;
+            if (root == null || !root.TryGetValue("collector", out collector) ||
+                !DateTime.TryParse(Str(Obj(collector), "publishedAt"), CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out published))
+                throw new InvalidDataException("нет времени публикации snapshot.json");
+            s.At = published.ToLocalTime();
+            s.Stale = (DateTime.UtcNow - published.ToUniversalTime()).TotalSeconds > 30;
             var ram = Obj(root["ram"]);
             s.FreeMb = Num(ram, "freeMb", 0); s.TotalMb = Num(ram, "totalMb", 1);
             var dm = Obj(root.ContainsKey("daemon") ? root["daemon"] : null);
@@ -170,15 +245,16 @@ namespace LunaWidget
             s.DaemonRunningJobs = (int)Num(dm, "runningJobs", 0); s.DaemonQueued = (int)Num(dm, "queuedJobs", 0);
             s.DaemonMax = (int)Num(dm, "max", 0); s.DaemonUptimeS = Num(dm, "uptimeS", 0);
 
-            // Claude limits travel inside session heartbeats: take the freshest beat that carries them.
             var beats = Arr(root.ContainsKey("sessions") ? root["sessions"] : null).ToList();
-            var withLimits = beats.Where(b => b.ContainsKey("limits")).OrderByDescending(b => Num(b, "updatedAt", 0)).FirstOrDefault();
-            if (withLimits != null)
-                foreach (var l in Arr(withLimits["limits"]))
+            foreach (var l in Arr(root.ContainsKey("claudeLimits") ? root["claudeLimits"] : null))
+            {
+                var kind = Str(l, "kind");
+                if (kind == "spend_limit") continue;
+                s.Limits.Add(new Limit
                 {
-                    if (Str(l, "kind") == "spend_limit") continue;
-                    s.Limits.Add(new Limit { Label = "Claude · " + WindowName(Str(l, "kind"), 0), Pct = Num(l, "percentUsed", 0), Resets = ResetsIn(Str(l, "resetsAt")) });
-                }
+                    Label = "Claude · " + WindowName(kind, 0), Pct = Num(l, "percentUsed", 0), Resets = ResetsIn(Str(l, "resetsAt"))
+                });
+            }
             var cl = Obj(root.ContainsKey("codexLimits") ? root["codexLimits"] : null);
             if (cl != null)
             {
@@ -286,6 +362,7 @@ namespace LunaWidget
         static void Analyse(Snapshot s)
         {
             if (!s.Ok) { s.Alerts.Add(new Alert { Error = false, Text = "Нет данных: " + (s.Error ?? "?") }); return; }
+            if (s.Stale) s.Alerts.Add(new Alert { Text = "Данные устарели" + (s.Error != null ? ": " + s.Error : "") });
             if (s.FreeMb < 1024) s.Alerts.Add(new Alert { Error = true, Text = "Мало памяти: " + Fmt.Gb(s.FreeMb) + " — новые задания ждут" });
             else if (s.FreeMb < 2048) s.Alerts.Add(new Alert { Error = false, Text = "Памяти немного: " + Fmt.Gb(s.FreeMb) });
             foreach (var se in s.Sessions)
@@ -350,6 +427,7 @@ namespace LunaWidget
         readonly PanelForm panel;
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly SynchronizationContext ui;
+        readonly Stopwatch leaseClock = new Stopwatch(), ensureClock = new Stopwatch();
         Snapshot last;
         bool polling;
         DateTime lastPoll = DateTime.MinValue;
@@ -383,19 +461,41 @@ namespace LunaWidget
             if (st.TryGetValue("pinned", out v) && v == "1") SetPinned(true);
 
             timer.Interval = 1000;
-            timer.Tick += (s, e) => { var every = panel.Visible ? 5 : 30; if ((DateTime.Now - lastPoll).TotalSeconds >= every) PollNow(); };
+            timer.Tick += (s, e) =>
+            {
+                if (leaseClock.Elapsed.TotalSeconds >= 20) RenewLease();
+                var every = panel.Visible ? 5 : 30;
+                if ((DateTime.Now - lastPoll).TotalSeconds >= every) PollNow();
+            };
+            RenewLease();
             timer.Start();
             PollNow();
+        }
+
+        void RenewLease()
+        {
+            leaseClock.Restart();
+            Collector.RenewLease();
         }
 
         public void PollNow()
         {
             if (polling) return;
             polling = true; lastPoll = DateTime.Now;
+            var previous = last;
             ThreadPool.QueueUserWorkItem(_ =>
             {
-                var snap = Collector.Poll();
-                ui.Post(__ => { polling = false; Apply(snap); }, null);
+                var snap = Collector.Poll(previous);
+                ui.Post(__ =>
+                {
+                    polling = false;
+                    if ((!snap.Ok || snap.Stale) && (!ensureClock.IsRunning || ensureClock.Elapsed.TotalSeconds >= 60))
+                    {
+                        ensureClock.Restart();
+                        ThreadPool.QueueUserWorkItem(___ => Collector.Ensure());
+                    }
+                    Apply(snap);
+                }, null);
             });
         }
 
