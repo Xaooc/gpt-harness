@@ -30,7 +30,7 @@ function fixture(t, status = 'busy') {
   return {
     cwd, register, transcript: path.join(project, 'live.jsonl'),
     hasLiveSession: () => hasLiveSession(claudeHome, now),
-    read: (cursors) => readSessions({ claudeHome, now, cursors })
+    read: (cursors, options) => readSessions({ claudeHome, now, cursors, ...options })
   };
 }
 
@@ -47,7 +47,7 @@ test('a busy session shows its Bash tool until the tool result arrives', async (
   writeFileSync(f.transcript, tool('bash', 'Bash', { command: 'echo café\nprintf done' }));
   const open = await f.read();
   assert.deepEqual(open.sessions, [{
-    v: 1, sessionId: 'live', name: 'example', cwd: f.cwd, updatedAt: toolSince, state: 'tool',
+    v: 1, sessionId: 'live', name: 'example', cwd: f.cwd, updatedAt: now, state: 'tool',
     tool: { name: 'Bash', detail: 'echo café', since: toolSince },
     turnSince: statusUpdatedAt, idleSince: 0, agents: []
   }]);
@@ -81,6 +81,30 @@ test('a recycled registry PID with a different process start is rejected', async
   assert.equal(await f.hasLiveSession(), false);
 });
 
+test('session identity is reused across samples and dropped when the PID dies', async (t) => {
+  const f = fixture(t);
+  const lookups = [];
+  const lookupStarts = (pids) => {
+    lookups.push(pids);
+    return new Map([[process.pid, procStart]]);
+  };
+  const first = await f.read(undefined, { lookupStarts });
+  const second = await f.read(first.cursors, { now: now + 1_000, lookupStarts });
+  assert.deepEqual(lookups, [[process.pid]]);
+  assert.equal(second.identities.get(process.pid).verified, true);
+  assert.equal(second.sessions[0].updatedAt, now + 1_000);
+
+  const kill = process.kill;
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (pid === process.pid && signal === 0) throw Object.assign(new Error('PID exited'), { code: 'ESRCH' });
+    return kill(pid, signal);
+  });
+  const third = await f.read(second.cursors, { now: now + 2_000, lookupStarts });
+  assert.deepEqual(third.sessions, []);
+  assert.equal(third.identities.has(process.pid), false);
+  assert.deepEqual(lookups, [[process.pid]]);
+});
+
 test('a new cursor starts at a line boundary in the recent transcript tail', async (t) => {
   const f = fixture(t);
   const tail = tool('recent', 'Bash', { command: 'echo recent' }, toolSince - 500);
@@ -92,7 +116,7 @@ test('a new cursor starts at a line boundary in the recent transcript tail', asy
   assert.equal(cursors.live.offset, Buffer.byteLength(text));
   assert.deepEqual(sessions[0].agents, []);
   assert.deepEqual(sessions[0].tool, { name: 'Bash', detail: 'echo recent', since: toolSince - 500 });
-  assert.equal(sessions[0].updatedAt, toolSince - 500);
+  assert.equal(sessions[0].updatedAt, now);
 });
 
 test('a shorter transcript resets the cursor and clears old open tools', async (t) => {

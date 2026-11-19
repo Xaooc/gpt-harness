@@ -1,6 +1,6 @@
 import { open, readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { platform, processAlive, readProcessStat } from './platform.mjs';
+import { platform, readProcessStat } from './platform.mjs';
 
 const MAX_READ_BYTES = 256 * 1024;
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -8,6 +8,8 @@ const MAX_OPEN_TOOLS = 256;
 const CHECKPOINT_BYTES = 64;
 const UNVERIFIED_MS = 10 * 60_000;
 const IDLE_TOOL_MAX_AGE_MS = 30 * 60_000;
+const BACKGROUND_AGENT_MAX_AGE_MS = 6 * 60 * 60_000;
+const sessionIdentities = Symbol('session identities');
 const BACKGROUND_RESULT = /^(?:Async agent launched|(?:Agent|Task) (?:started|launched) in (?:the )?background)/i;
 const TERMINAL_TASK_STATUS = new Set(['completed', 'failed', 'stopped', 'killed', 'cancelled', 'canceled']);
 
@@ -31,7 +33,20 @@ async function openFile(file) {
   }
 }
 
-async function registryRows(directory, now) {
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === 'EPERM'; }
+}
+
+function linuxStarts(pids) {
+  return new Map(pids.map((pid) => {
+    const stat = readProcessStat(pid);
+    return [pid, stat?.state === 'Z' ? null : stat?.started];
+  }));
+}
+
+async function registryRows(directory, now, identities = new Map(), lookupStarts) {
   const candidates = [];
   const buffer = Buffer.alloc(64 * 1024);
   for (const entry of await entries(directory)) {
@@ -49,34 +64,52 @@ async function registryRows(directory, now) {
       await handle.close();
     }
     if (typeof row?.sessionId !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(row.sessionId) ||
-        !processAlive(row.pid)) continue;
+        !pidAlive(row.pid)) continue;
     candidates.push(row);
   }
-  let starts, sameStart;
-  if (platform === 'win32' && candidates.length) {
-    const identity = await import('../../lib/process-identity.mjs');
-    starts = await identity.processStartsAsync(candidates.map(({ pid }) => pid));
-    sameStart = identity.sameStart;
+  const pids = [...new Set(candidates.map(({ pid }) => pid))];
+  const nextIdentities = new Map();
+  const pending = [];
+  for (const pid of pids) {
+    const cached = identities.get(pid);
+    if (cached && now - cached.checkedAt < UNVERIFIED_MS) nextIdentities.set(pid, cached);
+    else pending.push(pid);
+  }
+  const identity = platform === 'win32' && pids.length ? await import('../../lib/process-identity.mjs') : null;
+  if (pending.length) {
+    const starts = await (lookupStarts ?? identity?.processStartsAsync ?? linuxStarts)(pending);
+    for (const pid of pending) {
+      const actual = starts.get(pid);
+      if (actual !== null && pidAlive(pid)) nextIdentities.set(pid, { actual, checkedAt: now });
+    }
   }
   const rows = new Map();
   for (const row of candidates) {
-    const actual = starts?.get(row.pid) ?? readProcessStat(row.pid)?.started;
-    if (actual) {
-      if (!row.procStart || !(sameStart ? sameStart(actual, row.procStart) : actual === String(row.procStart))) continue;
+    const cached = nextIdentities.get(row.pid);
+    if (!cached) continue;
+    const expected = row.procStart ? String(row.procStart) : '';
+    let { verified } = cached;
+    if (cached.expected !== expected) {
+      verified = Boolean(expected && cached.actual &&
+        (identity ? identity.sameStart(cached.actual, expected) : cached.actual === expected));
+      nextIdentities.set(row.pid, { ...cached, expected, verified });
+    }
+    if (cached.actual) {
+      if (!verified) continue;
     } else {
       const updated = Math.max(timestamp(row.statusUpdatedAt) ?? 0, timestamp(row.updatedAt) ?? 0);
-      if (!(updated > now - UNVERIFIED_MS) || !processAlive(row.pid)) continue;
+      if (!(updated > now - UNVERIFIED_MS)) continue;
     }
     const previous = rows.get(row.sessionId);
-    if (!previous || (timestamp(row.updatedAt) ?? 0) >= (timestamp(previous.updatedAt) ?? 0)) {
-      rows.set(row.sessionId, row);
+    if (!previous || (timestamp(row.updatedAt) ?? 0) >= (timestamp(previous.row.updatedAt) ?? 0)) {
+      rows.set(row.sessionId, { row, verified });
     }
   }
-  return rows;
+  return { rows, identities: nextIdentities };
 }
 
 export async function hasLiveSession(claudeHome, now = Date.now()) {
-  return (await registryRows(path.join(claudeHome, 'sessions'), now)).size > 0;
+  return (await registryRows(path.join(claudeHome, 'sessions'), now)).rows.size > 0;
 }
 
 function oneLine(value, max = 80) {
@@ -204,14 +237,16 @@ async function tailTranscript(file, handle, previous) {
   };
 }
 
-export async function readSessions({ claudeHome, now = Date.now(), cursors = {} }) {
-  const rows = await registryRows(path.join(claudeHome, 'sessions'), now);
+export async function readSessions({
+  claudeHome, now = Date.now(), cursors = {}, identities = cursors[sessionIdentities], lookupStarts
+}) {
+  const { rows, identities: nextIdentities } = await registryRows(path.join(claudeHome, 'sessions'), now, identities, lookupStarts);
   const projects = path.join(claudeHome, 'projects');
   let projectEntries;
   const sessions = [];
   const nextCursors = [];
   for (const sessionId of [...rows.keys()].sort()) {
-    const row = rows.get(sessionId);
+    const { row, verified } = rows.get(sessionId);
     const cwd = typeof row.cwd === 'string' ? row.cwd : '';
     const statusSince = timestamp(row.statusUpdatedAt) ?? timestamp(row.updatedAt) ?? timestamp(row.startedAt) ?? 0;
     const previous = Object.hasOwn(cursors, sessionId) ? cursors[sessionId] : undefined;
@@ -240,17 +275,23 @@ export async function readSessions({ claudeHome, now = Date.now(), cursors = {} 
       }
     }
     const busy = row.status === 'busy';
-    const openTools = (cursor?.tools ?? []).filter(([, tool]) => busy || now - tool.since <= IDLE_TOOL_MAX_AGE_MS);
+    const openTools = (cursor?.tools ?? []).filter(([, tool]) => tool.backgroundId
+      ? now - tool.since <= BACKGROUND_AGENT_MAX_AGE_MS
+      : busy || now - tool.since <= IDLE_TOOL_MAX_AGE_MS);
     if (cursor) nextCursors.push([sessionId, { ...cursor, tools: openTools }]);
     const agents = openTools.filter(([, tool]) => isAgent(tool.name)).slice(-20)
       .map(([id, tool]) => ({ id, description: tool.detail, since: tool.since }));
     const tool = busy ? openTools.findLast(([, entry]) => !entry.backgroundId)?.[1] ?? null : null;
     const name = oneLine(row.name) || (/scratch-workspaces/i.test(cwd) ? '' : basename(cwd));
+    const updatedAt = busy && verified ? now : Math.max(statusSince, timestamp(row.updatedAt) ?? 0, cursor?.updatedAt ?? 0);
     sessions.push({
-      v: 1, sessionId, name, cwd, updatedAt: Math.max(statusSince, timestamp(row.updatedAt) ?? 0, cursor?.updatedAt ?? 0),
+      v: 1, sessionId, name, cwd, updatedAt,
       state: tool ? 'tool' : busy ? 'thinking' : 'idle',
       tool, turnSince: busy ? statusSince : 0, idleSince: busy ? 0 : statusSince, agents
     });
   }
-  return { sessions, cursors: Object.fromEntries(nextCursors) };
+  // The collector carries only the transcript cursors between samples.
+  const nextCursorState = Object.fromEntries(nextCursors);
+  Object.defineProperty(nextCursorState, sessionIdentities, { value: nextIdentities });
+  return { sessions, cursors: nextCursorState, identities: nextIdentities };
 }

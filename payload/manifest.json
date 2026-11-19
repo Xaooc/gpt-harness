@@ -303,7 +303,7 @@
       "src": "claude/scripts/lib/process-identity.mjs",
       "dest": "scripts/lib/process-identity.mjs",
       "kind": "file",
-      "sha256": "758718f2181da077d98c783224661fe053bfffd0bd8cbf608ea1b2880a050cab"
+      "sha256": "3075b4cf2ceafe41cb0889ebd14e556a955580514bec29475fac4e7348dd4b30"
     },
     {
       "src": "claude/scripts/lib/luna-win-runtime.sh",
@@ -3921,13 +3921,13 @@
       "src": "claude/scripts/conveyor/lib/ledger.mjs",
       "dest": "scripts/conveyor/lib/ledger.mjs",
       "kind": "file",
-      "sha256": "47cbe609012fe44b9029c0ff4baa6890c88c65ee18020ce1c314616df4b6f688"
+      "sha256": "2d08aa69f8c7b2343f18801ea23786e72580a5a1777ce7228166eb043fc66dbe"
     },
     {
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
       "dest": "scripts/conveyor/lib/orchestration.mjs",
       "kind": "file",
-      "sha256": "cce4235ed6ebd42d91d836061300583a43f40da4a77336215cf5a1b71c0eddd3"
+      "sha256": "ddbff8a8108c7e6a999732d0d007b3635a8f7218bc479ac329674d28bf95e7f2"
     },
     {
       "src": "claude/scripts/conveyor/lib/patch-recipes.mjs",
@@ -4033,7 +4033,7 @@
       "src": "claude/scripts/conveyor/test/exec.test.mjs",
       "dest": "scripts/conveyor/test/exec.test.mjs",
       "kind": "file",
-      "sha256": "ad9c21665badd96f8bc4dda2e20f84e1be2b3fb5a6a71ea614e633ab4b74d66d"
+      "sha256": "c6e8b8c605a2da7a5245e23a0a618e4015bb4d675f02906044f46cf9e6205032"
     },
     {
       "src": "claude/scripts/conveyor/test/fixtures/fake-wrapper.sh",
@@ -4070,7 +4070,7 @@
       "src": "claude/scripts/conveyor/test/ledger.test.mjs",
       "dest": "scripts/conveyor/test/ledger.test.mjs",
       "kind": "file",
-      "sha256": "1af9ce887cdb2bf7b7e0e785e3e118a1cf59289193224c9584ef2dd045a065ca"
+      "sha256": "b3b97eae1f945c059feb3958c729126330aa0954a627fe532b13344d4f63ec52"
     },
     {
       "src": "claude/scripts/conveyor/test/metrics.test.mjs",
@@ -5293,7 +5293,7 @@
       "src": "claude/scripts/conveyor/lib/sessions.mjs",
       "dest": "scripts/conveyor/lib/sessions.mjs",
       "kind": "file",
-      "sha256": "5692c436dc36de2b723caf3b30d2763da577c6dfccd07ea6d7fb6aa9b712c8a7"
+      "sha256": "215f14df80eaa28ad4e57fc9509c38d2b92e01fb0d0b6a369287d4bb73be6c6e"
     },
     {
       "src": "claude/scripts/conveyor/test/collector.test.mjs",
@@ -5305,7 +5305,7 @@
       "src": "claude/scripts/conveyor/test/sessions.test.mjs",
       "dest": "scripts/conveyor/test/sessions.test.mjs",
       "kind": "file",
-      "sha256": "39783dbef5d9628f5375d6e14b7be4c453db0417ca0c14be138f8a59bc4c3902"
+      "sha256": "0c5c370e88dff31844a02071bc3fad7db19b8ad42dfecd3d3f0db66639135658"
     },
     {
       "src": "claude/scripts/lib/supervised-run.mjs",

@@ -381,8 +381,13 @@ async function heartbeatClaudeLimits(run, now) {
 
 async function claudeUsage(now) {
   const run = paths().run;
-  let windows = await collectorClaudeLimits(run, now);
-  if (!windows.length) windows = await heartbeatClaudeLimits(run, now);
+  const collected = await collectorClaudeLimits(run, now);
+  const reported = new Set(collected.map(({ kind }) => kind));
+  const heartbeat = await heartbeatClaudeLimits(run, now).catch((error) => {
+    if (!collected.length) throw error;
+    return [];
+  });
+  const windows = [...collected, ...heartbeat.filter(({ kind }) => !reported.has(kind))];
   return { known: windows.length > 0, nearLimit: windows.some((limit) => limit.percentUsed >= 95), windows };
 }
 

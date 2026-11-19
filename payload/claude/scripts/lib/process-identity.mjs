@@ -120,6 +120,7 @@ function query(pid) {
 const options = { encoding: 'utf8', windowsHide: true, timeout: 2500, stdio: ['ignore', 'pipe', 'ignore'] };
 const args = (command) => ['-NoProfile', '-NonInteractive', '-Command', command];
 const value = (text) => /^\d+$/.test(text.trim()) ? text.trim() : '';
+const FILETIME_UNIX_EPOCH = 116_444_736_000_000_000n;
 
 export function processStart(pid) {
   const command = query(pid);
@@ -171,6 +172,10 @@ export function processStartAsync(pid) {
   });
 }
 
+export function processStartMillis(start) {
+  return Number(BigInt(start) - FILETIME_UNIX_EPOCH) / 10_000;
+}
+
 // Accept ISO timestamps too, for discovery records written with CIM's round-trip format.
 export function sameStart(actual, expected) {
   if (!actual || !expected) return true; // A failed probe or an older record must not discard live work.
@@ -180,7 +185,7 @@ export function sameStart(actual, expected) {
   const times = [Date.parse(`${match[1]}${match[3] || ''}`)];
   if (!match[3]) times.push(Date.parse(`${match[1]}Z`));
   return times.some((millis) => Number.isFinite(millis) && actual === String(
-    (BigInt(millis) + 11644473600000n) * 10000n + BigInt((match[2] || '').padEnd(7, '0'))));
+    FILETIME_UNIX_EPOCH + BigInt(millis) * 10_000n + BigInt((match[2] || '').padEnd(7, '0'))));
 }
 
 function selfTest() {
