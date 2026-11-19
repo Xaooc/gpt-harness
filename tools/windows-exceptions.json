@@ -20,6 +20,7 @@
   "claude/scripts/lib/luna-linux-test.mjs": "Linux launcher tests exercise setsid, permissions and proxy setup.",
   "claude/scripts/lib/luna-loadtest.mjs": "Windows load test probes cmd.exe and queries processes through PowerShell.",
   "claude/scripts/lib/luna-runtime.sh": "Linux shell runtime manages process groups with setsid.",
+  "claude/scripts/lib/luna-watch-test.sh": "Windows watcher tests exercise MSYS and native Windows PIDs.",
   "claude/scripts/lib/luna-win-runtime.sh": "Windows shell runtime handles MSYS PIDs and native paths.",
   "claude/scripts/lib/process-identity.mjs": "Windows launcher, overview and heavy gate use native process creation times.",
   "claude/scripts/lib/pytest-gate-test.py": "Linux pytest gate lifecycle tests require fcntl and POSIX signals.",

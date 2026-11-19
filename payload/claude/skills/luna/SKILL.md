@@ -86,7 +86,7 @@ Critics: `high` by default, `max` only for an attacker on auth/money/secrets (se
   `Monitor(command: "bash ~/.claude/scripts/luna-watch.sh -i 300 <out.md> [<out.md> ...]", timeout_ms: 1800000,
   description: "<job>: stall or end")`. One watcher can cover several jobs. It emits `STALL` when a running job's log hasn't
   grown for `-i` seconds (use 300 normally; 600 for complex-tier jobs that think long between steps), `RESUMED`, `END state=…`,
-  and `GONE` when the wrapper died without updating its status. Re-arm it when it expires while jobs still run.
+  and `GONE` when the wrapper died without updating its status. Re-arm it when it expires while jobs still run. Since 2026-11-18 a watcher also ends by itself: a glob argument is re-expanded every poll (`END <pattern> state=missing` if nothing matches for 10 min), a job whose files were removed ends as `state=missing`, it exits when its parent shell is gone, and after 4 h it prints `EXPIRED` (re-arm).
   **On `STALL`, act immediately**: read the tail of `<out>.log` and `luna-status.sh`. If it's really stuck (no new commands,
   the model isn't thinking), stop it (`bash ~/.claude/scripts/luna-stop.sh <out.md>`), tell the user, and
   re-brief smaller or switch model. Don't wait it out silently. The wrapper also has its own idle and total timeouts
@@ -297,8 +297,7 @@ stays with Claude. Treat every brief as the complete spec: whatever isn't in it 
 - For user-facing flows, map each request to its visible state, available choice, action order and acceptance check.
 - Give critics the original goal and diff.
 
-**Fix rounds**: name the exact gap and the general rule ("you changed X but not its 3 callers; whenever a
-signature changes, update every caller"), because it won't generalise from a single example on its own.
+**Fix rounds**: state the exact gap and general rule; if failure recurs, inspect the prior fix and recheck the failure path.
 
 **Complex tier under this lens**: the executor handles long, precise briefs over many files, so the
 more complex the job, the more exhaustive the brief must be. A thin brief to the complex tier is an expensive
@@ -342,10 +341,8 @@ each with evidence and the expected behaviour, plus the invariants to preserve.
 
 - Check `luna-status.sh`: `done` is expected; `incomplete` means contract headings are
   missing — read the result carefully and ask for the missing part if it matters.
-- Write mode: `git status` + `git diff`; check the diff against the acceptance criteria and
-  the quality bar (line lengths, test list, invariants); run the verification gates
-  yourself. Wrong or incomplete → re-brief with the specific gap.
-- Research: spot-check the key claims before relying on them.
+- Write mode: check status; compare diff to acceptance and quality; run gates yourself. Wrong/incomplete → re-brief with the gap. Verify deployed fixes live before claiming done. Widespread blanks: separate missing source data from incomplete retrieval.
+- Research: spot-check key claims first.
 - Commit yourself (never Luna), following the repo's commit rules.
 - Moderately complex change → run `luna-critics`, ideally **in parallel with starting the
   next independent slice**.

@@ -24,6 +24,9 @@ root is checked too. Unknown hashes are never patched. Silent SessionStart repai
 target/hash once in `luna-run/plugin-patch-state.json`; `--check` reports statuses without writing.
 Patching preserves the target's EOL, creates `*.orig-luna-harness` with `COPYFILE_EXCL`, and writes atomically.
 
+- `scripts/session-lifecycle-hook.mjs`: avoids appending an environment export that is already present.
+  Repeated SessionStart resumes otherwise grow CLAUDE_ENV_FILE until Bash fails.
+
 - `scripts/lib/process.mjs`: `taskkill` exits 128 when the process is already gone. The plugin only recognised the
   English "not found" text, so on a Russian (or any non-English) Windows a dead job stayed `running` forever and the
   stop gate kept asking to cancel it. Patched to treat exit 128 as "already gone".
