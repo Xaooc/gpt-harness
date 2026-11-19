@@ -575,4 +575,7 @@ export async function main(args = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) process.exitCode = await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  if (process.env.LUNA_SESSION_MAINTENANCE === '1') setTimeout(() => process.exit(1), 120_000).unref();
+  process.exitCode = await main();
+}

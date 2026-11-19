@@ -1133,6 +1133,7 @@ export async function main(args = process.argv.slice(2)) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  if (process.env.LUNA_SESSION_MAINTENANCE === '1') setTimeout(() => process.exit(1), 120_000).unref();
   main().then((code) => { process.exitCode = code; }).catch((error) => {
     process.stderr.write(`conveyor: ${error.message.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')}\n`);
     process.exitCode = 1;

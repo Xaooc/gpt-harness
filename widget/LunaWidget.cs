@@ -109,16 +109,6 @@ namespace LunaWidget
 
         static string LeaseFile() { return Path.Combine(CollectorDirectory(), "leases", "widget.json"); }
 
-        static string NodePath()
-        {
-            foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
-            {
-                try { var p = Path.Combine(dir.Trim(), "node.exe"); if (File.Exists(p)) return p; } catch { }
-            }
-            var pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-            return Path.Combine(pf, "nodejs", "node.exe");
-        }
-
         public static Snapshot Poll(Snapshot last = null)
         {
             var snap = new Snapshot();
@@ -131,7 +121,7 @@ namespace LunaWidget
             {
                 var error = ex is FileNotFoundException || ex is DirectoryNotFoundException ? "нет snapshot.json" : ex.Message;
                 if (error.Length > 80) error = error.Substring(0, 80);
-                snap = last != null && last.Ok ? last.WithReadError(error) : new Snapshot { Error = error };
+                snap = last != null && last.Ok ? last.WithReadError(error) : new Snapshot { Stale = true, Error = error };
             }
             Analyse(snap);
             return snap;
@@ -157,22 +147,6 @@ namespace LunaWidget
                     Thread.Sleep(50);
                 }
             }
-        }
-
-        public static void Ensure()
-        {
-            try
-            {
-                var script = Path.Combine(ClaudeHome, "scripts", "luna-collector.mjs");
-                if (!File.Exists(script)) return;
-                var psi = new ProcessStartInfo(NodePath(), "\"" + script + "\" ensure")
-                {
-                    UseShellExecute = false, CreateNoWindow = true
-                };
-                using (var p = Process.Start(psi))
-                    if (!p.WaitForExit(8000)) p.Kill();
-            }
-            catch { /* The snapshot warning stays visible until a subsequent poll succeeds. */ }
         }
 
         public static void RenewLease()
@@ -434,7 +408,7 @@ namespace LunaWidget
         readonly PanelForm panel;
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly SynchronizationContext ui;
-        readonly Stopwatch leaseClock = new Stopwatch(), ensureClock = new Stopwatch();
+        readonly Stopwatch leaseClock = new Stopwatch();
         Snapshot last;
         bool polling;
         DateTime lastPoll = DateTime.MinValue;
@@ -496,11 +470,6 @@ namespace LunaWidget
                 ui.Post(__ =>
                 {
                     polling = false;
-                    if ((!snap.Ok || snap.Stale) && (!ensureClock.IsRunning || ensureClock.Elapsed.TotalSeconds >= 60))
-                    {
-                        ensureClock.Restart();
-                        ThreadPool.QueueUserWorkItem(___ => Collector.Ensure());
-                    }
                     Apply(snap);
                 }, null);
             });

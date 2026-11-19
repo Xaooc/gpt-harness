@@ -16,8 +16,7 @@ const COMMAND = 'luna'
 const POLL_MS = 5000
 const BEAT_MS = 20_000
 const STALE_MS = 30_000
-const ENSURE_MS = 60_000
-const MAX_ENSURE_MS = 15 * ENSURE_MS
+const COLLECTOR_HINT = 'сборщик не отвечает — запустите: node ~/.claude/scripts/luna-collector.mjs start'
 
 const EMPTY: PanelData = { snapshot: null, claude: [], error: '', polledAt: 0, sessionId: '' }
 const VIEW0: View = {
@@ -344,8 +343,6 @@ let generation = 0
 let reading = false
 let sendingBeat = false
 let lastBeatAt = -Infinity
-let nextEnsureAt = -Infinity
-let ensureDelay = ENSURE_MS
 
 function markHidden(): void {
   visible = false
@@ -372,48 +369,30 @@ async function checkVisibility($: EngineInterface, epoch: number): Promise<boole
 async function refreshSnapshot($: EngineInterface, epoch: number): Promise<void> {
   reading = true
   try {
-    let home = ''
-    let unusable = false
     let snapshot: Snapshot | null = null
     let error = ''
     try {
-      home = await claudeHome($)
+      const home = await claudeHome($)
       const run = await $.env.get('LUNA_RUN_DIR')
       if (!await checkVisibility($, epoch)) return
       const path = `${run || `${home}/luna-run`}/collector/snapshot.json`
-      const text = await $.fs.read(path).catch(async (caught: unknown) => {
-        if (await checkVisibility($, epoch)) unusable = (await $.fs.exists(path).catch(() => undefined)) === false
-        throw caught
-      })
-      try { snapshot = parseSnapshot(text) }
-      catch (caught) { unusable = true; throw caught }
+      snapshot = parseSnapshot(await $.fs.read(path))
     } catch (caught) {
-      error = oneLine((caught as Error)?.message ?? caught, 200)
+      error = oneLine((caught as Error)?.message ?? caught, 200) || 'снимок сборщика недоступен'
     }
     if (epoch !== generation) return
     const [own, sessionId, now] = await Promise.all([currentLimits($), currentSessionId($), $.clock.now()])
     if (!await checkVisibility($, epoch)) return
+    if (snapshot && now - Date.parse(snapshot.collector?.publishedAt) > STALE_MS) error = 'снимок сборщика устарел'
+    // The newest data wins: a stale snapshot just read is still newer than the one shown before.
     const latest = snapshot ?? (await read($, data))?.snapshot ?? null
-    const stale = !!latest && now - Date.parse(latest.collector?.publishedAt) > STALE_MS
-    if (epoch !== generation) return
-    if (snapshot && !stale) {
-      nextEnsureAt = -Infinity
-      ensureDelay = ENSURE_MS
-    }
     await update($, data, prev => epoch !== generation ? prev ?? EMPTY : {
       snapshot: latest,
       claude: mergeClaudeLimits(own, latest?.claudeLimits ?? [], now),
-      error: stale && !error ? 'снимок сборщика устарел' : error,
+      error,
       polledAt: now,
       sessionId,
     })
-    if (home && (unusable || stale)) {
-      const ensureAt = await $.clock.now()
-      if (ensureAt < nextEnsureAt || !await checkVisibility($, epoch)) return
-      nextEnsureAt = ensureAt + Math.min(MAX_ENSURE_MS, ensureDelay * (0.8 + Math.random() * 0.4))
-      ensureDelay = Math.min(MAX_ENSURE_MS, ensureDelay * 2)
-      void $.process.run(['node', `${home}/scripts/luna-collector.mjs`, 'ensure'], { timeoutMs: 8000 }).catch(() => {})
-    }
   } finally { reading = false }
 }
 
@@ -770,6 +749,7 @@ export const register: Register = on => {
             <Tab id="tab-updates" hotkey="4" label="Версии" active={v.tab === 'updates'}
               onPress={() => void setView({ tab: 'updates' })} />
           </Box>
+          {d.error ? <Text size="caption" color="warning" wrap="wrap">{COLLECTOR_HINT}</Text> : null}
           {v.note && Date.now() - v.note.at < 15_000 ? (
             <Box paddingTop={1}><Text size="caption" color={v.note.level} wrap="wrap">{v.note.level === 'success' ? `✓ Сохранено: ${v.note.text}` : v.note.text}</Text></Box>
           ) : null}

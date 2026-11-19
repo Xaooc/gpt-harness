@@ -25,6 +25,7 @@
   "claude/scripts/lib/pytest-gate-test.py": "Linux pytest gate lifecycle tests require fcntl and POSIX signals.",
   "claude/scripts/heavy-gate.mjs": "Windows heavy gate batches native process identity probes.",
   "claude/scripts/luna-clean.mjs": "Windows cleanup resolves Git Bash temp paths and compares paths case-insensitively.",
+  "claude/scripts/luna-collector-supervisor.vbs": "Windows logon supervisor runs the collector in a hidden window.",
   "claude/scripts/luna-daemon.mjs": "Windows daemon uses native Codex spawning, taskkill and a PowerShell memory helper.",
   "claude/scripts/luna-harness-plugin-patch.mjs": "Windows runtime applies patches to the installed Codex plugin.",
   "claude/scripts/luna-mempri.ps1": "Windows memory priority helper is used by the daemon.",

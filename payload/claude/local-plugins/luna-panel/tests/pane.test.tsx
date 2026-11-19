@@ -252,43 +252,34 @@ test('collector: hiding a visible pane stops reads and beats', async ($, on) => 
   expect(calls).toHaveLength(0)
 })
 
-test('collector: a stale snapshot stays visible, retries back off and a fresh snapshot resets them', async ($, on) => {
+test('collector: a stale or missing snapshot keeps the last data and shows the start hint without launching', async ($, on) => {
   const calls: Calls = []
-  const options: { snapshotAge: number | 'missing' } = { snapshotAge: 31_000 }
+  const options: { snapshotAge: number | 'missing' } = { snapshotAge: 0 }
   const { clock } = engine(on, calls, options)
   const ui = await opened($, 'desktop')
-  expect(await ui.find({ type: 'Text', text: /Данные не обновляются/ })).toBeTruthy()
-  const ensure = ['node', '/home/t/.claude/scripts/luna-collector.mjs', 'ensure']
-  expect(calls).toEqual([ensure])
-  await clock.advance(45_000)
-  expect(calls).toEqual([ensure])
-  await clock.advance(30_000)
-  expect(calls).toEqual([ensure, ensure])
-  await clock.advance(70_000)
-  expect(calls).toEqual([ensure, ensure])
-  await clock.advance(75_000)
-  expect(calls).toEqual([ensure, ensure, ensure])
-  options.snapshotAge = 0
-  await clock.advance(5_000)
-  options.snapshotAge = 'missing'
-  await clock.advance(5_000)
-  expect(calls).toEqual([ensure, ensure, ensure, ensure])
-  expect(await ui.find({ type: 'Text', text: /^Sol 6\.1$/ })).toBeTruthy()
+  const hint = /сборщик не отвечает — запустите: node ~\/\.claude\/scripts\/luna-collector\.mjs start/
+  expect(await ui.find({ type: 'Text', text: hint })).toBeFalsy()
+  for (const age of [31_000, 'missing'] as const) {
+    options.snapshotAge = age
+    await clock.advance(60_000)
+    expect(await ui.find({ type: 'Text', text: hint })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Данные не обновляются/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^Sol 6\.1$/ })).toBeTruthy()
+  }
+  expect(calls).toHaveLength(0)
   await ui.unmount()
 })
 
-test('collector: malformed and unsupported snapshots trigger recovery from a cold pane', async ($, on) => {
+test('collector: malformed and unsupported snapshots show the start hint in a cold pane', async ($, on) => {
   const calls: Calls = []
   const options: { snapshotAge: 'malformed' | 'wrong-version' } = { snapshotAge: 'malformed' }
   const { clock } = engine(on, calls, options)
   const ui = await opened($, 'desktop')
-  const ensure = ['node', '/home/t/.claude/scripts/luna-collector.mjs', 'ensure']
-  expect(calls).toEqual([ensure])
+  expect(await ui.find({ type: 'Text', text: /luna-collector\.mjs start/ })).toBeTruthy()
   options.snapshotAge = 'wrong-version'
-  await clock.advance(45_000)
-  expect(calls).toEqual([ensure])
-  await clock.advance(30_000)
-  expect(calls).toEqual([ensure, ensure])
+  await clock.advance(5000)
+  expect(await ui.find({ type: 'Text', text: /luna-collector\.mjs start/ })).toBeTruthy()
+  expect(calls).toHaveLength(0)
   await ui.unmount()
 })
 

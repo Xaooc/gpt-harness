@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
 import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -30,114 +31,141 @@ async function until(read, accept, description, ms = 15_000) {
   assert.fail(`timed out waiting for ${description}`);
 }
 
-async function fixture(work, { idle = 60_000, live = true, pure = false, hangUsage = false } = {}) {
+async function fixture(work, { realOverview = false, hangUsage = false } = {}) {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'luna-collector-test-'));
   const claude = path.join(root, '.claude'), scripts = path.join(claude, 'scripts'), sessions = path.join(claude, 'sessions');
   const runDir = path.join(root, 'run'), directory = path.join(runDir, 'collector');
-  const discovery = path.join(directory, 'discovery.json'), lock = path.join(directory, 'collector.lock');
+  const discovery = path.join(directory, 'discovery.json');
+  const lock = path.join(claude, 'luna-run', 'collector', 'collector.lock');
   const snapshot = path.join(directory, 'snapshot.json'), cli = path.join(scripts, 'luna-collector.mjs');
-  const env = { ...process.env, HOME: root, USERPROFILE: root, LUNA_RUN_DIR: runDir, LUNA_COLLECTOR_IDLE_MS: String(idle) };
-  delete env.CONVEYOR_PLATFORM;
-  delete env.LUNA_OVERVIEW_HOME;
-  const command = async (action) => {
-    const { stdout } = await execute(process.execPath, [cli, action], { env, windowsHide: true, timeout });
+  const env = { ...process.env, HOME: root, USERPROFILE: root, LUNA_RUN_DIR: runDir,
+    CONVEYOR_HOME: path.join(claude, 'conveyor'), CLAUDE_HOME_DIR: claude, CODEX_HOME: path.join(root, '.codex') };
+  for (const name of ['CONVEYOR_PLATFORM', 'LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME']) delete env[name];
+  const command = async (action, options = {}) => {
+    const { stdout } = await execute(process.execPath, [cli, action], { env, windowsHide: true, timeout, ...options });
     return stdout.trim() ? JSON.parse(stdout) : null;
   };
   const request = (info, route, options = {}) => fetch(`http://127.0.0.1:${info.port}${route}`, {
     signal: AbortSignal.timeout(5000), ...options
   });
+  const discover = () => until(() => json(discovery), Boolean, 'discovery');
   const snapshotWhen = (accept) => until(() => json(snapshot), accept, 'snapshot');
+  const clock = path.join(root, 'clock'), audit = path.join(root, 'audit'), preload = path.join(root, 'preload.mjs');
+  let launched;
+  let advanceMs = 0;
+  const advance = async (ms) => {
+    advanceMs += ms;
+    await fs.writeFile(clock, String(advanceMs));
+  };
+  const launch = () => {
+    const child = spawn(process.execPath, ['--import', preload, cli, 'run'], { env, windowsHide: true, stdio: 'ignore' });
+    launched = { child, closed: once(child, 'close') };
+    return launched;
+  };
   try {
-    await Promise.all([fs.mkdir(sessions, { recursive: true }), fs.mkdir(directory, { recursive: true })]);
-    const files = ['luna-collector.mjs', 'lib/supervised-run.mjs', 'lib/luna-runtime.mjs', 'conveyor/lib/platform.mjs',
-      'conveyor/lib/sessions.mjs'];
+    await Promise.all([sessions, directory, path.dirname(lock)].map(dir => fs.mkdir(dir, { recursive: true })));
+    const files = ['luna-collector.mjs', 'conveyor/lib/platform.mjs', 'conveyor/lib/sessions.mjs'];
     if (process.platform === 'win32') files.push('lib/process-identity.mjs');
-    if (live) {
-      const procStart = process.platform === 'win32'
-        ? await (await import('../../lib/process-identity.mjs')).processStartAsync(process.pid)
-        : readProcessStat(process.pid)?.started;
-      await fs.writeFile(path.join(sessions, `${process.pid}.json`), JSON.stringify({
-        pid: process.pid, sessionId: 'self', procStart, updatedAt: Date.now()
-      }));
+    if (realOverview) {
+      await Promise.all(['conveyor', 'lib', 'learning'].map(name => fs.cp(path.join(sources, name),
+        path.join(scripts, name), { recursive: true })));
+      await fs.mkdir(path.join(claude, 'conveyor'), { recursive: true });
+      await fs.copyFile(new URL('../../../conveyor/orchestration.default.json', import.meta.url),
+        path.join(claude, 'conveyor', 'orchestration.default.json'));
+      files.push('luna-overview.mjs');
     }
     for (const name of files) {
       const file = path.join(scripts, name);
       await fs.mkdir(path.dirname(file), { recursive: true });
       await fs.copyFile(path.join(sources, name), file);
     }
-    const fakeOverview = `const values = { ram: { freeMb: 100, totalMb: 200 }, daemon: { running: false },
-      jobs: [{ id: 'first' }], codexLimits: null, orchestration: {}, gemini: {} };\n`;
-    await Promise.all(Object.entries({
-      'luna-overview.mjs': fakeOverview + (pure ? `
-        import { existsSync } from 'node:fs';
-        import path from 'node:path';
-        export function collect({ claudeHome }) {
-          if (existsSync(path.join(claudeHome, 'overview-fails'))) throw new Error('fixture overview failed');
-          if (existsSync(path.join(claudeHome, 'overview-stale'))) return {
-            ...values, sections: { jobs: { status: 'stale', reason: 'fixture used cached jobs' } }
-          };
-          return values;
+    if (!realOverview) await fs.writeFile(path.join(scripts, 'luna-overview.mjs'), `
+      import { appendFileSync, existsSync } from 'node:fs';
+      import path from 'node:path';
+      const values = { daemon: { running: false }, jobs: [{ id: 'first' }], codexLimits: null, orchestration: {} };
+      export async function collect({ claudeHome }) {
+        appendFileSync(path.join(claudeHome, 'overview-attempts'), 'read\\n');
+        if (existsSync(path.join(claudeHome, 'overview-pending'))) await new Promise(() => {});
+        if (existsSync(path.join(claudeHome, 'overview-fails'))) throw new Error('fixture overview failed');
+        if (existsSync(path.join(claudeHome, 'overview-stale'))) return {
+          ...values, sections: { jobs: { status: 'stale', reason: 'fixture used cached jobs' } }
+        };
+        return values;
+      }`);
+    if (!realOverview) await fs.writeFile(path.join(scripts, 'conveyor/usage.mjs'), (hangUsage ? `
+      import { writeFileSync } from 'node:fs';
+      import path from 'node:path';
+      export function collectUsage() {
+        writeFileSync(path.join(process.env.LUNA_RUN_DIR, 'usage-started'), '');
+        while (true) {}
+      }
+    ` : 'export const collectUsage = () => ({ locked: false });') + `
+      export const summarizeUsage = () => ({});
+      export const usagePaths = () => ({});
+      export const readUsageSummary = () => ({ at: new Date().toISOString() });`);
+    await fs.writeFile(clock, '0');
+    await fs.writeFile(preload, `
+      import childProcess from 'node:child_process';
+      import { appendFileSync, readFileSync } from 'node:fs';
+      import { createRequire, syncBuiltinESMExports } from 'node:module';
+      const audit = (value) => appendFileSync(${JSON.stringify(audit)}, JSON.stringify(value) + '\\n');
+      const realNow = Date.now;
+      Date.now = () => realNow() + (Number(readFileSync(${JSON.stringify(clock)}, 'utf8')) || 0);
+      for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
+        const original = childProcess[name];
+        childProcess[name] = function (...args) { audit({ child: name }); return original.apply(this, args); };
+      }
+      const threads = createRequire(import.meta.url)('node:worker_threads');
+      threads.Worker = class extends threads.Worker {
+        constructor(file, options) {
+          audit({ worker: options.workerData });
+          super(file, options);
         }
-      ` : 'process.stdout.write(JSON.stringify(values), () => process.exit(0));'),
-      'luna-reap-brokers.mjs': '',
-      'conveyor/usage.mjs': (hangUsage ? `
-        import { writeFileSync } from 'node:fs';
-        import path from 'node:path';
-        export function collectUsage() {
-          writeFileSync(path.join(process.env.LUNA_RUN_DIR, 'usage-started'), '');
-          while (true) {}
-        }
-      ` : 'export const collectUsage = () => ({ locked: false });') + `
-        export const readUsageSummary = () => ({ at: new Date().toISOString() });`,
-      'conveyor/exec.mjs': `console.log(JSON.stringify({ ok: true, note: 'fixture' }));`,
-      'conveyor/cli-update.mjs': `console.log(JSON.stringify({ codex: {}, agy: {}, checkedAt: new Date().toISOString() }));`
-    }).map(([name, code]) => fs.writeFile(path.join(scripts, name), code)));
-    await work({ command, request, snapshotWhen, discovery, lock, claude, cli, env });
+      };
+      syncBuiltinESMExports();
+    `);
+    await work({ command, request, launch, discover, snapshotWhen, discovery, lock, claude, env, advance, audit });
   } finally {
     try {
-      const owner = await json(lock);
-      if (owner && owner.pid !== process.pid && processAlive(owner.pid)) {
+      if (launched?.child.exitCode === null) {
         try { await command('stop'); }
-        catch { if (processAlive(owner.pid)) process.kill(owner.pid, 'SIGTERM'); }
-        await until(() => processAlive(owner.pid), (alive) => !alive, 'collector exit');
+        catch { launched.child.kill(); }
+        await launched.closed;
       }
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   }
+}
+
+async function beat(request, info, limits = []) {
+  const result = await request(info, '/beat', {
+    method: 'POST', headers: { 'x-luna-token': info.token }, body: beatBody(limits)
+  });
+  assert.equal(result.status, 204);
 }
 
 function beatBody(limits = []) {
   return JSON.stringify({ sessionId: 'panel-one', visible: true, limits });
 }
 
-test('concurrent ensure calls share a collector and subsequent ensure reuses it', { timeout }, async () => {
-  await fixture(async ({ command, discovery, lock, cli, claude }) => {
-    await fs.writeFile(lock, JSON.stringify({
-      pid: process.pid, instance: 'd2a30991-4497-4651-a4dd-df0d09014144', startedAt: new Date().toISOString(), procStart: '1'
-    }));
-    const launches = path.join(claude, 'launches');
-    const source = await fs.readFile(cli, 'utf8');
-    const countRuns = `import { appendFileSync } from 'node:fs';
-      if (process.argv[2] === 'run') appendFileSync(${JSON.stringify(launches)}, process.pid + '\\n');\n`;
-    await fs.writeFile(cli, source.replace('\n', `\n${countRuns}`));
-    const [first, ...others] = await Promise.all(Array.from({ length: 5 }, () => command('ensure')));
-    for (const info of others) assert.deepEqual(info, first);
-    assert.notEqual(first.pid, process.pid);
+test('a second foreground collector exits with code 3 and leaves the first owner in place', { timeout }, async () => {
+  await fixture(async ({ command, launch, discover, lock, discovery, env }) => {
+    await fs.writeFile(lock, JSON.stringify({ pid: 999_999_999, instance: 'd2a30991-4497-4651-a4dd-df0d09014144' }));
+    const { child } = launch();
+    const first = await discover();
+    assert.equal(first.pid, child.pid);
+    await assert.rejects(command('run', { env: { ...env, LUNA_RUN_DIR: path.join(env.LUNA_RUN_DIR, 'other') } }), { code: 3 });
     assert.deepEqual(await json(discovery), first);
     assert.equal((await json(lock)).instance, first.instance);
-    const start = performance.now();
-    assert.deepEqual(await command('ensure'), first);
-    assert.ok(performance.now() - start < 2000);
-    assert.equal((await fs.readFile(launches, 'utf8')).trim(), String(first.pid));
   });
 });
 
 test('beat requires the discovery token and publishes Claude limits', { timeout }, async () => {
-  await fixture(async ({ command, request, snapshotWhen }) => {
-    const info = await command('ensure');
+  await fixture(async ({ launch, discover, request, snapshotWhen }) => {
+    launch();
+    const info = await discover();
     const limit = { kind: 'five_hour', percentUsed: 42, resetsAt: new Date(Date.now() + 60_000).toISOString() };
-    const beat = { method: 'POST', body: beatBody([limit]) };
-    assert.equal((await request(info, '/beat', beat)).status, 403);
-    assert.equal((await request(info, '/beat', { ...beat, headers: { 'x-luna-token': info.token } })).status, 204);
+    assert.equal((await request(info, '/beat', { method: 'POST', body: beatBody([limit]) })).status, 403);
+    await beat(request, info, [limit]);
     const result = await snapshotWhen((value) => value?.claudeLimits.length && value.sections.jobs.status === 'ok');
     const [actual] = result.claudeLimits;
     assert.deepEqual(actual, { ...limit, sessionId: 'panel-one', observedAt: actual.observedAt });
@@ -145,23 +173,28 @@ test('beat requires the discovery token and publishes Claude limits', { timeout 
   });
 });
 
-test('an idle foreground collector exits cleanly and removes its lock and discovery', { timeout }, async () => {
-  await fixture(async ({ cli, env, discovery, lock }) => {
-    const child = spawn(process.execPath, [cli, 'run'], { env, windowsHide: true, stdio: 'ignore' });
-    const closed = once(child, 'close');
-    const info = await until(() => json(discovery), Boolean, 'discovery');
+test('a quiet foreground collector stays resident and releases discovery and lock on stop', { timeout }, async () => {
+  await fixture(async ({ launch, discover, command, snapshotWhen, advance, discovery, lock }) => {
+    const { child, closed } = launch();
+    const info = await discover();
     assert.equal(info.pid, child.pid);
-    await until(() => child.exitCode, (value) => value !== null, 'idle shutdown', 3500);
+    const first = await snapshotWhen((value) => value?.sections.sessions.status === 'ok');
+    await advance(90_000);
+    const second = await snapshotWhen((value) => value?.sections.sessions.okAt > first.sections.sessions.okAt);
+    assert.equal(second.sections.jobs.status, 'idle');
+    assert.equal(second.sections.jobs.attemptAt, null);
+    assert.equal(child.exitCode, null);
+    await command('stop');
     assert.deepEqual(await closed, [0, null]);
     assert.equal(await json(discovery), null);
     assert.equal(await json(lock), null);
-  }, { idle: 700, live: false });
+  });
 });
 
-test('shutdown terminates a hung usage worker and removes discovery and the lock', { timeout }, async () => {
-  await fixture(async ({ command, cli, env, discovery, lock }) => {
-    const child = spawn(process.execPath, [cli, 'run'], { env, windowsHide: true, stdio: 'ignore' });
-    const closed = once(child, 'close');
+test('shutdown stops a hung usage worker and removes discovery and the lock', { timeout }, async () => {
+  await fixture(async ({ command, launch, discover, request, env, discovery, lock }) => {
+    const { child, closed } = launch();
+    await beat(request, await discover());
     const started = path.join(env.LUNA_RUN_DIR, 'usage-started');
     await until(() => fs.stat(started).catch(() => null), Boolean, 'usage worker start');
     const start = performance.now();
@@ -210,28 +243,30 @@ test('supervised timeout still kills the grandchild when the root exits with std
 });
 
 test('a throwing overview keeps last good jobs and RAM continues advancing', { timeout }, async () => {
-  await fixture(async ({ command, request, snapshotWhen, claude }) => {
-    const info = await command('ensure');
+  await fixture(async ({ launch, discover, request, snapshotWhen, claude, advance }) => {
+    launch();
+    const info = await discover();
+    await beat(request, info);
     const previous = await snapshotWhen((value) => value?.sections.jobs.status === 'ok' && value.sections.ram.status === 'ok');
     await fs.writeFile(path.join(claude, 'overview-fails'), '');
-    const headers = { 'x-luna-token': info.token };
-    assert.equal((await request(info, '/beat', { method: 'POST', headers, body: beatBody() })).status, 204);
+    await advance(6000);
     const next = await snapshotWhen((value) => value?.sections.jobs.status === 'stale' &&
       value.sections.ram.okAt > previous.sections.ram.okAt);
     assert.deepEqual(next.jobs, previous.jobs);
     assert.equal(next.sections.jobs.okAt, previous.sections.jobs.okAt);
     assert.equal(next.sections.jobs.reason, 'fixture overview failed');
     assert.equal(next.sections.ram.status, 'ok');
-  }, { pure: true });
+  });
 });
 
 test('a stale overview section retains the cached jobs, success time and reason', { timeout }, async () => {
-  await fixture(async ({ command, request, snapshotWhen, claude }) => {
-    const info = await command('ensure');
+  await fixture(async ({ launch, discover, request, snapshotWhen, claude, advance }) => {
+    launch();
+    const info = await discover();
+    await beat(request, info);
     const previous = await snapshotWhen((value) => value?.sections.jobs.status === 'ok');
     await fs.writeFile(path.join(claude, 'overview-stale'), '');
-    const headers = { 'x-luna-token': info.token };
-    assert.equal((await request(info, '/beat', { method: 'POST', headers, body: beatBody() })).status, 204);
+    await advance(6000);
     const value = await snapshotWhen((result) => result?.sections.jobs.status === 'stale');
     assert.deepEqual(value.jobs, previous.jobs);
     assert.equal(value.sections.jobs.okAt, previous.sections.jobs.okAt);
@@ -239,5 +274,69 @@ test('a stale overview section retains the cached jobs, success time and reason'
     assert.equal(value.gemini, null);
     assert.equal(value.sections.gemini.status, 'unavailable');
     assert.equal(value.sections.gemini.reason, 'Gemini is not used');
-  }, { pure: true });
+  });
+});
+
+
+test('a running collector never launches a subprocess and reuses its usage worker', { timeout }, async () => {
+  await fixture(async ({ launch, discover, request, snapshotWhen, advance, audit }) => {
+    launch();
+    const info = await discover();
+    await beat(request, info);
+    const first = await snapshotWhen((value) => value?.sections.usage.status === 'ok' && value.sections.jobs.status === 'ok');
+    let jobsAt = first.sections.jobs.okAt;
+    for (const ms of [30_000, 30_000, 30_000, 31_000]) {
+      await advance(ms);
+      await beat(request, info);
+      const sample = await snapshotWhen((value) => value?.sections.jobs.okAt > jobsAt);
+      jobsAt = sample.sections.jobs.okAt;
+    }
+    await snapshotWhen((value) => value?.sections.usage.okAt > first.sections.usage.okAt);
+    const calls = (await fs.readFile(audit, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(calls, [{ worker: 'usage' }]);
+  }, { realOverview: true });
+});
+
+test('an outstanding overview read becomes stale at its next due time without starting again', { timeout }, async () => {
+  await fixture(async ({ launch, discover, request, snapshotWhen, claude, advance }) => {
+    await fs.writeFile(path.join(claude, 'overview-pending'), '');
+    launch();
+    await beat(request, await discover());
+    await snapshotWhen((value) => value?.sections.jobs.attemptAt);
+    await advance(6000);
+    const stale = await snapshotWhen((value) => value?.sections.jobs.status === 'stale');
+    assert.equal(stale.sections.jobs.reason, 'previous read still running');
+    assert.equal(await fs.readFile(path.join(claude, 'overview-attempts'), 'utf8'), 'read\n');
+  });
+});
+
+test('a daemon /jobs 503 preserves the last good listing and its success time', { timeout }, async () => {
+  await fixture(async ({ launch, discover, request, snapshotWhen, advance, env }) => {
+    let unavailable = false;
+    const server = createServer((req, res) => {
+      assert.equal(req.headers['x-luna-token'], 'fixture-token');
+      if (req.url === '/jobs' && unavailable) res.writeHead(503).end();
+      else res.end(JSON.stringify(req.url === '/jobs' ? { jobs: [{ id: 'first', state: 'running' }] } : { ok: true }));
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    try {
+      await fs.writeFile(path.join(env.LUNA_RUN_DIR, 'daemon.json'), JSON.stringify({
+        pid: process.pid, pid_start: readProcessStat(process.pid)?.started, token: 'fixture-token', port: server.address().port
+      }));
+      launch();
+      await beat(request, await discover());
+      const first = await snapshotWhen((value) => value?.sections.jobs.status === 'ok' &&
+        value.daemon.profiles?.default.jobs[0]?.id === 'first');
+      unavailable = true;
+      await advance(6000);
+      const next = await snapshotWhen((value) => value?.sections.jobs.status === 'stale');
+      assert.deepEqual(next.daemon.profiles.default.jobs, first.daemon.profiles.default.jobs);
+      assert.equal(next.sections.jobs.okAt, first.sections.jobs.okAt);
+      assert.match(next.sections.jobs.reason, /HTTP 503/);
+    } finally {
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    }
+  }, { realOverview: true });
 });

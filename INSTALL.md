@@ -221,6 +221,16 @@ from `~/.claude/local-plugins/`. After a package update changes the pane, bump i
 `claude plugin marketplace update luna-local && claude plugin update luna-panel@luna-local`, then restart sessions.
 Without the update every session keeps running the old pane.
 
+On Linux, the systemd user service starts the collector at logon. Check it with
+`systemctl --user status luna-collector`. Run `node ~/.claude/scripts/luna-collector.mjs stop` or
+`node ~/.claude/scripts/luna-collector.mjs start` to stop or start it. It stays resident (about 80 MB) and
+goes quiet when no Claude sessions or pane or widget leases are active.
+
+On Windows, the installer registers a hidden Windows Script Host supervisor to start the collector at logon.
+Check it with `node ~/.claude/scripts/luna-collector.mjs status`. Use the same command with `stop` or `start`
+to stop or start it. It stays resident (about 80 MB) and goes quiet when no Claude sessions or pane or widget
+leases are active. An explicit stop on Windows applies until the next start or logon.
+
 ## 5b. Luna tray widget
 A small native Windows app, ~25 MB RAM. It shows the same view as the pane, outside Claude Code, and does not
 depend on which session is open.

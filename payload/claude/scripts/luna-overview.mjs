@@ -42,6 +42,14 @@ const localPath = (value) => typeof value === 'string' && /^[A-Za-z]:[\\/]/.test
 const nativeLocalPath = (value) => typeof value === 'string' && path.isAbsolute(value) &&
   !value.startsWith('//') && !value.includes('\0');
 
+async function allReads(reads) {
+  const results = await Promise.allSettled(reads);
+  return results.map((result) => {
+    if (result.status === 'rejected') throw result.reason;
+    return result.value;
+  });
+}
+
 function runDirectory(claudeHome) {
   return path.resolve(process.env.LUNA_RUN_DIR || process.env.LUNA_OVERVIEW_HOME || path.join(claudeHome, 'luna-run'));
 }
@@ -50,8 +58,7 @@ function snapshotFile(run) {
   return path.join(run, 'collector', 'snapshot.json');
 }
 
-function configuration(claudeHome = path.join(homedir(), '.claude'), platform = process.platform) {
-  const run = runDirectory(claudeHome);
+function configuration(claudeHome = path.join(homedir(), '.claude'), platform = process.platform, run = runDirectory(claudeHome)) {
   return {
     claudeHome, platform, run, localPath: platform === 'win32' ? localPath : nativeLocalPath,
     daemon: path.resolve(process.env.LUNA_DAEMON_HOME || run),
@@ -228,7 +235,7 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000, {
   catch { return []; }
   const recent = [];
   let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(8, entries.length) }, async () => {
+  await allReads(Array.from({ length: Math.min(8, entries.length) }, async () => {
     while (cursor < entries.length && !signal?.aborted) {
       const entry = entries[cursor++];
       if (!entry.isFile()) continue;
@@ -241,7 +248,7 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000, {
   const jobs = [];
   cursor = 0;
   // Bound filesystem concurrency even when many stale wrapper entries remain.
-  await Promise.all(Array.from({ length: Math.min(8, entries.length) }, async () => {
+  await allReads(Array.from({ length: Math.min(8, entries.length) }, async () => {
     while (cursor < entries.length && !signal?.aborted) {
       const { file } = entries[cursor++];
       const text = await readText(file, 32 * 1024);
@@ -307,7 +314,7 @@ async function geminiActiveJobs(config, now, wrapperStart, signal) {
   catch { return { jobs: [], statuses: new Map() }; }
   const jobs = [], statuses = new Map();
   let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(8, names.length) }, async () => {
+  await allReads(Array.from({ length: Math.min(8, names.length) }, async () => {
     while (cursor < names.length && !signal.aborted) {
       const file = path.join(directory, names[cursor++]);
       const pointer = await readJson(file);
@@ -343,7 +350,7 @@ async function geminiUsage(config, now, active, signal) {
   const outputs = [...new Set(records.filter((record) => config.localPath(record.out) &&
     !(Date.parse(record.finished) < midnight.getTime())).map((record) => record.out))];
   let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(8, outputs.length) }, async () => {
+  await allReads(Array.from({ length: Math.min(8, outputs.length) }, async () => {
     while (cursor < outputs.length && !signal.aborted) {
       const out = outputs[cursor++];
       if (statuses.has(out)) continue;
@@ -364,7 +371,7 @@ async function geminiUsage(config, now, active, signal) {
 
 async function geminiMcp(config) {
   if (!config.geminiStatus) return null;
-  const [status, toml] = await Promise.all([readJson(config.geminiStatus), readText(config.codexConfig)]);
+  const [status, toml] = await allReads([readJson(config.geminiStatus), readText(config.codexConfig)]);
   if (!status) return null;
   return {
     configured: /^[ \t]*\[[ \t]*mcp_servers\.(?:antigravity-parallel|"antigravity-parallel"|'antigravity-parallel')[ \t]*\]/m
@@ -506,6 +513,48 @@ async function fetchJson(info, route, signal) {
   } catch { return null; }
 }
 
+async function readDaemonJobs(info, signal) {
+  const response = await fetch(`http://127.0.0.1:${info.port}/jobs`, {
+    headers: { 'X-Luna-Token': info.token }, signal, redirect: 'error'
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`/jobs returned HTTP ${response.status}`);
+  }
+  const list = await response.json().catch(() => null);
+  if (!Array.isArray(list?.jobs) || !list.jobs.every((job) => object(job) && string(job.id) && string(job.state))) {
+    throw new Error('/jobs returned an invalid job listing');
+  }
+  return list;
+}
+
+async function sampleDaemonJobs(info, signal, now, profile, result, previous, failures) {
+  try {
+    const list = await readDaemonJobs(info, signal);
+    result.jobs = daemonJobs(list.jobs, now, profile);
+    if (object(list.owners)) {
+      result.owners = Object.entries(list.owners).map(([owner, counts]) => ({
+        owner, running: number(counts?.running), queued: number(counts?.queued)
+      }));
+    }
+  } catch (error) {
+    result.jobs = previous?.jobs ?? [];
+    result.owners = previous?.owners ?? [];
+    failures[profile] = `${profile} daemon ${error.message}`;
+  }
+}
+
+function markDaemonJobs(snapshot, previous, failures) {
+  const reasons = Object.values(failures);
+  if (!reasons.length) return;
+  const prior = previous?.sections?.jobs;
+  const existing = snapshot.sections?.jobs;
+  (snapshot.sections ??= {}).jobs = {
+    attemptAt: snapshot.at, okAt: prior?.okAt ?? null, staleAfterMs: prior?.staleAfterMs ?? DEADLINE_MS,
+    status: prior?.okAt ? 'stale' : 'unavailable', reason: [...reasons, existing?.reason].filter(Boolean).join('; ')
+  };
+}
+
 function daemonJobs(list, now, profile) {
   if (!Array.isArray(list)) return [];
   return list.filter((job) => object(job) &&
@@ -579,15 +628,9 @@ async function healthCollection(directory, info, health, now = Date.now(), signa
 }
 
 async function daemonStatus(directory, now, snapshot, profile = 'default', options = {}) {
-  const { cacheRoot = directory, processStart, signal } = options;
+  const { signal, previous, failures = {} } = options;
   const info = await readJson(path.join(directory, 'daemon.json'));
   if (!info || !alive(info.pid)) return;
-  const discovery = await fs.stat(path.join(directory, 'daemon.json')).catch(() => null);
-  const identity = `${info.token || ''}:${discovery?.mtimeMs || 0}:${discovery?.size || 0}`;
-  if (info.pid_start && processStart) {
-    const actual = await cachedStart(cacheRoot, info.pid, info.pid_start, identity, now, processStart);
-    if (!sameStart(actual, info.pid_start)) return;
-  }
   signal?.throwIfAborted();
   const result = {
     running: true, pid: info.pid, uptimeS: seconds(info.startedAt, now), max: null,
@@ -597,11 +640,13 @@ async function daemonStatus(directory, now, snapshot, profile = 'default', optio
   if (profile === 'default') snapshot.daemon = result;
   if (!Number.isInteger(info.port) || info.port < 1 || info.port > 65535 || typeof info.token !== 'string') {
     Object.assign(result, await healthCollection(directory, info, null, now, signal));
+    failures[profile] = `${profile} daemon discovery has no valid /jobs endpoint`;
+    result.jobs = previous?.jobs ?? [];
     return;
   }
   const timeout = AbortSignal.timeout(3000);
   const fetchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  await Promise.all([
+  await allReads([
     fetchJson(info, '/health', fetchSignal).then(async (health) => {
       if (health?.pid !== undefined && health.pid !== info.pid) health = null;
       Object.assign(result, await healthCollection(directory, info, health, now, signal));
@@ -611,16 +656,8 @@ async function daemonStatus(directory, now, snapshot, profile = 'default', optio
       result.runningJobs = number(health?.jobs?.running);
       result.queuedJobs = number(health?.jobs?.queued);
     }),
-    fetchJson(info, '/jobs', fetchSignal).then((list) => {
-      result.jobs = daemonJobs(list?.jobs, now, profile);
-      if (object(list?.owners)) {
-        result.owners = Object.entries(list.owners).map(([owner, counts]) => ({
-          owner, running: number(counts?.running), queued: number(counts?.queued)
-        }));
-      }
-    })
+    sampleDaemonJobs(info, fetchSignal, now, profile, result, previous, failures)
   ]);
-  timeout.throwIfAborted();
 }
 
 function aggregateDaemons(profiles) {
@@ -679,23 +716,25 @@ async function buildStatus(directory, now) {
 }
 
 // Keep each probe's result local until it completes. An overdue probe cannot mutate the returned snapshot.
-async function collectSections(config, snapshot, probes) {
-  let previous;
-  const cache = readJson(snapshotFile(config.run), MAX_SNAPSHOT_BYTES).then((value) => { previous = value; });
-  await Promise.all(probes.map(async ([name, fields, probe]) => {
+async function collectSections(snapshot, probes, previous, signal) {
+  await allReads(probes.map(async ([name, fields, probe]) => {
     const controller = new AbortController();
+    const probeSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     let timer;
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => {
         const error = new Error('collection deadline exceeded');
-        reject(error);
         controller.abort(error);
+        if (!signal) reject(error);
       }, DEADLINE_MS);
     });
     try {
-      Object.assign(snapshot, await Promise.race([probe(controller.signal), timeout]));
+      const result = probe(probeSignal);
+      // A resident caller keeps ownership of an aborted read until the underlying work settles.
+      const value = await (signal ? result : Promise.race([result, timeout]));
+      probeSignal.throwIfAborted();
+      Object.assign(snapshot, value);
     } catch (error) {
-      await Promise.race([cache, timeout]).catch(() => {});
       for (const field of fields) {
         if (Object.hasOwn(previous || {}, field)) snapshot[field] = previous[field];
       }
@@ -715,7 +754,7 @@ async function collectSections(config, snapshot, probes) {
 }
 
 async function codexLimits(config, now) {
-  const candidates = await Promise.all([
+  const candidates = await allReads([
     readJson(path.join(config.run, 'codex-limits.json')),
     readJson(path.join(config.daemon, 'daemon-net', 'codex-limits.json'))
   ]);
@@ -738,7 +777,7 @@ function sharedProbes(config, snapshot, now, geminiActive, includeGemini) {
     }],
     ['switches', ['switches'], async () => ({ switches: await switches() })],
     ...(includeGemini ? [['gemini', ['gemini'], async (signal) => {
-      const [status, usage, mcp, quota] = await Promise.all([
+      const [status, usage, mcp, quota] = await allReads([
         availability, geminiUsage(config, now, geminiActive(signal), signal),
         geminiMcp(config), geminiQuotaStatus(now, config)
       ]);
@@ -749,12 +788,14 @@ function sharedProbes(config, snapshot, now, geminiActive, includeGemini) {
 }
 
 export async function collect({ now = Date.now(), platform = process.platform,
-  claudeHome = path.join(homedir(), '.claude'), includeGemini = true } = {}) {
-  return collectOverview(configuration(claudeHome, platform), Number(new Date(now)), includeGemini);
+  claudeHome = path.join(homedir(), '.claude'), includeGemini = true, signal, previous, runDir } = {}) {
+  return collectOverview(configuration(claudeHome, platform, runDir), Number(new Date(now)), includeGemini, { signal, previous });
 }
 
-async function collectOverview(config, now, includeGemini = true) {
+async function collectOverview(config, now, includeGemini = true, { signal, previous } = {}) {
   const snapshot = empty(now);
+  previous ??= await readJson(snapshotFile(config.run), MAX_SNAPSHOT_BYTES);
+  const jobsFailures = {};
   const identityDeadline = performance.now() + 2500;
   let starts;
   const processStart = async (pid, signal) => {
@@ -764,45 +805,47 @@ async function collectOverview(config, now, includeGemini = true) {
     return (await starts).get(pid) || '';
   };
   let activeGemini;
-  const geminiActive = (signal) => activeGemini ??= geminiActiveJobs(config, now, async (pid, expected) => {
+  const geminiActive = (probeSignal) => activeGemini ??= geminiActiveJobs(config, now, async (pid, expected) => {
     if (!alive(pid)) return false;
     if (config.platform === 'linux') {
       const wrapper = readProcess(pid);
       return wrapper && wrapper.state !== 'Z' && (!expected || wrapper.started === expected);
     }
-    return !expected || sameStart(await processStart(pid, signal), expected);
-  }, signal);
+    return Boolean(signal) || !expected || sameStart(await processStart(pid, probeSignal), expected);
+  }, probeSignal);
   const daemon = async (signal) => {
     const { daemon, daemons } = empty(now);
     const result = { daemon, daemons };
-    const options = { cacheRoot: config.run, signal, processStart: (pid) => processStart(pid, signal) };
-    await Promise.all([
-      daemonStatus(config.daemon, now, result, 'default', options),
-      daemonStatus(path.join(config.daemon, 'daemon-net'), now, result, 'net', options)
+    const options = { signal, failures: jobsFailures };
+    await allReads([
+      daemonStatus(config.daemon, now, result, 'default', { ...options, previous: previous?.daemons?.default }),
+      daemonStatus(path.join(config.daemon, 'daemon-net'), now, result, 'net', { ...options, previous: previous?.daemons?.net })
     ]);
     return { daemon: aggregateDaemons(daemons), daemons };
   };
   let daemonProbe;
   try {
-    await collectSections(config, snapshot, [
-      ['ram', ['ram'], () => ({
+    await collectSections(snapshot, [
+      ...(signal ? [] : [['ram', ['ram'], () => ({
         ram: { freeMb: Math.round((config.platform === 'linux' ? availableMemory() : freemem()) / 1048576),
           totalMb: Math.round(totalmem() / 1048576) }
-      })],
+      })]]),
       ['daemon', ['daemon', 'daemons'], (signal) => daemonProbe = daemon(signal)],
-      ['jobs', ['jobs'], async (signal) => {
-        const options = { acceptsPath: config.localPath, signal, processStart: (pid) => processStart(pid, signal) };
-        const [jobs, active] = await Promise.all([activeJobs(config.run, now, undefined, options), geminiActive(signal)]);
+      ['jobs', ['jobs'], async (probeSignal) => {
+        const options = { acceptsPath: config.localPath, signal: probeSignal,
+          processStart: signal ? undefined : (pid) => processStart(pid, probeSignal) };
+        const [jobs, active] = await allReads([activeJobs(config.run, now, undefined, options), geminiActive(probeSignal)]);
         const daemons = jobs.some((job) => job._conflict) ? (await daemonProbe.catch(() => snapshot)).daemons : {};
         return { jobs: [...reconcileConflictJobs(jobs, daemons), ...active.jobs].sort(newest).slice(0, 40) };
       }],
       ['build', ['build'], async () => ({ build: await buildStatus(config.build || await customBuildRoot(config.claudeHome), now) })],
-      ...sharedProbes(config, snapshot, now, geminiActive, includeGemini)
-    ]);
+      ...sharedProbes(config, snapshot, now, geminiActive, includeGemini).filter(([name]) => !signal || name !== 'usage')
+    ], previous, signal);
   } finally {
     // Keep ownership of the identity probe until PowerShell and its stdio close.
     await starts?.catch(() => {});
   }
+  markDaemonJobs(snapshot, previous, jobsFailures);
   return snapshot;
 }
 
@@ -1256,20 +1299,11 @@ async function selfTest() {
 
 async function publishedSnapshot() {
   const run = runDirectory(path.join(homedir(), '.claude'));
-  const file = snapshotFile(run);
-  const snapshot = await readJson(file, MAX_SNAPSHOT_BYTES);
-  const publishedAt = Date.parse(snapshot?.collector?.publishedAt ?? snapshot?.at);
-  if (Number.isFinite(publishedAt) && Date.now() - publishedAt <= 30_000) return snapshot;
-
-  const collector = fileURLToPath(new URL('./luna-collector.mjs', import.meta.url));
-  await new Promise((resolve) => {
-    const child = spawn(process.execPath, [collector, 'ensure'], {
-      stdio: 'ignore', windowsHide: true, env: { ...process.env, LUNA_RUN_DIR: run }
-    });
-    child.once('error', resolve);
-    child.once('close', resolve);
-  });
-  return await readJson(file, MAX_SNAPSHOT_BYTES) ?? snapshot ?? empty();
+  const snapshot = await readJson(snapshotFile(run), MAX_SNAPSHOT_BYTES);
+  if (!snapshot) {
+    process.stderr.write('сборщик не отвечает — запустите: node ~/.claude/scripts/luna-collector.mjs start\n');
+  }
+  return snapshot ?? empty();
 }
 
 async function main(args) {

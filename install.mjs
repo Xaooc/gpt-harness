@@ -20,6 +20,10 @@ const BEGIN = '<!-- luna-harness:begin -->';
 const END = '<!-- luna-harness:end -->';
 const CHECK_TIMEOUT = 300_000;
 const RECORD = 'luna-harness.installed.json';
+const COLLECTOR_UNIT = 'luna-collector.service';
+const COLLECTOR_SCRIPT = 'scripts/luna-collector.mjs';
+const COLLECTOR_SUPERVISOR = 'scripts/luna-collector-supervisor.vbs';
+const COLLECTOR_RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const USAGE = 'Usage: node install.mjs [--home <dir>] [--platform win32|linux] [--codex-build-root <winpath>]\n'
   + '  [--dry-run] [--check] [--owner-setup] [--accept-local-drift] [--no-plugin-patch] [--yes] [--uninstall] [--self-test] [--help]\n'
   + '--owner-setup: install pending external tools. Exits 4 if required entries are still pending.\n'
@@ -648,7 +652,156 @@ function installEnv(ctx) {
     replaced = true;
     return `LUNA_CUSTOM_CODEX_ROOT=${root}`;
   }) : `${previous}${previous && !previous.endsWith('\n') ? '\n' : ''}LUNA_CUSTOM_CODEX_ROOT=${root}\n`;
-  writeManaged(ctx, file, next);
+  ctx.collectorNode = process.execPath;
+  const previousNode = /^LUNA_NODE=([^\r\n]*)/m.exec(previous)?.[1] ?? null;
+  ctx.previousCollectorNode = previousNode === ctx.record?.collectorNode
+    ? ctx.record.previousCollectorNode : previousNode;
+  writeManaged(ctx, file, collectorNodeLine(next, ctx.collectorNode));
+}
+
+function collectorNodeLine(text, value) {
+  const key = /^LUNA_NODE=[^\r\n]*(?:\r?\n|$)/gm;
+  const line = value === null ? '' : `LUNA_NODE=${value}\n`;
+  if (key.test(text)) {
+    let entry = line;
+    return text.replace(key, () => {
+      const current = entry;
+      entry = '';
+      return current;
+    });
+  }
+  return line ? `${text}${text && !text.endsWith('\n') ? '\n' : ''}${line}` : text;
+}
+
+function collectorUnit(ctx) {
+  return path.join(ctx.home, '.config', 'systemd', 'user', COLLECTOR_UNIT);
+}
+
+function collectorUnitBytes(ctx) {
+  const escape = (value) => JSON.stringify(value.replaceAll('%', '%%'));
+  const node = escape(process.execPath);
+  const script = escape(path.join(ctx.claudeHome, COLLECTOR_SCRIPT).replaceAll('$', '$$'));
+  return Buffer.from([
+    '[Unit]', 'Description=Luna shared collector', '', '[Service]', `ExecStart=${node} ${script} run`,
+    'Restart=on-failure', 'RestartSec=10', 'RestartPreventExitStatus=3', 'Nice=10', '',
+    '[Install]', 'WantedBy=default.target', '',
+  ].join('\n'));
+}
+
+function supervisorDisabled(ctx) {
+  const target = path.resolve(ctx.home), real = path.resolve(os.homedir());
+  return process.env.LUNA_INSTALL_NO_SUPERVISOR === '1' || ctx.platform !== process.platform ||
+    (ctx.platform === 'win32' ? target.toLowerCase() !== real.toLowerCase() : target !== real);
+}
+
+function supervisorCommand(ctx, command, args) {
+  return (ctx.supervisorRunner ?? runCommand)(command, args, { env: homeEnvironment(ctx), timeout: 30_000 });
+}
+
+function collectorWarning(ctx, detail) {
+  const manual = ctx.platform === 'win32'
+    ? 'node "%USERPROFILE%\\.claude\\scripts\\luna-collector.mjs" run'
+    : 'node ~/.claude/scripts/luna-collector.mjs run &';
+  report(ctx, 'warn', `${detail}. Manual start: ${manual}`);
+}
+
+function systemctl(ctx, ...args) {
+  const result = supervisorCommand(ctx, 'systemctl', ['--user', ...args]);
+  if (result.status === 0) return true;
+  collectorWarning(ctx, `systemctl --user ${args.join(' ')} failed: ${commandOutput(result)}`);
+  return false;
+}
+
+function stopInstalledCollector(ctx) {
+  const script = path.join(ctx.claudeHome, COLLECTOR_SCRIPT);
+  const run = path.join(ctx.claudeHome, 'luna-run', 'collector');
+  const lock = path.join(run, 'collector.lock');
+  if (!fs.existsSync(script)) return true;
+  let owner;
+  try { owner = readJson(lock); }
+  catch (error) { if (error.code === 'ENOENT') return true; }
+  if (Number.isSafeInteger(owner?.pid) && owner.pid > 0) {
+    try { process.kill(owner.pid, 0); }
+    catch (error) { if (error.code === 'ESRCH') return true; }
+  }
+  const result = supervisorCommand(ctx, process.execPath, [script, 'stop']);
+  if (result.status === 0) {
+    // The legacy collector acknowledges stop before removing discovery and releasing its lock.
+    const discovery = path.join(run, 'discovery.json');
+    if (!readOptional(discovery)) return true;
+    const deadline = Date.now() + 6000;
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    while (fs.existsSync(lock) && Date.now() < deadline) Atomics.wait(sleeper, 0, 0, 50);
+    if (!fs.existsSync(lock)) return true;
+  }
+  collectorWarning(ctx, `The previous collector did not stop: ${commandOutput(result)}`);
+  return false;
+}
+
+function checkCollectorSupervisor(ctx) {
+  if (ctx.platform === 'linux') {
+    if (readOptional(collectorUnit(ctx))?.equals(collectorUnitBytes(ctx))) return 0;
+    report(ctx, 'warn', `Collector unit drift: ${collectorUnit(ctx)} is missing or differs`);
+    return 1;
+  }
+  if (supervisorDisabled(ctx)) return 0;
+  const value = supervisorCommand(ctx, 'reg.exe', ['query', COLLECTOR_RUN_KEY, '/v', 'LunaCollector']);
+  if (value.status === 0) return 0;
+  report(ctx, 'warn', 'Collector logon registration drift: HKCU Run value LunaCollector is missing or unreadable');
+  return 1;
+}
+
+function installCollectorSupervisor(ctx, canStart) {
+  if (ctx.dryRun || supervisorDisabled(ctx)) {
+    const supervisor = ctx.platform === 'linux' ? COLLECTOR_UNIT : 'HKCU Run value LunaCollector';
+    report(ctx, 'ok', `Would enable and start ${supervisor}`);
+    return;
+  }
+  if (!canStart) return;
+  if (ctx.platform === 'linux') {
+    if (systemctl(ctx, 'daemon-reload')) systemctl(ctx, 'enable', '--now', COLLECTOR_UNIT);
+    return;
+  }
+  const wscript = findExecutable('wscript.exe');
+  if (!wscript) {
+    collectorWarning(ctx, 'wscript.exe unavailable');
+    return;
+  }
+  const script = path.join(ctx.claudeHome, COLLECTOR_SUPERVISOR);
+  const value = `wscript.exe //B //NoLogo "${script}"`;
+  const result = supervisorCommand(ctx, 'reg.exe', ['add', COLLECTOR_RUN_KEY, '/v', 'LunaCollector', '/t', 'REG_SZ', '/d', value, '/f']);
+  if (result.status !== 0) collectorWarning(ctx, `Could not register the collector at logon: ${commandOutput(result)}`);
+  const start = supervisorCommand(ctx, process.execPath, [path.join(ctx.claudeHome, COLLECTOR_SCRIPT), 'start']);
+  if (start.status !== 0) collectorWarning(ctx, `Could not start the collector supervisor: ${commandOutput(start)}`);
+}
+
+function uninstallCollectorSupervisor(ctx) {
+  const disabled = supervisorDisabled(ctx) || ctx.dryRun;
+  if (ctx.platform === 'linux' && ctx.record.collectorUnitSha256) {
+    if (disabled) report(ctx, 'ok', `Would disable and stop ${COLLECTOR_UNIT}`);
+    else systemctl(ctx, 'disable', '--now', COLLECTOR_UNIT);
+    const file = collectorUnit(ctx);
+    const bytes = readOptional(file);
+    if (bytes && sha256(bytes) === ctx.record.collectorUnitSha256) removeFile(ctx, file);
+    else if (bytes) report(ctx, 'warn', `Kept locally edited file: ${file}`);
+    if (!disabled) systemctl(ctx, 'daemon-reload');
+  }
+  if (ctx.platform === 'win32' && ctx.record.collectorNode) {
+    if (disabled) report(ctx, 'ok', 'Would remove HKCU Run value LunaCollector and stop the collector');
+    else {
+      const result = supervisorCommand(ctx, 'reg.exe', ['delete', COLLECTOR_RUN_KEY, '/v', 'LunaCollector', '/f']);
+      if (result.status !== 0) report(ctx, 'warn', `Could not delete HKCU Run value LunaCollector: ${commandOutput(result)}`);
+      atomicWrite(path.join(ctx.claudeHome, 'luna-run', 'collector', 'stopped'), '');
+      stopInstalledCollector(ctx);
+    }
+    if (!ctx.record.createdEnv) {
+      const file = path.join(ctx.claudeHome, 'luna-harness.env');
+      const current = readOptional(file)?.toString('utf8');
+      if (current && /^LUNA_NODE=([^\r\n]*)/m.exec(current)?.[1] === ctx.record.collectorNode) {
+        writeManaged(ctx, file, collectorNodeLine(current, ctx.record.previousCollectorNode ?? null));
+      }
+    }
+  }
 }
 
 function installSentinel(ctx) {
@@ -949,6 +1102,13 @@ function prepareInstall(ctx, manifest) {
   }
   for (const dest of Object.keys(ctx.record?.files ?? {})) observe(resolveInside(ctx.claudeHome, dest));
   for (const name of [RECORD, 'luna-harness.env', 'codex-gate-runner-off']) observe(path.join(ctx.claudeHome, name));
+  if (ctx.platform === 'linux') {
+    const file = collectorUnit(ctx);
+    const previous = observe(file);
+    if (previous && !previous.equals(collectorUnitBytes(ctx)) && sha256(previous) !== ctx.record?.collectorUnitSha256) {
+      driftedFiles.push(file);
+    }
+  }
   ctx.droppedHooks = droppedHooks;
   ctx.prepared = { fragment, hooks, patches, existingFiles, driftedFiles, observed };
 }
@@ -1039,6 +1199,8 @@ function saveRecord(ctx, manifest, restoration, created) {
   const pluginFiles = [...new Set([...(ctx.record?.pluginFiles ?? []), ...patchedFiles])];
   const record = {
     v: 1, installedAt: ctx.record?.installedAt ?? new Date().toISOString(), repoCommit, files,
+    ...(ctx.collectorUnitSha256 ? { collectorUnitSha256: ctx.collectorUnitSha256 } : {}),
+    ...(ctx.collectorNode ? { collectorNode: ctx.collectorNode, previousCollectorNode: ctx.previousCollectorNode } : {}),
     hooks: ctx.prepared.hooks, marketplaces: ['luna-local'], ...created, restoration, pluginFiles,
   };
   if (ctx.record && JSON.stringify(record) !== JSON.stringify(ctx.record)) {
@@ -1104,6 +1266,7 @@ function uninstall(ctx) {
   if (!patches && ctx.platform === 'linux' && ctx.record.pluginFiles?.length) {
     report(ctx, 'warn', 'Recorded Windows plugin patches were left untouched on Linux');
   }
+  uninstallCollectorSupervisor(ctx);
   if (previous) {
     const backup = readOptional(`${settingsPath}${BACKUP_SUFFIX}`);
     if (!backup) backupOnce(ctx, settingsPath);
@@ -1191,6 +1354,7 @@ function installPrepared(ctx, preflightFn) {
     }
   }
   preflightFn(ctx);
+  const supervisorCheck = ctx.check ? checkCollectorSupervisor(ctx) : 0;
   let checkStatus = 0;
   if (!(ctx.dryRun && ctx.check)) {
     const restoration = Object.fromEntries(['settings.json', 'CLAUDE.md'].map(name =>
@@ -1201,6 +1365,8 @@ function installPrepared(ctx, preflightFn) {
       createdEnv: ctx.record?.createdEnv === true || (ctx.platform === 'win32'
         && !fs.existsSync(path.join(ctx.claudeHome, 'luna-harness.env'))),
     };
+    const oldCollector = !ctx.record?.collectorUnitSha256 && !ctx.record?.collectorNode;
+    const canStart = ctx.dryRun || supervisorDisabled(ctx) || !oldCollector || stopInstalledCollector(ctx);
     pruneUpgrade(ctx, manifest);
     installFiles(ctx, manifest);
     installSettings(ctx, resolveInside(ctx.payload, manifest.settings));
@@ -1212,12 +1378,18 @@ function installPrepared(ctx, preflightFn) {
       else patchPlugins(ctx, resolveInside(ctx.payload, manifest.pluginPatches));
       checkCustomCodex(ctx);
     }
+    if (ctx.platform === 'linux') {
+      const bytes = collectorUnitBytes(ctx);
+      writeManaged(ctx, collectorUnit(ctx), bytes);
+      ctx.collectorUnitSha256 = sha256(bytes);
+    }
     saveRecord(ctx, manifest, restoration, created);
+    installCollectorSupervisor(ctx, canStart);
   }
   const externalStatus = configureExternals(ctx);
   if (ctx.check) checkStatus = runChecks(ctx);
   printSummary(ctx);
-  return externalStatus || checkStatus;
+  return externalStatus || checkStatus || supervisorCheck;
 }
 
 function main() {

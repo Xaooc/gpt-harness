@@ -1,18 +1,16 @@
 #!/usr/bin/env node
-import childProcess, { execFile, spawn } from 'node:child_process';
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { execFile, spawn } from 'node:child_process';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { syncBuiltinESMExports } from 'node:module';
 import { freemem, totalmem } from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
 import { home, platform, processAlive, readProcessStat } from './conveyor/lib/platform.mjs';
-import { availableMemory } from './lib/luna-runtime.mjs';
-import { run, sweepOrphans } from './lib/supervised-run.mjs';
+import { readSessions } from './conveyor/lib/sessions.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const HERE = path.dirname(SELF);
@@ -21,7 +19,8 @@ const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
 const LEASE_MS = 90 * SECOND;
 const DEADLINE = 120 * SECOND;
-const SHUTDOWN_GRACE_MS = 4750;
+const SHUTDOWN_GRACE_MS = 3000;
+const QUIET_MS = 30 * SECOND;
 const MAX_SNAPSHOT = 3 * 1024 * 1024;
 const MAX_BEAT = 16 * 1024;
 const FAST_SECTIONS = ['daemon', 'jobs', 'codexLimits', 'orchestration'];
@@ -32,16 +31,17 @@ const object = (value) => value && typeof value === 'object' && !Array.isArray(v
 function configuration() {
   const claudeHome = path.resolve(home(), '.claude');
   const runDir = path.resolve(process.env.LUNA_RUN_DIR || path.join(claudeHome, 'luna-run'));
-  const directory = path.join(runDir, 'collector');
-  return { claudeHome, runDir, directory, lock: path.join(directory, 'collector.lock'),
-    starting: path.join(directory, 'starting'),
+  const directory = path.join(runDir, 'collector'), local = path.join(claudeHome, 'luna-run', 'collector');
+  return { claudeHome, runDir, directory, lock: path.join(local, 'collector.lock'), stopped: path.join(local, 'stopped'),
     discovery: path.join(directory, 'discovery.json'), snapshot: path.join(directory, 'snapshot.json'),
-    schedule: path.join(directory, 'schedule.json'), widget: path.join(directory, 'leases', 'widget.json') };
+    widget: path.join(directory, 'leases', 'widget.json') };
 }
 
-function readJson(file) {
-  try { return JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
-  catch (error) {
+function readJson(file, maxBytes) {
+  try {
+    if (maxBytes && statSync(file).size > maxBytes) return null;
+    return JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+  } catch (error) {
     if (error.code === 'ENOENT' || error instanceof SyntaxError) return null;
     throw error;
   }
@@ -57,67 +57,46 @@ function writeAtomic(file, text) {
   } finally { remove(temp); }
 }
 
-async function processStart(pid) {
-  if (platform === 'linux') return readProcessStat(pid)?.started ?? null;
-  if (platform !== 'win32') return null;
-  const identity = path.join(HERE, 'lib', 'process-identity.mjs');
-  if (existsSync(identity)) {
-    const { processStartAsync } = await import(pathToFileURL(identity).href);
-    if (processStartAsync) return await processStartAsync(pid) || null;
-  }
-  return new Promise((resolve) => {
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToFileTimeUtc()`],
-    { windowsHide: true, timeout: 2500 }, (error, stdout) => resolve(error ? null : stdout.trim() || null));
-  });
+function ownerAlive(owner) {
+  return processAlive(owner?.pid) && (!owner.procStart || platform !== 'linux' ||
+    String(owner.procStart) === readProcessStat(owner.pid)?.started);
 }
 
-async function ownerAlive(owner) {
-  if (!processAlive(owner?.pid)) return false;
-  if (!owner.procStart) return true;
-  const actual = await processStart(owner.pid);
-  return actual ? String(owner.procStart) === actual : processAlive(owner.pid);
-}
+function acquireLock(file, owner) {
+  const write = (target) => {
+    try { writeFileSync(target, JSON.stringify(owner), { flag: 'wx', mode: 0o600 }); return true; }
+    catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+  };
+  if (write(file)) return true;
+  const freshEmptyLock = () => Date.now() - statSync(file, { throwIfNoEntry: false })?.mtimeMs < 10 * SECOND;
+  const previous = readJson(file);
+  if (ownerAlive(previous) || !previous && freshEmptyLock()) return false;
 
-async function acquireLock(file, owner) {
-  // Publish a complete startup claim with a hard link. Only its owner may create or replace collector.lock.
-  // If a claimant dies, the next claim is keyed to that dead instance and has its own exclusive link.
-  const root = `${file}.startup`, candidate = `${root}.${owner.instance}.tmp`;
-  const chain = [];
-  writeFileSync(candidate, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
-  let held = false;
+  // Serialize replacement of a dead owner's lock, including recovery if a reclaimer dies.
+  const instance = (value) => /^[a-f0-9-]{36}$/i.test(value?.instance) ? value.instance : 'unknown';
+  const candidate = `${file}.${owner.instance}.tmp`;
+  write(candidate);
+  const claims = [];
   try {
-    let claim = root;
+    let claim = `${file}.reclaim.${instance(previous)}`;
     for (;;) {
       try {
         linkSync(candidate, claim);
-        held = true;
-        chain.push([claim, owner.instance]);
         break;
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-      }
-      const previous = readJson(claim);
-      if (!/^[a-f0-9-]{36}$/i.test(previous?.instance) || await ownerAlive(previous)) return false;
-      chain.push([claim, previous.instance]);
-      claim = `${root}.${previous.instance}`;
+      } catch (error) { if (error.code !== 'EEXIST') throw error; }
+      const reclaimer = readJson(claim);
+      if (instance(reclaimer) === 'unknown' || ownerAlive(reclaimer)) return false;
+      claims.push(claim);
+      claim = `${file}.reclaim.${reclaimer.instance}`;
     }
-    if (!chain.every(([name, instance]) => readJson(name)?.instance === instance)) return false;
-    if (await ownerAlive(readJson(file))) return false;
+    claims.push(claim);
+    const current = readJson(file);
+    if (current?.instance !== previous?.instance || ownerAlive(current) || !current && freshEmptyLock()) return false;
     remove(file);
-    try {
-      writeFileSync(file, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
-    } catch (error) {
-      if (error.code !== 'EEXIST') remove(file);
-      throw error;
-    }
-    return true;
+    return write(file);
   } finally {
-    if (held && chain.every(([name, instance]) => readJson(name)?.instance === instance)) {
-      for (const [name] of chain) remove(name);
-    } else if (held) {
-      const [name] = chain.at(-1);
-      if (readJson(name)?.instance === owner.instance) remove(name);
+    if (claims.length && readJson(claims.at(-1))?.instance === owner.instance) {
+      for (const claim of claims) remove(claim);
     }
     remove(candidate);
   }
@@ -143,160 +122,15 @@ async function healthy(config) {
   } catch { return null; }
 }
 
-async function claimStartup(file) {
-  const owner = { pid: process.pid, instance: randomUUID() };
-  const claim = () => {
-    try {
-      writeFileSync(file, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
-      return owner.instance;
-    } catch (error) { if (error.code !== 'EEXIST') throw error; }
-  };
-  const claimed = claim();
-  if (claimed) return claimed;
-  const stale = () => {
-    const stat = statSync(file, { throwIfNoEntry: false });
-    return stat && Date.now() - stat.mtimeMs >= 10 * SECOND;
-  };
-  // Serialize stale-claim removal so one contender cannot remove another's new claim.
-  const recovery = `${file}.recovery`;
-  if (!stale() || !await acquireLock(recovery, owner)) return;
-  try {
-    if (stale()) remove(file);
-    return claim();
-  } finally {
-    remove(recovery);
-  }
-}
-
-async function ensure(config) {
-  const until = performance.now() + 5 * SECOND;
-  let info = await healthy(config);
-  if (info) return info;
-  mkdirSync(config.directory, { recursive: true, mode: 0o700 });
-  const claim = await claimStartup(config.starting);
-  const release = () => {
-    if (claim && readJson(config.starting)?.instance === claim) remove(config.starting);
-  };
-  let launchError;
-  if (claim) {
-    info = await healthy(config);
-    if (info) { release(); return info; }
-    if (!await ownerAlive(readJson(config.lock))) {
-      const launching = spawn(process.execPath, [SELF, 'run'], { cwd: config.directory,
-        detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env, LUNA_RUN_DIR: config.runDir } });
-      launching.once('error', (error) => { launchError = error; });
-      launching.unref();
-    }
-  }
-  do {
-    await sleep(Math.min(80, Math.max(0, until - 200 - performance.now())));
-    info = await healthy(config);
-    if (info) { release(); return info; }
-    if (launchError) { release(); throw launchError; }
-  } while (performance.now() < until - 200);
-  throw new Error('collector discovery and health timed out');
-}
-
-const helper = (name) => path.join(HERE, name);
-const overview = helper('luna-overview.mjs');
-const helpers = new Set([overview, helper('luna-reap-brokers.mjs'), helper('conveyor/gemini-quota.mjs'),
-  helper('conveyor/exec.mjs'), helper('conveyor/cli-update.mjs'), helper('conveyor/usage.mjs')]);
-
-// The legacy CLI owns three detached schedules. In its private fallback process, suppress those
-// launches so only the collector's supervised schedules run. The standalone CLI is unaffected.
-export function suppressLegacyOverviewLaunches() {
-  const originalSpawn = childProcess.spawn, originalExecFile = childProcess.execFile;
-  const originalExit = process.exit.bind(process);
-  const probes = new Set();
-  let exitPending = false, exitCode;
-  const track = (child) => {
-    probes.add(child);
-    child.once('close', () => {
-      probes.delete(child);
-      if (exitPending && !probes.size) originalExit(exitCode);
-    });
-    return child;
-  };
-  const auxiliary = new Set([helper('luna-reap-brokers.mjs'),
-    process.env.LUNA_USAGE_COLLECTOR || helper('conveyor/usage.mjs'),
-    process.env.LUNA_GEMINI_QUOTA_CMD || helper('conveyor/gemini-quota.mjs')]);
-  childProcess.spawn = function (command, args, options) {
-    if (command === process.execPath && options?.detached && auxiliary.has(args?.[0])) {
-      throw new Error('scheduled by luna-collector');
-    }
-    return track(originalSpawn.apply(this, arguments));
-  };
-  childProcess.execFile = function (...args) {
-    return track(originalExecFile.apply(this, args));
-  };
-  // Keep the root available to taskkill if the legacy formatter finishes while a probe is still alive.
-  process.exit = (code) => {
-    if (!probes.size) originalExit(code);
-    exitPending = true;
-    exitCode = code;
-  };
-  syncBuiltinESMExports();
-}
-
-function markerFor(directory) {
-  const id = createHash('sha256').update(directory).digest('hex');
-  const source = `/* luna-collector:${id} */ if (process.argv[1] === ${JSON.stringify(overview)}) ` +
-    `(await import(${JSON.stringify(import.meta.url)})).suppressLegacyOverviewLaunches();`;
-  return `--import=data:text/javascript,${encodeURIComponent(source)}`;
-}
-
-async function hasOverviewExport() {
-  // Importing the legacy CLI evaluates its main routine, which calls process.exit().
-  const source = await readFile(overview, 'utf8');
-  const declaration = /\bexport\s+(?:(?:async\s+)?function\s+collect\b|(?:const|let|var)\s+collect\b)/;
-  const named = /\bexport\s*\{[^}]*\bcollect\b[^}]*\}/;
-  return declaration.test(source) || named.test(source);
-}
-
-async function runWorkerJob({ task, options, env }) {
-  if (task === 'overview') {
-    const { collect } = await import('./luna-overview.mjs');
-    return typeof collect === 'function' ? { snapshot: await collect(options) } : null;
-  }
-  if (task === 'sessions') {
-    const { readSessions } = await import('./conveyor/lib/sessions.mjs');
-    // readSessions returns { sessions, cursors }; the cursors come back to the collector for the next pass.
-    return typeof readSessions === 'function' ? await readSessions(options) : null;
-  }
-  const { now, lockNonce } = options;
+async function runUsage({ now }) {
   const { collectUsage, readUsageSummary } = await import('./conveyor/usage.mjs');
-  if ((await collectUsage({ now, env, lockNonce })).locked) throw new Error('usage collection already running');
-  return { ...await readUsageSummary({ now, env }), stale: false };
+  if ((await collectUsage({ now })).locked) throw new Error('usage collection already running');
+  return { ...await readUsageSummary({ now }), stale: false };
 }
 
-function collectInWorker(workers, task, options, env, deadline) {
-  if (!workers.has(task)) {
-    const worker = new Worker(new URL(import.meta.url), { workerData: { task }, env, execArgv: [] });
-    workers.set(task, worker);
-    worker.on('error', () => {}); // The active request handles errors; an idle worker can also exit.
-    worker.once('exit', () => { if (workers.get(task) === worker) workers.delete(task); });
-  }
-  const worker = workers.get(task);
-  return new Promise((resolve, reject) => {
-    const clear = () => {
-      clearTimeout(timer);
-      worker.off('message', receive);
-      worker.off('exit', exit);
-    };
-    const receive = ({ value, error }) => {
-      clear();
-      if (error) reject(new Error(error));
-      else resolve(value);
-    };
-    const exit = (code) => {
-      clear();
-      reject(new Error(`${task} worker exited with code ${code}`));
-    };
-    const timer = setTimeout(() => { void worker.terminate(); }, deadline);
-    worker.once('message', receive);
-    worker.once('exit', exit);
-    worker.postMessage(options);
-  });
+async function readProbeJson(file) {
+  try { return JSON.parse((await readFile(file, 'utf8')).replace(/^\uFEFF/, '')); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
 function section(staleAfterMs) {
@@ -421,10 +255,6 @@ function assembleServer(token, health, beat, stop) {
 }
 
 async function serve(config, owner) {
-  const env = { ...process.env, LUNA_RUN_DIR: config.runDir };
-  // The old Windows overview uses LUNA_OVERVIEW_HOME for its run root.
-  const overviewEnv = { ...env, LUNA_OVERVIEW_HOME: env.LUNA_OVERVIEW_HOME || config.runDir };
-  const marker = markerFor(config.directory);
   const token = randomBytes(16).toString('hex');
   const defaults = {
     v: 1, ram: { freeMb: null, totalMb: null }, daemon: { running: false, appServer: null, healthy: false },
@@ -433,16 +263,20 @@ async function serve(config, owner) {
   if (platform === 'win32') defaults.daemons = {};
   const values = { ...defaults, cli: null };
   const beats = new Map(), limits = new Map(), jobs = [], pending = new Set();
-  const workers = new Map();
   const shutdown = new AbortController();
   const metadata = Object.fromEntries(
     [...FAST_SECTIONS, 'ram', 'sessions', 'usage', 'cli', 'catalog', 'gemini'].map((name) => [name, section(0)]));
   metadata.gemini.reason = 'Gemini is not used';
-  let seq = 0, dirty = true, stopping = false;
-  let overviewExport;
-  let idleSince = Date.now(), liveSession = false, nextSessionCheck = 0, fastMs = MINUTE;
-  let schedule = readJson(config.schedule) || {};
-  let lastSections, timer;
+  const saved = readJson(config.snapshot, MAX_SNAPSHOT);
+  if (saved?.version === 2) {
+    for (const name of Object.keys(values)) if (Object.hasOwn(saved, name)) values[name] = saved[name];
+    for (const [name, state] of Object.entries(metadata)) {
+      if (object(saved.sections?.[name])) Object.assign(state, saved.sections[name]);
+    }
+  }
+  let seq = 0, dirty = true, stopping = false, quiet = true, liveSession = false, fastMs = MINUTE;
+  let lastSections, timer, usageWorker, widgetRead, nextWidgetAt = 0;
+  let widgetAt = NaN;
   let wakeStop;
   const stopped = new Promise((resolve) => { wakeStop = resolve; });
   const stop = () => { stopping = true; shutdown.abort(); wakeStop(); };
@@ -454,7 +288,6 @@ async function serve(config, owner) {
         typeof body.visible !== 'boolean' || !Array.isArray(body.limits)) throw new Error('invalid beat');
     const now = Date.now();
     beats.set(body.sessionId, { at: now, visible: body.visible });
-    idleSince = null;
     for (const item of body.limits) {
       if (typeof item?.kind !== 'string' || !item.kind.trim() || !Number.isFinite(item.percentUsed)) continue;
       const resetsAt = item.resetsAt ?? null;
@@ -477,104 +310,66 @@ async function serve(config, owner) {
     dirty = true;
   }
 
-  function register({ names = [], interval, deadline = DEADLINE, work, merge, hourly }) {
-    const saved = hourly && schedule[hourly];
-    const job = { names, interval, deadline, work, merge, hourly, last: 0, busy: false, failures: 0, dueAt: 0 };
-    if (Number.isFinite(saved?.dueAt)) {
-      job.dueAt = saved.dueAt;
-      job.failures = Number.isSafeInteger(saved.failures) ? saved.failures : 0;
-      if (saved.section) Object.assign(metadata[hourly], saved.section);
-      if (hourly === 'cli') values.cli = saved.value ?? null;
-    }
+  function register({ names, interval, deadline = DEADLINE, work, merge }) {
+    const job = { names, interval, deadline, work, merge, last: -Infinity, dueAt: 0, busy: false };
     jobs.push(job);
+    return job;
   }
 
   function attempt(job, now) {
-    const { names, deadline, work, merge, hourly } = job;
+    const { names, deadline, work, merge } = job;
     job.busy = true;
     job.last = now;
+    job.dueAt = now + job.interval();
     for (const name of names) meta(name).attemptAt = iso(now);
     dirty = true;
     const fail = (error) => {
-      for (const name of names) report(name, meta(name).okAt ? 'stale' : 'error', Date.now(), message(error));
-      if (!names.length) log(error);
-      job.failures++;
+      for (const name of names) report(name, meta(name).okAt ? 'stale' : 'unavailable', Date.now(), message(error));
     };
-    let timedOut = false;
+    const controller = new AbortController();
     const timeout = setTimeout(() => {
-      timedOut = true;
-      fail(new Error(`deadline exceeded after ${deadline} ms`));
+      const error = new Error(`deadline exceeded after ${deadline} ms`);
+      controller.abort(error);
+      fail(error);
     }, deadline);
-    const done = Promise.resolve().then(() => work(now)).then((result) => {
-      if (timedOut) return;
-      merge?.(result, Date.now());
-      job.failures = 0;
+    const signal = AbortSignal.any([controller.signal, shutdown.signal]);
+    const done = Promise.resolve().then(() => work(now, signal)).then((result) => {
+      if (!controller.signal.aborted) merge(result, Date.now());
     }).catch((error) => {
-      if (!timedOut) fail(error);
+      if (!signal.aborted) fail(error);
     }).finally(() => {
-      // Keep the job's slot until its worker or supervised process has finished.
       clearTimeout(timeout);
       job.busy = false;
-      if (!job.failures) job.dueAt = job.last + job.interval();
-      else {
-        const retry = Math.min(job.interval(), SECOND * 2 ** Math.min(job.failures, 16));
-        job.dueAt = Date.now() + retry;
-      }
-      if (hourly) {
-        schedule = { ...schedule, [hourly]: { dueAt: job.dueAt, failures: job.failures, section: { ...metadata[hourly] },
-          ...(hourly === 'cli' ? { value: values.cli } : {}) } };
-        try { writeAtomic(config.schedule, JSON.stringify(schedule) + '\n'); }
-        catch (error) { log(error); }
-      }
       pending.delete(done);
     });
     pending.add(done);
   }
 
-  async function runHelper(file, args, { deadlineMs = DEADLINE, childEnv = env, maxOutput } = {}) {
-    const result = await run([process.execPath, marker, file, ...args], {
-      cwd: config.directory, env: childEnv, deadlineMs, maxOutput, signal: shutdown.signal
-    });
-    if (result.timedOut) throw new Error(`${path.basename(file)} timed out`);
-    if (result.code !== 0) throw new Error(`${path.basename(file)} exited ${result.code}: ${message(result.stderr)}`);
-    return result.stdout;
-  }
-
   const fast = () => fastMs;
   const probeDeadline = 4 * SECOND;
-  const probeOptions = (now) => ({ now, platform, claudeHome: config.claudeHome });
   register({ names: ['ram'], interval: fast, deadline: SECOND,
-    work: () => ({ freeMb: Math.round((platform === 'linux' ? availableMemory() : freemem()) / 1048576),
-      totalMb: Math.round(totalmem() / 1048576) }),
+    async work() {
+      let available = freemem();
+      if (platform === 'linux') {
+        const meminfo = await readFile('/proc/meminfo', 'utf8').catch(() => '');
+        const match = /^MemAvailable:\s+(\d+)/m.exec(meminfo);
+        if (match) available = Number(match[1]) * 1024;
+      }
+      return { freeMb: Math.round(available / 1048576), totalMb: Math.round(totalmem() / 1048576) };
+    },
     merge: (result, now) => { values.ram = result; report('ram', 'ok', now); } });
   register({ names: FAST_SECTIONS, interval: fast, deadline: probeDeadline,
-    async work(now) {
-      overviewExport ??= await hasOverviewExport();
-      if (overviewExport) {
-        const result = await collectInWorker(workers, 'overview', { ...probeOptions(now), includeGemini: false }, env, probeDeadline);
-        if (result) return result.snapshot;
-        overviewExport = false;
-      }
-      // The legacy producer can include 100 session files of up to 64 KiB each.
-      return JSON.parse(await runHelper(overview, ['--json'], {
-        deadlineMs: probeDeadline, childEnv: overviewEnv, maxOutput: 8 * 1024 * 1024
-      }));
+    async work(now, signal) {
+      const { collect } = await import('./luna-overview.mjs');
+      return collect({ now, platform, claudeHome: config.claudeHome, includeGemini: false, signal, runDir: config.runDir,
+        previous: { ...values, sections: { jobs: { ...meta('jobs') } } } });
     },
     merge(result, now) {
-      if (!object(result)) throw new Error('overview returned no snapshot');
-      // RAM has its own live sampler and never uses the overview's cached fallback.
-      if (result.sections?.ram?.status !== 'stale' &&
-          Number.isFinite(result.ram?.freeMb) && Number.isFinite(result.ram?.totalMb)) {
-        values.ram = result.ram;
-        report('ram', 'ok', now);
-      }
       for (const name of FAST_SECTIONS) {
         const supplied = Object.hasOwn(result, name) && (name !== 'jobs' || Array.isArray(result.jobs));
-        const stale = result.sections?.[name];
-        if (stale?.status === 'stale') {
-          if (supplied) values[name] = result[name];
-          metadata[name].okAt ??= stale.okAt ?? null;
-          report(name, 'stale', now, stale.reason);
+        const state = result.sections?.[name];
+        if (state?.status === 'stale' || state?.status === 'unavailable') {
+          report(name, state.status === 'unavailable' && meta(name).okAt ? 'stale' : state.status, now, state.reason);
           continue;
         }
         if (!supplied) {
@@ -585,59 +380,69 @@ async function serve(config, owner) {
         report(name, 'ok', now);
       }
       for (const name of ['build', 'switches', 'daemons']) {
-        if (Object.hasOwn(result, name)) values[name] = result[name];
+        if (Object.hasOwn(result, name) && !result.sections?.[name]) values[name] = result[name];
       }
     } });
   let sessionCursors = {};
-  register({ names: ['sessions'], interval: fast, deadline: probeDeadline,
-    async work(now) {
-      if (!existsSync(helper('conveyor/lib/sessions.mjs'))) return null;
-      return collectInWorker(workers, 'sessions', { ...probeOptions(now), runDir: config.runDir, cursors: sessionCursors },
-        env, probeDeadline);
-    },
+  const sessions = register({ names: ['sessions'], interval: () => quiet ? QUIET_MS : fastMs, deadline: probeDeadline,
+    work: (now) => readSessions({ now, claudeHome: config.claudeHome, cursors: sessionCursors }),
     merge(result, now) {
-      if (result === null) {
-        values.sessions = [];
-        report('sessions', 'unavailable', now, 'readSessions is unavailable');
-        return;
-      }
       if (!Array.isArray(result.sessions)) throw new Error('readSessions did not return a session list');
-      if (result.cursors && typeof result.cursors === 'object') sessionCursors = result.cursors;
+      sessionCursors = result.cursors;
       values.sessions = result.sessions;
+      liveSession = result.sessions.length > 0;
       report('sessions', 'ok', now);
     } });
-  register({ names: ['usage'], interval: () => 2 * MINUTE, async work(now) {
-    const lockNonce = randomUUID();
-    try { return await collectInWorker(workers, 'usage', { now, lockNonce }, env, DEADLINE); }
-    catch (error) {
-      const { usagePaths } = await import('./conveyor/usage.mjs');
-      if (usagePaths) {
-        const { lock } = usagePaths(env);
-        if (readJson(path.join(lock, 'owner.json'))?.nonce === lockNonce) rmSync(lock, { recursive: true, force: true });
+  register({ names: ['usage'], interval: () => 2 * MINUTE,
+    work(now) {
+      if (!usageWorker) {
+        const worker = new Worker(new URL(import.meta.url), { workerData: 'usage', execArgv: [],
+          env: { ...process.env, LUNA_RUN_DIR: config.runDir } });
+        worker.on('error', () => {}); // An idle worker can also exit.
+        worker.once('exit', () => { usageWorker = undefined; });
+        usageWorker = worker;
       }
-      throw error;
-    }
-  },
+      const worker = usageWorker;
+      return new Promise((resolve, reject) => {
+        const receive = ({ value, error }) => {
+          worker.off('exit', exit);
+          if (error) reject(new Error(error));
+          else resolve(value);
+        };
+        const exit = (code) => {
+          worker.off('message', receive);
+          reject(new Error(`usage worker exited with code ${code}`));
+        };
+        worker.once('message', receive);
+        worker.once('exit', exit);
+        worker.postMessage({ now });
+      });
+    },
     merge: (result, now) => { values.usage = result; report('usage', 'ok', now); } });
-  register({ interval: () => 10 * MINUTE, work: () => runHelper(helper('luna-reap-brokers.mjs'), []) });
-  register({ names: ['cli'], hourly: 'cli', interval: () => HOUR,
-    work: async () => JSON.parse(await runHelper(helper('conveyor/cli-update.mjs'), ['status', '--json'])),
+  const conveyor = process.env.CONVEYOR_HOME || path.join(config.claudeHome, 'conveyor');
+  register({ names: ['cli'], interval: () => MINUTE,
+    work: () => readProbeJson(path.join(config.claudeHome, 'conveyor', 'cli-cache.json')),
     merge(result, now) {
-      if (!object(result) || result.ok === false) throw new Error(result?.reason || 'CLI status returned no data');
+      const at = Date.parse(result?.checkedAt);
+      if (!object(result?.codex) || !object(result?.agy) || !Number.isFinite(at)) {
+        report('cli', meta('cli').okAt ? 'stale' : 'unavailable', now, 'CLI cache missing or invalid');
+        return;
+      }
       values.cli = result;
-      report('cli', 'ok', now);
+      report('cli', 'ok', at);
     } });
-  register({ names: ['catalog'], hourly: 'catalog', interval: () => HOUR,
-    work: async () => JSON.parse(await runHelper(helper('conveyor/exec.mjs'),
-      ['catalog', 'refresh', '--provider', 'all', '--actor', 'panel'])),
+  register({ names: ['catalog'], interval: () => MINUTE,
+    work: () => readProbeJson(path.join(conveyor, 'orchestration.json')),
     merge(result, now) {
-      if (result?.ok !== true) throw new Error(result?.reason || 'catalog refresh failed');
-      report('catalog', 'ok', now, result.note ? message(result.note) : null);
+      const at = Date.parse(result?.catalogUpdatedAt);
+      if (Number.isFinite(at)) report('catalog', 'ok', at);
+      else report('catalog', 'unavailable', now, 'orchestration.json has no catalog timestamp');
     } });
-  register({ interval: () => 10 * MINUTE, deadline: 4 * SECOND, work: () => sweepOrphans(helpers, marker) });
 
   function publish(now) {
-    const sections = Object.fromEntries(Object.entries(metadata).map(([name, state]) => [name, sectionView(state, now)]));
+    const sections = Object.fromEntries(Object.entries(metadata).map(([name, state]) => [
+      name, quiet && name !== 'sessions' ? { ...state, status: 'idle', reason: null } : sectionView(state, now)
+    ]));
     const serialized = JSON.stringify(sections);
     if (!dirty && lastSections === serialized) return;
     const snapshot = { ...values, at: iso(now), version: 2,
@@ -649,110 +454,100 @@ async function serve(config, owner) {
     dirty = false;
   }
 
-  const idleMs = Number(process.env.LUNA_COLLECTOR_IDLE_MS);
-  const idlePeriod = Number.isFinite(idleMs) && idleMs > 0 ? idleMs : MINUTE;
-  const pollMs = Math.min(SECOND, Math.max(25, Math.floor(idlePeriod / 4)));
-
-  async function tick() {
+  function tick() {
     const now = Date.now();
     for (const [sessionId, lease] of beats) if (now - lease.at >= LEASE_MS) beats.delete(sessionId);
     for (const [kind, limit] of limits) {
       const expires = limit.resetsAt ? Date.parse(limit.resetsAt) : Date.parse(limit.observedAt) + LEASE_MS;
       if (expires <= now) { limits.delete(kind); dirty = true; }
     }
-    const widgetAge = now - Date.parse(readJson(config.widget)?.at);
-    const widget = widgetAge >= 0 && widgetAge < LEASE_MS;
+    if (!widgetRead && now >= nextWidgetAt) {
+      nextWidgetAt = now + (quiet ? QUIET_MS : 5 * SECOND);
+      widgetRead = readProbeJson(config.widget).then((lease) => { widgetAt = Date.parse(lease?.at); })
+        .catch(log).finally(() => { pending.delete(widgetRead); widgetRead = undefined; });
+      pending.add(widgetRead);
+    }
+    const widget = now >= widgetAt && now - widgetAt < LEASE_MS;
+    const nextQuiet = !widget && !beats.size && !liveSession;
     const nextFast = widget || [...beats.values()].some((lease) => lease.visible) ? 5 * SECOND : MINUTE;
-    if (nextFast !== fastMs) {
+    const waking = quiet && !nextQuiet;
+    if (quiet !== nextQuiet || fastMs !== nextFast) {
+      quiet = nextQuiet;
       fastMs = nextFast;
-      for (const job of jobs) {
-        if (job.interval === fast && !job.failures) job.dueAt = job.last + fastMs;
-      }
+      dirty = true;
+      for (const job of jobs) job.dueAt = waking ? now : job.last + job.interval();
     }
-    if (widget || beats.size) {
-      idleSince = null;
-      nextSessionCheck = 0;
-    } else {
-      if (now >= nextSessionCheck || idleSince !== null && now - idleSince >= idlePeriod) {
-        try {
-          const { hasLiveSession } = await import('./conveyor/lib/sessions.mjs');
-          liveSession = await hasLiveSession(config.claudeHome, now);
-        }
-        catch (error) { log(error); liveSession = true; }
-        nextSessionCheck = now + Math.min(5 * SECOND, idlePeriod / 4);
+    for (const job of quiet ? [sessions] : jobs) {
+      for (const name of job.names) {
+        meta(name).staleAfterMs = name === 'cli' ? 6 * HOUR : name === 'catalog' ? HOUR : job.interval() + job.deadline;
       }
-      if (stopping) return;
-      if (liveSession || beats.size) idleSince = null;
-      else idleSince ??= now;
-      if (idleSince !== null && now - idleSince >= idlePeriod) {
-        stop();
-        return;
-      }
-    }
-    for (const job of jobs) {
-      for (const name of job.names) meta(name).staleAfterMs = job.interval() + job.deadline;
-      if (!job.busy && now >= job.dueAt) attempt(job, now);
+      if (now < job.dueAt) continue;
+      if (job.busy) {
+        job.dueAt = now + job.interval();
+        for (const name of job.names) report(name, 'stale', now, 'previous read still running');
+      } else attempt(job, now);
     }
     publish(now);
   }
 
-  const poll = async () => {
-    try { await tick(); } catch (error) { log(error); }
-    if (!stopping) timer = setTimeout(poll, pollMs);
+  const poll = () => {
+    try { tick(); } catch (error) { log(error); }
+    if (!stopping) timer = setTimeout(poll, SECOND);
   };
-  const serverError = (error) => { log(error); stop(); };
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
-  let forcedExit = false;
+  const signals = ['SIGINT', 'SIGTERM', ...(platform === 'win32' ? ['SIGHUP'] : [])];
+  for (const signal of signals) process.on(signal, stop);
   try {
     await listen(server);
-    server.on('error', serverError);
+    server.on('error', (error) => { log(error); stop(); });
     if (stopping) return;
     const info = { version: 1, pid: owner.pid, instance: owner.instance, port: server.address().port, token,
       startedAt: owner.startedAt };
     writeAtomic(config.discovery, JSON.stringify(info) + '\n');
-    void poll();
+    poll();
     await stopped;
   } finally {
     stop();
     clearTimeout(timer);
     server.close();
     server.closeAllConnections();
-    const terminateWorkers = () => Promise.allSettled([...workers.values()].map((worker) => worker.terminate()));
     const grace = new AbortController();
-    await Promise.race([
-      Promise.allSettled(pending).then(terminateWorkers),
-      sleep(SHUTDOWN_GRACE_MS, undefined, { signal: grace.signal }).then(() => {
-        forcedExit = true;
-        void terminateWorkers();
-      })
-    ]);
+    await Promise.race([Promise.allSettled(pending), sleep(SHUTDOWN_GRACE_MS, undefined, { signal: grace.signal })]);
     grace.abort();
-    if (!forcedExit && (seq || dirty && Object.values(metadata).some((state) => state.attemptAt))) {
-      try { publish(Date.now()); } catch (error) { log(error); }
-    }
-    process.removeListener('SIGINT', stop);
-    process.removeListener('SIGTERM', stop);
+    dirty = true;
+    try { publish(Date.now()); } catch (error) { log(error); }
+    for (const signal of signals) process.removeListener(signal, stop);
   }
-  return forcedExit;
 }
 
 async function runCollector(config) {
-  mkdirSync(config.directory, { recursive: true, mode: 0o700 });
-  const owner = { pid: process.pid, instance: randomUUID(), startedAt: iso(), procStart: await processStart(process.pid) };
-  if (!owner.procStart && (platform === 'linux' || platform === 'win32')) throw new Error('cannot read collector process start time');
-  if (!await acquireLock(config.lock, owner)) return;
-  let forcedExit;
+  mkdirSync(path.dirname(config.lock), { recursive: true, mode: 0o700 });
+  const owner = { pid: process.pid, instance: randomUUID(), startedAt: iso(), procStart: readProcessStat(process.pid)?.started };
+  if (!acquireLock(config.lock, owner)) return 3;
   try {
-    remove(config.discovery);
+    if (platform === 'win32') remove(config.stopped);
     mkdirSync(path.dirname(config.widget), { recursive: true, mode: 0o700 });
-    forcedExit = await serve(config, owner);
+    await serve(config, owner);
   } finally {
-    if (readJson(config.lock)?.instance === owner.instance) {
-      try { remove(config.discovery); } finally { remove(config.lock); }
-    }
+    try { remove(config.discovery); } finally { remove(config.lock); }
   }
-  if (forcedExit) process.exit(0);
+  return 0;
+}
+
+async function start(config) {
+  if (platform === 'win32') {
+    const script = path.join(HERE, 'luna-collector-supervisor.vbs');
+    remove(config.stopped);
+    const child = spawn('wscript.exe', ['//B', '//NoLogo', script], { detached: true, windowsHide: true, stdio: 'ignore' });
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    child.unref();
+    process.stdout.write('Started the Luna collector supervisor.\n');
+  } else if (platform === 'linux') {
+    await new Promise((resolve, reject) => {
+      execFile('systemctl', ['--user', 'start', 'luna-collector.service'], { timeout: 30 * SECOND },
+        (error) => error ? reject(error) : resolve());
+    });
+    process.stdout.write('Asked systemd to start luna-collector.service.\n');
+  } else throw new Error('collector supervision is unavailable on this platform');
 }
 
 async function main(command) {
@@ -760,38 +555,51 @@ async function main(command) {
   const print = (value) => process.stdout.write(JSON.stringify(value) + '\n');
   switch (command) {
     case 'ensure':
-      print(await ensure(config));
+      process.stderr.write('Use luna-collector.mjs start to start the collector.\n');
+      return 2;
+    case 'start':
+      await start(config);
       break;
     case 'run':
-      await runCollector(config);
-      break;
+      return runCollector(config);
     case 'status': {
-      const data = readJson(config.snapshot);
+      const data = readJson(config.snapshot, MAX_SNAPSHOT);
       const snapshot = data && { version: data.version, at: data.at, collector: data.collector, sections: data.sections,
         ...(data.truncated ? { truncated: true } : {}) };
       print({ discovery: readJson(config.discovery), snapshot });
       break;
     }
     case 'stop': {
+      if (platform === 'win32') {
+        mkdirSync(path.dirname(config.stopped), { recursive: true, mode: 0o700 });
+        writeAtomic(config.stopped, '');
+      }
       const info = await healthy(config);
       if (info) {
         if (!(await request(info, '/stop', 'POST')).ok) throw new Error('collector refused stop');
-      } else if (await ownerAlive(readJson(config.lock))) throw new Error('collector is not answering health');
+        const deadline = performance.now() + 4 * SECOND;
+        while (readJson(config.lock)?.instance === info.instance && performance.now() < deadline) await sleep(50);
+        if (readJson(config.lock)?.instance === info.instance) throw new Error('collector stop timed out');
+      } else if (ownerAlive(readJson(config.lock))) throw new Error('collector is not answering health');
       break;
     }
     default:
-      throw new Error('usage: luna-collector.mjs ensure | run | status | stop');
+      throw new Error('usage: luna-collector.mjs start | run | status | stop');
   }
 }
 
-if (!isMainThread && workerData?.task) {
+if (!isMainThread && workerData === 'usage') {
   parentPort.on('message', async (options) => {
-    try { parentPort.postMessage({ value: await runWorkerJob({ ...workerData, options, env: process.env }) }); }
+    try { parentPort.postMessage({ value: await runUsage(options) }); }
     catch (error) { parentPort.postMessage({ error: message(error) }); }
   });
 } else if (process.argv[1] && path.resolve(process.argv[1]) === SELF) {
-  try { await main(process.argv[2]); }
-  catch (error) {
+  try {
+    const action = process.argv[2];
+    const code = await main(action);
+    if (action === 'run' && code === 0) process.exit(0);
+    process.exitCode = code ?? 0;
+  } catch (error) {
     process.stderr.write(`luna-collector: ${message(error)}\n`);
     process.exitCode = 1;
   }
