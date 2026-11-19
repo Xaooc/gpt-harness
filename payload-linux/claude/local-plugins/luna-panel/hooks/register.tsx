@@ -2,21 +2,21 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type {
-  ChainEntry, ClaudeLimit, CliStatus, Collapsed, Job, PanelData, SessionBeat, Snapshot, View,
+  ChainEntry, ClaudeLimit, CliStatus, Collapsed, Job, PanelData, Snapshot, View,
 } from '../types'
 
 // The Luna pane, conveyor edition: limits of every provider, the executor chains with the active one marked, every
 // executor's jobs (Codex, Gemini, Claude subagents), the orchestration editor and CLI updates.
-// Data: `node ~/.claude/scripts/luna-overview.mjs` every POLL_MS + $.session.usage(); settings through
+// Data: the Luna collector snapshot and $.session.usage(); settings through
 // `node ~/.claude/scripts/conveyor/exec.mjs config …`; updates through `node ~/.claude/scripts/conveyor/cli-update.mjs`.
 
 const PANE = 'luna-panel'
 const TITLE = 'Luna'
 const COMMAND = 'luna'
-/** This installed pane sends this session's heartbeat; a preview copy (luna-panel-next) sets this false. */
-const WRITE_BEAT = true
 const POLL_MS = 5000
-const IDLE_POLL_MS = 20_000
+const BEAT_MS = 20_000
+const STALE_MS = 30_000
+const ENSURE_MS = 60_000
 
 const EMPTY: PanelData = { snapshot: null, claude: [], error: '', polledAt: 0, sessionId: '' }
 const VIEW0: View = {
@@ -146,17 +146,6 @@ function oneLine(text: unknown, max = 80): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean
 }
 
-function toolDetail(tool: string, input: Record<string, unknown>): string {
-  const base = (p: unknown) => String(p ?? '').split(/[\\/]/).pop() ?? ''
-  if (tool === 'Bash') return oneLine(input.command)
-  if (['Read', 'Edit', 'Write', 'NotebookEdit'].includes(tool)) return base(input.file_path ?? input.notebook_path)
-  if (tool === 'Grep' || tool === 'Glob') return oneLine(input.pattern, 60)
-  if (tool === 'Agent' || tool === 'Task') return oneLine(input.description, 60)
-  if (tool === 'WebFetch') { try { return new URL(String(input.url)).host } catch { return '' } }
-  if (tool === 'WebSearch') return oneLine(input.query, 60)
-  return ''
-}
-
 function describeCommand(raw: string): { text: string; isRaw: boolean } {
   let cmd = raw.trim().replace(/^\S*?(?:sh|bash|dash|zsh)\s+(?:-\w+\s+)*/i, '').replace(/^["']|["']$/g, '')
   cmd = cmd.replace(/^(?:cd\s+\S+\s*&&\s*)+/, '').trim()
@@ -196,11 +185,6 @@ function projectOfJobs(jobs: Job[]): string {
   return base(first)
 }
 
-function sessionName(cwd: string): string {
-  if (!cwd || /scratch-workspaces/i.test(cwd)) return ''
-  return cwd.split(/[\\/]/).filter(Boolean).pop() ?? ''
-}
-
 // ---- What needs the person ---------------------------------------------------------------------------------------
 
 type Alert = { level: 'error' | 'warning'; text: string }
@@ -210,8 +194,10 @@ function attentionItems(d: PanelData): Alert[] {
   const out: Alert[] = []
   if (!s) return d.error ? [{ level: 'warning', text: 'Нет данных от сборщика' }] : []
   const free = s.ram.freeMb
-  if (free < 1024) out.push({ level: 'error', text: `Мало памяти: ${gb(free)}, новые задачи ждут` })
-  else if (free < 2048) out.push({ level: 'warning', text: `Памяти немного: ${gb(free)}` })
+  if (free !== null) {
+    if (free < 1024) out.push({ level: 'error', text: `Мало памяти: ${gb(free)}, новые задачи ждут` })
+    else if (free < 2048) out.push({ level: 'warning', text: `Памяти немного: ${gb(free)}` })
+  }
   for (const j of s.jobs) {
     if (j.state === 'running' && (j.idleS ?? 0) >= 900) {
       out.push({ level: 'error', text: `${modelName(j.provider, j.model)} «${jobName(j.out)}» молчит ${duration(j.idleS ?? 0)}` })
@@ -237,103 +223,49 @@ function attentionItems(d: PanelData): Alert[] {
 
 // ---- Polling -------------------------------------------------------------------------------------------------------
 
-let polling = false
-let pollStartedAt = 0
-let ticker: { cancel: () => void } | null = null
-let lastPollAt = 0
-let closedByPerson = false
-let homeDir = ''
+async function claudeHome($: EngineInterface): Promise<string> {
+  const home = await $.env.get('USERPROFILE') || await $.env.get('HOME')
+  if (home) return `${home.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude`
+  const installed = $.plugin.root.replace(/\\/g, '/').match(/^(.*\/\.claude)\/(?:local-plugins|plugins)\//i)
+  if (installed?.[1]) return installed[1]
+  throw new Error('Не найден домашний каталог Claude')
+}
 
-async function home($: EngineInterface): Promise<string> {
-  if (homeDir) return homeDir
-  let h = await $.env.get('HOME')
-  if (!h) {
-    const result = await $.process.run(['node', '-p', 'require("os").homedir()'], { timeoutMs: 2000 })
-    h = result.stdout.trim()
+function parseSnapshot(text: string): Snapshot {
+  const s = JSON.parse(text) as Snapshot | null
+  if (s?.version !== 2 || !Number.isFinite(Date.parse(s.collector?.publishedAt)) ||
+      !s.ram || !s.daemon || !Array.isArray(s.jobs) || !Array.isArray(s.claudeLimits)) {
+    throw new Error('Некорректный снимок сборщика')
   }
-  homeDir = h.replace(/\\/g, '/')
-  return homeDir
+  return s
 }
 
-async function poll($: EngineInterface): Promise<void> {
-  const now = Date.now()
-  if (polling && now - pollStartedAt < 20_000) return
-  polling = true
-  pollStartedAt = now
-  try { await pollOnce($) } finally { polling = false }
-}
-
-function ensureTicker($: EngineInterface): void {
-  if (ticker) return
-  ticker = $.clock.every(POLL_MS, () => { void tick($) })
-}
-
-async function tick($: EngineInterface): Promise<void> {
-  // The catalog is checked hourly even while the pane is hidden, so a model released today is in the picker by the
-  // time the owner looks.
-  void refreshCatalog($, true)
-  if ((await $.clock.now()) - lastPollAt < IDLE_POLL_MS) {
-    let shown = false
-    try { shown = (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced && p.isShown) } catch {}
-    if (!shown) return
-  }
-  await poll($)
-}
-
-/**
- * Claude's limits are per account, so a window this session's usage lacks (the desktop often reports only the week)
- * is taken from the freshest other session's heartbeat, as long as that window has not reset since.
- */
-function mergeClaudeLimits(own: ClaudeLimit[], beats: SessionBeat[], now: number): ClaudeLimit[] {
-  const out = new Map(own.map(l => [l.kind, l]))
-  const fresh = beats.filter(b => b.limits?.length && now - b.updatedAt < 6 * 3600_000).sort((a, b) => b.updatedAt - a.updatedAt)
-  for (const b of fresh) {
-    for (const l of b.limits ?? []) {
-      const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
-      if (!out.has(l.kind) && !(Number.isFinite(resets) && resets <= now)) out.set(l.kind, l)
-    }
+function mergeClaudeLimits(own: ClaudeLimit[], shared: ClaudeLimit[], now: number): ClaudeLimit[] {
+  const out = new Map<string, ClaudeLimit>()
+  for (const limit of [...own, ...shared]) {
+    if (!out.has(limit.kind) && (!limit.resetsAt || Date.parse(limit.resetsAt) > now)) out.set(limit.kind, limit)
   }
   return [...out.values()]
 }
 
-async function pollOnce($: EngineInterface): Promise<void> {
-  const h = await home($)
-  const sessionId = await currentSessionId($)
-  let snapshot: Snapshot | null = null
-  let error = ''
-  try {
-    const payload = WRITE_BEAT ? await beatPayload($) : ''
-    const run = await $.process.run(['node', `${h}/.claude/scripts/luna-overview.mjs`, ...(payload ? ['--beat'] : [])],
-      { timeoutMs: 12_000, ...(payload ? { stdin: payload } : {}) })
-    if (run.exitCode === 0 && run.stdout.trim()) snapshot = JSON.parse(run.stdout) as Snapshot
-    else error = (run.stderr || `exit ${run.exitCode}`).trim().slice(0, 200)
-  } catch (caught) {
-    error = String((caught as Error)?.message ?? caught).slice(0, 200)
-  }
-  let claude: ClaudeLimit[] = []
-  try {
-    claude = (await $.session.usage()).rateLimits ?? []
-    if (claude.length) lastLimits = claude
-  } catch {}
-  const polledAt = await $.clock.now()
-  await update($, data, prev => ({
-    snapshot: snapshot ?? prev?.snapshot ?? null,
-    claude: mergeClaudeLimits(claude.length > 0 ? claude : prev?.claude ?? [], (snapshot ?? prev?.snapshot)?.sessions ?? [], polledAt),
-    error,
-    polledAt,
-    sessionId,
-  }))
-  lastPollAt = polledAt
-  if (Date.now() - cliLoadedAt > 3600_000) void loadCli($, false, true)
+async function currentSessionId($: EngineInterface): Promise<string> {
+  const fromEnv = await $.env.get('CLAUDE_CODE_SESSION_ID')
+  if (fromEnv) return fromEnv
+  try { return (await $.session.id()) ?? '' } catch { return '' }
+}
+
+async function currentLimits($: EngineInterface): Promise<ClaudeLimit[]> {
+  try { return (await $.session.usage()).rateLimits ?? [] } catch { return [] }
 }
 
 // ---- Actions: settings and updates (each one a CLI run; the result becomes a one-line note) -----------------------
 
 type ActionResult = { ok: boolean; note: string }
 
-async function runJson($: EngineInterface, argv: string[], timeoutMs: number): Promise<ActionResult & { json?: unknown }> {
+async function runJson($: EngineInterface, script: string, args: string[], timeoutMs: number):
+  Promise<ActionResult & { json?: unknown }> {
   try {
-    const run = await $.process.run(argv, { timeoutMs })
+    const run = await $.process.run(['node', `${await claudeHome($)}/scripts/conveyor/${script}`, ...args], { timeoutMs })
     // The whole output is one JSON document (pretty-printed or not); else its last line is.
     const out = run.stdout.trim()
     const lines = out.split(/\r?\n/).filter(Boolean)
@@ -352,74 +284,49 @@ async function act($: EngineInterface, key: string, args: string[], okText: stri
   const v = await read($, view)
   if (v?.busy) return
   await update($, view, prev => ({ ...(prev ?? VIEW0), busy: key, confirm: null }))
-  const h = await home($)
-  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/exec.mjs`, ...args, '--actor', 'panel'], 30_000)
+  const r = await runJson($, 'exec.mjs', [...args, '--actor', 'panel'], 30_000)
   const at = await $.clock.now()
   await update($, view, prev => ({
     ...(prev ?? VIEW0), busy: null,
     note: { text: r.ok ? okText : `Не применено: ${r.note}`, level: (r.ok ? 'success' : 'error') as 'success' | 'error', at },
   }))
-  await poll($)
 }
 
-let catalogCheckedAt = -Infinity
 let catalogBusy = false
 
-/** New Codex models (the Codex CLI's live model list) and new Claude aliases (read from Claude Code itself) join the
- *  catalog by themselves when the session starts and every hour after; the link forces a check now.
- *  Only adds models, never changes a chain. */
-async function refreshCatalog($: EngineInterface, quiet: boolean): Promise<void> {
+async function refreshCatalog($: EngineInterface): Promise<void> {
   if (catalogBusy) return
   catalogBusy = true
-  try { await refreshCatalogOnce($, quiet) } finally { catalogBusy = false }
-}
-
-async function refreshCatalogOnce($: EngineInterface, quiet: boolean): Promise<void> {
-  const now = await $.clock.now()
-  if (quiet && now - catalogCheckedAt < 3_600_000) return
-  catalogCheckedAt = now
-  const h = await home($)
-  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/exec.mjs`, 'catalog', 'refresh', '--provider', 'all',
+  try {
     // 120 s: room for exec.mjs's own limits (Codex 15 s, then the cache; 15 s per Claude Code binary scanned).
-    '--actor', 'panel'], 120_000)
-  const added = r.ok && /^added /.test(r.note)
-    ? r.note.replace(/^added /, '').replace(/;.*$/, '').split(/,\s*/).map(x => { const [p, m] = x.split('/'); return m ? modelName(p, m) : x }).join(', ')
-    : ''
-  if (!quiet || added || !r.ok) {
+    const r = await runJson($, 'exec.mjs', ['catalog', 'refresh', '--provider', 'all', '--actor', 'panel'], 120_000)
+    const names = r.ok && /^added /.test(r.note) ? r.note.replace(/^added /, '').replace(/;.*$/, '').split(/,\s*/) : []
+    const added = names.map(x => { const [p, m] = x.split('/'); return m ? modelName(p, m) : x }).join(', ')
     const text = !r.ok ? `Поиск моделей: ${r.note}` : added ? `В каталог добавлены: ${added}` : 'Новых моделей нет'
     const level = (r.ok ? 'success' : 'warning') as 'success' | 'warning'
     await update($, view, prev => ({ ...(prev ?? VIEW0), note: { text, level, at: Date.now() } }))
-  }
-  if (added) await poll($)
+  } finally { catalogBusy = false }
 }
 
-let cliLoadedAt = 0
 let cliLoading = false
 
-// Versions load by themselves when the pane first draws and every hour after, quietly; the button forces a refresh.
-async function loadCli($: EngineInterface, refresh: boolean, quiet = false): Promise<void> {
+async function loadCli($: EngineInterface, refresh: boolean): Promise<void> {
   if (cliLoading) return
   cliLoading = true
-  cliLoadedAt = Date.now()
-  try { await loadCliOnce($, refresh, quiet) } finally { cliLoading = false }
-}
-
-async function loadCliOnce($: EngineInterface, refresh: boolean, quiet: boolean): Promise<void> {
-  if (!quiet) await update($, view, prev => ({ ...(prev ?? VIEW0), busy: 'cli-status' }))
-  const h = await home($)
-  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/cli-update.mjs`, 'status', '--json',
-    ...(refresh ? ['--refresh'] : [])], 45_000)
-  const cli = (r.json as CliStatus | undefined)
-  await update($, view, prev => ({
-    ...(prev ?? VIEW0), busy: quiet ? prev?.busy ?? null : null, cli: cli?.codex || cli?.agy ? cli : prev?.cli ?? null,
-    ...(r.ok || quiet ? {} : { note: { text: `Проверка обновлений: ${r.note}`, level: 'warning' as const, at: Date.now() } }),
-  }))
+  try {
+    await update($, view, prev => ({ ...(prev ?? VIEW0), busy: 'cli-status' }))
+    const r = await runJson($, 'cli-update.mjs', ['status', '--json', ...(refresh ? ['--refresh'] : [])], 45_000)
+    const cli = (r.json as CliStatus | undefined)
+    await update($, view, prev => ({
+      ...(prev ?? VIEW0), busy: null, cli: cli?.codex || cli?.agy ? cli : prev?.cli ?? null,
+      ...(r.ok ? {} : { note: { text: `Проверка обновлений: ${r.note}`, level: 'warning' as const, at: Date.now() } }),
+    }))
+  } finally { cliLoading = false }
 }
 
 async function runUpdate($: EngineInterface, what: string, extra: string[]): Promise<void> {
   await update($, view, prev => ({ ...(prev ?? VIEW0), busy: `update-${what}`, confirm: null }))
-  const h = await home($)
-  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/cli-update.mjs`, ...extra, '--confirm'], 600_000)
+  const r = await runJson($, 'cli-update.mjs', [...extra, '--confirm'], 600_000)
   await update($, view, prev => ({
     ...(prev ?? VIEW0), busy: null,
     note: { text: r.ok ? `Обновлено: ${r.note}` : `Не обновлено: ${r.note}`, level: (r.ok ? 'success' : 'error') as 'success' | 'error', at: Date.now() },
@@ -427,146 +334,177 @@ async function runUpdate($: EngineInterface, what: string, extra: string[]): Pro
   await loadCli($, false)
 }
 
-// ---- Heartbeat (only the installed panel writes it) ------------------------------------------------------------------
-
-const beat: Omit<SessionBeat, 'v' | 'sessionId' | 'name' | 'cwd' | 'updatedAt'> & { cwd: string } = {
-  state: 'idle', tool: null, turnSince: 0, idleSince: Date.now(), agents: [], cwd: '',
-}
-let beatSessionId = ''
-let lastLimits: ClaudeLimit[] = []
-let queuedBeat = false
-let lastBeatPoll = 0
-
-async function currentSessionId($: EngineInterface): Promise<string> {
-  const fromEnv = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
-  if (fromEnv) return fromEnv
-  try { return (await $.session.id()) ?? '' } catch { return '' }
-}
-
-async function initBeat($: EngineInterface, cwd?: string): Promise<void> {
-  if (!beatSessionId) beatSessionId = await currentSessionId($)
-  if (cwd) beat.cwd = cwd
-  if (!beat.cwd) {
-    try {
-      const r = await $.process.run(['node', '-e', 'process.stdout.write(process.cwd())'], { timeoutMs: 5000 })
-      if (r.exitCode === 0) beat.cwd = r.stdout.trim()
-    } catch {}
-  }
-}
-
-function queueBeat($: EngineInterface): void {
-  if (!WRITE_BEAT || queuedBeat) return
-  queuedBeat = true
-  const wait = Math.max(0, 1000 - (Date.now() - lastBeatPoll))
-  $.clock.after(wait, () => { queuedBeat = false; void poll($) })
-}
-
-async function beatPayload($: EngineInterface): Promise<string> {
-  await initBeat($)
-  lastBeatPoll = Date.now()
-  if (!beatSessionId || !/^[A-Za-z0-9._-]{1,128}$/.test(beatSessionId)) return ''
-  const out: SessionBeat = {
-    v: 1, sessionId: beatSessionId, name: sessionName(beat.cwd), cwd: beat.cwd, updatedAt: Date.now(),
-    state: beat.state, tool: beat.tool, turnSince: beat.turnSince, idleSince: beat.idleSince, agents: beat.agents,
-    ...(lastLimits.length ? { limits: lastLimits } : {}),
-  }
-  return JSON.stringify(out)
-}
-
 // ---- Hooks -----------------------------------------------------------------------------------------------------------
+
+let ticker: ReturnType<EngineInterface['clock']['every']> | null = null
+let paneOpen: boolean | null = null
+let visible = false
+let generation = 0
+let reading = false
+let sendingBeat = false
+let lastBeatAt = -Infinity
+let lastEnsureAt = -Infinity
+
+function markHidden(): void {
+  visible = false
+  generation++
+  lastBeatAt = -Infinity
+}
+
+function stopTicker(): void {
+  markHidden()
+  ticker?.cancel()
+  ticker = null
+}
+
+async function checkVisibility($: EngineInterface, epoch: number): Promise<boolean> {
+  if (!ticker || epoch !== generation) return false
+  const panes = await $.ui.panes().catch(() => [])
+  if (!ticker || epoch !== generation) return false
+  const shown = panes.some(p => p.id === PANE && p.isPlaced && p.isShown)
+  if (!shown && visible) markHidden()
+  visible = shown
+  return shown
+}
+
+async function refreshSnapshot($: EngineInterface, epoch: number): Promise<void> {
+  reading = true
+  try {
+    let home = ''
+    let missing = false
+    let snapshot: Snapshot | null = null
+    let error = ''
+    try {
+      home = await claudeHome($)
+      const run = await $.env.get('LUNA_RUN_DIR')
+      if (!await checkVisibility($, epoch)) return
+      const path = `${run || `${home}/luna-run`}/collector/snapshot.json`
+      const text = await $.fs.read(path).catch(async (caught: unknown) => {
+        if (await checkVisibility($, epoch)) missing = (await $.fs.exists(path).catch(() => undefined)) === false
+        throw caught
+      })
+      snapshot = parseSnapshot(text)
+    } catch (caught) {
+      error = oneLine((caught as Error)?.message ?? caught, 200)
+    }
+    if (epoch !== generation) return
+    const [own, sessionId, now] = await Promise.all([currentLimits($), currentSessionId($), $.clock.now()])
+    if (!await checkVisibility($, epoch)) return
+    const latest = snapshot ?? (await read($, data))?.snapshot ?? null
+    const stale = !!latest && now - Date.parse(latest.collector?.publishedAt) > STALE_MS
+    if (epoch !== generation) return
+    await update($, data, prev => epoch !== generation ? prev ?? EMPTY : {
+      snapshot: latest,
+      claude: mergeClaudeLimits(own, latest?.claudeLimits ?? [], now),
+      error: stale && !error ? 'снимок сборщика устарел' : error,
+      polledAt: now,
+      sessionId,
+    })
+    if (home && (missing || stale)) {
+      const ensureAt = await $.clock.now()
+      if (ensureAt - lastEnsureAt < ENSURE_MS || !await checkVisibility($, epoch)) return
+      lastEnsureAt = ensureAt
+      void $.process.run(['node', `${home}/scripts/luna-collector.mjs`, 'ensure'], { timeoutMs: 8000 }).catch(() => {})
+    }
+  } finally { reading = false }
+}
+
+async function sendBeat($: EngineInterface, epoch: number, now: number): Promise<void> {
+  sendingBeat = true
+  lastBeatAt = now
+  try {
+    const run = await $.env.get('LUNA_RUN_DIR')
+    const path = `${run || `${await claudeHome($)}/luna-run`}/collector/discovery.json`
+    if (!await checkVisibility($, epoch)) return
+    const { version, port, token } = JSON.parse(await $.fs.read(path))
+    if (version !== 1 || !Number.isInteger(port) || port < 1 || port > 65535 ||
+        typeof token !== 'string' || !/^[a-f0-9]{32}$/i.test(token)) return
+    const [sessionId, limits] = await Promise.all([currentSessionId($), currentLimits($)])
+    if (!sessionId || !await checkVisibility($, epoch)) return
+    await $.http.fetch(`http://127.0.0.1:${port}/beat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-luna-token': token },
+      body: JSON.stringify({ sessionId, visible: true, limits }),
+    })
+  } catch {
+    // Discovery may be absent or replaced while the collector starts.
+  } finally { sendingBeat = false }
+}
+
+async function tick($: EngineInterface): Promise<void> {
+  const epoch = generation
+  const now = await $.clock.now()
+  if (!await checkVisibility($, epoch)) return
+  if (!sendingBeat && now - lastBeatAt >= BEAT_MS) void sendBeat($, epoch, now)
+  if (!reading) await refreshSnapshot($, epoch)
+}
+
+async function startTicker($: EngineInterface): Promise<void> {
+  if (ticker || !paneOpen) return
+  // The engine also disposes this timer when the hooks module unloads.
+  ticker = $.clock.every(POLL_MS, () => { void tick($).catch(() => {}) })
+  await tick($).catch(() => {})
+}
+
+async function openPane($: EngineInterface): Promise<void> {
+  const epoch = generation
+  paneOpen = true
+  await $.ui.open({ id: PANE, title: TITLE })
+  if (epoch === generation) await startTicker($)
+}
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({ name: COMMAND, description: 'Open the Luna pane (limits, executors, settings, updates)' })
-    if (e.cwd) beat.cwd = e.cwd
-    queueBeat($)
-    void $.ui.open({ id: PANE, title: TITLE })
-    void poll($)
-    void refreshCatalog($, true)
-    ensureTicker($)
+    void openPane($).catch(() => {})
     return started
   })
 
-  on('turn.start', async ($, e, next) => {
-    if (!e.agentId) { beat.state = 'thinking'; beat.tool = null; beat.turnSince = Date.now(); queueBeat($) }
-    ensureTicker($)
-    return next(e)
-  })
-
-  on('turn.complete', async ($, e, next) => {
-    const done = await next(e)
-    const agentId = (e as { agentId?: string }).agentId
-    if (agentId) beat.agents = beat.agents.filter(a => a.id !== agentId)
-    else { beat.state = 'idle'; beat.tool = null; beat.turnSince = 0; beat.idleSince = Date.now() }
-    queueBeat($)
-    return done
-  })
-
-  on('agent.spawn', async ($, e, next) => {
-    const spawned = await next(e)
-    const agentId = (spawned as { agentId?: string } | undefined)?.agentId
-    if (agentId) {
-      beat.agents = [...beat.agents.filter(a => a.id !== agentId),
-        { id: agentId, description: oneLine(e.description, 60), since: Date.now() }].slice(-20)
-      queueBeat($)
-    }
-    return spawned
-  })
-
-  on('tool.call', async ($, e, next) => {
-    const isMain = !(e as { agentId?: string }).agentId
-    if (isMain) {
-      beat.state = 'tool'
-      beat.tool = { name: e.tool, detail: toolDetail(e.tool, e as unknown as Record<string, unknown>), since: Date.now() }
-      queueBeat($)
-    }
-    try {
-      return await next(e)
-    } finally {
-      if (isMain && beat.state === 'tool') { beat.state = 'thinking'; beat.tool = null; queueBeat($) }
-    }
-  })
-
   on('command.run', { command: COMMAND }, async $ => {
-    closedByPerson = false
-    ensureTicker($)
-    await poll($)
-    await $.ui.open({ id: PANE, title: TITLE })
-    void refreshCatalog($, true)
+    await openPane($)
     return { text: 'Luna pane opened.' }
   })
 
-  on('prompt.submit', async ($, e, next) => {
-    const result = await next(e)
-    ensureTicker($)
-    if (!closedByPerson) {
-      try {
-        const shown = (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)
-        if (!shown) await $.ui.open({ id: PANE, title: TITLE })
-      } catch {}
-    }
-    return result
-  })
-
   on('session.attach', async ($, e, next) => {
+    const epoch = generation
     const attached = await next(e)
-    if (!closedByPerson) void $.ui.open({ id: PANE, title: TITLE })
-    ensureTicker($)
+    if (epoch === generation) void startTicker($)
     return attached
   })
 
-  on('ui.close', { id: PANE }, async ($, e, next) => {
-    if (e.origin.kind === 'person') closedByPerson = true
+  on('session.detach', async ($, e, next) => {
+    stopTicker()
+    const epoch = generation
+    const detached = await next(e)
+    if (e.reason === 'detach' && (await $.session.surfaces()).length && epoch === generation) void startTicker($)
+    return detached
+  })
+
+  on('session.end', ($, e, next) => {
+    if (e.reason !== 'clear') {
+      paneOpen = false
+      stopTicker()
+    }
+    return next(e)
+  })
+
+  on('ui.close', { id: PANE }, ($, e, next) => {
+    paneOpen = false
+    stopTicker()
     return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    // A reloaded module can inherit a pane without receiving session.start.
+    if (paneOpen === null) {
+      paneOpen = true
+      void startTicker($)
+    }
     const els = $.ui.resolve(e)
     const { Box, Text, Button, Select, Input } = els
     // Svg exists on the remote surfaces only; the terminal gets text meters instead.
     const Svg = 'Svg' in els ? els.Svg : null
-    ensureTicker($)
     const d = (await read($, data)) ?? EMPTY
     const folded = (await read($, collapsed)) ?? {}
     const v = (await read($, view)) ?? VIEW0
@@ -806,7 +744,7 @@ export const register: Register = on => {
       const hasError = alerts.some(a => a.level === 'error')
       const color = alerts.length === 0 ? 'success' : hasError ? 'error' : 'warning'
       const text = alerts.length === 0 ? 'в порядке' : hasError ? 'проблема' : 'внимание'
-      const free = snap?.ram.freeMb
+      const free = snap?.ram.freeMb ?? undefined
       return (
         <Box flexDirection="column">
           <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
@@ -821,7 +759,7 @@ export const register: Register = on => {
             <Tab id="tab-usage" hotkey="2" label="Расход" active={v.tab === 'usage'} onPress={() => void setView({ tab: 'usage' })} />
             <Tab id="tab-settings" hotkey="3" label="Настройки" active={v.tab === 'settings'} onPress={() => void setView({ tab: 'settings' })} />
             <Tab id="tab-updates" hotkey="4" label="Версии" active={v.tab === 'updates'}
-              onPress={() => { void setView({ tab: 'updates' }); if (!v.cli) void loadCli($, false) }} />
+              onPress={() => void setView({ tab: 'updates' })} />
           </Box>
           {v.note && Date.now() - v.note.at < 15_000 ? (
             <Box paddingTop={1}><Text size="caption" color={v.note.level} wrap="wrap">{v.note.level === 'success' ? `✓ Сохранено: ${v.note.text}` : v.note.text}</Text></Box>
@@ -1289,7 +1227,7 @@ export const register: Register = on => {
                 onSubmit={value => void setView({ draftEfforts: value.replace(/\s+/g, '') })} />
             </Box>
             <Link id="catalog-refresh" label="найти новые модели Codex и Claude"
-              onPress={() => void refreshCatalog($, false)} />
+              onPress={() => void refreshCatalog($)} />
           </Fold>
         </Box>
       )
@@ -1298,7 +1236,9 @@ export const register: Register = on => {
     // ---- Updates tab ----
 
     const updates = () => {
-      const c = v.cli
+      const collected = snap?.cli
+      const c = v.cli && !(Date.parse(collected?.checkedAt ?? '') > Date.parse(v.cli.checkedAt ?? ''))
+        ? v.cli : collected
       const Card = ({ id, name, installed, latest, note, can, onUpdate, extra }: {
         id: string; name: string; installed?: string | null; latest?: string | null; note?: string; can: boolean
         onUpdate: () => void; extra?: RenderChildren

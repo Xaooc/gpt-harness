@@ -1,5 +1,4 @@
-// Shapes produced by ~/.claude/scripts/luna-overview.mjs and ~/.claude/scripts/conveyor/cli-update.mjs,
-// read by the pane. Every section added for the conveyor is optional: older collectors omit it.
+// Shapes read from the Luna collector snapshot and the explicit CLI status action.
 
 export type LimitWindow = { usedPercent: number; windowMins: number | null; resetsAt: string | null }
 
@@ -114,10 +113,26 @@ export type Usage = {
   notes?: string[]
 }
 
+export type SectionName = 'ram' | 'daemon' | 'jobs' | 'sessions' | 'codexLimits' | 'orchestration' | 'usage' | 'gemini' | 'cli' | 'catalog'
+
+export type SectionStatus = {
+  attemptAt: string | null
+  okAt: string | null
+  staleAfterMs: number
+  status: 'ok' | 'stale' | 'error' | 'unavailable'
+  reason: string | null
+}
+
 export type Snapshot = {
   v: number
+  version: 2
   at: string
-  ram: { freeMb: number; totalMb: number }
+  collector: { pid: number; instance: string; seq: number; publishedAt: string }
+  sections: Record<SectionName, SectionStatus>
+  cli: CliStatus | null
+  claudeLimits: SharedClaudeLimit[]
+  truncated?: true
+  ram: { freeMb: number | null; totalMb: number | null }
   daemon: {
     running: boolean
     healthy?: boolean
@@ -140,7 +155,8 @@ export type Snapshot = {
   usage?: Usage | null
 }
 
-export type ClaudeLimit = { kind: string; percentUsed: number; resetsAt?: string }
+export type ClaudeLimit = { kind: string; percentUsed: number; resetsAt?: string | null }
+export type SharedClaudeLimit = ClaudeLimit & { resetsAt: string | null; observedAt: string; sessionId: string }
 
 export type CliStatus = {
   codex?: {
