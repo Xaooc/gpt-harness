@@ -422,6 +422,49 @@ function configureExternals(ctx) {
   }) ? 4 : 0;
 }
 
+// Claude Code runs a plugin from its cache (~/.claude/plugins/cache/<marketplace>/<plugin>/<version>), not from
+// local-plugins: new files reach sessions only after the marketplace is refreshed and the plugin updated. Without this
+// an upgrade from git leaves every session on the old Luna panel.
+function refreshLocalPlugins(ctx) {
+  const root = path.join(ctx.claudeHome, 'local-plugins') + path.sep;
+  const changed = [...new Set([...(ctx.writtenPaths ?? [])].filter(file => file.startsWith(root))
+    .map(file => file.slice(root.length).split(path.sep)[0]).filter(name => name && !name.startsWith('.')))];
+  if (!changed.length) return;
+  const installed = (() => {
+    try { return readJson(path.join(ctx.claudeHome, 'plugins', 'installed_plugins.json'))?.plugins ?? {}; }
+    catch { return {}; }
+  })();
+  const plugins = changed.filter(name => Object.hasOwn(installed, `${name}@luna-local`));
+  if (!plugins.length) return;
+  const manual = ['claude plugin marketplace update luna-local',
+    ...plugins.map(name => `claude plugin update ${name}@luna-local`)].join(' && ');
+  if (ctx.dryRun || supervisorDisabled(ctx)) {
+    report(ctx, 'ok', `Would refresh the Claude plugin cache: ${manual}`);
+    return;
+  }
+  const executable = externalExecutable('claude');
+  if (!executable) {
+    report(ctx, 'warn', `claude not found on PATH; to load the new plugin files run: ${manual}`);
+    return;
+  }
+  const [bin, ...prefix] = executable;
+  const env = { ...homeEnvironment(ctx), CLAUDE_CONFIG_DIR: ctx.claudeHome };
+  delete env.CLAUDE_PLUGIN_DATA;
+  const run = (args) => (ctx.pluginRunner ?? runCommand)(bin, [...prefix, ...args], { cwd: ctx.home, env, timeout: 120_000 });
+  const marketplace = run(['plugin', 'marketplace', 'update', 'luna-local']);
+  if (marketplace.status !== 0 || marketplace.error) {
+    report(ctx, 'warn', `Could not refresh the luna-local marketplace (${commandOutput(marketplace) || 'failed'}); run: ${manual}`);
+    return;
+  }
+  const updated = [];
+  for (const name of plugins) {
+    const result = run(['plugin', 'update', `${name}@luna-local`]);
+    if (result.status === 0 && !result.error) updated.push(name);
+    else report(ctx, 'warn', `Could not update ${name}@luna-local (${commandOutput(result) || 'failed'}); run: claude plugin update ${name}@luna-local`);
+  }
+  if (updated.length) report(ctx, 'ok', `Updated ${updated.join(', ')} in the Claude plugin cache; restart Claude sessions to load them`);
+}
+
 function installFiles(ctx, manifest) {
   if (manifest.version !== 1 || !Array.isArray(manifest.files)) throw new Error('Unsupported payload manifest');
   for (const file of manifest.files) {
@@ -1513,6 +1556,7 @@ function installPrepared(ctx, preflightFn) {
     saveRecord(ctx, manifest, restoration, created);
   }
   const externalStatus = configureExternals(ctx);
+  refreshLocalPlugins(ctx);
   if (ctx.check) checkStatus = runChecks(ctx);
   if (checkAfterInstall) supervisorCheck = checkCollectorSupervisor(ctx);
   printSummary(ctx);

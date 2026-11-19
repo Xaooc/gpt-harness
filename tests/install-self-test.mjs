@@ -977,7 +977,9 @@ if (probe.keys) {
       atomicWrite(path.join(options.payload, 'manifest.json'), json(manifest));
       const calls = [];
       const supervisorRunner = (...args) => { calls.push(args); return { status: 1 }; };
-      const linux = overrides => makeContext({ ...options, platform: 'linux', supervisorRunner, ...overrides });
+      // The plugin-cache refresh touches the real Claude config the same way: never from a temp home.
+      const pluginRunner = (...args) => { calls.push(args); return { status: 1 }; };
+      const linux = overrides => makeContext({ ...options, platform: 'linux', supervisorRunner, pluginRunner, ...overrides });
       const unit = path.join(options.home, '.config', 'systemd', 'user', 'luna-collector.service');
       const vars = ['HOME', 'USERPROFILE', 'LUNA_INSTALL_NO_SUPERVISOR'];
       const previous = vars.map((key) => [key, process.env[key]]);
