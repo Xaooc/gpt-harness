@@ -5192,7 +5192,7 @@
       "src": "claude/scripts/conveyor/lib/sessions.mjs",
       "dest": "scripts/conveyor/lib/sessions.mjs",
       "kind": "file",
-      "sha256": "be71ec185b025b2b461c114905b5add18f1503e5facc46c89f7ce2d25cea4fb0"
+      "sha256": "e857b629abb813610eca5b316b63c0b2f7d77d23156fc34f0bcc865b3dade4cc"
     },
     {
       "src": "claude/scripts/conveyor/test/collector.test.mjs",
@@ -5204,7 +5204,7 @@
       "src": "claude/scripts/conveyor/test/sessions.test.mjs",
       "dest": "scripts/conveyor/test/sessions.test.mjs",
       "kind": "file",
-      "sha256": "6670e11e8c3cfdd8fdd6b25ee2e46f092674051a23b7101751d33022633434c1"
+      "sha256": "a8a3444e6bacc464897108ca235e14ae0922347120059a07734823cee5e06240"
     },
     {
       "src": "claude/scripts/lib/supervised-run.mjs",

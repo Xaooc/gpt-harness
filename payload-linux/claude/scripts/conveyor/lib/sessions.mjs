@@ -244,6 +244,15 @@ function readToolBlocks(line, state, unbasedPlanOperations) {
   let row;
   try { row = JSON.parse(line.toString('utf8')); } catch { return; }
   const content = row?.message?.content;
+  // A task notification delivered while the session is mid-turn is queued, not sent as a user message: it is written
+  // as an `attachment` row (queued_command prompt) and a `queue-operation` row (content), never as a user entry.
+  const queued = row?.type === 'attachment' && row.attachment?.type === 'queued_command' ? row.attachment.prompt
+    : row?.type === 'queue-operation' ? row.content : undefined;
+  if (!row?.isSidechain && typeof queued === 'string' && queued.startsWith('<task-notification>')) {
+    completeAgents(queued, state.tools);
+    completeBackground(queued, state.background);
+    return;
+  }
   if (row?.isSidechain || !['user', 'assistant'].includes(row?.type)) return;
   const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
   if (!Array.isArray(blocks)) return;

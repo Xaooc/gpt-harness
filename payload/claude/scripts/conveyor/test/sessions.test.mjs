@@ -194,7 +194,17 @@ test('completed background commands disappear while monitors and executors remai
   const command = 'node ~/.claude/scripts/conveyor/exec.mjs run';
   appendFileSync(f.transcript, tool('exec', 'Bash', { command, run_in_background: true }, toolSince + 2) +
     result('exec', 'Command running in background with ID: shell-2.'));
-  assert.deepEqual((await f.read(completed.cursors)).sessions[0].background, [
+  const withExecutor = await f.read(completed.cursors);
+  assert.deepEqual(withExecutor.sessions[0].background, [
     { id: 'shell-2', kind: 'executor', text: command, since: toolSince + 2 }, monitor
+  ]);
+
+  // A notification that arrives mid-turn is queued: written as an attachment row, not as a user message.
+  appendFileSync(f.transcript, JSON.stringify({
+    type: 'attachment', timestamp: new Date(now).toISOString(),
+    attachment: { type: 'queued_command', prompt: `<task-notification><task-id>${monitor.id}</task-id><status>completed</status></task-notification>` }
+  }) + '\n');
+  assert.deepEqual((await f.read(withExecutor.cursors)).sessions[0].background, [
+    { id: 'shell-2', kind: 'executor', text: command, since: toolSince + 2 }
   ]);
 });
