@@ -122,6 +122,9 @@ The same Claude Code + Codex setup as the source machine:
 - **Codex plugin review-gate fixes:** the broker reaper, plus patches to the `codex@openai-codex` plugin (broker
   orphaning, thread leak, unelevated sandbox).
 - **Luna pane:** a Claude Code plugin, `/luna`, showing live RAM, Claude/Codex limits and jobs per session.
+  Claude runs it from its plugin cache, so after an upgrade the installer refreshes that cache itself
+  (`claude plugin marketplace update luna-local`, `claude plugin update luna-panel@luna-local`); restart Claude
+  sessions to load the new panel. If `claude` is not on PATH it prints those two commands instead.
 - **Self-learning loop:** captures corrections and job outcomes, proposes rule edits daily, gated by code and a Sol
   critic, every edit revertible. It starts with **empty data** on this machine.
 - **Custom Codex build:** Codex 0.164.0 plus a patch, so model commands run in busybox `sh` (~6 MB) instead of
