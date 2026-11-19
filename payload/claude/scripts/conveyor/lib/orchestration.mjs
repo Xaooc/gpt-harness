@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { home, lockOwnerAlive, lockOwnerStart } from './platform.mjs';
+import { lockOwnerAlive, lockOwnerStart } from './platform.mjs';
 
 const providers = ['codex', 'gemini', 'claude'];
 const reasons = ['quota', 'region', 'auth', 'start'];
@@ -337,7 +337,9 @@ async function codexUsage(now) {
 }
 
 async function collectorClaudeLimits(run, now) {
-  const roots = new Set([run, path.resolve(home(), '.claude', 'luna-run')]);
+  // The collector publishes under the same run directory (LUNA_RUN_DIR, default ~/.claude/luna-run): reading the real
+  // home as well would make an isolated run (tests, a second run root) see this machine's live limits.
+  const roots = new Set([run]);
   if (process.env.CLAUDE_HOME_DIR) roots.add(path.resolve(process.env.CLAUDE_HOME_DIR, 'luna-run'));
   const snapshots = await Promise.all([...roots].map((root) => optionalJson(path.join(root, 'collector', 'snapshot.json'))));
   const latest = new Map();

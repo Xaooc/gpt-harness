@@ -247,7 +247,7 @@ function assembleServer(token, health, beat, stop) {
     }
     if (req.method === 'GET' && req.url === '/health') return reply(200, health());
     if (req.method === 'POST' && req.url === '/stop') {
-      res.once('finish', stop);
+      res.once('finish', () => stop('stop requested over HTTP'));
       req.resume();
       return reply(204);
     }
@@ -286,7 +286,12 @@ function assembleServer(token, health, beat, stop) {
   return server;
 }
 
-async function serve(config, owner) {
+function reclaim(config, owner) {
+  try { writeFileSync(config.lock, JSON.stringify(owner), { flag: 'wx', mode: 0o600 }); return true; }
+  catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+}
+
+async function serve(config, owner, result = {}) {
   const token = randomBytes(16).toString('hex');
   const defaults = {
     v: 1, ram: { freeMb: null, totalMb: null }, daemon: { running: false, appServer: null, healthy: false },
@@ -311,8 +316,12 @@ async function serve(config, owner) {
   let widgetAt = NaN;
   let wakeStop;
   const stopped = new Promise((resolve) => { wakeStop = resolve; });
-  const stop = () => { stopping = true; shutdown.abort(); wakeStop(); };
   const log = (error) => process.stderr.write(`luna-collector: ${message(error)}\n`);
+  // Every stop says why in the journal: a collector that exits silently cannot be diagnosed.
+  const stop = (reason) => {
+    if (!stopping && typeof reason === 'string') log(`stopping: ${reason}`);
+    stopping = true; shutdown.abort(); wakeStop();
+  };
   const meta = (name) => metadata[name];
 
   const server = assembleServer(token, () => ({ ok: true, instance: owner.instance, seq }), (body) => {
@@ -529,16 +538,22 @@ async function serve(config, owner) {
 
   const poll = () => {
     try {
-      if (readJson(config.lock)?.instance !== owner.instance) { stop(); return; }
+      const current = readJson(config.lock);
+      if (current?.instance !== owner.instance) {
+        // A vanished lock (deleted by a cleaner or by hand) is ours to recreate; only another owner's lock ends us.
+        if (!current && reclaim(config, owner)) log('lock file was missing; recreated it');
+        else { result.code = 3; stop(`lock now names ${current?.instance ?? 'nothing'}`); return; }
+      }
       tick();
     } catch (error) { log(error); }
     if (!stopping) timer = setTimeout(poll, SECOND);
   };
   const signals = ['SIGINT', 'SIGTERM', ...(platform === 'win32' ? ['SIGHUP'] : [])];
-  for (const signal of signals) process.on(signal, stop);
+  const onSignal = (signal) => stop(`signal ${signal}`);
+  for (const signal of signals) process.on(signal, onSignal);
   try {
     await listen(server);
-    server.on('error', (error) => { log(error); stop(); });
+    server.on('error', (error) => { log(error); stop('server error'); });
     if (stopping) return;
     const info = { version: 1, pid: owner.pid, instance: owner.instance, port: server.address().port, token,
       startedAt: owner.startedAt };
@@ -559,7 +574,7 @@ async function serve(config, owner) {
       grace.abort();
       server.close();
       server.closeAllConnections();
-      for (const signal of signals) process.removeListener(signal, stop);
+      for (const signal of signals) process.removeListener(signal, onSignal);
     }
   }
 }
@@ -588,9 +603,11 @@ async function runCollector(config, epoch) {
   try {
     if (supervisorStopped(config, epoch)) return 0;
     mkdirSync(path.dirname(config.widget), { recursive: true, mode: 0o700 });
-    await serve(config, owner);
+    const result = {};
+    await serve(config, owner, result);
+    // Exit 3 (another collector owns the lock) is the one exit the supervisors do not restart.
+    return result.code ?? 0;
   } finally { releaseLock(config, owner); }
-  return 0;
 }
 
 function systemctl(action) {
@@ -675,7 +692,7 @@ if (!isMainThread && workerData === 'usage') {
   try {
     const action = process.argv[2];
     const code = await main(action);
-    if (action === 'run' && code === 0) process.exit(0);
+    if (action === 'run') process.exit(code ?? 0);
     process.exitCode = code ?? 0;
   } catch (error) {
     process.stderr.write(`luna-collector: ${message(error)}\n`);

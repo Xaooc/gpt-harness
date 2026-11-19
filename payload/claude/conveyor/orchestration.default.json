@@ -285,7 +285,7 @@
         "complex": [
           {
             "provider": "codex",
-            "model": "gpt-6.1-sol",
+            "model": "gpt-6.2-sol",
             "effort": "max"
           },
           {
@@ -295,11 +295,6 @@
           }
         ],
         "simple": [
-          {
-            "provider": "gemini",
-            "model": "gemini-3.8-flash",
-            "effort": "high"
-          },
           {
             "provider": "codex",
             "model": "gpt-6-luna",
@@ -324,16 +319,11 @@
           },
           {
             "provider": "codex",
-            "model": "gpt-6.1-sol",
-            "effort": "max"
+            "model": "gpt-6.2-sol",
+            "effort": "high"
           }
         ],
         "simple": [
-          {
-            "provider": "gemini",
-            "model": "gemini-3.8-flash",
-            "effort": "high"
-          },
           {
             "provider": "claude",
             "model": "haiku",

@@ -688,7 +688,7 @@ function collectorUnitBytes(ctx) {
   return Buffer.from([
     '[Unit]', 'Description=Luna shared collector', 'StartLimitIntervalSec=300', 'StartLimitBurst=5', '',
     '[Service]', `ExecStart=${node} ${script} run`,
-    'Restart=on-failure', 'RestartSec=10', 'RestartPreventExitStatus=3', 'Nice=10', '',
+    'Restart=always', 'RestartSec=10', 'RestartPreventExitStatus=3', 'Nice=10', '',
     '[Install]', 'WantedBy=default.target', '',
   ].join('\n'));
 }

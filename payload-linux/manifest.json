@@ -414,7 +414,7 @@
       "src": "claude/conveyor/orchestration.default.json",
       "dest": "conveyor/orchestration.default.json",
       "kind": "file",
-      "sha256": "1c7fb3fd2ffcc74afb15ec48befdc164f98da6d3de0280c4902de80ef684b3e5"
+      "sha256": "998a78e8d270036a05c7a82500b7f0915a3ac77bba4c275af004fc12e6e3ec96"
     },
     {
       "src": "claude/hooks/conveyor-hygiene-session-start.mjs",
@@ -3812,7 +3812,7 @@
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
       "dest": "scripts/conveyor/lib/orchestration.mjs",
       "kind": "file",
-      "sha256": "d6f6b4ae547ff9885c2b21d9a2bdcb1791ba7c38b052c39cdc67d5b72a422b88"
+      "sha256": "d0d0fe2b1a4596d2ef5d33d411ef0c869c497f4e0e7ff26dba9f46f6045e94dd"
     },
     {
       "src": "claude/scripts/conveyor/lib/patch-recipes.mjs",
@@ -5216,7 +5216,7 @@
       "src": "claude/scripts/luna-collector.mjs",
       "dest": "scripts/luna-collector.mjs",
       "kind": "file",
-      "sha256": "c65f845ff57f42aaa958b60b1344d254a055ba1a21debb1f8b13d8b4357287fd",
+      "sha256": "81915a6c93727e720aee411a479d05b3df5ad1725c2042a4a6a17ab492b2de3c",
       "executable": true
     }
   ],
