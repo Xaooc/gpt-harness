@@ -72,13 +72,24 @@ function Test-AdminOnly([string]$Path) {
   return $true
 }
 
+# With HideExclusionsFromLocalAdmins, Get-MpPreference shows a placeholder instead of the real exclusions: nothing this
+# script decides from Defender's state could be verified, so it refuses to change anything or to drop its record.
+function Get-Defender {
+  $current = Get-MpPreference
+  if (@($current.ExclusionPath) + @($current.ExclusionProcess) | Where-Object { $_ -like 'N/A*' }) {
+    throw 'Defender hides its exclusions from local administrators on this machine (HideExclusionsFromLocalAdmins), ' +
+      'so this script cannot verify them. Nothing was changed; manage the exclusions through the policy that sets them.'
+  }
+  return $current
+}
+
 function Read-Record {
   if (-not (Test-Path -LiteralPath $record)) { return [pscustomobject]@{ paths = @(); processes = @(); pending = $null } }
   if (-not (Test-AdminOnly $recordDir) -or -not (Test-AdminOnly $record)) {
     throw "$record can be changed by non-administrators, so it cannot prove which exclusions this script added. " +
       'Inspect it and Defender''s exclusions by hand, delete it, then run this script again.'
   }
-  try { $saved = Get-Content -LiteralPath $record -Raw | ConvertFrom-Json }
+  try { $saved = Get-Content -LiteralPath $record -Raw -Encoding UTF8 | ConvertFrom-Json }
   catch { throw "$record is not valid JSON; inspect it and Defender's exclusions by hand. Nothing was changed." }
   return [pscustomobject]@{
     paths = @($saved.paths | Where-Object { $_ })
@@ -100,14 +111,14 @@ function Write-Record([string[]]$Paths, [string[]]$Processes, $Pending) {
   $tmp = Join-Path $recordDir ("defender-exclusions.$PID.tmp")
   [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
   Protect-Item $tmp
-  if (Test-Path -LiteralPath $record) { [IO.File]::Replace($tmp, $record, $null) } else { [IO.File]::Move($tmp, $record) }
+  if (Test-Path -LiteralPath $record) { [IO.File]::Replace($tmp, $record, [NullString]::Value) } else { [IO.File]::Move($tmp, $record) }
 }
 
 # Entries planned by a run that stopped before it could reconcile: keep those Defender has (they were absent when
 # that run planned them), drop the rest.
 function Resolve-Pending($Saved) {
   if (-not $Saved.pending) { return $Saved }
-  $current = Get-MpPreference
+  $current = Get-Defender
   $Saved.paths = @($Saved.paths | Where-Object { @($Saved.pending.paths) -notcontains $_ -or $current.ExclusionPath -contains $_ })
   $Saved.processes = @($Saved.processes | Where-Object { @($Saved.pending.processes) -notcontains $_ -or $current.ExclusionProcess -contains $_ })
   Write-Record $Saved.paths $Saved.processes $null
@@ -123,7 +134,7 @@ try {
   $saved = Resolve-Pending (Read-Record)
 
   if ($Remove) {
-    $current = Get-MpPreference
+    $current = Get-Defender
     $removePaths = @($saved.paths | Where-Object { $current.ExclusionPath -contains $_ })
     $removeProcesses = @($saved.processes | Where-Object { $current.ExclusionProcess -contains $_ })
     if (-not $removePaths -and -not $removeProcesses) {
@@ -140,7 +151,7 @@ try {
       if ($removeProcesses) { Remove-MpPreference -ExclusionProcess $removeProcesses }
     } finally {
       # Keep in the record whatever is still present, so a failed removal can be retried.
-      $after = Get-MpPreference
+      $after = Get-Defender
       $leftPaths = @($saved.paths | Where-Object { $after.ExclusionPath -contains $_ })
       $leftProcesses = @($saved.processes | Where-Object { $after.ExclusionProcess -contains $_ })
       if ($leftPaths -or $leftProcesses) { Write-Record $leftPaths $leftProcesses $null }
@@ -162,7 +173,7 @@ try {
   $buildRoot = Join-Path $env:USERPROFILE 'codex-build'
   $envFile = Join-Path $env:USERPROFILE '.claude\luna-harness.env'
   if (Test-Path -LiteralPath $envFile) {
-    $line = Get-Content -LiteralPath $envFile | Where-Object { $_ -match '^\s*LUNA_CUSTOM_CODEX_ROOT=' } | Select-Object -First 1
+    $line = Get-Content -LiteralPath $envFile -Encoding UTF8 | Where-Object { $_ -match '^\s*LUNA_CUSTOM_CODEX_ROOT=' } | Select-Object -First 1
     if ($line) { $buildRoot = ($line -replace '^\s*LUNA_CUSTOM_CODEX_ROOT=', '').Trim('"', "'", ' ') }
   }
   $paths += $buildRoot
@@ -177,9 +188,16 @@ try {
     $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Where-Object { $_.Source -match '\.exe$' } | Select-Object -First 1
     if ($cmd) { $processes += $cmd.Source }
   }
-  $npmCodex = Join-Path $env:APPDATA 'npm\node_modules\@openai'
-  if (Test-Path -LiteralPath $npmCodex) {
-    $processes += @(Get-ChildItem -LiteralPath $npmCodex -Recurse -Filter 'codex.exe' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+  # Codex: a native codex.exe on PATH, or the native binary inside the npm package next to the codex shim that PATH finds.
+  $codexRoots = @(Join-Path $env:APPDATA 'npm\node_modules\@openai')
+  foreach ($cmd in @(Get-Command codex -All -ErrorAction SilentlyContinue)) {
+    if ($cmd.Source -match '\.exe$') { $processes += $cmd.Source }
+    elseif ($cmd.Source) { $codexRoots += Join-Path (Split-Path $cmd.Source) 'node_modules\@openai' }
+  }
+  foreach ($root in ($codexRoots | Select-Object -Unique)) {
+    if (Test-Path -LiteralPath $root) {
+      $processes += @(Get-ChildItem -LiteralPath $root -Recurse -Filter 'codex.exe' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    }
   }
   foreach ($candidate in @((Join-Path $buildRoot 'dist\bin\codex.exe'), "$env:ProgramFiles\Git\bin\bash.exe",
                            "$env:ProgramFiles\Git\usr\bin\bash.exe", "$env:ProgramFiles\Git\cmd\git.exe",
@@ -191,7 +209,7 @@ try {
       $_ -and $_ -match '\.exe$' -and -not $_.StartsWith($systemRoot, [StringComparison]::OrdinalIgnoreCase)
     } | Select-Object -Unique)
 
-  $current = Get-MpPreference
+  $current = Get-Defender
   $newPaths = @($paths | Where-Object { $current.ExclusionPath -notcontains $_ })
   $newProcesses = @($processes | Where-Object { $current.ExclusionProcess -notcontains $_ })
 
@@ -207,7 +225,7 @@ try {
     if ($newPaths) { Add-MpPreference -ExclusionPath $newPaths }
     if ($newProcesses) { Add-MpPreference -ExclusionProcess $newProcesses }
   } finally {
-    $after = Get-MpPreference
+    $after = Get-Defender
     $addedPaths = @($newPaths | Where-Object { $after.ExclusionPath -contains $_ })
     $addedProcesses = @($newProcesses | Where-Object { $after.ExclusionProcess -contains $_ })
     Write-Record ($saved.paths + $addedPaths) ($saved.processes + $addedProcesses) $null

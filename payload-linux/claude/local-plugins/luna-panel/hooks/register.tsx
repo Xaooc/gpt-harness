@@ -198,12 +198,13 @@ function attentionItems(d: PanelData): Alert[] {
     if (free < 1024) out.push({ level: 'error', text: `Мало памяти: ${gb(free)}, новые задачи ждут` })
     else if (free < 2048) out.push({ level: 'warning', text: `Памяти немного: ${gb(free)}` })
   }
-  for (const j of s.jobs) {
+  const jobs = s.jobs.filter(j => providerOf(j) !== 'gemini')
+  for (const j of jobs) {
     if (j.state === 'running' && (j.idleS ?? 0) >= 900) {
       out.push({ level: 'error', text: `${modelName(j.provider, j.model)} «${jobName(j.out)}» молчит ${duration(j.idleS ?? 0)}` })
     }
   }
-  const starved = s.jobs.filter(j => j.state === 'waiting-ram').length
+  const starved = jobs.filter(j => j.state === 'waiting-ram').length
   if (starved) out.push({ level: 'warning', text: `${starved} ${starved === 1 ? 'задача ждёт' : 'задач ждут'} памяти` })
   if (s.daemon.running && s.daemon.healthy === false) out.push({ level: 'error', text: 'Демон Codex не отвечает' })
   const o = s.orchestration
@@ -1072,7 +1073,8 @@ export const register: Register = on => {
       // Only the providers shown above count, so every share is a share of the displayed week (Gemini history is left out).
       const byModel = (usage.byModel7d ?? []).filter(m => m.provider !== 'gemini')
       const byProject = (usage.byProject7d ?? [])
-        .map(p => ({ ...p, total: p.claude === undefined && p.codex === undefined ? p.total : (p.claude ?? 0) + (p.codex ?? 0) }))
+        // A row without the per-provider split may include Gemini: it cannot be a share of this week, so it is left out.
+        .map(p => ({ ...p, total: (p.claude ?? 0) + (p.codex ?? 0) }))
         .filter(p => p.total > 0).sort((a, b) => b.total - a.total)
       const topJobs = (usage.topJobs ?? []).filter(j => j.provider === 'codex' || j.provider === 'claude')
       return (
