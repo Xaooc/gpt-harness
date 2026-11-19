@@ -6,7 +6,7 @@ import type {
 } from '../types'
 
 // The Luna pane, conveyor edition: limits of every provider, the executor chains with the active one marked, every
-// executor's jobs (Codex, Gemini, Claude subagents), the orchestration editor and CLI updates.
+// executor's jobs (Codex, Claude subagents), the orchestration editor and CLI updates.
 // Data: the Luna collector snapshot and $.session.usage(); settings through
 // `node ~/.claude/scripts/conveyor/exec.mjs config …`; updates through `node ~/.claude/scripts/conveyor/cli-update.mjs`.
 
@@ -22,7 +22,7 @@ const MAX_ENSURE_MS = 15 * ENSURE_MS
 const EMPTY: PanelData = { snapshot: null, claude: [], error: '', polledAt: 0, sessionId: '' }
 const VIEW0: View = {
   tab: 'overview', editTier: null, filter: 'all', confirm: null, busy: null, note: null, cli: null,
-  draftModel: '', draftProvider: 'gemini', draftEfforts: 'low,medium,high', presetName: '',
+  draftModel: '', draftProvider: 'codex', draftEfforts: 'low,medium,high', presetName: '',
 }
 const data = atom({ plugin: 'luna-panel', key: 'data' } as const, EMPTY)
 const collapsed = atom({ plugin: 'luna-panel', key: 'collapsed' } as const, {} as Collapsed)
@@ -605,7 +605,8 @@ export const register: Register = on => {
       o?.catalog?.[provider]?.find(m => m.model === model)?.efforts ?? EFFORTS_ALL
     const modelOptions = () => {
       const all: { value: string; label: string }[] = []
-      for (const [provider, models] of Object.entries(o?.catalog ?? {})) {
+      // Gemini is out of the owner's setup: its catalog entries are kept on disk but never offered.
+      for (const [provider, models] of Object.entries(o?.catalog ?? {}).filter(([p]) => p !== 'gemini')) {
         for (const m of models) all.push({ value: `${provider}|${m.model}`, label: modelName(provider, m.model) })
       }
       // A label two providers share gets its provider, so the list stays unambiguous.
@@ -787,7 +788,6 @@ export const register: Register = on => {
 
     const jobs = snap.jobs
     const codex = snap.codexLimits
-    const gem = snap.gemini
     const room = Math.max(4, (e.viewport?.rows ?? 40) - 30)
 
     // ---- Overview ----
@@ -824,13 +824,6 @@ export const register: Register = on => {
         .sort((a, b) => (a.kind === 'five_hour' ? -1 : b.kind === 'five_hour' ? 1 : 0))
       const cx = [codex?.primary, codex?.secondary].filter((x): x is NonNullable<typeof x> => !!x)
         .sort((a, b) => (a.windowMins ?? 0) - (b.windowMins ?? 0))
-      const q = gem?.quota
-      // Gemini's own windows; `3p-*` are Antigravity's quotas for other vendors' models, which the harness never uses.
-      const allBuckets = q?.available ? q.buckets : []
-      const own = allBuckets.filter(x => /^gemini/i.test(x.name))
-      const buckets = (own.length ? own : allBuckets)
-        .sort((x, y) => (/5h/.test(x.name) ? -1 : /5h/.test(y.name) ? 1 : 0))
-      const bucketName = (name: string) => (/5h/.test(name) ? '5 ч' : /week/.test(name) ? 'неделя' : name.replace(/^gemini-/, '').slice(0, 7))
       const today = usage?.today
       return (
         <Section title="Лимиты">
@@ -848,23 +841,11 @@ export const register: Register = on => {
                 right={w.usedPercent >= thresholdPct ? `≥ порога ${thresholdPct}%` : resetShort(w.resetsAt) || `порог ${thresholdPct}%`} />
             )) : <LimitLine provider="Codex" showName window="" pct={null} right="нет данных" />}
           </Box>
-          <Rule />
-          <Box flexDirection="column">
-          {buckets.length ? buckets.map((b, i) => {
-            const used = b.usedPercent ?? (b.remainingFraction !== undefined ? (1 - b.remainingFraction) * 100 : null)
-            return <LimitLine provider="Gemini" showName={i === 0} window={bucketName(b.name)} pct={used} right={resetShort(b.resetAt)} />
-          }) : (
-            <LimitLine provider="Gemini" showName window="квота" pct={null}
-              color={gem?.available === false ? 'error' : 'success'}
-              right={!gem ? 'нет данных' : !gem.available ? `недоступен: ${reasonRu(gem.reason)}`
-                : q?.lastExhaustedAt ? `исчерпывался ${clock(q.lastExhaustedAt)}` : q?.reason ? 'остаток не прочитан' : 'нет данных о квоте'} />
-          )}
-          </Box>
           {today ? (
             <Box paddingTop={0}>
               <Button key="today-usage" plain onPress={() => void setView({ tab: 'usage' })}>
                 <Text size="caption" color="subtle" wrap="truncate-end">
-                  сегодня  Claude {tokens(tok(today.claude))} · Codex {tokens(tok(today.codex))} · Gemini {tokens(tok(today.gemini))} ток.  ›
+                  сегодня  Claude {tokens(tok(today.claude))} · Codex {tokens(tok(today.codex))} ток.  ›
                 </Text>
               </Button>
             </Box>
@@ -883,12 +864,42 @@ export const register: Register = on => {
       if (!o) return <Text size="caption" color="subtle">Оркестрация не настроена</Text>
       const last = snap.switches?.[0]
       const recent = last && now - Date.parse(last.at) < 6 * 3600_000
+      // Collapsed by default: the complex tier stays visible as the one-line summary; the state is remembered.
+      const open = folded['exec'] === undefined ? false : !folded['exec']
+      const tiers = Object.entries(o.chains)
+      const lead = tiers.find(([tier]) => tier === 'complex') ?? tiers[0]
+      const blocked = tiers.filter(([, chain]) => chain.length > 0 && !chain.some(c => c.available)).length
+      const panelCount = Object.keys(o.panels ?? {}).length
+      const plural = (n: number, one: string, few: string, many: string) =>
+        n % 10 === 1 && n % 100 !== 11 ? one : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? few : many
+      const more = [
+        tiers.length > 1 ? `ещё ${tiers.length - 1} ${plural(tiers.length - 1, 'уровень', 'уровня', 'уровней')}` : '',
+        panelCount ? `${panelCount} ${plural(panelCount, 'панель', 'панели', 'панелей')}` : '',
+      ].filter(Boolean).join(' · ')
       return (
-        <Section title="Исполнители" right={<Link id="exec-settings" label="настройки" tone="quiet" onPress={() => void setView({ tab: 'settings' })} />}>
-          {Object.entries(o.chains).map(([tier, chain], i) => (
+        <Card>
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+            <Button key="fold-exec" plain onPress={() => void update($, collapsed, prev => ({ ...(prev ?? {}), exec: open }))}>
+              <Text size="caption" weight="semibold" color="subtle">{'ИСПОЛНИТЕЛИ'}{open ? '  ⌄' : '  ›'}</Text>
+            </Button>
+            <Link id="exec-settings" label="настройки" tone="quiet" onPress={() => void setView({ tab: 'settings' })} />
+          </Box>
+          {!open ? (
+            <Box flexDirection="column">
+              {lead ? <TierLine tier={lead[0]} chain={lead[1]} /> : null}
+              {more || blocked ? (
+                <Button key="fold-exec-more" plain onPress={() => void update($, collapsed, prev => ({ ...(prev ?? {}), exec: open }))}>
+                  <Text size="caption" color="subtle" wrap="truncate-end">
+                    {more}{blocked ? <Text color="error">{`${more ? ' · ' : ''}без исполнителя: ${blocked}`}</Text> : null}
+                  </Text>
+                </Button>
+              ) : null}
+            </Box>
+          ) : null}
+          {open ? tiers.map(([tier, chain], i) => (
             <Box flexDirection="column" key={`tl-${tier}`}>{i > 0 ? <Rule /> : null}<TierLine tier={tier} chain={chain} /></Box>
-          ))}
-          {Object.keys(o.panels ?? {}).length ? (
+          )) : null}
+          {open && Object.keys(o.panels ?? {}).length ? (
             <Box flexDirection="column" marginTop={1}>
               <Text size="caption" color="subtle">Панели · все места работают одновременно</Text>
               {Object.entries(o.panels ?? {}).map(([name, seats]) => (
@@ -910,7 +921,7 @@ export const register: Register = on => {
               {clock(last.at)} {TIER_RU[last.tier] ?? last.tier}: {last.from} → {last.to}{last.reason ? ` (${reasonRu(last.reason)})` : ''}
             </Text>
           ) : null}
-        </Section>
+        </Card>
       )
     }
 
@@ -923,14 +934,13 @@ export const register: Register = on => {
       const doing = !isRunning || !a ? '' : cmd ? cmd.text
         : a.kind === 'thinking' ? 'думает' : a.kind === 'editing' ? `правит${a.text ? ` ${a.text}` : ''}`
         : a.kind === 'writing' ? 'пишет ответ' : a.kind === 'starting' ? 'запускается' : a.text || ''
-      const prov = providerOf(j)
       return (
         <Box flexDirection="column">
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Text size="footnote" wrap="truncate-end" dimColor={!isRunning}>
               <Text color={quiet ?? (isRunning ? 'success' : 'warning')}>{isRunning ? '▶' : '◷'} </Text>
-              <Text color={prov === 'gemini' ? 'suggestion' : 'subtle'}>{prov === 'gemini' ? 'Gemini' : 'Codex'} </Text>
-              <Text weight="medium">{modelName(j.provider, j.model).replace(/^Gemini /, '')}</Text>
+              <Text color="subtle">Codex </Text>
+              <Text weight="medium">{modelName(j.provider, j.model)}</Text>
               <Text color="subtle"> {j.effort} </Text>{jobName(j.out)}
             </Text>
             <Text size="caption" color={quiet ?? 'subtle'} tabular>
@@ -946,11 +956,11 @@ export const register: Register = on => {
       const beats = snap.sessions ?? []
       const counts = {
         codex: jobs.filter(j => providerOf(j) === 'codex' && j.state === 'running').length,
-        gemini: jobs.filter(j => providerOf(j) === 'gemini' && j.state === 'running').length,
         claude: beats.reduce((n, b) => n + (b.agents?.length ?? 0), 0),
       }
-      const showJob = (j: Job) => v.filter === 'all' || v.filter === providerOf(j)
-      const showAgents = v.filter === 'all' || v.filter === 'claude'
+      const filter = v.filter === 'gemini' ? 'all' : v.filter
+      const showJob = (j: Job) => filter === 'all' || filter === providerOf(j)
+      const showAgents = filter === 'all' || filter === 'claude'
       const visible = jobs.filter(showJob)
       const ids = [...new Set([...beats.map(b => b.sessionId), ...visible.map(j => j.owner).filter(Boolean)])]
       const all = ids.map(id => ({ id, beat: beats.find(b => b.sessionId === id), jobs: visible.filter(j => j.owner === id) }))
@@ -965,7 +975,6 @@ export const register: Register = on => {
             <Box flexDirection="row" gap={0}>
               <Chip id="f-all" label="все" active={v.filter === 'all'} onPress={() => void setView({ filter: 'all' })} />
               <Chip id="f-codex" label={`Codex ${counts.codex}`} active={v.filter === 'codex'} onPress={() => void setView({ filter: 'codex' })} />
-              <Chip id="f-gemini" label={`Gemini ${counts.gemini}`} active={v.filter === 'gemini'} onPress={() => void setView({ filter: 'gemini' })} />
               <Chip id="f-claude" label={`Claude ${counts.claude}`} active={v.filter === 'claude'} onPress={() => void setView({ filter: 'claude' })} />
             </Box>
           } />
@@ -1045,12 +1054,11 @@ export const register: Register = on => {
       const PROV = [
         { key: 'claude', name: 'Claude', hex: '#d97757' },
         { key: 'codex', name: 'Codex', hex: '#8b949e' },
-        { key: 'gemini', name: 'Gemini', hex: '#4c8df6' },
       ] as const
       const today = usage.today ?? {}
       const week = usage.week ?? {}
       const days = (usage.days ?? []).slice(-7)
-      const dayTotal = (x: (typeof days)[number]) => tok(x.claude) + tok(x.codex) + tok(x.gemini)
+      const dayTotal = (x: (typeof days)[number]) => tok(x.claude) + tok(x.codex)
       const max = Math.max(1, ...days.map(dayTotal))
       // Seven stacked columns, one per day, providers in their own colour; drawn as one small SVG.
       const W = 220
@@ -1123,7 +1131,7 @@ export const register: Register = on => {
           {(usage.topJobs ?? []).length ? (
             <Section title="Самые тяжёлые задачи">
               {(usage.topJobs ?? []).slice(0, 5).map(j => (
-                <Row label={j.provider === 'gemini' ? 'Gemini' : j.provider === 'codex' ? 'Codex' : 'Claude'} value={tokens(j.total)}
+                <Row label={j.provider === 'codex' ? 'Codex' : 'Claude'} value={tokens(j.total)}
                   sub={`${jobTitle(j.name, j.at)}${j.project ? ` · ${shortProject(j.project)}` : ''}`} />
               ))}
             </Section>
@@ -1208,14 +1216,14 @@ export const register: Register = on => {
             ))}
           </Fold>
           <Fold id="set-catalog" title="Каталог моделей" byDefault={false}>
-            {Object.entries(o.catalog ?? {}).map(([p, models]) => (
+            {Object.entries(o.catalog ?? {}).filter(([p]) => p !== 'gemini').map(([p, models]) => (
               <Box flexDirection="row" gap={1} key={`cat-${p}`}>
                 <Box width={7} flexShrink={0}><Text size="footnote" color="subtle">{p}</Text></Box>
                 <Box flexGrow={1} flexShrink={1}><Text size="footnote" wrap="wrap">{models.map(m => modelName(p, m.model)).join(' · ')}</Text></Box>
               </Box>
             ))}
             <Box flexDirection="row" alignItems="center" gap={1} paddingTop={1}>
-              <Select key="draft-provider" value={v.draftProvider} options={['codex', 'gemini', 'claude'].map(p => ({ value: p, label: p }))}
+              <Select key="draft-provider" value={v.draftProvider} options={['codex', 'claude'].map(p => ({ value: p, label: p }))}
                 onSelect={value => void setView({ draftProvider: value })} />
               <Box flexGrow={1} minWidth={14}>
                 <Input key="draft-model" placeholder="id новой модели" value={v.draftModel}
@@ -1276,7 +1284,6 @@ export const register: Register = on => {
         )
       }
       const cx = c?.codex
-      const ag = c?.agy
       return (
         <Box flexDirection="column">
           <Head text={c?.checkedAt ? `проверено в ${clock(c.checkedAt)}` : 'версии'}
@@ -1287,18 +1294,8 @@ export const register: Register = on => {
               cx?.expectedByHarness && cx.latest && cx.expectedByHarness !== cx.latest ? `харнесс закреплён на ${cx.expectedByHarness}` : '',
             ].filter(Boolean).join(' · ')}
             onUpdate={() => void runUpdate($, 'codex', ['update', 'codex', ...(cx?.latest ? ['--version', cx.latest] : [])])} />
-          <Card id="agy" name="Antigravity" installed={ag?.installed} latest={ag?.latest} can={!ag?.busy?.reason}
-            note={[
-              ag?.checksumOk === false ? 'сумма бинаря не совпадает: Gemini отключён' : ag?.checksumOk ? 'сумма закреплена' : '',
-              ag?.busy?.reason ? `занят: ${ag.busy.reason}` : '',
-            ].filter(Boolean).join(' · ')}
-            onUpdate={() => void runUpdate($, 'agy', ['update', 'agy', ...(ag?.latestUrl ? ['--url', ag.latestUrl] : [])])}
-            extra={ag?.rollbackAvailable ? (
-              <Link id="agy-rollback" tone="danger" label={armed('rollback-agy') ? 'точно откатить?' : 'откатить на прошлую версию'}
-                onPress={confirmThen('rollback-agy', () => void runUpdate($, 'agy-rollback', ['rollback', 'agy']))} />
-            ) : undefined} />
           <Box paddingTop={1}>
-            <Text size="caption" color="subtle" wrap="wrap">Codex ставится, когда демон свободен; Antigravity проверяется запуском до замены и откатывается при ошибке.</Text>
+            <Text size="caption" color="subtle" wrap="wrap">Codex ставится, когда демон свободен.</Text>
           </Box>
         </Box>
       )

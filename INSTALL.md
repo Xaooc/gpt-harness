@@ -272,9 +272,20 @@ Check: `<root>\dist\bin\codex.exe --version` prints `codex-cli 0.164.0`. A new r
 starts a daemon on the new binary.
 
 ## 8. Optional, user action only
-- **Windows Defender exclusions** for the project folders and `%USERPROFILE%\.claude` cut CPU load from scanning
-  `node_modules` a lot. This is a security setting: explain the trade-off and let the user do it themselves
-  (Windows Security → Virus & threat protection → Exclusions).
+- **Windows Defender exclusions (strongly recommended on this setup).** Real-time protection scans every file the
+  harness touches and every process it starts (node, bash, git, codex), which can keep the CPU saturated. The user
+  runs, in an elevated PowerShell (Run as administrator):
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File tools\windows-defender-exclusions.ps1 -ExtraPath C:\dev
+  ```
+
+  It lists what it will exclude (`%USERPROFILE%\.claude`, `%USERPROFILE%\.codex`, the npm folders, the custom Codex
+  build, the folders given with `-ExtraPath` — use the folders that hold your projects — and the exact `node`, `git`,
+  `bash`, `codex` executables) and asks before changing anything; `-Remove` takes back exactly what it added.
+  Trade-off: excluded folders and processes are not scanned, so keep only trusted folders there. This is a security
+  setting: explain it and let the user run it; never run it for them. On Windows 11 a **Dev Drive** for the project
+  folders is an alternative: Defender scans it in its lighter performance mode.
 - **Desktop apps:** if the user doesn't use the ChatGPT/Codex desktop app, closing it saves ~2 GB RAM. Our jobs don't
   need it.
 

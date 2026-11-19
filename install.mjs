@@ -286,6 +286,13 @@ function preflight(ctx) {
     : 'codex --version failed; install Codex 0.164.0 (npm package @openai/codex, version 0.164.0)');
   const powershell = findExecutable('pwsh') ?? findExecutable('powershell');
   report(ctx, powershell ? 'ok' : 'warn', powershell ? `PowerShell: ${powershell}` : 'PowerShell not found');
+  // Defender's real-time scan of the many small processes and files is a common CPU drain on this setup. The user
+  // adds the exclusions themselves (a security setting); the script records what it added.
+  const defenderRecord = path.join(ctx.claudeHome, 'luna-run', 'defender-exclusions.json');
+  if (!fs.existsSync(defenderRecord)) {
+    report(ctx, 'warn', 'Windows Defender: no harness exclusions yet. To stop real-time scanning from loading the CPU, '
+      + 'run tools\\windows-defender-exclusions.ps1 in an elevated PowerShell (see INSTALL.md, step 8)');
+  }
 }
 
 function readJson(file) {

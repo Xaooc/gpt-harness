@@ -378,7 +378,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "5edc30affc41da5e9d99ef2fd6a7d7b796a31b7860af5b9d4b5cae9b80862703"
+      "sha256": "ec98640dd36f695f737cb1c71bafc13eb9483074cec42da1381db1e9bbfbd515"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
@@ -390,13 +390,13 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "4a321fd21e11976195b7d859cdbca5315e2aed940fa92802279407ab0079b196"
+      "sha256": "ee5c732324e7410b19dfeb1a427022cc4f5f073ef3db24fefbdddf184803a74d"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",
       "dest": "local-plugins/luna-panel/tests/pane.test.tsx",
       "kind": "file",
-      "sha256": "355f8fe244cf22e15b592f2f40cebdabd27715b3d15e0eaef721055b29147aff"
+      "sha256": "8aa866218a36190b7ba186d56e927a28c5e3826ac336f7b7f187ae658d845d9f"
     },
     {
       "src": "claude/local-plugins/luna-panel/tsconfig.json",

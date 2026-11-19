@@ -97,16 +97,21 @@ test('overview: every limit window, the active executor per tier, on every surfa
     expect(await ui.find({ type: 'Text', text: /Luna/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^Claude$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^Codex$/ })).toBeTruthy()
-    expect(await ui.find({ type: 'Text', text: /^Gemini$/ })).toBeTruthy()
-    // The active executor of the complex tier is named in full, version included.
+    // Gemini is out of the owner's setup: no Gemini row in the limits.
+    expect(await ui.find({ type: 'Text', text: /^Gemini$/ })).toBeFalsy()
+    // The executors card starts collapsed: the complex tier stays visible as the summary, named in full.
     expect(await ui.find({ type: 'Text', text: /^Sol 6\.1$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^Сложное\s*$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /все места работают одновременно/ })).toBeFalsy()
+    expect(await ui.find({ type: 'Text', text: /ещё \d+ уров/ })).toBeTruthy()
     // Claude's shared five-hour window is shown next to the local week.
     expect(await ui.find({ type: 'Text', text: /^5 ч/ })).toBeTruthy()
     // Groups inside a section card are separated by a drawn rule (text, so every surface shows it).
     expect(await ui.find({ type: 'Text', text: /^┈{20,}$/ })).toBeTruthy()
-    // Panels run all their seats at once; they are listed in the overview so they are never mistaken for chains.
+    // Expanding the card lists every tier and the panels, which run all their seats at once.
+    await ui.press({ key: 'fold-exec' })
     expect(await ui.find({ type: 'Text', text: /все места работают одновременно/ })).toBeTruthy()
+    await ui.press({ key: 'fold-exec' })
     await ui.unmount()
   }
 })
