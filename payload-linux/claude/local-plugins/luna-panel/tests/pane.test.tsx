@@ -28,7 +28,7 @@ const LIMITS = [{ kind: 'seven_day', percentUsed: 69, resetsAt: '2026-11-19T22:0
 function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, options: {
   snapshot?: Snapshot
   shown?: boolean
-  snapshotAge?: number | 'missing'
+  snapshotAge?: number | 'missing' | 'malformed' | 'wrong-version'
 } = {}) {
   const snap = options.snapshot ?? snapshot
   const clock = mock.clock(on, { now: START })
@@ -52,8 +52,11 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, opt
     reads.push(e.path)
     if (e.path === `${RUN_DIR}/collector/snapshot.json`) {
       if (options.snapshotAge === 'missing') return { deny: 'file missing' }
-      const publishedAt = new Date(clock.now() - (options.snapshotAge ?? 0)).toISOString()
-      return { value: JSON.stringify({ ...snap, collector: { ...snap.collector, publishedAt } }) }
+      if (options.snapshotAge === 'malformed') return { value: '{' }
+      const age = typeof options.snapshotAge === 'number' ? options.snapshotAge : 0
+      const publishedAt = new Date(clock.now() - age).toISOString()
+      const version = options.snapshotAge === 'wrong-version' ? 1 : snap.version
+      return { value: JSON.stringify({ ...snap, version, collector: { ...snap.collector, publishedAt } }) }
     }
     if (e.path === `${RUN_DIR}/collector/discovery.json`) {
       return { value: JSON.stringify({ ...snap.collector, version: 1, port: 12345, token: TOKEN, startedAt: snap.at }) }
@@ -242,7 +245,7 @@ test('collector: hiding a visible pane stops reads and beats', async ($, on) => 
   expect(calls).toHaveLength(0)
 })
 
-test('collector: a stale snapshot stays visible and ensures at most once per minute', async ($, on) => {
+test('collector: a stale snapshot stays visible, retries back off and a fresh snapshot resets them', async ($, on) => {
   const calls: Calls = []
   const options: { snapshotAge: number | 'missing' } = { snapshotAge: 31_000 }
   const { clock } = engine(on, calls, options)
@@ -250,16 +253,35 @@ test('collector: a stale snapshot stays visible and ensures at most once per min
   expect(await ui.find({ type: 'Text', text: /Данные не обновляются/ })).toBeTruthy()
   const ensure = ['node', '/home/t/.claude/scripts/luna-collector.mjs', 'ensure']
   expect(calls).toEqual([ensure])
-  await clock.advance(59_999)
+  await clock.advance(45_000)
   expect(calls).toEqual([ensure])
-  await clock.advance(1)
+  await clock.advance(30_000)
   expect(calls).toEqual([ensure, ensure])
+  await clock.advance(70_000)
+  expect(calls).toEqual([ensure, ensure])
+  await clock.advance(75_000)
+  expect(calls).toEqual([ensure, ensure, ensure])
   options.snapshotAge = 0
-  await clock.advance(55_000)
+  await clock.advance(5_000)
   options.snapshotAge = 'missing'
   await clock.advance(5_000)
-  expect(calls).toEqual([ensure, ensure, ensure])
+  expect(calls).toEqual([ensure, ensure, ensure, ensure])
   expect(await ui.find({ type: 'Text', text: /^Sol 6\.1$/ })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('collector: malformed and unsupported snapshots trigger recovery from a cold pane', async ($, on) => {
+  const calls: Calls = []
+  const options: { snapshotAge: 'malformed' | 'wrong-version' } = { snapshotAge: 'malformed' }
+  const { clock } = engine(on, calls, options)
+  const ui = await opened($, 'desktop')
+  const ensure = ['node', '/home/t/.claude/scripts/luna-collector.mjs', 'ensure']
+  expect(calls).toEqual([ensure])
+  options.snapshotAge = 'wrong-version'
+  await clock.advance(45_000)
+  expect(calls).toEqual([ensure])
+  await clock.advance(30_000)
+  expect(calls).toEqual([ensure, ensure])
   await ui.unmount()
 })
 

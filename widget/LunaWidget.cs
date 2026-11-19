@@ -77,7 +77,8 @@ namespace LunaWidget
     class Snapshot
     {
         public bool Ok, Stale; public string Error;
-        public double FreeMb, TotalMb;
+        public double? FreeMb;
+        public double TotalMb;
         public bool DaemonRunning, DaemonHealthy = true, AppServerDown; public int DaemonRunningJobs, DaemonQueued, DaemonMax;
         public double DaemonUptimeS;
         public List<Limit> Limits = new List<Limit>();
@@ -237,7 +238,9 @@ namespace LunaWidget
             s.At = published.ToLocalTime();
             s.Stale = (DateTime.UtcNow - published.ToUniversalTime()).TotalSeconds > 30;
             var ram = Obj(root["ram"]);
-            s.FreeMb = Num(ram, "freeMb", 0); s.TotalMb = Num(ram, "totalMb", 1);
+            double freeMb = Num(ram, "freeMb", double.NaN);
+            s.FreeMb = double.IsNaN(freeMb) ? (double?)null : freeMb;
+            s.TotalMb = Num(ram, "totalMb", 1);
             var dm = Obj(root.ContainsKey("daemon") ? root["daemon"] : null);
             s.DaemonRunning = Bool(dm, "running", false);
             s.DaemonHealthy = Bool(dm, "healthy", true);
@@ -363,8 +366,12 @@ namespace LunaWidget
         {
             if (!s.Ok) { s.Alerts.Add(new Alert { Error = false, Text = "Нет данных: " + (s.Error ?? "?") }); return; }
             if (s.Stale) s.Alerts.Add(new Alert { Text = "Данные устарели" + (s.Error != null ? ": " + s.Error : "") });
-            if (s.FreeMb < 1024) s.Alerts.Add(new Alert { Error = true, Text = "Мало памяти: " + Fmt.Gb(s.FreeMb) + " — новые задания ждут" });
-            else if (s.FreeMb < 2048) s.Alerts.Add(new Alert { Error = false, Text = "Памяти немного: " + Fmt.Gb(s.FreeMb) });
+            if (s.FreeMb < 1024)
+                s.Alerts.Add(new Alert {
+                    Error = true, Text = "Мало памяти: " + Fmt.Gb(s.FreeMb.Value) + " — новые задания ждут"
+                });
+            else if (s.FreeMb < 2048)
+                s.Alerts.Add(new Alert { Error = false, Text = "Памяти немного: " + Fmt.Gb(s.FreeMb.Value) });
             foreach (var se in s.Sessions)
                 foreach (var j in se.Jobs)
                     if (j.State == "running" && j.IdleS >= 900)
@@ -504,7 +511,9 @@ namespace LunaWidget
             last = s;
             var color = s.Alerts.Any(a => a.Error) ? Pal.Err : s.Alerts.Count > 0 ? Pal.Warn : s.Ok ? Pal.Ok : Pal.Sub;
             SetIcon(color, s.Running);
-            var tip = s.Alerts.Count > 0 ? s.Alerts[0].Text : (s.Running > 0 ? "Codex: " + s.Running + " в работе" : "Codex свободен") + " · ОЗУ " + Fmt.Gb(s.FreeMb);
+            var ram = s.FreeMb.HasValue ? Fmt.Gb(s.FreeMb.Value) : "нет данных";
+            var tip = s.Alerts.Count > 0 ? s.Alerts[0].Text
+                : (s.Running > 0 ? "Codex: " + s.Running + " в работе" : "Codex свободен") + " · ОЗУ " + ram;
             tray.Text = ("Luna — " + tip).Length > 63 ? ("Luna — " + tip).Substring(0, 62) + "…" : "Luna — " + tip;
             panel.SetData(s);
         }
@@ -983,8 +992,10 @@ namespace LunaWidget
 
             // Resources, each limit with its reset time.
             var rows = new List<Tuple<string, string, double, Color, string>>();
-            double used = 100 - s.FreeMb / Math.Max(1, s.TotalMb) * 100;
-            rows.Add(Tuple.Create("Память", Fmt.Gb(s.FreeMb) + " свободно", used, s.FreeMb < 1024 ? Pal.Err : s.FreeMb < 2048 ? Pal.Warn : Pal.Ok, (string)null));
+            double used = s.FreeMb.HasValue ? 100 - s.FreeMb.Value / Math.Max(1, s.TotalMb) * 100 : double.NaN;
+            var ram = s.FreeMb.HasValue ? Fmt.Gb(s.FreeMb.Value) + " свободно" : "нет данных";
+            var ramColor = !s.FreeMb.HasValue ? Pal.Sub : s.FreeMb < 1024 ? Pal.Err : s.FreeMb < 2048 ? Pal.Warn : Pal.Ok;
+            rows.Add(Tuple.Create("Память", ram, used, ramColor, (string)null));
             foreach (var l in s.Limits) rows.Add(Tuple.Create(l.Label, Math.Round(l.Pct) + "%", l.Pct, Pal.Sev(l.Pct), l.Resets));
             int resH = S(34) + rows.Sum(r => S(r.Item5 != null ? 38 : 24)) + S(26);
             if (!measure)
@@ -999,8 +1010,11 @@ namespace LunaWidget
                     var vs = TextRenderer.MeasureText(g, r.Item2, fBody, Size.Empty, TextFormatFlags.NoPadding);
                     TextRenderer.DrawText(g, r.Item2, fBody, new Point(mx - S(8) - vs.Width, ry), r.Item4, TextFormatFlags.NoPadding);
                     FillRound(g, new Rectangle(mx, ry + S(6), meterW, S(6)), S(3), Pal.Track);
-                    int fw = Math.Max(S(6), (int)(meterW * Math.Min(100, Math.Max(0, r.Item3)) / 100));
-                    FillRound(g, new Rectangle(mx, ry + S(6), fw, S(6)), S(3), r.Item4);
+                    if (!double.IsNaN(r.Item3))
+                    {
+                        int fw = Math.Max(S(6), (int)(meterW * Math.Min(100, Math.Max(0, r.Item3)) / 100));
+                        FillRound(g, new Rectangle(mx, ry + S(6), fw, S(6)), S(3), r.Item4);
+                    }
                     if (r.Item5 != null) TextRenderer.DrawText(g, r.Item5, fSmall, new Point(pad + S(12), ry + S(18)), Pal.Sub, TextFormatFlags.NoPadding);
                     ry += S(r.Item5 != null ? 38 : 24);
                 }

@@ -36,12 +36,12 @@ export function shell() {
   return [platform === 'win32' ? bash() : '/bin/sh', '-c'];
 }
 
-export function killTree(child, signal, { groupOnly = false } = {}) {
+export function killTree(child, signal, { groupOnly = false, timeoutMs = 5000 } = {}) {
   const pid = typeof child === 'number' ? child : child?.pid;
   if (!Number.isSafeInteger(pid) || pid <= 0) return;
   if (platform === 'win32') {
     const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
-      stdio: 'ignore', windowsHide: true, timeout: 5000
+      stdio: 'ignore', windowsHide: true, timeout: timeoutMs
     });
     // A failed taskkill is reported to stderr, never thrown: callers are cleaning up after a timeout and must still
     // write their result.

@@ -1,10 +1,20 @@
 import { execFile, spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { killTree, listProcesses, processAlive, readProcessStat } from '../conveyor/lib/platform.mjs';
+import { listProcesses, processAlive, readProcessStat } from '../conveyor/lib/platform.mjs';
 
 const live = new Set();
 const windows = process.platform === 'win32';
+const GRACE_MS = 2000;
+
+function signalProcess(pid, signal) {
+  try { process.kill(pid, signal); return true; }
+  catch (error) {
+    if (signal === 0 && error.code === 'EPERM') return true;
+    if (error.code !== 'ESRCH') throw error;
+    return false;
+  }
+}
 
 function treeMembers(group, known = new Map()) {
   let rows;
@@ -30,11 +40,11 @@ function sameProcess(row) {
 function signalOutsideGroup(members, group, signal) {
   for (const row of members.values()) {
     if (row.group === group || !sameProcess(row)) continue;
-    try { process.kill(row.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    signalProcess(row.pid, signal);
   }
 }
 
-async function terminate(child) {
+async function terminate(child, pgid) {
   if (windows) {
     const error = await new Promise((resolve) => {
       execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 10_000 }, resolve);
@@ -43,22 +53,24 @@ async function terminate(child) {
     return;
   }
   // Some helpers start probes in their own process groups. Keep their identities across reparenting.
-  let members = treeMembers(child.pid);
-  killTree(child, 'SIGTERM', { groupOnly: true });
-  signalOutsideGroup(members, child.pid, 'SIGTERM');
-  await sleep(2000);
-  members = treeMembers(child.pid, members);
-  killTree(child, 'SIGKILL', { groupOnly: true });
-  signalOutsideGroup(members, child.pid, 'SIGKILL');
-  const until = performance.now() + 1000;
-  while ([...members.values()].some(sameProcess) && performance.now() < until) await sleep(20);
+  let members = treeMembers(pgid);
+  signalProcess(-pgid, 'SIGTERM');
+  signalOutsideGroup(members, pgid, 'SIGTERM');
+  await sleep(GRACE_MS);
+  members = treeMembers(pgid, members);
+  signalProcess(-pgid, 'SIGKILL');
+  signalOutsideGroup(members, pgid, 'SIGKILL');
+  // Give the kernel a bounded chance to deliver SIGKILL before returning these PIDs to the caller.
+  const until = performance.now() + 100;
+  while ([...members.values()].some(sameProcess) && performance.now() < until) await sleep(10);
 }
 
-export async function run(argv, { deadlineMs = 120_000, cwd, env, maxOutput = 4 * 1024 * 1024 } = {}) {
+export async function run(argv, { deadlineMs = 120_000, cwd, env, maxOutput = 4 * 1024 * 1024, signal } = {}) {
   const child = spawn(argv[0], argv.slice(1), {
     cwd, env, detached: !windows, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe']
   });
-  if (child.pid) live.add(child.pid);
+  const pgid = child.pid;
+  if (pgid) live.add(pgid);
   let remaining = maxOutput;
   const capture = (stream) => {
     const chunks = [];
@@ -71,24 +83,66 @@ export async function run(argv, { deadlineMs = 120_000, cwd, env, maxOutput = 4 
     return () => Buffer.concat(chunks).toString('utf8');
   };
   const stdout = capture(child.stdout), stderr = capture(child.stderr);
-  let spawnError, termination;
+  let spawnError, timedOut = false, terminating = false, closeGrace, groupPoll;
   child.once('error', (error) => { spawnError = error; });
+  const destroyPipes = () => {
+    child.stdout.destroy();
+    child.stderr.destroy();
+  };
+  let finish;
+  const result = new Promise((resolve) => { finish = resolve; });
+  let exitCode = null;
+  child.once('exit', (code) => {
+    exitCode = code;
+    if (!windows) return;
+    clearTimeout(timer);
+    closeGrace = setTimeout(() => {
+      destroyPipes();
+      finish(code);
+    }, GRACE_MS);
+  });
+  child.once('close', (code) => {
+    clearTimeout(closeGrace);
+    if (terminating && !windows) return;
+    const checkGroup = () => {
+      if (windows || !pgid || !signalProcess(-pgid, 0)) finish(code);
+      else groupPoll = setTimeout(checkGroup, 50);
+    };
+    checkGroup();
+  });
+  const stop = async () => {
+    if (!pgid || terminating) return;
+    terminating = true;
+    clearTimeout(groupPoll);
+    try { await terminate(child, pgid); }
+    catch (error) { spawnError ??= error; }
+    finally {
+      destroyPipes();
+      finish(exitCode);
+    }
+  };
   const timer = setTimeout(() => {
-    if (child.pid) termination = terminate(child).catch((error) => { spawnError ??= error; });
+    timedOut = true;
+    void stop();
   }, deadlineMs);
+  if (signal?.aborted) void stop();
+  else signal?.addEventListener('abort', stop, { once: true });
   try {
-    const code = await new Promise((resolve) => child.once('close', resolve));
-    await termination;
-    return { code, stdout: stdout(), stderr: stderr() || spawnError?.message || '', timedOut: Boolean(termination) };
+    const code = await result;
+    return { code, stdout: stdout(), stderr: stderr() || spawnError?.message || '', timedOut };
   } finally {
     clearTimeout(timer);
-    live.delete(child.pid);
+    clearTimeout(closeGrace);
+    clearTimeout(groupPoll);
+    signal?.removeEventListener('abort', stop);
+    live.delete(pgid);
   }
 }
 
 // The marker is an exact Node argv entry scoped to this collector's run directory.
-export function sweepOrphans(scripts, marker) {
+export async function sweepOrphans(scripts, marker) {
   if (process.platform !== 'linux') return;
+  const orphans = [];
   for (const row of listProcesses() ?? []) {
     const { pid, ppid, group, started } = row;
     if (pid === process.pid || live.has(pid) || ppid > 1 && processAlive(ppid)) continue;
@@ -97,9 +151,14 @@ export function sweepOrphans(scripts, marker) {
     if (argv[1] !== marker || !scripts.has(argv[2])) continue;
     const current = readProcessStat(pid);
     if (current?.started !== started || current.ppid !== ppid || current.state === 'Z') continue;
-    if (group === pid) killTree(pid, 'SIGKILL', { groupOnly: true });
-    else {
-      try { process.kill(pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-    }
+    const target = group === pid ? -pid : pid;
+    if (signalProcess(target, 'SIGTERM')) orphans.push({ row, target });
+  }
+  if (!orphans.length) return;
+  await sleep(GRACE_MS);
+  for (const { row, target } of orphans) {
+    const current = readProcessStat(row.pid);
+    if (current && current.started !== row.started) continue;
+    if (target < 0 || current && current.state !== 'Z') signalProcess(target, 'SIGKILL');
   }
 }

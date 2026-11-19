@@ -95,7 +95,7 @@ function writeJson(file, value, header = null) {
 }
 
 // A live collector never loses its lock on a timer, including during a large first scan.
-export function acquireUsageLock(paths = usagePaths()) {
+export function acquireUsageLock(paths = usagePaths(), nonce = randomUUID()) {
   fs.mkdirSync(paths.home, { recursive: true });
   for (let attempt = 0; attempt < 2; attempt++) {
     try { fs.mkdirSync(paths.lock); }
@@ -117,7 +117,6 @@ export function acquireUsageLock(paths = usagePaths()) {
       fs.rmSync(retired, { recursive: true, force: true });
       continue;
     }
-    const nonce = randomUUID();
     try { writeJson(path.join(paths.lock, 'owner.json'), { pid: process.pid, start: lockOwnerStart(), nonce }); }
     catch (error) { fs.rmSync(paths.lock, { recursive: true, force: true }); throw error; }
     return () => {
@@ -485,8 +484,8 @@ function compactArchive(state, paths, now, since) {
   }
 }
 
-export function collectUsage({ env = process.env, now = Date.now() } = {}) {
-  const started = performance.now(), paths = usagePaths(env), release = acquireUsageLock(paths);
+export function collectUsage({ env = process.env, now = Date.now(), lockNonce } = {}) {
+  const started = performance.now(), paths = usagePaths(env), release = acquireUsageLock(paths, lockNonce);
   if (!release) return { locked: true, bytesRead: 0 };
   try {
     const index = readStateIndex(paths.state);

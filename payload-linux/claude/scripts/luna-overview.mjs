@@ -278,7 +278,7 @@ async function geminiMcp(config) {
   };
 }
 
-async function orchestrationStatus(snapshot, now) {
+async function orchestrationStatus(snapshot, now, includeGemini) {
   const { config, source } = await loadConfigWithSource();
   const state = await providerState(config, { now, persist: false });
   const chains = Object.create(null), panels = Object.create(null);
@@ -297,6 +297,7 @@ async function orchestrationStatus(snapshot, now) {
     presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
     catalog: config.catalog, configError: null
   };
+  if (!includeGemini) return;
   // Resolve an availability probe even when no configured tier or panel currently uses Gemini.
   const model = config.catalog.gemini[0];
   const probe = { tiers: { gemini: [{ provider: 'gemini', model: model.model, effort: model.efforts[0] }] } };
@@ -512,10 +513,10 @@ async function codexLimits(config, now) {
   return { codexLimits: limits ? { ...limits, ageS: seconds(limits.at, now) } : null };
 }
 
-function sharedProbes(config, snapshot, now, geminiActive) {
+function sharedProbes(config, snapshot, now, geminiActive, includeGemini) {
   // Orchestration and Gemini share availability data. Keep the subprobes parallel and commit the Gemini fields together.
   const routing = { orchestration: { ...snapshot.orchestration }, gemini: { ...snapshot.gemini } };
-  const orchestration = orchestrationStatus(routing, now);
+  const orchestration = orchestrationStatus(routing, now, includeGemini);
   const availability = orchestration.then(() => routing.gemini, (error) => ({
     ...routing.gemini, reason: cleanText(String(error.message), 500)
   }));
@@ -526,23 +527,23 @@ function sharedProbes(config, snapshot, now, geminiActive) {
       return { orchestration: routing.orchestration };
     }],
     ['switches', ['switches'], async () => ({ switches: await switches() })],
-    ['gemini', ['gemini'], async (signal) => {
+    ...(includeGemini ? [['gemini', ['gemini'], async (signal) => {
       const [status, usage, mcp, quota] = await Promise.all([
         availability, geminiUsage(config, now, geminiActive(signal), signal),
         geminiMcp(config), geminiQuotaStatus(now, config)
       ]);
       return { gemini: { ...status, ...usage, mcp, quota } };
-    }],
+    }]] : []),
     ['usage', ['usage'], async () => ({ usage: await usageStatus(now, config) })]
   ];
 }
 
 export async function collect({ now = Date.now(), platform = process.platform,
-  claudeHome = path.join(homedir(), '.claude') } = {}) {
-  return collectOverview(configuration(claudeHome, platform), Number(new Date(now)));
+  claudeHome = path.join(homedir(), '.claude'), includeGemini = true } = {}) {
+  return collectOverview(configuration(claudeHome, platform), Number(new Date(now)), includeGemini);
 }
 
-async function collectOverview(config, now) {
+async function collectOverview(config, now, includeGemini = true) {
   const snapshot = empty(now);
   const wrapperStart = (pid, expected) => {
     const wrapper = readProcess(pid);
@@ -564,7 +565,7 @@ async function collectOverview(config, now) {
       const [jobs, active] = await Promise.all([activeJobs(config.run, now, undefined, signal), geminiActive(signal)]);
       return { jobs: [...jobs, ...active.jobs].sort(newest).slice(0, 40) };
     }],
-    ...sharedProbes(config, snapshot, now, geminiActive)
+    ...sharedProbes(config, snapshot, now, geminiActive, includeGemini)
   ]);
   return snapshot;
 }

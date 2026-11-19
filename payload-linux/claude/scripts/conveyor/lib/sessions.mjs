@@ -1,11 +1,15 @@
 import { open, readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { processAlive } from './platform.mjs';
+import { platform, processAlive, readProcessStat } from './platform.mjs';
 
 const MAX_READ_BYTES = 256 * 1024;
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_OPEN_TOOLS = 256;
 const CHECKPOINT_BYTES = 64;
+const UNVERIFIED_MS = 10 * 60_000;
+const IDLE_TOOL_MAX_AGE_MS = 30 * 60_000;
+const BACKGROUND_RESULT = /^(?:Async agent launched|(?:Agent|Task) (?:started|launched) in (?:the )?background)/i;
+const TERMINAL_TASK_STATUS = new Set(['completed', 'failed', 'stopped', 'killed', 'cancelled', 'canceled']);
 
 const missing = (error) => error.code === 'ENOENT' || error.code === 'ENOTDIR';
 
@@ -27,8 +31,8 @@ async function openFile(file) {
   }
 }
 
-async function registryRows(directory) {
-  const rows = new Map();
+async function registryRows(directory, now) {
+  const candidates = [];
   const buffer = Buffer.alloc(64 * 1024);
   for (const entry of await entries(directory)) {
     if (!entry.isFile() || !/^\d+\.json$/.test(entry.name)) continue;
@@ -46,12 +50,33 @@ async function registryRows(directory) {
     }
     if (typeof row?.sessionId !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(row.sessionId) ||
         !processAlive(row.pid)) continue;
+    candidates.push(row);
+  }
+  let starts, sameStart;
+  if (platform === 'win32' && candidates.length) {
+    const identity = await import('../../lib/process-identity.mjs');
+    starts = await identity.processStartsAsync(candidates.map(({ pid }) => pid));
+    sameStart = identity.sameStart;
+  }
+  const rows = new Map();
+  for (const row of candidates) {
+    const actual = starts?.get(row.pid) ?? readProcessStat(row.pid)?.started;
+    if (actual) {
+      if (!row.procStart || !(sameStart ? sameStart(actual, row.procStart) : actual === String(row.procStart))) continue;
+    } else {
+      const updated = Math.max(timestamp(row.statusUpdatedAt) ?? 0, timestamp(row.updatedAt) ?? 0);
+      if (!(updated > now - UNVERIFIED_MS) || !processAlive(row.pid)) continue;
+    }
     const previous = rows.get(row.sessionId);
     if (!previous || (timestamp(row.updatedAt) ?? 0) >= (timestamp(previous.updatedAt) ?? 0)) {
       rows.set(row.sessionId, row);
     }
   }
   return rows;
+}
+
+export async function hasLiveSession(claudeHome, now = Date.now()) {
+  return (await registryRows(path.join(claudeHome, 'sessions'), now)).size > 0;
 }
 
 function oneLine(value, max = 80) {
@@ -77,17 +102,47 @@ function toolDetail(name, input) {
   return '';
 }
 
-function readToolBlocks(line, tools, statusSince) {
+function completeAgents(text, tools) {
+  if (typeof text !== 'string' || !text.startsWith('<task-notification>')) return;
+  for (const [, notice] of text.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)) {
+    const status = /<status>([^<]+)<\/status>/.exec(notice)?.[1];
+    if (!TERMINAL_TASK_STATUS.has(status)) continue;
+    const toolId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(notice)?.[1];
+    const taskId = /<task-id>([^<]+)<\/task-id>/.exec(notice)?.[1];
+    for (const [id, tool] of tools) {
+      if (isAgent(tool.name) && (id === toolId || taskId && tool.backgroundId === taskId)) tools.delete(id);
+    }
+  }
+}
+
+function backgroundAgentId(block, result, singleResult) {
+  if (block.is_error) return undefined;
+  const text = Array.isArray(block.content) ? block.content.map((item) => item?.text ?? '').join('\n') : block.content;
+  const asyncResult = singleResult && (result?.isAsync === true || result?.status === 'async_launched');
+  if (!asyncResult && (typeof text !== 'string' || !BACKGROUND_RESULT.test(text))) return undefined;
+  return (asyncResult && (result.taskId ?? result.agentId)) ||
+    /\b(?:agentId|taskId):\s*([\w-]+)/i.exec(text)?.[1] || block.tool_use_id;
+}
+
+function readToolBlocks(line, tools) {
   let row;
   try { row = JSON.parse(line.toString('utf8')); } catch { return; }
-  const blocks = row?.message?.content;
-  if (row?.isSidechain || !Array.isArray(blocks)) return;
-  const since = timestamp(row.timestamp) ?? statusSince;
+  const content = row?.message?.content;
+  if (row?.isSidechain || !['user', 'assistant'].includes(row?.type)) return;
+  const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
+  if (!Array.isArray(blocks)) return;
+  const since = timestamp(row.timestamp);
   for (const block of blocks) {
     if (row.type === 'user' && block?.type === 'tool_result') {
-      tools.delete(block.tool_use_id);
+      const id = block.tool_use_id;
+      const tool = tools.get(id);
+      const backgroundId = isAgent(tool?.name) && backgroundAgentId(block, row.toolUseResult, blocks.length === 1);
+      if (backgroundId) tools.set(id, { ...tool, backgroundId });
+      else tools.delete(id);
+    } else if (row.type === 'user' && block?.type === 'text') {
+      completeAgents(block.text, tools);
     } else if (row.type === 'assistant' && block?.type === 'tool_use' &&
-        typeof block.id === 'string' && block.id.length <= 128 && typeof block.name === 'string') {
+        since !== undefined && typeof block.id === 'string' && block.id.length <= 128 && typeof block.name === 'string') {
       const name = oneLine(block.name);
       if (!name) continue;
       tools.delete(block.id);
@@ -95,24 +150,28 @@ function readToolBlocks(line, tools, statusSince) {
       if (tools.size > MAX_OPEN_TOOLS) tools.delete(tools.keys().next().value);
     }
   }
+  return since;
 }
 
-function parseChunk(chunk, previous, statusSince) {
+function parseChunk(chunk, previous, skipPartialLine) {
   const data = previous?.partial ? Buffer.concat([previous.partial, chunk]) : chunk;
   const tools = new Map(previous?.tools);
-  let droppingLine = previous?.droppingLine ?? false;
+  let droppingLine = previous?.droppingLine ?? skipPartialLine;
+  let updatedAt = previous?.updatedAt ?? 0;
   let start = 0;
   for (let end; (end = data.indexOf(10, start)) !== -1; start = end + 1) {
-    if (!droppingLine && end - start <= MAX_LINE_BYTES) readToolBlocks(data.subarray(start, end), tools, statusSince);
+    if (!droppingLine && end - start <= MAX_LINE_BYTES) {
+      updatedAt = Math.max(updatedAt, readToolBlocks(data.subarray(start, end), tools) ?? 0);
+    }
     droppingLine = false;
   }
   // Skip the remainder of an oversized row before resuming at the next line.
   droppingLine ||= data.length - start > MAX_LINE_BYTES;
   const partial = !droppingLine && start < data.length ? Buffer.from(data.subarray(start)) : null;
-  return { tools: [...tools], partial, droppingLine };
+  return { tools: [...tools], partial, droppingLine, updatedAt };
 }
 
-async function tailTranscript(file, handle, previous, statusSince) {
+async function tailTranscript(file, handle, previous) {
   const stat = await handle.stat();
   if (!stat.isFile()) return undefined;
   const { size, dev, ino, birthtimeMs, mtimeMs } = stat;
@@ -128,19 +187,25 @@ async function tailTranscript(file, handle, previous, statusSince) {
     budget -= bytesRead;
     if (bytesRead !== boundary.length || !boundary.equals(previous.checkpoint)) previous = undefined;
   }
-  const offset = previous?.offset ?? 0;
+  const offset = previous?.offset ?? Math.max(0, size - budget);
+  let skipPartialLine = false;
+  if (!previous && offset > 0) {
+    const before = Buffer.alloc(1);
+    await handle.read(before, 0, 1, offset - 1);
+    skipPartialLine = before[0] !== 10;
+  }
   const chunk = Buffer.alloc(Math.min(budget, size - offset));
   const { bytesRead } = chunk.length ? await handle.read(chunk, 0, chunk.length, offset) : { bytesRead: 0 };
   const data = chunk.subarray(0, bytesRead);
   const checkpoint = bytesRead ? Buffer.from(data.subarray(-CHECKPOINT_BYTES)) : previous?.checkpoint ?? Buffer.alloc(0);
   return {
     file, dev, ino, birthtimeMs, mtimeMs, offset: offset + bytesRead, checkpoint,
-    ...parseChunk(data, previous, statusSince)
+    ...parseChunk(data, previous, skipPartialLine)
   };
 }
 
 export async function readSessions({ claudeHome, now = Date.now(), cursors = {} }) {
-  const rows = await registryRows(path.join(claudeHome, 'sessions'));
+  const rows = await registryRows(path.join(claudeHome, 'sessions'), now);
   const projects = path.join(claudeHome, 'projects');
   let projectEntries;
   const sessions = [];
@@ -148,7 +213,7 @@ export async function readSessions({ claudeHome, now = Date.now(), cursors = {} 
   for (const sessionId of [...rows.keys()].sort()) {
     const row = rows.get(sessionId);
     const cwd = typeof row.cwd === 'string' ? row.cwd : '';
-    const statusSince = timestamp(row.statusUpdatedAt) ?? timestamp(row.updatedAt) ?? timestamp(row.startedAt) ?? now;
+    const statusSince = timestamp(row.statusUpdatedAt) ?? timestamp(row.updatedAt) ?? timestamp(row.startedAt) ?? 0;
     const previous = Object.hasOwn(cursors, sessionId) ? cursors[sessionId] : undefined;
     const filename = `${sessionId}.jsonl`;
     let file = path.join(projects, cwd.replace(/[^A-Za-z0-9]/g, '-'), filename);
@@ -169,20 +234,20 @@ export async function readSessions({ claudeHome, now = Date.now(), cursors = {} 
     let cursor;
     if (handle) {
       try {
-        cursor = await tailTranscript(file, handle, previous, statusSince);
+        cursor = await tailTranscript(file, handle, previous);
       } finally {
         await handle.close();
       }
     }
-    if (cursor) nextCursors.push([sessionId, cursor]);
-    const openTools = cursor?.tools ?? [];
+    const busy = row.status === 'busy';
+    const openTools = (cursor?.tools ?? []).filter(([, tool]) => busy || now - tool.since <= IDLE_TOOL_MAX_AGE_MS);
+    if (cursor) nextCursors.push([sessionId, { ...cursor, tools: openTools }]);
     const agents = openTools.filter(([, tool]) => isAgent(tool.name)).slice(-20)
       .map(([id, tool]) => ({ id, description: tool.detail, since: tool.since }));
-    const busy = row.status === 'busy';
-    const tool = busy ? openTools.at(-1)?.[1] ?? null : null;
+    const tool = busy ? openTools.findLast(([, entry]) => !entry.backgroundId)?.[1] ?? null : null;
     const name = oneLine(row.name) || (/scratch-workspaces/i.test(cwd) ? '' : basename(cwd));
     sessions.push({
-      v: 1, sessionId, name, cwd, updatedAt: now,
+      v: 1, sessionId, name, cwd, updatedAt: Math.max(statusSince, timestamp(row.updatedAt) ?? 0, cursor?.updatedAt ?? 0),
       state: tool ? 'tool' : busy ? 'thinking' : 'idle',
       tool, turnSince: busy ? statusSince : 0, idleSince: busy ? 0 : statusSince, agents
     });

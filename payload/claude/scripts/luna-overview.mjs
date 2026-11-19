@@ -191,23 +191,25 @@ async function probeStarts(deadline) {
   const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
     windowsHide: true, stdio: ['ignore', 'pipe', 'ignore']
   });
-  let stdout = '', timedOut = false, exited = false;
+  let stdout = '', exited = false;
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (text) => { stdout += text; });
   child.on('error', () => {});
   child.once('exit', () => { exited = true; });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    if (!exited && child.pid) {
-      try { killTree(child, 'SIGKILL'); } catch {}
-      child.kill('SIGKILL');
-    }
-    child.stdout.destroy();
-  }, timeoutMs);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (!exited && child.pid) {
+        try { killTree(child, 'SIGKILL', { timeoutMs: 1000 }); } catch {}
+        child.kill('SIGKILL');
+      }
+      child.stdout.destroy();
+      reject(new Error('PowerShell identity probe timed out'));
+    }, timeoutMs);
+  });
   let code;
-  try { code = await new Promise((resolve) => child.once('close', resolve)); }
+  try { code = await Promise.race([new Promise((resolve) => child.once('close', resolve)), timeout]); }
   finally { clearTimeout(timer); }
-  if (timedOut) throw new Error('PowerShell identity probe timed out');
   if (code !== 0) throw new Error('PowerShell identity probe failed');
   const starts = new Map();
   for (const line of stdout.split(/\r?\n/)) {
@@ -289,7 +291,8 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000, {
         sandbox: values.sandbox || '', engine: values.engine || '', ageS: seconds(values.started, now),
         dir: values.dir || '', error: values.error || '',
         queuePos: /^\d+$/.test(queue || '') && Number.isSafeInteger(Number(queue)) ? Number(queue) : null,
-        owner: values.owner || '', idleS: activity.idleS, activity: activity.activity,
+        owner: values.owner || '', idleS: activity.idleS, activity: activity.activity, provider: 'codex',
+        ...(values.daemon_profile ? { daemonProfile: values.daemon_profile } : {}),
         ...(conflict ? { _conflict: conflict } : {})
       });
     }
@@ -371,7 +374,7 @@ async function geminiMcp(config) {
   };
 }
 
-async function orchestrationStatus(snapshot, now) {
+async function orchestrationStatus(snapshot, now, includeGemini) {
   const { config, source } = await loadConfigWithSource();
   const state = await providerState(config, { now, persist: false });
   const chains = Object.create(null), panels = Object.create(null);
@@ -390,6 +393,7 @@ async function orchestrationStatus(snapshot, now) {
     presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
     catalog: config.catalog, configError: null
   };
+  if (!includeGemini) return;
   // Resolve an availability probe even when no configured tier or panel currently uses Gemini.
   const model = config.catalog.gemini[0];
   const probe = { tiers: { gemini: [{ provider: 'gemini', model: model.model, effort: model.efforts[0] }] } };
@@ -502,7 +506,7 @@ async function fetchJson(info, route, signal) {
   } catch { return null; }
 }
 
-function daemonJobs(list, now) {
+function daemonJobs(list, now, profile) {
   if (!Array.isArray(list)) return [];
   return list.filter((job) => object(job) &&
     (job.state === 'running' || job.state === 'queued' || string(job.state).startsWith('waiting-')))
@@ -512,7 +516,8 @@ function daemonJobs(list, now) {
       ageS: seconds(job.queuedAt, now) ?? number(job.ageS), cwd: string(job.cwd), reason: string(job.reason),
       idleS: null, activity: { kind: job.state === 'queued' || string(job.state).startsWith('waiting-')
         ? 'queued' : 'unknown', text: job.state === 'queued' || string(job.state).startsWith('waiting-')
-          ? string(job.state) : '', sinceS: null }
+          ? string(job.state) : '', sinceS: null }, provider: 'codex',
+      ...(profile ? { daemonProfile: profile } : {})
     })).sort(newest).slice(0, 30);
 }
 
@@ -607,7 +612,7 @@ async function daemonStatus(directory, now, snapshot, profile = 'default', optio
       result.queuedJobs = number(health?.jobs?.queued);
     }),
     fetchJson(info, '/jobs', fetchSignal).then((list) => {
-      result.jobs = daemonJobs(list?.jobs, now);
+      result.jobs = daemonJobs(list?.jobs, now, profile);
       if (object(list?.owners)) {
         result.owners = Object.entries(list.owners).map(([owner, counts]) => ({
           owner, running: number(counts?.running), queued: number(counts?.queued)
@@ -616,6 +621,32 @@ async function daemonStatus(directory, now, snapshot, profile = 'default', optio
     })
   ]);
   timeout.throwIfAborted();
+}
+
+function aggregateDaemons(profiles) {
+  const running = Object.values(profiles).filter((daemon) => daemon.running);
+  if (!running.length) return profiles.default;
+  const sum = (key) => running.every((daemon) => typeof daemon[key] === 'number')
+    ? running.reduce((total, daemon) => total + daemon[key], 0) : null;
+  const primary = profiles.default.running ? profiles.default : profiles.net;
+  const owners = new Map();
+  for (const daemon of running) {
+    for (const entry of daemon.owners) {
+      const current = owners.get(entry.owner) || { owner: entry.owner, running: 0, queued: 0 };
+      for (const key of ['running', 'queued']) {
+        current[key] = current[key] === null || entry[key] === null ? null : current[key] + entry[key];
+      }
+      owners.set(entry.owner, current);
+    }
+  }
+  return {
+    ...primary, healthy: running.every((daemon) => daemon.healthy), degraded: running.some((daemon) => daemon.degraded),
+    appServer: running.some((daemon) => daemon.appServer === 'down') ? 'down'
+      : running.some((daemon) => daemon.appServer === 'restarting') ? 'restarting'
+        : running.every((daemon) => daemon.appServer === 'up') ? 'up' : null,
+    max: sum('max'), runningJobs: sum('runningJobs'), queuedJobs: sum('queuedJobs'), owners: [...owners.values()],
+    jobs: running.flatMap((daemon) => daemon.jobs).sort(newest).slice(0, 30), profiles
+  };
 }
 
 async function buildStatus(directory, now) {
@@ -692,10 +723,10 @@ async function codexLimits(config, now) {
   return { codexLimits: limits ? { ...limits, ageS: seconds(limits.at, now) } : null };
 }
 
-function sharedProbes(config, snapshot, now, geminiActive) {
+function sharedProbes(config, snapshot, now, geminiActive, includeGemini) {
   // Orchestration and Gemini share availability data. Keep the subprobes parallel and commit the Gemini fields together.
   const routing = { orchestration: { ...snapshot.orchestration }, gemini: { ...snapshot.gemini } };
-  const orchestration = orchestrationStatus(routing, now);
+  const orchestration = orchestrationStatus(routing, now, includeGemini);
   const availability = orchestration.then(() => routing.gemini, (error) => ({
     ...routing.gemini, reason: cleanText(String(error.message), 500)
   }));
@@ -706,23 +737,23 @@ function sharedProbes(config, snapshot, now, geminiActive) {
       return { orchestration: routing.orchestration };
     }],
     ['switches', ['switches'], async () => ({ switches: await switches() })],
-    ['gemini', ['gemini'], async (signal) => {
+    ...(includeGemini ? [['gemini', ['gemini'], async (signal) => {
       const [status, usage, mcp, quota] = await Promise.all([
         availability, geminiUsage(config, now, geminiActive(signal), signal),
         geminiMcp(config), geminiQuotaStatus(now, config)
       ]);
       return { gemini: { ...status, ...usage, mcp, quota } };
-    }],
+    }]] : []),
     ['usage', ['usage'], async () => ({ usage: await usageStatus(now, config) })]
   ];
 }
 
 export async function collect({ now = Date.now(), platform = process.platform,
-  claudeHome = path.join(homedir(), '.claude') } = {}) {
-  return collectOverview(configuration(claudeHome, platform), Number(new Date(now)));
+  claudeHome = path.join(homedir(), '.claude'), includeGemini = true } = {}) {
+  return collectOverview(configuration(claudeHome, platform), Number(new Date(now)), includeGemini);
 }
 
-async function collectOverview(config, now) {
+async function collectOverview(config, now, includeGemini = true) {
   const snapshot = empty(now);
   const identityDeadline = performance.now() + 2500;
   let starts;
@@ -749,7 +780,7 @@ async function collectOverview(config, now) {
       daemonStatus(config.daemon, now, result, 'default', options),
       daemonStatus(path.join(config.daemon, 'daemon-net'), now, result, 'net', options)
     ]);
-    return result;
+    return { daemon: aggregateDaemons(daemons), daemons };
   };
   let daemonProbe;
   try {
@@ -766,7 +797,7 @@ async function collectOverview(config, now) {
         return { jobs: [...reconcileConflictJobs(jobs, daemons), ...active.jobs].sort(newest).slice(0, 40) };
       }],
       ['build', ['build'], async () => ({ build: await buildStatus(config.build || await customBuildRoot(config.claudeHome), now) })],
-      ...sharedProbes(config, snapshot, now, geminiActive)
+      ...sharedProbes(config, snapshot, now, geminiActive, includeGemini)
     ]);
   } finally {
     // Keep ownership of the identity probe until PowerShell and its stdio close.
@@ -861,7 +892,7 @@ async function selfTest() {
       assert.deepEqual(snapshot.daemon, { running: false, appServer: null, healthy: false, degraded: false });
       assert.deepEqual(Object.keys(snapshot.jobs[0]), [
         'out', 'state', 'model', 'effort', 'sandbox', 'engine', 'ageS', 'dir', 'error', 'queuePos',
-        'owner', 'idleS', 'activity'
+        'owner', 'idleS', 'activity', 'provider'
       ]);
       assert.deepEqual(Object.keys(snapshot.build), ['line', 'building', 'exeAt']);
     });
@@ -1022,7 +1053,9 @@ async function selfTest() {
       await fs.writeFile(path.join(netDir, 'daemon.json'), JSON.stringify({
         pid: process.pid, port: 2, token: 'SECRET-NET', startedAt: new Date(now).toISOString()
       }));
-      globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, appServer: 'up' }) });
+      globalThis.fetch = async () => ({
+        ok: true, json: async () => ({ ok: true, appServer: 'up', jobs: [{ id: 'fixture', state: 'running' }] })
+      });
       const profiles = empty(now);
       await Promise.all([
         daemonStatus(config.daemon, now, profiles), daemonStatus(netDir, now, profiles, 'net')
@@ -1032,6 +1065,12 @@ async function selfTest() {
         assert.equal(profiles.daemons.default.running, true);
         assert.equal(profiles.daemons.net.running, true);
         assert.ok(human(profiles).includes('Daemon net'));
+        const netOnly = aggregateDaemons({ ...profiles.daemons, default: empty(now).daemon });
+        assert.equal(netOnly.running, true);
+        assert.equal(netOnly.profiles.net, profiles.daemons.net);
+        assert.equal(netOnly.profiles.default.running, false);
+        assert.equal(netOnly.jobs[0].provider, 'codex');
+        assert.equal(netOnly.jobs[0].daemonProfile, 'net');
       });
       const healthFile = path.join(config.daemon, 'daemon-health.json');
       await fs.unlink(healthFile);
@@ -1198,7 +1237,7 @@ async function selfTest() {
       assert.ok(!JSON.stringify(jobs).includes('token'));
       assert.deepEqual(Object.keys(jobs[0]), [
         'id', 'state', 'model', 'effort', 'sandbox', 'owner', 'ageS', 'cwd', 'reason', 'idleS',
-        'activity'
+        'activity', 'provider'
       ]);
     });
     check('human summary', () => assert.ok(human(snapshot).includes('Daemon stopped')));

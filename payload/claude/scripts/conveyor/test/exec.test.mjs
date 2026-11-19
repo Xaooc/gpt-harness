@@ -251,7 +251,8 @@ test('Codex threshold persists hysteresis, hands off to Sonnet, and ignores stal
     assert.equal(first.status, 0, first.stderr);
     assert.equal(JSON.parse(first.stdout).selected.model, 'sonnet');
     assert.match(JSON.parse(first.stdout).chain[0].reason, /codex 83% ≥ 80% \(5h window\)/);
-    const handoff = await env.run('complex');
+    const isolatedHome = { HOME: env.root, USERPROFILE: env.root };
+    const handoff = await env.run('complex', '-r', isolatedHome);
     assert.equal(handoff.status, 4, handoff.stderr);
     const dispatch = await readJson(`${env.out}.dispatch.json`);
     assert.equal(dispatch.action, 'claude-subagent');
@@ -264,6 +265,17 @@ test('Codex threshold persists hysteresis, hands off to Sonnet, and ignores stal
     assert.equal(dispatch.warning, 'claude near limit');
     assert.deepEqual(JSON.parse(handoff.stdout), dispatch);
     assert.deepEqual(dispatch.attempts, []);
+    await fs.unlink(path.join(sessions, 'live.json'));
+    const collector = path.join(process.env.CLAUDE_HOME_DIR, 'luna-run', 'collector');
+    await fs.mkdir(collector, { recursive: true });
+    const observedAt = new Date().toISOString();
+    await fs.writeFile(path.join(collector, 'snapshot.json'), JSON.stringify({
+      version: 2, at: observedAt, claudeLimits: [{
+        kind: 'five_hour', percentUsed: 96, observedAt, resetsAt: new Date(Date.now() + 60_000).toISOString(), sessionId: 'panel'
+      }]
+    }));
+    const collectedHandoff = await env.run('complex', '-r', isolatedHome);
+    assert.equal(JSON.parse(collectedHandoff.stdout).warning, 'claude near limit');
     assert.equal((await readJson(paths().providers)).codex.switched, true);
     await env.limits(78, { net: true });
     assert.equal((await resolveChain('complex')).selected.provider, 'claude');

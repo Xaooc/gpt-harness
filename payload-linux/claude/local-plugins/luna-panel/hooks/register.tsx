@@ -17,6 +17,7 @@ const POLL_MS = 5000
 const BEAT_MS = 20_000
 const STALE_MS = 30_000
 const ENSURE_MS = 60_000
+const MAX_ENSURE_MS = 15 * ENSURE_MS
 
 const EMPTY: PanelData = { snapshot: null, claude: [], error: '', polledAt: 0, sessionId: '' }
 const VIEW0: View = {
@@ -343,7 +344,8 @@ let generation = 0
 let reading = false
 let sendingBeat = false
 let lastBeatAt = -Infinity
-let lastEnsureAt = -Infinity
+let nextEnsureAt = -Infinity
+let ensureDelay = ENSURE_MS
 
 function markHidden(): void {
   visible = false
@@ -371,7 +373,7 @@ async function refreshSnapshot($: EngineInterface, epoch: number): Promise<void>
   reading = true
   try {
     let home = ''
-    let missing = false
+    let unusable = false
     let snapshot: Snapshot | null = null
     let error = ''
     try {
@@ -380,10 +382,11 @@ async function refreshSnapshot($: EngineInterface, epoch: number): Promise<void>
       if (!await checkVisibility($, epoch)) return
       const path = `${run || `${home}/luna-run`}/collector/snapshot.json`
       const text = await $.fs.read(path).catch(async (caught: unknown) => {
-        if (await checkVisibility($, epoch)) missing = (await $.fs.exists(path).catch(() => undefined)) === false
+        if (await checkVisibility($, epoch)) unusable = (await $.fs.exists(path).catch(() => undefined)) === false
         throw caught
       })
-      snapshot = parseSnapshot(text)
+      try { snapshot = parseSnapshot(text) }
+      catch (caught) { unusable = true; throw caught }
     } catch (caught) {
       error = oneLine((caught as Error)?.message ?? caught, 200)
     }
@@ -393,6 +396,10 @@ async function refreshSnapshot($: EngineInterface, epoch: number): Promise<void>
     const latest = snapshot ?? (await read($, data))?.snapshot ?? null
     const stale = !!latest && now - Date.parse(latest.collector?.publishedAt) > STALE_MS
     if (epoch !== generation) return
+    if (snapshot && !stale) {
+      nextEnsureAt = -Infinity
+      ensureDelay = ENSURE_MS
+    }
     await update($, data, prev => epoch !== generation ? prev ?? EMPTY : {
       snapshot: latest,
       claude: mergeClaudeLimits(own, latest?.claudeLimits ?? [], now),
@@ -400,10 +407,11 @@ async function refreshSnapshot($: EngineInterface, epoch: number): Promise<void>
       polledAt: now,
       sessionId,
     })
-    if (home && (missing || stale)) {
+    if (home && (unusable || stale)) {
       const ensureAt = await $.clock.now()
-      if (ensureAt - lastEnsureAt < ENSURE_MS || !await checkVisibility($, epoch)) return
-      lastEnsureAt = ensureAt
+      if (ensureAt < nextEnsureAt || !await checkVisibility($, epoch)) return
+      nextEnsureAt = ensureAt + Math.min(MAX_ENSURE_MS, ensureDelay * (0.8 + Math.random() * 0.4))
+      ensureDelay = Math.min(MAX_ENSURE_MS, ensureDelay * 2)
       void $.process.run(['node', `${home}/scripts/luna-collector.mjs`, 'ensure'], { timeoutMs: 8000 }).catch(() => {})
     }
   } finally { reading = false }

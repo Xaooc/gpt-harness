@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import childProcess, { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { readdir, readFile } from 'node:fs/promises';
+import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { syncBuiltinESMExports } from 'node:module';
 import { freemem, totalmem } from 'node:os';
@@ -21,9 +21,10 @@ const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
 const LEASE_MS = 90 * SECOND;
 const DEADLINE = 120 * SECOND;
+const SHUTDOWN_GRACE_MS = 4750;
 const MAX_SNAPSHOT = 3 * 1024 * 1024;
 const MAX_BEAT = 16 * 1024;
-const FAST_SECTIONS = ['daemon', 'jobs', 'codexLimits', 'orchestration', 'gemini'];
+const FAST_SECTIONS = ['daemon', 'jobs', 'codexLimits', 'orchestration'];
 const iso = (time = Date.now()) => new Date(time).toISOString();
 const message = (error) => String(error?.message ?? error).replace(/[\r\n]+/g, ' ').slice(0, 500);
 const object = (value) => value && typeof value === 'object' && !Array.isArray(value);
@@ -33,6 +34,7 @@ function configuration() {
   const runDir = path.resolve(process.env.LUNA_RUN_DIR || path.join(claudeHome, 'luna-run'));
   const directory = path.join(runDir, 'collector');
   return { claudeHome, runDir, directory, lock: path.join(directory, 'collector.lock'),
+    starting: path.join(directory, 'starting'),
     discovery: path.join(directory, 'discovery.json'), snapshot: path.join(directory, 'snapshot.json'),
     schedule: path.join(directory, 'schedule.json'), widget: path.join(directory, 'leases', 'widget.json') };
 }
@@ -141,27 +143,56 @@ async function healthy(config) {
   } catch { return null; }
 }
 
+async function claimStartup(file) {
+  const owner = { pid: process.pid, instance: randomUUID() };
+  const claim = () => {
+    try {
+      writeFileSync(file, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
+      return owner.instance;
+    } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  };
+  const claimed = claim();
+  if (claimed) return claimed;
+  const stale = () => {
+    const stat = statSync(file, { throwIfNoEntry: false });
+    return stat && Date.now() - stat.mtimeMs >= 10 * SECOND;
+  };
+  // Serialize stale-claim removal so one contender cannot remove another's new claim.
+  const recovery = `${file}.recovery`;
+  if (!stale() || !await acquireLock(recovery, owner)) return;
+  try {
+    if (stale()) remove(file);
+    return claim();
+  } finally {
+    remove(recovery);
+  }
+}
+
 async function ensure(config) {
   const until = performance.now() + 5 * SECOND;
   let info = await healthy(config);
   if (info) return info;
   mkdirSync(config.directory, { recursive: true, mode: 0o700 });
-  let launching, launchError, nextLaunch = 0;
-  do {
-    if (!launching && performance.now() >= nextLaunch && (!nextLaunch || !readJson(config.lock))) {
-      nextLaunch = performance.now() + 250;
-      launching = spawn(process.execPath, [SELF, 'run'], { cwd: config.directory,
+  const claim = await claimStartup(config.starting);
+  const release = () => {
+    if (claim && readJson(config.starting)?.instance === claim) remove(config.starting);
+  };
+  let launchError;
+  if (claim) {
+    info = await healthy(config);
+    if (info) { release(); return info; }
+    if (!await ownerAlive(readJson(config.lock))) {
+      const launching = spawn(process.execPath, [SELF, 'run'], { cwd: config.directory,
         detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env, LUNA_RUN_DIR: config.runDir } });
       launching.once('error', (error) => { launchError = error; });
-      launching.once('exit', () => { launching = null; });
       launching.unref();
     }
-    await sleep(Math.min(80, Math.max(0, until - performance.now())));
+  }
+  do {
+    await sleep(Math.min(80, Math.max(0, until - 200 - performance.now())));
     info = await healthy(config);
-    if (info) return info;
-    if (launchError) throw launchError;
-    // A healthy owner can disappear between its health response and printing discovery. Contending
-    // launchers recheck the lock in run, including when the owner is still starting or shutting down.
+    if (info) { release(); return info; }
+    if (launchError) { release(); throw launchError; }
   } while (performance.now() < until - 200);
   throw new Error('collector discovery and health timed out');
 }
@@ -232,26 +263,39 @@ async function runWorkerJob({ task, options, env }) {
     // readSessions returns { sessions, cursors }; the cursors come back to the collector for the next pass.
     return typeof readSessions === 'function' ? await readSessions(options) : null;
   }
-  const { now } = options;
+  const { now, lockNonce } = options;
   const { collectUsage, readUsageSummary } = await import('./conveyor/usage.mjs');
-  if ((await collectUsage({ now, env })).locked) throw new Error('usage collection already running');
+  if ((await collectUsage({ now, env, lockNonce })).locked) throw new Error('usage collection already running');
   return { ...await readUsageSummary({ now, env }), stale: false };
 }
 
-function collectInWorker(task, options, env, deadline) {
-  // Usage does synchronous I/O and holds its own lock. It runs in this process and releases the
-  // lock itself, even when overdue. Pure probes can be terminated at the deadline.
+function collectInWorker(workers, task, options, env, deadline) {
+  if (!workers.has(task)) {
+    const worker = new Worker(new URL(import.meta.url), { workerData: { task }, env, execArgv: [] });
+    workers.set(task, worker);
+    worker.on('error', () => {}); // The active request handles errors; an idle worker can also exit.
+    worker.once('exit', () => { if (workers.get(task) === worker) workers.delete(task); });
+  }
+  const worker = workers.get(task);
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL(import.meta.url), { workerData: { task, options, env }, env, execArgv: [] });
-    const timer = deadline && setTimeout(() => { void worker.terminate(); }, deadline);
-    let result, failure;
-    worker.once('message', (value) => { result = { value }; });
-    worker.once('error', (error) => { failure = error; });
-    worker.once('exit', (code) => {
+    const clear = () => {
       clearTimeout(timer);
-      if (code === 0 && result) resolve(result.value);
-      else reject(failure || new Error(`${task} worker exited with code ${code}`));
-    });
+      worker.off('message', receive);
+      worker.off('exit', exit);
+    };
+    const receive = ({ value, error }) => {
+      clear();
+      if (error) reject(new Error(error));
+      else resolve(value);
+    };
+    const exit = (code) => {
+      clear();
+      reject(new Error(`${task} worker exited with code ${code}`));
+    };
+    const timer = setTimeout(() => { void worker.terminate(); }, deadline);
+    worker.once('message', receive);
+    worker.once('exit', exit);
+    worker.postMessage(options);
   });
 }
 
@@ -323,23 +367,6 @@ function listen(server) {
   });
 }
 
-async function hasLiveSession(claudeHome) {
-  const directory = path.join(claudeHome, 'sessions');
-  let names;
-  try { names = await readdir(directory); }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue;
-    try {
-      const session = JSON.parse((await readFile(path.join(directory, name), 'utf8')).replace(/^\uFEFF/, ''));
-      if (processAlive(session?.pid)) return true;
-    } catch (error) {
-      if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
-    }
-  }
-  return false;
-}
-
 function assembleServer(token, health, beat, stop) {
   const expected = Buffer.from(token);
   const server = createServer((req, res) => {
@@ -406,9 +433,11 @@ async function serve(config, owner) {
   if (platform === 'win32') defaults.daemons = {};
   const values = { ...defaults, cli: null };
   const beats = new Map(), limits = new Map(), jobs = [], pending = new Set();
+  const workers = new Map();
+  const shutdown = new AbortController();
   const metadata = Object.fromEntries(
-    [...FAST_SECTIONS, 'ram', 'sessions', 'usage', 'cli', 'catalog'].map((name) => [name, section(0)]));
-  let quota, quotaStatus = section(10 * MINUTE + DEADLINE);
+    [...FAST_SECTIONS, 'ram', 'sessions', 'usage', 'cli', 'catalog', 'gemini'].map((name) => [name, section(0)]));
+  metadata.gemini.reason = 'Gemini is not used';
   let seq = 0, dirty = true, stopping = false;
   let overviewExport;
   let idleSince = Date.now(), liveSession = false, nextSessionCheck = 0, fastMs = MINUTE;
@@ -416,9 +445,9 @@ async function serve(config, owner) {
   let lastSections, timer;
   let wakeStop;
   const stopped = new Promise((resolve) => { wakeStop = resolve; });
-  const stop = () => { stopping = true; wakeStop(); };
+  const stop = () => { stopping = true; shutdown.abort(); wakeStop(); };
   const log = (error) => process.stderr.write(`luna-collector: ${message(error)}\n`);
-  const meta = (name) => name === 'quota' ? quotaStatus : metadata[name];
+  const meta = (name) => metadata[name];
 
   const server = assembleServer(token, () => ({ ok: true, instance: owner.instance, seq }), (body) => {
     if (stopping || typeof body?.sessionId !== 'string' || !body.sessionId ||
@@ -483,7 +512,7 @@ async function serve(config, owner) {
     }).catch((error) => {
       if (!timedOut) fail(error);
     }).finally(() => {
-      // An overdue in-process operation retains its slot until it releases its own resources.
+      // Keep the job's slot until its worker or supervised process has finished.
       clearTimeout(timeout);
       job.busy = false;
       if (!job.failures) job.dueAt = job.last + job.interval();
@@ -504,7 +533,7 @@ async function serve(config, owner) {
 
   async function runHelper(file, args, { deadlineMs = DEADLINE, childEnv = env, maxOutput } = {}) {
     const result = await run([process.execPath, marker, file, ...args], {
-      cwd: config.directory, env: childEnv, deadlineMs, maxOutput
+      cwd: config.directory, env: childEnv, deadlineMs, maxOutput, signal: shutdown.signal
     });
     if (result.timedOut) throw new Error(`${path.basename(file)} timed out`);
     if (result.code !== 0) throw new Error(`${path.basename(file)} exited ${result.code}: ${message(result.stderr)}`);
@@ -522,7 +551,7 @@ async function serve(config, owner) {
     async work(now) {
       overviewExport ??= await hasOverviewExport();
       if (overviewExport) {
-        const result = await collectInWorker('overview', probeOptions(now), env, probeDeadline);
+        const result = await collectInWorker(workers, 'overview', { ...probeOptions(now), includeGemini: false }, env, probeDeadline);
         if (result) return result.snapshot;
         overviewExport = false;
       }
@@ -533,19 +562,26 @@ async function serve(config, owner) {
     },
     merge(result, now) {
       if (!object(result)) throw new Error('overview returned no snapshot');
-      if (Number.isFinite(result.ram?.freeMb) && Number.isFinite(result.ram?.totalMb)) {
+      // RAM has its own live sampler and never uses the overview's cached fallback.
+      if (result.sections?.ram?.status !== 'stale' &&
+          Number.isFinite(result.ram?.freeMb) && Number.isFinite(result.ram?.totalMb)) {
         values.ram = result.ram;
         report('ram', 'ok', now);
       }
       for (const name of FAST_SECTIONS) {
-        if (!Object.hasOwn(result, name) || name === 'jobs' && !Array.isArray(result.jobs)) {
+        const supplied = Object.hasOwn(result, name) && (name !== 'jobs' || Array.isArray(result.jobs));
+        const stale = result.sections?.[name];
+        if (stale?.status === 'stale') {
+          if (supplied) values[name] = result[name];
+          metadata[name].okAt ??= stale.okAt ?? null;
+          report(name, 'stale', now, stale.reason);
+          continue;
+        }
+        if (!supplied) {
           report(name, meta(name).okAt ? 'stale' : 'unavailable', now, 'overview did not supply this section');
           continue;
         }
-        if (name === 'gemini' && object(result.gemini)) {
-          if (quota === undefined && result.gemini.quota?.available) quota = result.gemini.quota;
-          values.gemini = { ...result.gemini, ...(quota === undefined ? {} : { quota }) };
-        } else values[name] = result[name];
+        values[name] = result[name];
         report(name, 'ok', now);
       }
       for (const name of ['build', 'switches', 'daemons']) {
@@ -556,7 +592,7 @@ async function serve(config, owner) {
   register({ names: ['sessions'], interval: fast, deadline: probeDeadline,
     async work(now) {
       if (!existsSync(helper('conveyor/lib/sessions.mjs'))) return null;
-      return collectInWorker('sessions', { ...probeOptions(now), runDir: config.runDir, cursors: sessionCursors },
+      return collectInWorker(workers, 'sessions', { ...probeOptions(now), runDir: config.runDir, cursors: sessionCursors },
         env, probeDeadline);
     },
     merge(result, now) {
@@ -570,20 +606,20 @@ async function serve(config, owner) {
       values.sessions = result.sessions;
       report('sessions', 'ok', now);
     } });
-  register({ names: ['usage'], interval: () => 2 * MINUTE, work: (now) => collectInWorker('usage', { now }, env),
+  register({ names: ['usage'], interval: () => 2 * MINUTE, async work(now) {
+    const lockNonce = randomUUID();
+    try { return await collectInWorker(workers, 'usage', { now, lockNonce }, env, DEADLINE); }
+    catch (error) {
+      const { usagePaths } = await import('./conveyor/usage.mjs');
+      if (usagePaths) {
+        const { lock } = usagePaths(env);
+        if (readJson(path.join(lock, 'owner.json'))?.nonce === lockNonce) rmSync(lock, { recursive: true, force: true });
+      }
+      throw error;
+    }
+  },
     merge: (result, now) => { values.usage = result; report('usage', 'ok', now); } });
   register({ interval: () => 10 * MINUTE, work: () => runHelper(helper('luna-reap-brokers.mjs'), []) });
-  if (platform === 'linux') {
-    register({ names: ['quota'], interval: () => 10 * MINUTE,
-      work: async () => JSON.parse(await runHelper(helper('conveyor/gemini-quota.mjs'), ['--json', '--refresh'])),
-      merge(result, now) {
-        if (result?.available !== true) throw new Error(result?.reason || 'Gemini quota unavailable');
-        const { available, at, buckets, lastExhaustedAt = result.proxy?.lastExhaustedAt } = result;
-        quota = { available, at, buckets, ...(lastExhaustedAt ? { lastExhaustedAt } : {}) };
-        values.gemini = { ...values.gemini, quota };
-        report('quota', 'ok', now);
-      } });
-  }
   register({ names: ['cli'], hourly: 'cli', interval: () => HOUR,
     work: async () => JSON.parse(await runHelper(helper('conveyor/cli-update.mjs'), ['status', '--json'])),
     merge(result, now) {
@@ -598,19 +634,10 @@ async function serve(config, owner) {
       if (result?.ok !== true) throw new Error(result?.reason || 'catalog refresh failed');
       report('catalog', 'ok', now, result.note ? message(result.note) : null);
     } });
-  register({ interval: () => 10 * MINUTE, deadline: SECOND, work: () => sweepOrphans(helpers, marker) });
+  register({ interval: () => 10 * MINUTE, deadline: 4 * SECOND, work: () => sweepOrphans(helpers, marker) });
 
   function publish(now) {
     const sections = Object.fromEntries(Object.entries(metadata).map(([name, state]) => [name, sectionView(state, now)]));
-    if (platform === 'linux' && quotaStatus.attemptAt) {
-      const status = sectionView(quotaStatus, now);
-      const overviewStatus = sections.gemini;
-      sections.gemini = { ...overviewStatus, attemptAt: [overviewStatus.attemptAt, status.attemptAt].sort().at(-1),
-        ...(['error', 'stale'].includes(status.status) ? {
-          status: overviewStatus.okAt || status.okAt ? 'stale' : 'error', reason: status.reason
-        } : {}) };
-      if (!sections.gemini.okAt) sections.gemini.okAt = status.okAt;
-    }
     const serialized = JSON.stringify(sections);
     if (!dirty && lastSections === serialized) return;
     const snapshot = { ...values, at: iso(now), version: 2,
@@ -647,7 +674,10 @@ async function serve(config, owner) {
       nextSessionCheck = 0;
     } else {
       if (now >= nextSessionCheck || idleSince !== null && now - idleSince >= idlePeriod) {
-        try { liveSession = await hasLiveSession(config.claudeHome); }
+        try {
+          const { hasLiveSession } = await import('./conveyor/lib/sessions.mjs');
+          liveSession = await hasLiveSession(config.claudeHome, now);
+        }
         catch (error) { log(error); liveSession = true; }
         nextSessionCheck = now + Math.min(5 * SECOND, idlePeriod / 4);
       }
@@ -673,6 +703,7 @@ async function serve(config, owner) {
   const serverError = (error) => { log(error); stop(); };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
+  let forcedExit = false;
   try {
     await listen(server);
     server.on('error', serverError);
@@ -687,13 +718,23 @@ async function serve(config, owner) {
     clearTimeout(timer);
     server.close();
     server.closeAllConnections();
-    await Promise.allSettled(pending);
-    if (seq || dirty && Object.values(metadata).some((state) => state.attemptAt)) {
+    const terminateWorkers = () => Promise.allSettled([...workers.values()].map((worker) => worker.terminate()));
+    const grace = new AbortController();
+    await Promise.race([
+      Promise.allSettled(pending).then(terminateWorkers),
+      sleep(SHUTDOWN_GRACE_MS, undefined, { signal: grace.signal }).then(() => {
+        forcedExit = true;
+        void terminateWorkers();
+      })
+    ]);
+    grace.abort();
+    if (!forcedExit && (seq || dirty && Object.values(metadata).some((state) => state.attemptAt))) {
       try { publish(Date.now()); } catch (error) { log(error); }
     }
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
   }
+  return forcedExit;
 }
 
 async function runCollector(config) {
@@ -701,15 +742,17 @@ async function runCollector(config) {
   const owner = { pid: process.pid, instance: randomUUID(), startedAt: iso(), procStart: await processStart(process.pid) };
   if (!owner.procStart && (platform === 'linux' || platform === 'win32')) throw new Error('cannot read collector process start time');
   if (!await acquireLock(config.lock, owner)) return;
+  let forcedExit;
   try {
     remove(config.discovery);
     mkdirSync(path.dirname(config.widget), { recursive: true, mode: 0o700 });
-    await serve(config, owner);
+    forcedExit = await serve(config, owner);
   } finally {
     if (readJson(config.lock)?.instance === owner.instance) {
       try { remove(config.discovery); } finally { remove(config.lock); }
     }
   }
+  if (forcedExit) process.exit(0);
 }
 
 async function main(command) {
@@ -742,7 +785,10 @@ async function main(command) {
 }
 
 if (!isMainThread && workerData?.task) {
-  parentPort.postMessage(await runWorkerJob(workerData));
+  parentPort.on('message', async (options) => {
+    try { parentPort.postMessage({ value: await runWorkerJob({ ...workerData, options, env: process.env }) }); }
+    catch (error) { parentPort.postMessage({ error: message(error) }); }
+  });
 } else if (process.argv[1] && path.resolve(process.argv[1]) === SELF) {
   try { await main(process.argv[2]); }
   catch (error) {

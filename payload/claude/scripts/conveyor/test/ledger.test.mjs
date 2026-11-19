@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ChildProcess } from 'node:child_process';
+import { ChildProcess, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -301,6 +301,42 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
   assert.equal((await f.run(stop, [], {}, input)).stdout, '');
   assert.ok(spawned.includes(check));
   assert.deepEqual(spawned.filter((file) => file !== 'git' && file !== check), []);
+
+  await t.test('a live Windows wrapper in the home index blocks completion', () => {
+    const homeIndex = path.join(f.env.HOME, '.claude', 'luna-run', 'active');
+    fs.mkdirSync(homeIndex, { recursive: true });
+    fs.rmSync(path.join(active, 'owned'));
+    fs.writeFileSync(path.join(homeIndex, 'owned'), `${owned}\n${process.pid}\n${started}\n`);
+    fs.writeFileSync(`${owned}.status`, `state=running\nowner=${f.env.CLAUDE_CODE_SESSION_ID}\nstarted=${started}\n`);
+    const identity = new URL('../../../../../payload/claude/scripts/lib/process-identity.mjs', import.meta.url);
+    const powershell = path.join(f.root, 'bin', 'powershell.exe');
+    const fileTime = BigInt(Date.parse(started)) * 10_000n + 116_444_736_000_000_000n;
+    fs.writeFileSync(powershell, `#!/bin/sh\nprintf '%s\\n' '${fileTime}'\n`, { mode: 0o755 });
+    const moduleUrl = (source) => `data:text/javascript,${encodeURIComponent(source)}`;
+    const loader = `
+      export function resolve(specifier, context, next) {
+        if (specifier === '../../lib/process-identity.mjs') {
+          return { url: ${JSON.stringify(identity.href)}, shortCircuit: true };
+        }
+        return next(specifier, context);
+      }
+    `;
+    const preload = moduleUrl(`import { register } from 'node:module'; register(${JSON.stringify(moduleUrl(loader))});`);
+    const stdout = execFileSync(process.execPath, ['--import', preload, stop], {
+      cwd: f.repo,
+      env: { ...f.env, CONVEYOR_PLATFORM: 'win32', USERPROFILE: f.env.HOME,
+        FAKE_UNTRACKED_ARGS: shellList(JSON.parse(f.env.FAKE_UNTRACKED)) },
+      input, encoding: 'utf8', timeout
+    });
+    assert.equal(stdout.trim(), JSON.stringify({ decision: 'block', reason: sanitizeQuote(`8. finish executor jobs: ${owned}`) }));
+    fs.rmSync(path.join(homeIndex, 'owned'));
+  });
+
+  await t.test('an unreadable live index blocks completion', async () => {
+    fs.writeFileSync(path.join(run, 'gem-active'), '');
+    const result = await f.run(stop, [], {}, input);
+    assert.match(result.stdout, /"decision":"block","reason":"8\. cannot verify executor jobs:.*gem-active/);
+  });
 });
 
 test('stop check 10 audits completed reviews before complex writes and has its own calibration', { timeout }, async (t) => {

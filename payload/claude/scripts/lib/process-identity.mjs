@@ -128,21 +128,39 @@ export function processStart(pid) {
   catch { return ''; }
 }
 
-export function processStarts(pids) {
+function startsQuery(pids) {
   const ids = [...new Set(pids)].filter((pid) => Number.isSafeInteger(pid) && pid > 0);
-  const result = new Map();
-  if (!ids.length) return result;
+  if (!ids.length) return null;
   const filter = ids.map((pid) => `ProcessId=${pid}`).join(' OR ');
-  const command = `Get-CimInstance Win32_Process -Filter '${filter}' | ForEach-Object {` +
+  return `Get-CimInstance Win32_Process -Filter '${filter}' | ForEach-Object {` +
     `if ($_.CreationDate) { "$($_.ProcessId) $($_.CreationDate.ToFileTimeUtc())" } }`;
-  try {
-    const output = execFileSync('powershell.exe', args(command), options);
-    for (const line of output.split(/\r?\n/)) {
-      const match = /^(\d+) (\d+)$/.exec(line.trim());
-      if (match) result.set(Number(match[1]), match[2]);
-    }
-  } catch {}
+}
+
+function parseStarts(output) {
+  const result = new Map();
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^(\d+) (\d+)$/.exec(line.trim());
+    if (match) result.set(Number(match[1]), match[2]);
+  }
   return result;
+}
+
+export function processStarts(pids) {
+  const command = startsQuery(pids);
+  try {
+    if (command) return parseStarts(execFileSync('powershell.exe', args(command), options));
+  } catch {}
+  return new Map();
+}
+
+export function processStartsAsync(pids) {
+  const command = startsQuery(pids);
+  if (!command) return Promise.resolve(new Map());
+  return new Promise((resolve) => {
+    execFile('powershell.exe', args(command), options, (error, stdout) => {
+      resolve(error ? new Map() : parseStarts(stdout));
+    });
+  });
 }
 
 export function processStartAsync(pid) {
