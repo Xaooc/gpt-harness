@@ -2,13 +2,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { entryText, isGenuineHumanEntry } from '../../learning/extract.mjs';
 import { readJsonl, sanitizeQuote } from '../../learning/common.mjs';
 import { loadConfig } from './orchestration.mjs';
 import { repositorySurface, uiFile } from './profile.mjs';
-import { shell } from './platform.mjs';
+import { home, platform, processAlive, readProcessStat, shell } from './platform.mjs';
 
 const execute = promisify(execFile);
 const now = () => new Date().toISOString();
@@ -722,18 +722,212 @@ function linked(state, id) {
   return !!link && (link.item === 'none' ? !!link.reason?.trim() : state.items.some((item) => item.id === link.item));
 }
 
-async function ownedJobs(context) {
-  const command = process.env.CONVEYOR_OVERVIEW_CMD || [process.execPath, path.join(claudeHome(), 'scripts', 'luna-overview.mjs')];
-  const result = await runCommand(command, [], context.cwd);
-  if (result.rc !== 0) throw new Error(`executor overview: ${result.stderr}`);
-  const overview = JSON.parse(result.stdout);
-  if (!Array.isArray(overview.jobs)) throw new Error('executor overview has no jobs array');
-  return overview.jobs.filter((job) => job.owner === context.session
-    && /^(?:running|starting|pending|queued|waiting(?:-.*)?)$/.test(job.state));
+const liveJobState = /^(?:running|starting|pending|queued|waiting(?:-.*)?)$/;
+
+function readJobFile(file, limit = 64 * 1024) {
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size > limit) throw new Error(`invalid job file: ${file}`);
+    return { text: fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''), mtimeMs: stat.mtimeMs };
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
-async function cleanupProblem(context, state, repos) {
-  const running = await ownedJobs(context);
+async function jobProcessCheck(pids) {
+  let identity, starts, identityError, linuxClock;
+  if (platform === 'win32' && pids.length) {
+    try {
+      identity = await import('../../lib/process-identity.mjs');
+      starts = await identity.processStartsAsync(pids);
+    } catch (error) {
+      identityError = error;
+    }
+  }
+  return (pid, expected, pointerTime) => {
+    if (!processAlive(pid)) return false;
+    if (identityError) throw identityError;
+    const actual = platform === 'win32' ? starts?.get(pid) : readProcessStat(pid)?.started;
+    if (!actual) throw new Error(`cannot read start time for live PID ${pid}`);
+    if (expected) return identity ? identity.sameStart(actual, expected) : actual === String(expected);
+    if (pointerTime === undefined) throw new Error('missing live daemon start time');
+
+    let startedAt;
+    if (identity) {
+      startedAt = identity.processStartMillis(actual);
+    } else {
+      linuxClock ??= {
+        boot: Date.now() - os.uptime() * 1000,
+        ticks: Number(execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 2500 }).trim())
+      };
+      if (linuxClock.ticks > 0) startedAt = linuxClock.boot + Number(actual) * 1000 / linuxClock.ticks;
+    }
+    if (!Number.isFinite(startedAt)) throw new Error(`cannot read start time for live PID ${pid}`);
+    return startedAt <= pointerTime;
+  };
+}
+
+function indexedJob(directory, entry, gemini, session) {
+  const pointer = readJobFile(path.join(directory, entry), 32 * 1024);
+  if (!pointer) return;
+  const gem = gemini ? JSON.parse(pointer.text) : null;
+  if (gemini && gem?.v !== 1) throw new Error(`invalid Gemini pointer: ${entry}`);
+  const [out, pid, start] = gemini ? [gem.out, gem.wrapper_pid] : pointer.text.split(/\r?\n/, 3).map((line) => line.trim());
+  if (typeof out !== 'string' || !path.isAbsolute(out) || out.startsWith('//') || out.includes('\0')) {
+    throw new Error(`invalid output path: ${entry}`);
+  }
+  const status = readJobFile(`${out}.status`);
+  if (!status) {
+    if (pid && !processAlive(Number(pid))) return;
+    throw new Error(`status file is missing: ${out}.status`);
+  }
+  const fields = new Map();
+  for (const line of status.text.split(/\r?\n/)) {
+    const equals = line.indexOf('=');
+    if (equals < 1) continue;
+    const key = line.slice(0, equals);
+    if (!fields.has(key)) fields.set(key, line.slice(equals + 1));
+  }
+  const state = fields.get('state');
+  if (!state) throw new Error(`missing job state: ${out}.status`);
+  if ((fields.get('owner') || gem?.owner) !== session || !liveJobState.test(state)) return;
+  if (gemini && (fields.get('provider') !== 'gemini' || !pid)) return;
+
+  const statusPid = fields.get('wrapper_pid');
+  const wrapperPid = Number(pid || statusPid);
+  if (pid || statusPid) {
+    if (!Number.isSafeInteger(wrapperPid) || wrapperPid < 1) throw new Error(`invalid wrapper PID: ${out}.status`);
+    // On Windows the active pointer uses the native PID, while the status may name Bash's PID.
+    const expected = start || (wrapperPid === Number(statusPid) ? fields.get('wrapper_start') : undefined);
+    return { out, state, id: fields.get('daemon_job'), pid: wrapperPid, expected, pointerTime: pointer.mtimeMs };
+  }
+  const time = Date.now();
+  if (Date.parse(fields.get('started')) < time - os.uptime() * 1000 || time - status.mtimeMs > 600_000) return;
+  return { out, state, id: fields.get('daemon_job') };
+}
+
+async function indexedJobs(run, index, session) {
+  const directory = path.join(run, index);
+  const gemini = index === 'gem-active';
+  const jobs = [], errors = [];
+  let entries;
+  try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
+  catch (error) {
+    if (error.code === 'ENOENT') return { jobs, errors };
+    throw new Error(`live ${index} index: ${error.message}`);
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || (gemini && !entry.name.endsWith('.json'))) continue;
+    try {
+      const job = indexedJob(directory, entry.name, gemini, session);
+      if (job) jobs.push(job);
+    } catch (error) {
+      errors.push(`${index}/${entry.name}: ${error.message}`);
+    }
+  }
+  return { jobs, errors };
+}
+
+async function daemonDiscovery(directory) {
+  const file = path.join(directory, 'daemon.json');
+  try {
+    const discovery = readJobFile(file);
+    if (!discovery) return;
+    const info = JSON.parse(discovery.text);
+    if (!Number.isSafeInteger(info?.pid) || info.pid < 1) throw new Error('invalid daemon PID');
+    return { file, info };
+  } catch (error) {
+    throw new Error(`daemon jobs (${file}): ${error.message}`);
+  }
+}
+
+function listedJobs(jobs, session, source, errors) {
+  return jobs.filter((job) => {
+    if (typeof job?.owner !== 'string' || typeof job.state !== 'string') {
+      errors.push(`${source} has an invalid job entry`);
+      return false;
+    }
+    return job.owner === session && liveJobState.test(job.state);
+  });
+}
+
+async function daemonOwnedJobs({ file, info }, session, liveProcess, errors) {
+  try {
+    if (!liveProcess(info.pid, info.pid_start)) return [];
+    if (!Number.isInteger(info.port) || info.port < 1 || info.port > 65535 || !info.token || typeof info.token !== 'string') {
+      throw new Error('invalid daemon port or token');
+    }
+    const response = await fetch(`http://127.0.0.1:${info.port}/jobs`, {
+      headers: { 'X-Luna-Token': info.token }, signal: AbortSignal.timeout(5000), redirect: 'error'
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`/jobs returned HTTP ${response.status}`);
+    }
+    const list = await response.json();
+    if (!Array.isArray(list?.jobs)) throw new Error('/jobs response has no jobs array');
+    return listedJobs(list.jobs, session, `daemon jobs (${file})`, errors);
+  } catch (error) {
+    throw new Error(`daemon jobs (${file}): ${error.message}`);
+  }
+}
+
+async function ownedJobs(context) {
+  const jobs = new Map();
+  const errors = [];
+  const result = (list) => ({ jobs: list, ...(errors.length ? { error: errors.join('; ') } : {}) });
+  const settled = (results) => results.flatMap((entry) => {
+    if (entry.status === 'fulfilled') return entry.value === undefined ? [] : [entry.value];
+    errors.push(entry.reason.message);
+    return [];
+  });
+  try {
+    const command = process.env.CONVEYOR_OVERVIEW_CMD;
+    if (command) {
+      const output = await runCommand(command, [], context.cwd);
+      if (output.rc !== 0) throw new Error(`executor overview: ${output.stderr}`);
+      const overview = JSON.parse(output.stdout);
+      if (!Array.isArray(overview.jobs)) throw new Error('executor overview has no jobs array');
+      return result(listedJobs(overview.jobs, context.session, 'executor overview', errors));
+    }
+    const defaultRun = path.resolve(process.env.HOME || home(), '.claude', 'luna-run');
+    const run = path.resolve(process.env.LUNA_RUN_DIR || process.env.LUNA_OVERVIEW_HOME || path.join(claudeHome(), 'luna-run'));
+    const daemon = path.resolve(process.env.LUNA_DAEMON_HOME || run);
+    const directories = [...new Set([daemon, defaultRun].flatMap((directory) => [directory, path.join(directory, 'daemon-net')]))];
+    // The learning registry records terminal jobs. The live indexes have no display limits here.
+    const [discoveries, indexes] = await Promise.all([
+      Promise.allSettled(directories.map(daemonDiscovery)),
+      Promise.allSettled([...new Set([run, defaultRun])].flatMap((root) =>
+        ['active', 'gem-active'].map((index) => indexedJobs(root, index, context.session))))
+    ]);
+    const daemons = settled(discoveries);
+    const indexed = settled(indexes).flatMap((index) => {
+      errors.push(...index.errors);
+      return index.jobs;
+    });
+    const pids = [...new Set([...daemons.map(({ info }) => info.pid), ...indexed.map(({ pid }) => pid)])].filter(processAlive);
+    const checkProcess = await jobProcessCheck(pids);
+    for (const { out, state, id, pid, expected, pointerTime } of indexed) {
+      try {
+        if (!pid || checkProcess(pid, expected, pointerTime)) jobs.set(out, { out, state, id });
+      } catch (error) {
+        errors.push(`${out}: ${error.message}`);
+      }
+    }
+    const listings = settled(await Promise.allSettled(
+      daemons.map((discovery) => daemonOwnedJobs(discovery, context.session, checkProcess, errors))));
+    const wrappedIds = new Set([...jobs.values()].map((job) => job.id).filter(Boolean));
+    return result([...jobs.values(), ...listings.flat().filter((job) => !wrappedIds.has(job.id))]);
+  } catch (error) {
+    errors.push(error.message);
+    return result([...jobs.values()]);
+  }
+}
+
+async function cleanupProblem(context, state, repos, jobLookup) {
+  const { jobs: running, error } = jobLookup ?? await ownedJobs(context);
+  if (error !== undefined) return `cannot verify executor jobs: ${error}`;
   if (running.length) return `finish executor jobs: ${running.map((job) => job.out || job.state).join(', ')}`;
   const remaining = state.temps.filter((file) => fs.lstatSync(file, { throwIfNoEntry: false }));
   if (remaining.length) return `remove registered temporary paths: ${remaining.join(', ')}`;
@@ -859,11 +1053,9 @@ export async function gateStatus(context) {
   const final = lastAssistant ? entryText(lastAssistant.entry) : '';
   const checked = new Set([...final.matchAll(checklistLines)].map((match) => match[1]));
   const completionChecklist = checked.size > 0 || /^\s*(?:[-*]|\d+[.)])\s+\[[ xX]\](?=\s|$)/m.test(final);
-  if (!completionChecklist) {
-    const running = await ownedJobs(context);
-    if (running.length) return { applies: true, ok: true,
-      systemMessage: `conveyor: work in progress, ${running.length} jobs running` };
-  }
+  const jobLookup = completionChecklist ? null : await ownedJobs(context);
+  if (jobLookup?.jobs.length) return { applies: true, ok: true,
+    systemMessage: `conveyor: work in progress, ${jobLookup.jobs.length} jobs running` };
   const scope = nonGit ? '; non-git code edits: ledger checks only, turn checks unavailable' : '';
   const block = (check, reason) => ({ applies: true, ok: false, check,
     reason: check === 9 ? `${check}. ${reason}${scope}` : sanitizeQuote(`${check}. ${reason}${scope}`, 1500) });
@@ -898,7 +1090,7 @@ export async function gateStatus(context) {
   const absent = state.items.filter((item) => !checked.has(item.id));
   if (absent.length) return block(7, `include the ledger checklist in the final message: ${absent.map((item) => item.id).join(', ')}`);
   if (!state.gateWaived && !nonGit) {
-    const cleanup = await cleanupProblem(context, state, repos);
+    const cleanup = await cleanupProblem(context, state, repos, jobLookup);
     if (cleanup) return block(8, cleanup);
   }
   if (!state.gateWaived && await screenshotProblem(context, state, evidenceRepos)) {

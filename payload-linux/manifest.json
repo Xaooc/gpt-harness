@@ -54,7 +54,7 @@
       "src": "claude/hooks/luna-clean-hook.mjs",
       "dest": "hooks/luna-clean-hook.mjs",
       "kind": "file",
-      "sha256": "c85004517706f7c8a60c254bb54c36d0437e19052fd0bd1fffe287e6562448df",
+      "sha256": "52089b323e0a35f4dac906a4164a61b4d9620d9851fcfef8d027b9e838ea394e",
       "executable": true
     },
     {
@@ -74,7 +74,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "3cd2110b37d25276f12c4932b15ae898b4a80dd5b3072504609eb1ca1942d47e"
+      "sha256": "a00ec506368a2dd22647a5e46624d00d0eb1306238502a38ff077346a3eefa8f"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
@@ -86,13 +86,13 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "a4876ab241c02541fc418e257bcc37c334825c306543d20b5b148af00398dde8"
+      "sha256": "33cdb1ddbaefaf30ee0e6fd98674e12105ca9b5ce163e970345d6eabc8eb2132"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",
       "dest": "local-plugins/luna-panel/tests/pane.test.tsx",
       "kind": "file",
-      "sha256": "8281f619c3f9aa6a5ff80ed7f978b8686b7403ec8722ed14949a51c098e399f9"
+      "sha256": "211c8e2789145baba84914be6dba407fe727a30864cd2f694b2794074aa5594e"
     },
     {
       "src": "claude/local-plugins/luna-panel/tsconfig.json",
@@ -104,7 +104,7 @@
       "src": "claude/local-plugins/luna-panel/types/index.d.ts",
       "dest": "local-plugins/luna-panel/types/index.d.ts",
       "kind": "file",
-      "sha256": "5613d0b1408f8918c3928c177d19e350d4cb72a4fff6c3527dcc55b4274201c3"
+      "sha256": "b68042818e85079c6d8e5cc600a7b766e148243c214a8ee3de1ac39d30dc612c"
     },
     {
       "src": "claude/scripts/disk/audit.mjs",
@@ -320,14 +320,14 @@
       "src": "claude/scripts/luna-overview.mjs",
       "dest": "scripts/luna-overview.mjs",
       "kind": "file",
-      "sha256": "8565c74f0eacab70d1bda0bbd64bdc1d0c66d15a358660562ac843b3cb661163",
+      "sha256": "0932f311fa2ba1f9ec720f4da11709c0264212f2261b722c7cb7cbf9ee09481a",
       "executable": true
     },
     {
       "src": "claude/scripts/luna-overview.sh",
       "dest": "scripts/luna-overview.sh",
       "kind": "file",
-      "sha256": "0b67fb721bc6f9ebf8e3002554f98e940e3f980750e9ad1dc71c82b05f95a393",
+      "sha256": "9814bea30548f2abb6a1ca929347792a3bf2a6e159333915dfb58fb4581b6585",
       "executable": true
     },
     {
@@ -414,7 +414,7 @@
       "src": "claude/conveyor/orchestration.default.json",
       "dest": "conveyor/orchestration.default.json",
       "kind": "file",
-      "sha256": "1c7fb3fd2ffcc74afb15ec48befdc164f98da6d3de0280c4902de80ef684b3e5"
+      "sha256": "998a78e8d270036a05c7a82500b7f0915a3ac77bba4c275af004fc12e6e3ec96"
     },
     {
       "src": "claude/hooks/conveyor-hygiene-session-start.mjs",
@@ -3765,14 +3765,14 @@
       "src": "claude/scripts/conveyor/cli-update.mjs",
       "dest": "scripts/conveyor/cli-update.mjs",
       "kind": "file",
-      "sha256": "470d901d582981e25ac2210c91d5f57b33b3f94164ef4ad4e36f09bf72b40a42",
+      "sha256": "e6bf1381198ccafffeb94d784bf827d1a7bac58c5ca70f915d5da960efd6005f",
       "executable": true
     },
     {
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "3c47e116cda576965d10e82e751c221c3c55971edba9bfa348e8d2fece73fcb3",
+      "sha256": "aa45f39f0768a25c3696d6224e6d534bafdd5629ef78c63670dd4001702623b7",
       "executable": true
     },
     {
@@ -3806,13 +3806,13 @@
       "src": "claude/scripts/conveyor/lib/ledger.mjs",
       "dest": "scripts/conveyor/lib/ledger.mjs",
       "kind": "file",
-      "sha256": "ac8a22a599027e85078e63a3ae3f71c92c5ce9c53c18be8ab48f1532aedf77e1"
+      "sha256": "2d08aa69f8c7b2343f18801ea23786e72580a5a1777ce7228166eb043fc66dbe"
     },
     {
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
       "dest": "scripts/conveyor/lib/orchestration.mjs",
       "kind": "file",
-      "sha256": "3a764de9c1555ce73094689baf8099d65959f8763d606697b5bb6ce702ebdc0f"
+      "sha256": "d0d0fe2b1a4596d2ef5d33d411ef0c869c497f4e0e7ff26dba9f46f6045e94dd"
     },
     {
       "src": "claude/scripts/conveyor/lib/patch-recipes.mjs",
@@ -3824,7 +3824,7 @@
       "src": "claude/scripts/conveyor/lib/platform.mjs",
       "dest": "scripts/conveyor/lib/platform.mjs",
       "kind": "file",
-      "sha256": "6b48c125f84480b62d2994d8690a23e02f7a2aa608e9c14fa7e9a18a1e0b0c84"
+      "sha256": "1550d752f192781e40694ec83e0094bead97731b8b3be4272f23fa1090db5576"
     },
     {
       "src": "claude/scripts/conveyor/lib/profile.mjs",
@@ -3836,7 +3836,7 @@
       "src": "claude/scripts/conveyor/usage.mjs",
       "dest": "scripts/conveyor/usage.mjs",
       "kind": "file",
-      "sha256": "ce8fff3883ad9569342f6d65dea5c47f0d9af697d65c9ea9fdde8712c8a64642",
+      "sha256": "18d4d349ee27a660de3305b15dae655ae31255d3c131ca44dcd5f2af20e69add",
       "executable": true
     },
     {
@@ -3908,7 +3908,7 @@
       "src": "claude/local-plugins/luna-panel/tests/snapshot.fixture.ts",
       "dest": "local-plugins/luna-panel/tests/snapshot.fixture.ts",
       "kind": "file",
-      "sha256": "7f8976994ad9d794465833e8180964f3dce317a258a2a907a31c5fe010a708aa"
+      "sha256": "dd60f8e062a62eda2de9b104c733de30170295720e3b5aed28a74d4ed520e7dd"
     },
     {
       "src": "claude/scripts/conveyor/test/check.test.mjs",
@@ -3932,7 +3932,7 @@
       "src": "claude/scripts/conveyor/test/exec.test.mjs",
       "dest": "scripts/conveyor/test/exec.test.mjs",
       "kind": "file",
-      "sha256": "a2a7d5f245ce86958d51c3fa90900bc088fe6314351292a4f344e7ae76ee66c5"
+      "sha256": "4fa08b9d8f8c4e2f4dc09daa1a693ae4430a43e5edfbea2d4410064f1f30e90e"
     },
     {
       "src": "claude/scripts/conveyor/test/fixtures/fake-wrapper.sh",
@@ -3969,7 +3969,7 @@
       "src": "claude/scripts/conveyor/test/ledger.test.mjs",
       "dest": "scripts/conveyor/test/ledger.test.mjs",
       "kind": "file",
-      "sha256": "c9081bdffdef009c8ded351b4e8e11d8a12c76982bd423678ace57e13a812c24"
+      "sha256": "b3b97eae1f945c059feb3958c729126330aa0954a627fe532b13344d4f63ec52"
     },
     {
       "src": "claude/scripts/conveyor/test/metrics.test.mjs",
@@ -3993,7 +3993,7 @@
       "src": "claude/scripts/conveyor/test/usage.test.mjs",
       "dest": "scripts/conveyor/test/usage.test.mjs",
       "kind": "file",
-      "sha256": "5885bf82d55ba84731eecf6b1ef5e9e9af39377a805e8dce88304a297b5d353c"
+      "sha256": "184415b0176f43a23aabf4ada372f99a7dc57217bb4652456cd9daf6d773e097"
     },
     {
       "src": "claude/scripts/learning/test/target-fixtures.mjs",
@@ -5187,6 +5187,37 @@
       "dest": "skills/ui-ux-pro-max/scripts",
       "kind": "file",
       "sha256": "1f80a44a7c81b3d286013ba1e133581ff5966544496a9caa758291dba3e5a4f2"
+    },
+    {
+      "src": "claude/scripts/conveyor/lib/sessions.mjs",
+      "dest": "scripts/conveyor/lib/sessions.mjs",
+      "kind": "file",
+      "sha256": "e857b629abb813610eca5b316b63c0b2f7d77d23156fc34f0bcc865b3dade4cc"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/collector.test.mjs",
+      "dest": "scripts/conveyor/test/collector.test.mjs",
+      "kind": "file",
+      "sha256": "530abedc50fca5794816b869d157c089cb66d10888fe5fb780f2f6725b9f7602"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/sessions.test.mjs",
+      "dest": "scripts/conveyor/test/sessions.test.mjs",
+      "kind": "file",
+      "sha256": "a8a3444e6bacc464897108ca235e14ae0922347120059a07734823cee5e06240"
+    },
+    {
+      "src": "claude/scripts/lib/supervised-run.mjs",
+      "dest": "scripts/lib/supervised-run.mjs",
+      "kind": "file",
+      "sha256": "1f08d61a75a340b0f958394ee3b10034288817ca0515e291776e59f4dcb6235e"
+    },
+    {
+      "src": "claude/scripts/luna-collector.mjs",
+      "dest": "scripts/luna-collector.mjs",
+      "kind": "file",
+      "sha256": "81915a6c93727e720aee411a479d05b3df5ad1725c2042a4a6a17ab492b2de3c",
+      "executable": true
     }
   ],
   "settings": "settings/hooks.json",

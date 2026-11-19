@@ -6,22 +6,22 @@ import type {
 } from '../types'
 
 // The Luna pane, conveyor edition: limits of every provider, the executor chains with the active one marked, every
-// executor's jobs (Codex, Gemini, Claude subagents), the orchestration editor and CLI updates.
-// Data: `node ~/.claude/scripts/luna-overview.mjs` every POLL_MS + $.session.usage(); settings through
+// executor's jobs (Codex, Claude subagents), the orchestration editor and CLI updates.
+// Data: the Luna collector snapshot and $.session.usage(); settings through
 // `node ~/.claude/scripts/conveyor/exec.mjs config …`; updates through `node ~/.claude/scripts/conveyor/cli-update.mjs`.
 
 const PANE = 'luna-panel'
 const TITLE = 'Luna'
 const COMMAND = 'luna'
-/** This installed pane sends this session's heartbeat; a preview copy (luna-panel-next) sets this false. */
-const WRITE_BEAT = true
 const POLL_MS = 5000
-const IDLE_POLL_MS = 20_000
+const BEAT_MS = 20_000
+const STALE_MS = 30_000
+const COLLECTOR_HINT = 'сборщик не отвечает — запустите: node ~/.claude/scripts/luna-collector.mjs start'
 
 const EMPTY: PanelData = { snapshot: null, claude: [], error: '', polledAt: 0, sessionId: '' }
 const VIEW0: View = {
   tab: 'overview', editTier: null, filter: 'all', confirm: null, busy: null, note: null, cli: null,
-  draftModel: '', draftProvider: 'gemini', draftEfforts: 'low,medium,high', presetName: '',
+  draftModel: '', draftProvider: 'codex', draftEfforts: 'low,medium,high', presetName: '',
 }
 const data = atom({ plugin: 'luna-panel', key: 'data' } as const, EMPTY)
 const collapsed = atom({ plugin: 'luna-panel', key: 'collapsed' } as const, {} as Collapsed)
@@ -146,17 +146,6 @@ function oneLine(text: unknown, max = 80): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean
 }
 
-function toolDetail(tool: string, input: Record<string, unknown>): string {
-  const base = (p: unknown) => String(p ?? '').split(/[\\/]/).pop() ?? ''
-  if (tool === 'Bash') return oneLine(input.command)
-  if (['Read', 'Edit', 'Write', 'NotebookEdit'].includes(tool)) return base(input.file_path ?? input.notebook_path)
-  if (tool === 'Grep' || tool === 'Glob') return oneLine(input.pattern, 60)
-  if (tool === 'Agent' || tool === 'Task') return oneLine(input.description, 60)
-  if (tool === 'WebFetch') { try { return new URL(String(input.url)).host } catch { return '' } }
-  if (tool === 'WebSearch') return oneLine(input.query, 60)
-  return ''
-}
-
 function describeCommand(raw: string): { text: string; isRaw: boolean } {
   let cmd = raw.trim().replace(/^\S*?(?:sh|bash|dash|zsh)\s+(?:-\w+\s+)*/i, '').replace(/^["']|["']$/g, '')
   cmd = cmd.replace(/^(?:cd\s+\S+\s*&&\s*)+/, '').trim()
@@ -196,11 +185,6 @@ function projectOfJobs(jobs: Job[]): string {
   return base(first)
 }
 
-function sessionName(cwd: string): string {
-  if (!cwd || /scratch-workspaces/i.test(cwd)) return ''
-  return cwd.split(/[\\/]/).filter(Boolean).pop() ?? ''
-}
-
 // ---- What needs the person ---------------------------------------------------------------------------------------
 
 type Alert = { level: 'error' | 'warning'; text: string }
@@ -210,14 +194,17 @@ function attentionItems(d: PanelData): Alert[] {
   const out: Alert[] = []
   if (!s) return d.error ? [{ level: 'warning', text: 'Нет данных от сборщика' }] : []
   const free = s.ram.freeMb
-  if (free < 1024) out.push({ level: 'error', text: `Мало памяти: ${gb(free)}, новые задачи ждут` })
-  else if (free < 2048) out.push({ level: 'warning', text: `Памяти немного: ${gb(free)}` })
-  for (const j of s.jobs) {
+  if (free !== null) {
+    if (free < 1024) out.push({ level: 'error', text: `Мало памяти: ${gb(free)}, новые задачи ждут` })
+    else if (free < 2048) out.push({ level: 'warning', text: `Памяти немного: ${gb(free)}` })
+  }
+  const jobs = s.jobs.filter(j => providerOf(j) !== 'gemini')
+  for (const j of jobs) {
     if (j.state === 'running' && (j.idleS ?? 0) >= 900) {
       out.push({ level: 'error', text: `${modelName(j.provider, j.model)} «${jobName(j.out)}» молчит ${duration(j.idleS ?? 0)}` })
     }
   }
-  const starved = s.jobs.filter(j => j.state === 'waiting-ram').length
+  const starved = jobs.filter(j => j.state === 'waiting-ram').length
   if (starved) out.push({ level: 'warning', text: `${starved} ${starved === 1 ? 'задача ждёт' : 'задач ждут'} памяти` })
   if (s.daemon.running && s.daemon.healthy === false) out.push({ level: 'error', text: 'Демон Codex не отвечает' })
   const o = s.orchestration
@@ -237,103 +224,49 @@ function attentionItems(d: PanelData): Alert[] {
 
 // ---- Polling -------------------------------------------------------------------------------------------------------
 
-let polling = false
-let pollStartedAt = 0
-let ticker: { cancel: () => void } | null = null
-let lastPollAt = 0
-let closedByPerson = false
-let homeDir = ''
+async function claudeHome($: EngineInterface): Promise<string> {
+  const home = await $.env.get('USERPROFILE') || await $.env.get('HOME')
+  if (home) return `${home.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude`
+  const installed = $.plugin.root.replace(/\\/g, '/').match(/^(.*\/\.claude)\/(?:local-plugins|plugins)\//i)
+  if (installed?.[1]) return installed[1]
+  throw new Error('Не найден домашний каталог Claude')
+}
 
-async function home($: EngineInterface): Promise<string> {
-  if (homeDir) return homeDir
-  let h = await $.env.get('HOME')
-  if (!h) {
-    const result = await $.process.run(['node', '-p', 'require("os").homedir()'], { timeoutMs: 2000 })
-    h = result.stdout.trim()
+function parseSnapshot(text: string): Snapshot {
+  const s = JSON.parse(text) as Snapshot | null
+  if (s?.version !== 2 || !Number.isFinite(Date.parse(s.collector?.publishedAt)) ||
+      !s.ram || !s.daemon || !Array.isArray(s.jobs) || !Array.isArray(s.claudeLimits)) {
+    throw new Error('Некорректный снимок сборщика')
   }
-  homeDir = h.replace(/\\/g, '/')
-  return homeDir
+  return s
 }
 
-async function poll($: EngineInterface): Promise<void> {
-  const now = Date.now()
-  if (polling && now - pollStartedAt < 20_000) return
-  polling = true
-  pollStartedAt = now
-  try { await pollOnce($) } finally { polling = false }
-}
-
-function ensureTicker($: EngineInterface): void {
-  if (ticker) return
-  ticker = $.clock.every(POLL_MS, () => { void tick($) })
-}
-
-async function tick($: EngineInterface): Promise<void> {
-  // The catalog is checked hourly even while the pane is hidden, so a model released today is in the picker by the
-  // time the owner looks.
-  void refreshCatalog($, true)
-  if ((await $.clock.now()) - lastPollAt < IDLE_POLL_MS) {
-    let shown = false
-    try { shown = (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced && p.isShown) } catch {}
-    if (!shown) return
-  }
-  await poll($)
-}
-
-/**
- * Claude's limits are per account, so a window this session's usage lacks (the desktop often reports only the week)
- * is taken from the freshest other session's heartbeat, as long as that window has not reset since.
- */
-function mergeClaudeLimits(own: ClaudeLimit[], beats: SessionBeat[], now: number): ClaudeLimit[] {
-  const out = new Map(own.map(l => [l.kind, l]))
-  const fresh = beats.filter(b => b.limits?.length && now - b.updatedAt < 6 * 3600_000).sort((a, b) => b.updatedAt - a.updatedAt)
-  for (const b of fresh) {
-    for (const l of b.limits ?? []) {
-      const resets = l.resetsAt ? Date.parse(l.resetsAt) : NaN
-      if (!out.has(l.kind) && !(Number.isFinite(resets) && resets <= now)) out.set(l.kind, l)
-    }
+function mergeClaudeLimits(own: ClaudeLimit[], shared: ClaudeLimit[], now: number): ClaudeLimit[] {
+  const out = new Map<string, ClaudeLimit>()
+  for (const limit of [...own, ...shared]) {
+    if (!out.has(limit.kind) && (!limit.resetsAt || Date.parse(limit.resetsAt) > now)) out.set(limit.kind, limit)
   }
   return [...out.values()]
 }
 
-async function pollOnce($: EngineInterface): Promise<void> {
-  const h = await home($)
-  const sessionId = await currentSessionId($)
-  let snapshot: Snapshot | null = null
-  let error = ''
-  try {
-    const payload = WRITE_BEAT ? await beatPayload($) : ''
-    const run = await $.process.run(['node', `${h}/.claude/scripts/luna-overview.mjs`, ...(payload ? ['--beat'] : [])],
-      { timeoutMs: 12_000, ...(payload ? { stdin: payload } : {}) })
-    if (run.exitCode === 0 && run.stdout.trim()) snapshot = JSON.parse(run.stdout) as Snapshot
-    else error = (run.stderr || `exit ${run.exitCode}`).trim().slice(0, 200)
-  } catch (caught) {
-    error = String((caught as Error)?.message ?? caught).slice(0, 200)
-  }
-  let claude: ClaudeLimit[] = []
-  try {
-    claude = (await $.session.usage()).rateLimits ?? []
-    if (claude.length) lastLimits = claude
-  } catch {}
-  const polledAt = await $.clock.now()
-  await update($, data, prev => ({
-    snapshot: snapshot ?? prev?.snapshot ?? null,
-    claude: mergeClaudeLimits(claude.length > 0 ? claude : prev?.claude ?? [], (snapshot ?? prev?.snapshot)?.sessions ?? [], polledAt),
-    error,
-    polledAt,
-    sessionId,
-  }))
-  lastPollAt = polledAt
-  if (Date.now() - cliLoadedAt > 3600_000) void loadCli($, false, true)
+async function currentSessionId($: EngineInterface): Promise<string> {
+  const fromEnv = await $.env.get('CLAUDE_CODE_SESSION_ID')
+  if (fromEnv) return fromEnv
+  try { return (await $.session.id()) ?? '' } catch { return '' }
+}
+
+async function currentLimits($: EngineInterface): Promise<ClaudeLimit[]> {
+  try { return (await $.session.usage()).rateLimits ?? [] } catch { return [] }
 }
 
 // ---- Actions: settings and updates (each one a CLI run; the result becomes a one-line note) -----------------------
 
 type ActionResult = { ok: boolean; note: string }
 
-async function runJson($: EngineInterface, argv: string[], timeoutMs: number): Promise<ActionResult & { json?: unknown }> {
+async function runJson($: EngineInterface, script: string, args: string[], timeoutMs: number):
+  Promise<ActionResult & { json?: unknown }> {
   try {
-    const run = await $.process.run(argv, { timeoutMs })
+    const run = await $.process.run(['node', `${await claudeHome($)}/scripts/conveyor/${script}`, ...args], { timeoutMs })
     // The whole output is one JSON document (pretty-printed or not); else its last line is.
     const out = run.stdout.trim()
     const lines = out.split(/\r?\n/).filter(Boolean)
@@ -352,74 +285,49 @@ async function act($: EngineInterface, key: string, args: string[], okText: stri
   const v = await read($, view)
   if (v?.busy) return
   await update($, view, prev => ({ ...(prev ?? VIEW0), busy: key, confirm: null }))
-  const h = await home($)
-  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/exec.mjs`, ...args, '--actor', 'panel'], 30_000)
+  const r = await runJson($, 'exec.mjs', [...args, '--actor', 'panel'], 30_000)
   const at = await $.clock.now()
   await update($, view, prev => ({
     ...(prev ?? VIEW0), busy: null,
     note: { text: r.ok ? okText : `Не применено: ${r.note}`, level: (r.ok ? 'success' : 'error') as 'success' | 'error', at },
   }))
-  await poll($)
 }
 
-let catalogCheckedAt = -Infinity
 let catalogBusy = false
 
-/** New Codex models (the Codex CLI's live model list) and new Claude aliases (read from Claude Code itself) join the
- *  catalog by themselves when the session starts and every hour after; the link forces a check now.
- *  Only adds models, never changes a chain. */
-async function refreshCatalog($: EngineInterface, quiet: boolean): Promise<void> {
+async function refreshCatalog($: EngineInterface): Promise<void> {
   if (catalogBusy) return
   catalogBusy = true
-  try { await refreshCatalogOnce($, quiet) } finally { catalogBusy = false }
-}
-
-async function refreshCatalogOnce($: EngineInterface, quiet: boolean): Promise<void> {
-  const now = await $.clock.now()
-  if (quiet && now - catalogCheckedAt < 3_600_000) return
-  catalogCheckedAt = now
-  const h = await home($)
-  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/exec.mjs`, 'catalog', 'refresh', '--provider', 'all',
+  try {
     // 120 s: room for exec.mjs's own limits (Codex 15 s, then the cache; 15 s per Claude Code binary scanned).
-    '--actor', 'panel'], 120_000)
-  const added = r.ok && /^added /.test(r.note)
-    ? r.note.replace(/^added /, '').replace(/;.*$/, '').split(/,\s*/).map(x => { const [p, m] = x.split('/'); return m ? modelName(p, m) : x }).join(', ')
-    : ''
-  if (!quiet || added || !r.ok) {
+    const r = await runJson($, 'exec.mjs', ['catalog', 'refresh', '--provider', 'all', '--actor', 'panel'], 120_000)
+    const names = r.ok && /^added /.test(r.note) ? r.note.replace(/^added /, '').replace(/;.*$/, '').split(/,\s*/) : []
+    const added = names.map(x => { const [p, m] = x.split('/'); return m ? modelName(p, m) : x }).join(', ')
     const text = !r.ok ? `Поиск моделей: ${r.note}` : added ? `В каталог добавлены: ${added}` : 'Новых моделей нет'
     const level = (r.ok ? 'success' : 'warning') as 'success' | 'warning'
     await update($, view, prev => ({ ...(prev ?? VIEW0), note: { text, level, at: Date.now() } }))
-  }
-  if (added) await poll($)
+  } finally { catalogBusy = false }
 }
 
-let cliLoadedAt = 0
 let cliLoading = false
 
-// Versions load by themselves when the pane first draws and every hour after, quietly; the button forces a refresh.
-async function loadCli($: EngineInterface, refresh: boolean, quiet = false): Promise<void> {
+async function loadCli($: EngineInterface, refresh: boolean): Promise<void> {
   if (cliLoading) return
   cliLoading = true
-  cliLoadedAt = Date.now()
-  try { await loadCliOnce($, refresh, quiet) } finally { cliLoading = false }
-}
-
-async function loadCliOnce($: EngineInterface, refresh: boolean, quiet: boolean): Promise<void> {
-  if (!quiet) await update($, view, prev => ({ ...(prev ?? VIEW0), busy: 'cli-status' }))
-  const h = await home($)
-  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/cli-update.mjs`, 'status', '--json',
-    ...(refresh ? ['--refresh'] : [])], 45_000)
-  const cli = (r.json as CliStatus | undefined)
-  await update($, view, prev => ({
-    ...(prev ?? VIEW0), busy: quiet ? prev?.busy ?? null : null, cli: cli?.codex || cli?.agy ? cli : prev?.cli ?? null,
-    ...(r.ok || quiet ? {} : { note: { text: `Проверка обновлений: ${r.note}`, level: 'warning' as const, at: Date.now() } }),
-  }))
+  try {
+    await update($, view, prev => ({ ...(prev ?? VIEW0), busy: 'cli-status' }))
+    const r = await runJson($, 'cli-update.mjs', ['status', '--json', ...(refresh ? ['--refresh'] : [])], 45_000)
+    const cli = (r.json as CliStatus | undefined)
+    await update($, view, prev => ({
+      ...(prev ?? VIEW0), busy: null, cli: cli?.codex || cli?.agy ? cli : prev?.cli ?? null,
+      ...(r.ok ? {} : { note: { text: `Проверка обновлений: ${r.note}`, level: 'warning' as const, at: Date.now() } }),
+    }))
+  } finally { cliLoading = false }
 }
 
 async function runUpdate($: EngineInterface, what: string, extra: string[]): Promise<void> {
   await update($, view, prev => ({ ...(prev ?? VIEW0), busy: `update-${what}`, confirm: null }))
-  const h = await home($)
-  const r = await runJson($, ['node', `${h}/.claude/scripts/conveyor/cli-update.mjs`, ...extra, '--confirm'], 600_000)
+  const r = await runJson($, 'cli-update.mjs', [...extra, '--confirm'], 600_000)
   await update($, view, prev => ({
     ...(prev ?? VIEW0), busy: null,
     note: { text: r.ok ? `Обновлено: ${r.note}` : `Не обновлено: ${r.note}`, level: (r.ok ? 'success' : 'error') as 'success' | 'error', at: Date.now() },
@@ -427,146 +335,164 @@ async function runUpdate($: EngineInterface, what: string, extra: string[]): Pro
   await loadCli($, false)
 }
 
-// ---- Heartbeat (only the installed panel writes it) ------------------------------------------------------------------
-
-const beat: Omit<SessionBeat, 'v' | 'sessionId' | 'name' | 'cwd' | 'updatedAt'> & { cwd: string } = {
-  state: 'idle', tool: null, turnSince: 0, idleSince: Date.now(), agents: [], cwd: '',
-}
-let beatSessionId = ''
-let lastLimits: ClaudeLimit[] = []
-let queuedBeat = false
-let lastBeatPoll = 0
-
-async function currentSessionId($: EngineInterface): Promise<string> {
-  const fromEnv = (await $.env.get('CLAUDE_CODE_SESSION_ID')) ?? ''
-  if (fromEnv) return fromEnv
-  try { return (await $.session.id()) ?? '' } catch { return '' }
-}
-
-async function initBeat($: EngineInterface, cwd?: string): Promise<void> {
-  if (!beatSessionId) beatSessionId = await currentSessionId($)
-  if (cwd) beat.cwd = cwd
-  if (!beat.cwd) {
-    try {
-      const r = await $.process.run(['node', '-e', 'process.stdout.write(process.cwd())'], { timeoutMs: 5000 })
-      if (r.exitCode === 0) beat.cwd = r.stdout.trim()
-    } catch {}
-  }
-}
-
-function queueBeat($: EngineInterface): void {
-  if (!WRITE_BEAT || queuedBeat) return
-  queuedBeat = true
-  const wait = Math.max(0, 1000 - (Date.now() - lastBeatPoll))
-  $.clock.after(wait, () => { queuedBeat = false; void poll($) })
-}
-
-async function beatPayload($: EngineInterface): Promise<string> {
-  await initBeat($)
-  lastBeatPoll = Date.now()
-  if (!beatSessionId || !/^[A-Za-z0-9._-]{1,128}$/.test(beatSessionId)) return ''
-  const out: SessionBeat = {
-    v: 1, sessionId: beatSessionId, name: sessionName(beat.cwd), cwd: beat.cwd, updatedAt: Date.now(),
-    state: beat.state, tool: beat.tool, turnSince: beat.turnSince, idleSince: beat.idleSince, agents: beat.agents,
-    ...(lastLimits.length ? { limits: lastLimits } : {}),
-  }
-  return JSON.stringify(out)
-}
-
 // ---- Hooks -----------------------------------------------------------------------------------------------------------
+
+let ticker: ReturnType<EngineInterface['clock']['every']> | null = null
+let paneOpen: boolean | null = null
+let visible = false
+let generation = 0
+let reading = false
+let sendingBeat = false
+let lastBeatAt = -Infinity
+
+function markHidden(): void {
+  visible = false
+  generation++
+  lastBeatAt = -Infinity
+}
+
+function stopTicker(): void {
+  markHidden()
+  ticker?.cancel()
+  ticker = null
+}
+
+async function checkVisibility($: EngineInterface, epoch: number): Promise<boolean> {
+  if (!ticker || epoch !== generation) return false
+  const panes = await $.ui.panes().catch(() => [])
+  if (!ticker || epoch !== generation) return false
+  const shown = panes.some(p => p.id === PANE && p.isPlaced && p.isShown)
+  if (!shown && visible) markHidden()
+  visible = shown
+  return shown
+}
+
+async function refreshSnapshot($: EngineInterface, epoch: number): Promise<void> {
+  reading = true
+  try {
+    let snapshot: Snapshot | null = null
+    let error = ''
+    try {
+      const home = await claudeHome($)
+      const run = await $.env.get('LUNA_RUN_DIR')
+      if (!await checkVisibility($, epoch)) return
+      const path = `${run || `${home}/luna-run`}/collector/snapshot.json`
+      snapshot = parseSnapshot(await $.fs.read(path))
+    } catch (caught) {
+      error = oneLine((caught as Error)?.message ?? caught, 200) || 'снимок сборщика недоступен'
+    }
+    if (epoch !== generation) return
+    const [own, sessionId, now] = await Promise.all([currentLimits($), currentSessionId($), $.clock.now()])
+    if (!await checkVisibility($, epoch)) return
+    if (snapshot && now - Date.parse(snapshot.collector?.publishedAt) > STALE_MS) error = 'снимок сборщика устарел'
+    // The newest data wins: a stale snapshot just read is still newer than the one shown before.
+    const latest = snapshot ?? (await read($, data))?.snapshot ?? null
+    await update($, data, prev => epoch !== generation ? prev ?? EMPTY : {
+      snapshot: latest,
+      claude: mergeClaudeLimits(own, latest?.claudeLimits ?? [], now),
+      error,
+      polledAt: now,
+      sessionId,
+    })
+  } finally { reading = false }
+}
+
+async function sendBeat($: EngineInterface, epoch: number, now: number): Promise<void> {
+  sendingBeat = true
+  lastBeatAt = now
+  try {
+    const run = await $.env.get('LUNA_RUN_DIR')
+    const path = `${run || `${await claudeHome($)}/luna-run`}/collector/discovery.json`
+    if (!await checkVisibility($, epoch)) return
+    const { version, port, token } = JSON.parse(await $.fs.read(path))
+    if (version !== 1 || !Number.isInteger(port) || port < 1 || port > 65535 ||
+        typeof token !== 'string' || !/^[a-f0-9]{32}$/i.test(token)) return
+    const [sessionId, limits] = await Promise.all([currentSessionId($), currentLimits($)])
+    if (!sessionId || !await checkVisibility($, epoch)) return
+    await $.http.fetch(`http://127.0.0.1:${port}/beat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-luna-token': token },
+      body: JSON.stringify({ sessionId, visible: true, limits }),
+    })
+  } catch {
+    // Discovery may be absent or replaced while the collector starts.
+  } finally { sendingBeat = false }
+}
+
+async function tick($: EngineInterface): Promise<void> {
+  const epoch = generation
+  const now = await $.clock.now()
+  if (!await checkVisibility($, epoch)) return
+  if (!sendingBeat && now - lastBeatAt >= BEAT_MS) void sendBeat($, epoch, now)
+  if (!reading) await refreshSnapshot($, epoch)
+}
+
+async function startTicker($: EngineInterface): Promise<void> {
+  if (ticker || !paneOpen) return
+  // The engine also disposes this timer when the hooks module unloads.
+  ticker = $.clock.every(POLL_MS, () => { void tick($).catch(() => {}) })
+  await tick($).catch(() => {})
+}
+
+async function openPane($: EngineInterface): Promise<void> {
+  const epoch = generation
+  paneOpen = true
+  await $.ui.open({ id: PANE, title: TITLE })
+  if (epoch === generation) await startTicker($)
+}
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({ name: COMMAND, description: 'Open the Luna pane (limits, executors, settings, updates)' })
-    if (e.cwd) beat.cwd = e.cwd
-    queueBeat($)
-    void $.ui.open({ id: PANE, title: TITLE })
-    void poll($)
-    void refreshCatalog($, true)
-    ensureTicker($)
+    void openPane($).catch(() => {})
     return started
   })
 
-  on('turn.start', async ($, e, next) => {
-    if (!e.agentId) { beat.state = 'thinking'; beat.tool = null; beat.turnSince = Date.now(); queueBeat($) }
-    ensureTicker($)
-    return next(e)
-  })
-
-  on('turn.complete', async ($, e, next) => {
-    const done = await next(e)
-    const agentId = (e as { agentId?: string }).agentId
-    if (agentId) beat.agents = beat.agents.filter(a => a.id !== agentId)
-    else { beat.state = 'idle'; beat.tool = null; beat.turnSince = 0; beat.idleSince = Date.now() }
-    queueBeat($)
-    return done
-  })
-
-  on('agent.spawn', async ($, e, next) => {
-    const spawned = await next(e)
-    const agentId = (spawned as { agentId?: string } | undefined)?.agentId
-    if (agentId) {
-      beat.agents = [...beat.agents.filter(a => a.id !== agentId),
-        { id: agentId, description: oneLine(e.description, 60), since: Date.now() }].slice(-20)
-      queueBeat($)
-    }
-    return spawned
-  })
-
-  on('tool.call', async ($, e, next) => {
-    const isMain = !(e as { agentId?: string }).agentId
-    if (isMain) {
-      beat.state = 'tool'
-      beat.tool = { name: e.tool, detail: toolDetail(e.tool, e as unknown as Record<string, unknown>), since: Date.now() }
-      queueBeat($)
-    }
-    try {
-      return await next(e)
-    } finally {
-      if (isMain && beat.state === 'tool') { beat.state = 'thinking'; beat.tool = null; queueBeat($) }
-    }
-  })
-
   on('command.run', { command: COMMAND }, async $ => {
-    closedByPerson = false
-    ensureTicker($)
-    await poll($)
-    await $.ui.open({ id: PANE, title: TITLE })
-    void refreshCatalog($, true)
+    await openPane($)
     return { text: 'Luna pane opened.' }
   })
 
-  on('prompt.submit', async ($, e, next) => {
-    const result = await next(e)
-    ensureTicker($)
-    if (!closedByPerson) {
-      try {
-        const shown = (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)
-        if (!shown) await $.ui.open({ id: PANE, title: TITLE })
-      } catch {}
-    }
-    return result
-  })
-
   on('session.attach', async ($, e, next) => {
+    const epoch = generation
     const attached = await next(e)
-    if (!closedByPerson) void $.ui.open({ id: PANE, title: TITLE })
-    ensureTicker($)
+    if (epoch === generation) void startTicker($)
     return attached
   })
 
-  on('ui.close', { id: PANE }, async ($, e, next) => {
-    if (e.origin.kind === 'person') closedByPerson = true
+  on('session.detach', async ($, e, next) => {
+    stopTicker()
+    const epoch = generation
+    const detached = await next(e)
+    if (e.reason === 'detach' && (await $.session.surfaces()).length && epoch === generation) void startTicker($)
+    return detached
+  })
+
+  on('session.end', ($, e, next) => {
+    if (e.reason !== 'clear') {
+      paneOpen = false
+      stopTicker()
+    }
+    return next(e)
+  })
+
+  on('ui.close', { id: PANE }, ($, e, next) => {
+    paneOpen = false
+    stopTicker()
     return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    // A reloaded module can inherit a pane without receiving session.start.
+    if (paneOpen === null) {
+      paneOpen = true
+      void startTicker($)
+    }
     const els = $.ui.resolve(e)
     const { Box, Text, Button, Select, Input } = els
     // Svg exists on the remote surfaces only; the terminal gets text meters instead.
     const Svg = 'Svg' in els ? els.Svg : null
-    ensureTicker($)
     const d = (await read($, data)) ?? EMPTY
     const folded = (await read($, collapsed)) ?? {}
     const v = (await read($, view)) ?? VIEW0
@@ -659,7 +585,8 @@ export const register: Register = on => {
       o?.catalog?.[provider]?.find(m => m.model === model)?.efforts ?? EFFORTS_ALL
     const modelOptions = () => {
       const all: { value: string; label: string }[] = []
-      for (const [provider, models] of Object.entries(o?.catalog ?? {})) {
+      // Gemini is out of the owner's setup: its catalog entries are kept on disk but never offered.
+      for (const [provider, models] of Object.entries(o?.catalog ?? {}).filter(([p]) => p !== 'gemini')) {
         for (const m of models) all.push({ value: `${provider}|${m.model}`, label: modelName(provider, m.model) })
       }
       // A label two providers share gets its provider, so the list stays unambiguous.
@@ -806,7 +733,7 @@ export const register: Register = on => {
       const hasError = alerts.some(a => a.level === 'error')
       const color = alerts.length === 0 ? 'success' : hasError ? 'error' : 'warning'
       const text = alerts.length === 0 ? 'в порядке' : hasError ? 'проблема' : 'внимание'
-      const free = snap?.ram.freeMb
+      const free = snap?.ram.freeMb ?? undefined
       return (
         <Box flexDirection="column">
           <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
@@ -821,8 +748,9 @@ export const register: Register = on => {
             <Tab id="tab-usage" hotkey="2" label="Расход" active={v.tab === 'usage'} onPress={() => void setView({ tab: 'usage' })} />
             <Tab id="tab-settings" hotkey="3" label="Настройки" active={v.tab === 'settings'} onPress={() => void setView({ tab: 'settings' })} />
             <Tab id="tab-updates" hotkey="4" label="Версии" active={v.tab === 'updates'}
-              onPress={() => { void setView({ tab: 'updates' }); if (!v.cli) void loadCli($, false) }} />
+              onPress={() => void setView({ tab: 'updates' })} />
           </Box>
+          {d.error ? <Text size="caption" color="warning" wrap="wrap">{COLLECTOR_HINT}</Text> : null}
           {v.note && Date.now() - v.note.at < 15_000 ? (
             <Box paddingTop={1}><Text size="caption" color={v.note.level} wrap="wrap">{v.note.level === 'success' ? `✓ Сохранено: ${v.note.text}` : v.note.text}</Text></Box>
           ) : null}
@@ -839,9 +767,9 @@ export const register: Register = on => {
       )
     }
 
-    const jobs = snap.jobs
+    // Gemini is out of the owner's setup: leftover Gemini jobs are not shown (and never labelled as another provider).
+    const jobs = (snap.jobs ?? []).filter(j => providerOf(j) !== 'gemini')
     const codex = snap.codexLimits
-    const gem = snap.gemini
     const room = Math.max(4, (e.viewport?.rows ?? 40) - 30)
 
     // ---- Overview ----
@@ -878,13 +806,6 @@ export const register: Register = on => {
         .sort((a, b) => (a.kind === 'five_hour' ? -1 : b.kind === 'five_hour' ? 1 : 0))
       const cx = [codex?.primary, codex?.secondary].filter((x): x is NonNullable<typeof x> => !!x)
         .sort((a, b) => (a.windowMins ?? 0) - (b.windowMins ?? 0))
-      const q = gem?.quota
-      // Gemini's own windows; `3p-*` are Antigravity's quotas for other vendors' models, which the harness never uses.
-      const allBuckets = q?.available ? q.buckets : []
-      const own = allBuckets.filter(x => /^gemini/i.test(x.name))
-      const buckets = (own.length ? own : allBuckets)
-        .sort((x, y) => (/5h/.test(x.name) ? -1 : /5h/.test(y.name) ? 1 : 0))
-      const bucketName = (name: string) => (/5h/.test(name) ? '5 ч' : /week/.test(name) ? 'неделя' : name.replace(/^gemini-/, '').slice(0, 7))
       const today = usage?.today
       return (
         <Section title="Лимиты">
@@ -902,23 +823,11 @@ export const register: Register = on => {
                 right={w.usedPercent >= thresholdPct ? `≥ порога ${thresholdPct}%` : resetShort(w.resetsAt) || `порог ${thresholdPct}%`} />
             )) : <LimitLine provider="Codex" showName window="" pct={null} right="нет данных" />}
           </Box>
-          <Rule />
-          <Box flexDirection="column">
-          {buckets.length ? buckets.map((b, i) => {
-            const used = b.usedPercent ?? (b.remainingFraction !== undefined ? (1 - b.remainingFraction) * 100 : null)
-            return <LimitLine provider="Gemini" showName={i === 0} window={bucketName(b.name)} pct={used} right={resetShort(b.resetAt)} />
-          }) : (
-            <LimitLine provider="Gemini" showName window="квота" pct={null}
-              color={gem?.available === false ? 'error' : 'success'}
-              right={!gem ? 'нет данных' : !gem.available ? `недоступен: ${reasonRu(gem.reason)}`
-                : q?.lastExhaustedAt ? `исчерпывался ${clock(q.lastExhaustedAt)}` : q?.reason ? 'остаток не прочитан' : 'нет данных о квоте'} />
-          )}
-          </Box>
           {today ? (
             <Box paddingTop={0}>
               <Button key="today-usage" plain onPress={() => void setView({ tab: 'usage' })}>
                 <Text size="caption" color="subtle" wrap="truncate-end">
-                  сегодня  Claude {tokens(tok(today.claude))} · Codex {tokens(tok(today.codex))} · Gemini {tokens(tok(today.gemini))} ток.  ›
+                  сегодня  Claude {tokens(tok(today.claude))} · Codex {tokens(tok(today.codex))} ток.  ›
                 </Text>
               </Button>
             </Box>
@@ -937,12 +846,42 @@ export const register: Register = on => {
       if (!o) return <Text size="caption" color="subtle">Оркестрация не настроена</Text>
       const last = snap.switches?.[0]
       const recent = last && now - Date.parse(last.at) < 6 * 3600_000
+      // Collapsed by default: the complex tier stays visible as the one-line summary; the state is remembered.
+      const open = folded['exec'] === undefined ? false : !folded['exec']
+      const tiers = Object.entries(o.chains)
+      const lead = tiers.find(([tier]) => tier === 'complex') ?? tiers[0]
+      const blocked = tiers.filter(([, chain]) => chain.length > 0 && !chain.some(c => c.available)).length
+      const panelCount = Object.keys(o.panels ?? {}).length
+      const plural = (n: number, one: string, few: string, many: string) =>
+        n % 10 === 1 && n % 100 !== 11 ? one : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? few : many
+      const more = [
+        tiers.length > 1 ? `ещё ${tiers.length - 1} ${plural(tiers.length - 1, 'уровень', 'уровня', 'уровней')}` : '',
+        panelCount ? `${panelCount} ${plural(panelCount, 'панель', 'панели', 'панелей')}` : '',
+      ].filter(Boolean).join(' · ')
       return (
-        <Section title="Исполнители" right={<Link id="exec-settings" label="настройки" tone="quiet" onPress={() => void setView({ tab: 'settings' })} />}>
-          {Object.entries(o.chains).map(([tier, chain], i) => (
+        <Card>
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+            <Button key="fold-exec" plain onPress={() => void update($, collapsed, prev => ({ ...(prev ?? {}), exec: open }))}>
+              <Text size="caption" weight="semibold" color="subtle">{'ИСПОЛНИТЕЛИ'}{open ? '  ⌄' : '  ›'}</Text>
+            </Button>
+            <Link id="exec-settings" label="настройки" tone="quiet" onPress={() => void setView({ tab: 'settings' })} />
+          </Box>
+          {!open ? (
+            <Box flexDirection="column">
+              {lead ? <TierLine tier={lead[0]} chain={lead[1]} /> : null}
+              {more || blocked ? (
+                <Button key="fold-exec-more" plain onPress={() => void update($, collapsed, prev => ({ ...(prev ?? {}), exec: open }))}>
+                  <Text size="caption" color="subtle" wrap="truncate-end">
+                    {more}{blocked ? <Text color="error">{`${more ? ' · ' : ''}без исполнителя: ${blocked}`}</Text> : null}
+                  </Text>
+                </Button>
+              ) : null}
+            </Box>
+          ) : null}
+          {open ? tiers.map(([tier, chain], i) => (
             <Box flexDirection="column" key={`tl-${tier}`}>{i > 0 ? <Rule /> : null}<TierLine tier={tier} chain={chain} /></Box>
-          ))}
-          {Object.keys(o.panels ?? {}).length ? (
+          )) : null}
+          {open && Object.keys(o.panels ?? {}).length ? (
             <Box flexDirection="column" marginTop={1}>
               <Text size="caption" color="subtle">Панели · все места работают одновременно</Text>
               {Object.entries(o.panels ?? {}).map(([name, seats]) => (
@@ -964,7 +903,7 @@ export const register: Register = on => {
               {clock(last.at)} {TIER_RU[last.tier] ?? last.tier}: {last.from} → {last.to}{last.reason ? ` (${reasonRu(last.reason)})` : ''}
             </Text>
           ) : null}
-        </Section>
+        </Card>
       )
     }
 
@@ -977,14 +916,13 @@ export const register: Register = on => {
       const doing = !isRunning || !a ? '' : cmd ? cmd.text
         : a.kind === 'thinking' ? 'думает' : a.kind === 'editing' ? `правит${a.text ? ` ${a.text}` : ''}`
         : a.kind === 'writing' ? 'пишет ответ' : a.kind === 'starting' ? 'запускается' : a.text || ''
-      const prov = providerOf(j)
       return (
         <Box flexDirection="column">
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Text size="footnote" wrap="truncate-end" dimColor={!isRunning}>
               <Text color={quiet ?? (isRunning ? 'success' : 'warning')}>{isRunning ? '▶' : '◷'} </Text>
-              <Text color={prov === 'gemini' ? 'suggestion' : 'subtle'}>{prov === 'gemini' ? 'Gemini' : 'Codex'} </Text>
-              <Text weight="medium">{modelName(j.provider, j.model).replace(/^Gemini /, '')}</Text>
+              <Text color="subtle">Codex </Text>
+              <Text weight="medium">{modelName(j.provider, j.model)}</Text>
               <Text color="subtle"> {j.effort} </Text>{jobName(j.out)}
             </Text>
             <Text size="caption" color={quiet ?? 'subtle'} tabular>
@@ -996,20 +934,44 @@ export const register: Register = on => {
       )
     }
 
+    const background = (b?: SessionBeat) => b?.background ?? []
+
+    // The session's plan: progress, the step in work, and what is left, in one or two quiet lines.
+    const PlanLine = ({ plan }: { plan: NonNullable<SessionBeat['plan']> }) => {
+      const finished = plan.done >= plan.total
+      const next = plan.items.find(i => i.status === 'pending')
+      return (
+        <Box flexDirection="column">
+          <Box flexDirection="row" gap={1}>
+            <Text size="caption" color={finished ? 'success' : 'subtle'} tabular>{`${plan.done}/${plan.total}`}</Text>
+            <Text size="footnote" wrap="truncate-end" dimColor={finished}>
+              {finished ? 'план выполнен' : plan.current ?? (next ? `дальше: ${next.content}` : 'план')}
+            </Text>
+          </Box>
+          {!finished && plan.current && next ? (
+            <Box paddingLeft={4}><Text size="caption" color="subtle" wrap="truncate-end">{`дальше: ${next.content}`}</Text></Box>
+          ) : null}
+        </Box>
+      )
+    }
+
     const Jobs = () => {
       const beats = snap.sessions ?? []
       const counts = {
         codex: jobs.filter(j => providerOf(j) === 'codex' && j.state === 'running').length,
-        gemini: jobs.filter(j => providerOf(j) === 'gemini' && j.state === 'running').length,
-        claude: beats.reduce((n, b) => n + (b.agents?.length ?? 0), 0),
+        claude: beats.reduce((n, b) => n + (b.agents?.length ?? 0) + background(b).length, 0),
       }
-      const showJob = (j: Job) => v.filter === 'all' || v.filter === providerOf(j)
-      const showAgents = v.filter === 'all' || v.filter === 'claude'
+      const filter = v.filter === 'gemini' ? 'all' : v.filter
+      const showJob = (j: Job) => filter === 'all' || filter === providerOf(j)
+      const showAgents = filter === 'all' || filter === 'claude'
       const visible = jobs.filter(showJob)
       const ids = [...new Set([...beats.map(b => b.sessionId), ...visible.map(j => j.owner).filter(Boolean)])]
       const all = ids.map(id => ({ id, beat: beats.find(b => b.sessionId === id), jobs: visible.filter(j => j.owner === id) }))
-      const busyNow = (g: (typeof all)[number]) => !!g.beat && now - g.beat.updatedAt <= 60_000 && g.beat.state !== 'idle'
-      const withWork = all.filter(g => g.jobs.length || (showAgents && (g.beat?.agents?.length ?? 0) > 0) || busyNow(g) || g.id === d.sessionId)
+      // Sessions in the snapshot are verified live by the collector: a quiet one is waiting, not gone.
+      const busyNow = (g: (typeof all)[number]) => !!g.beat && g.beat.state !== 'idle'
+      const planOpen = (b?: SessionBeat) => !!b?.plan && b.plan.total > 0 && b.plan.done < b.plan.total
+      const withWork = all.filter(g => g.jobs.length || (showAgents && ((g.beat?.agents?.length ?? 0) > 0 || background(g.beat).length > 0))
+        || (filter !== 'codex' && planOpen(g.beat)) || busyNow(g) || g.id === d.sessionId)
         .sort((a, b) => (a.id === d.sessionId ? -1 : b.id === d.sessionId ? 1 : 0) || (b.jobs.length - a.jobs.length))
       const idle = all.filter(g => !withWork.includes(g) && g.beat && now - g.beat.updatedAt <= 15 * 60_000)
       const orphans = visible.filter(j => !j.owner)
@@ -1019,7 +981,6 @@ export const register: Register = on => {
             <Box flexDirection="row" gap={0}>
               <Chip id="f-all" label="все" active={v.filter === 'all'} onPress={() => void setView({ filter: 'all' })} />
               <Chip id="f-codex" label={`Codex ${counts.codex}`} active={v.filter === 'codex'} onPress={() => void setView({ filter: 'codex' })} />
-              <Chip id="f-gemini" label={`Gemini ${counts.gemini}`} active={v.filter === 'gemini'} onPress={() => void setView({ filter: 'gemini' })} />
               <Chip id="f-claude" label={`Claude ${counts.claude}`} active={v.filter === 'claude'} onPress={() => void setView({ filter: 'claude' })} />
             </Box>
           } />
@@ -1029,24 +990,35 @@ export const register: Register = on => {
           {withWork.map(g => {
             const b = g.beat
             const isMe = g.id === d.sessionId
-            const stale = !b || now - b.updatedAt > 60_000
             const name = b?.name || projectOfJobs(g.jobs) || (isMe ? 'эта сессия' : 'без папки')
-            const state = !b ? '' : stale ? 'неактивна' : b.state === 'thinking' ? 'думает' : b.state === 'tool' && b.tool ? b.tool.name : 'ждёт вас'
-            const stateColor = !stale && b?.state === 'thinking' ? 'claude' : !stale && b?.state === 'idle' ? 'warning' : 'subtle'
+            const state = !b ? '' : b.state === 'thinking' ? 'думает' : b.state === 'tool' && b.tool ? b.tool.name : 'ждёт вас'
+            const stateColor = b?.state === 'thinking' ? 'claude' : b?.state === 'idle' ? 'warning' : 'subtle'
             const id = `s-${g.id}`
             const open = !folded[id]
+            const plan = filter !== 'codex' && b?.plan && b.plan.total > 0 ? b.plan : null
+            // Executor launches already have their own Codex row; the shell that waits for them adds nothing.
+            const bg = showAgents ? background(b).filter(x => x.kind !== 'executor' || g.jobs.length === 0) : []
+            const work = g.jobs.length + (showAgents ? b?.agents?.length ?? 0 : 0) + bg.length
+            const summary = [plan ? `${plan.done}/${plan.total}` : '', work ? `${work} в работе` : ''].filter(Boolean).join(' · ')
             return (
               <Card>
                 <Box flexDirection="row" justifyContent="space-between" gap={1}>
                   <Button key={`fold-${id}`} plain onPress={toggle(id)}>
                     <Text size="footnote" weight="semibold" wrap="truncate-end">{name}
-                      <Text size="caption" weight="regular" color="subtle">{isMe ? '  эта' : ''}{open ? '' : `  ${g.jobs.length} ›`}</Text>
+                      <Text size="caption" weight="regular" color="subtle">{isMe ? '  эта' : ''}{open ? '' : `  ${summary || 'нет задач'} ›`}</Text>
                     </Text>
                   </Button>
                   <Text size="caption" color={stateColor}>{state}</Text>
                 </Box>
                 {open ? (
                   <Box flexDirection="column" paddingLeft={1}>
+                    {plan ? <PlanLine plan={plan} /> : null}
+                    {bg.map(x => (
+                      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+                        <Text size="footnote" wrap="truncate-end"><Text color="subtle">{x.kind === 'monitor' ? '◉ монитор ' : '⟳ фон '}</Text>{x.text || 'команда'}</Text>
+                        <Text size="caption" color="subtle" tabular>{duration((now - x.since) / 1000)}</Text>
+                      </Box>
+                    ))}
                     {showAgents ? (b?.agents ?? []).map(a => (
                       <Box flexDirection="row" justifyContent="space-between" gap={1}>
                         <Text size="footnote" wrap="truncate-end"><Text color="claude">◇ Claude </Text>{a.description || 'агент'}</Text>
@@ -1099,12 +1071,11 @@ export const register: Register = on => {
       const PROV = [
         { key: 'claude', name: 'Claude', hex: '#d97757' },
         { key: 'codex', name: 'Codex', hex: '#8b949e' },
-        { key: 'gemini', name: 'Gemini', hex: '#4c8df6' },
       ] as const
       const today = usage.today ?? {}
       const week = usage.week ?? {}
       const days = (usage.days ?? []).slice(-7)
-      const dayTotal = (x: (typeof days)[number]) => tok(x.claude) + tok(x.codex) + tok(x.gemini)
+      const dayTotal = (x: (typeof days)[number]) => tok(x.claude) + tok(x.codex)
       const max = Math.max(1, ...days.map(dayTotal))
       // Seven stacked columns, one per day, providers in their own colour; drawn as one small SVG.
       const W = 220
@@ -1134,6 +1105,13 @@ export const register: Register = on => {
       const pct = (a: number, b: number) => (b ? `${Math.round((a / b) * 100)}%` : '')
       const todayAll = PROV.reduce((n, p) => n + tok(today[p.key]), 0)
       const weekAll = PROV.reduce((n, p) => n + tok(week[p.key]), 0)
+      // Only the providers shown above count, so every share is a share of the displayed week (Gemini history is left out).
+      const byModel = (usage.byModel7d ?? []).filter(m => m.provider !== 'gemini')
+      const byProject = (usage.byProject7d ?? [])
+        // A row without the per-provider split may include Gemini: it cannot be a share of this week, so it is left out.
+        .map(p => ({ ...p, total: (p.claude ?? 0) + (p.codex ?? 0) }))
+        .filter(p => p.total > 0).sort((a, b) => b.total - a.total)
+      const topJobs = (usage.topJobs ?? []).filter(j => j.provider === 'codex' || j.provider === 'claude')
       return (
         <Box flexDirection="column">
           <Section title="Сегодня" right={<Text size="caption" color="subtle" tabular>{tokens(todayAll)} ток.{usage.stale ? ' · обновляю' : ''}</Text>}>
@@ -1164,20 +1142,20 @@ export const register: Register = on => {
           {PROV.map(p => <Row label={p.name} value={tokens(tok(week[p.key]))} sub={pct(tok(week[p.key]), weekAll)} />)}
           </Section>
 
-          {(usage.byModel7d ?? []).length ? (
+          {byModel.length ? (
             <Section title="По моделям · 7 дней">
-              {(usage.byModel7d ?? []).slice(0, 6).map(m => <Row label={modelName(m.provider, m.model).slice(0, 9)} value={tokens(m.total)} sub={pct(m.total, weekAll)} />)}
+              {byModel.slice(0, 6).map(m => <Row label={modelName(m.provider, m.model).slice(0, 9)} value={tokens(m.total)} sub={pct(m.total, weekAll)} />)}
             </Section>
           ) : null}
-          {(usage.byProject7d ?? []).length ? (
+          {byProject.length ? (
             <Section title="По проектам · 7 дней">
-              {(usage.byProject7d ?? []).slice(0, 6).map(p => <Row label={shortProject(p.project).slice(0, 9)} value={tokens(p.total)} sub={pct(p.total, weekAll)} />)}
+              {byProject.slice(0, 6).map(p => <Row label={shortProject(p.project).slice(0, 9)} value={tokens(p.total)} sub={pct(p.total, weekAll)} />)}
             </Section>
           ) : null}
-          {(usage.topJobs ?? []).length ? (
+          {topJobs.length ? (
             <Section title="Самые тяжёлые задачи">
-              {(usage.topJobs ?? []).slice(0, 5).map(j => (
-                <Row label={j.provider === 'gemini' ? 'Gemini' : j.provider === 'codex' ? 'Codex' : 'Claude'} value={tokens(j.total)}
+              {topJobs.slice(0, 5).map(j => (
+                <Row label={j.provider === 'codex' ? 'Codex' : 'Claude'} value={tokens(j.total)}
                   sub={`${jobTitle(j.name, j.at)}${j.project ? ` · ${shortProject(j.project)}` : ''}`} />
               ))}
             </Section>
@@ -1262,14 +1240,14 @@ export const register: Register = on => {
             ))}
           </Fold>
           <Fold id="set-catalog" title="Каталог моделей" byDefault={false}>
-            {Object.entries(o.catalog ?? {}).map(([p, models]) => (
+            {Object.entries(o.catalog ?? {}).filter(([p]) => p !== 'gemini').map(([p, models]) => (
               <Box flexDirection="row" gap={1} key={`cat-${p}`}>
                 <Box width={7} flexShrink={0}><Text size="footnote" color="subtle">{p}</Text></Box>
                 <Box flexGrow={1} flexShrink={1}><Text size="footnote" wrap="wrap">{models.map(m => modelName(p, m.model)).join(' · ')}</Text></Box>
               </Box>
             ))}
             <Box flexDirection="row" alignItems="center" gap={1} paddingTop={1}>
-              <Select key="draft-provider" value={v.draftProvider} options={['codex', 'gemini', 'claude'].map(p => ({ value: p, label: p }))}
+              <Select key="draft-provider" value={v.draftProvider} options={['codex', 'claude'].map(p => ({ value: p, label: p }))}
                 onSelect={value => void setView({ draftProvider: value })} />
               <Box flexGrow={1} minWidth={14}>
                 <Input key="draft-model" placeholder="id новой модели" value={v.draftModel}
@@ -1289,7 +1267,7 @@ export const register: Register = on => {
                 onSubmit={value => void setView({ draftEfforts: value.replace(/\s+/g, '') })} />
             </Box>
             <Link id="catalog-refresh" label="найти новые модели Codex и Claude"
-              onPress={() => void refreshCatalog($, false)} />
+              onPress={() => void refreshCatalog($)} />
           </Fold>
         </Box>
       )
@@ -1298,7 +1276,9 @@ export const register: Register = on => {
     // ---- Updates tab ----
 
     const updates = () => {
-      const c = v.cli
+      const collected = snap?.cli
+      const c = v.cli && !(Date.parse(collected?.checkedAt ?? '') > Date.parse(v.cli.checkedAt ?? ''))
+        ? v.cli : collected
       const Card = ({ id, name, installed, latest, note, can, onUpdate, extra }: {
         id: string; name: string; installed?: string | null; latest?: string | null; note?: string; can: boolean
         onUpdate: () => void; extra?: RenderChildren
@@ -1328,7 +1308,6 @@ export const register: Register = on => {
         )
       }
       const cx = c?.codex
-      const ag = c?.agy
       return (
         <Box flexDirection="column">
           <Head text={c?.checkedAt ? `проверено в ${clock(c.checkedAt)}` : 'версии'}
@@ -1339,18 +1318,8 @@ export const register: Register = on => {
               cx?.expectedByHarness && cx.latest && cx.expectedByHarness !== cx.latest ? `харнесс закреплён на ${cx.expectedByHarness}` : '',
             ].filter(Boolean).join(' · ')}
             onUpdate={() => void runUpdate($, 'codex', ['update', 'codex', ...(cx?.latest ? ['--version', cx.latest] : [])])} />
-          <Card id="agy" name="Antigravity" installed={ag?.installed} latest={ag?.latest} can={!ag?.busy?.reason}
-            note={[
-              ag?.checksumOk === false ? 'сумма бинаря не совпадает: Gemini отключён' : ag?.checksumOk ? 'сумма закреплена' : '',
-              ag?.busy?.reason ? `занят: ${ag.busy.reason}` : '',
-            ].filter(Boolean).join(' · ')}
-            onUpdate={() => void runUpdate($, 'agy', ['update', 'agy', ...(ag?.latestUrl ? ['--url', ag.latestUrl] : [])])}
-            extra={ag?.rollbackAvailable ? (
-              <Link id="agy-rollback" tone="danger" label={armed('rollback-agy') ? 'точно откатить?' : 'откатить на прошлую версию'}
-                onPress={confirmThen('rollback-agy', () => void runUpdate($, 'agy-rollback', ['rollback', 'agy']))} />
-            ) : undefined} />
           <Box paddingTop={1}>
-            <Text size="caption" color="subtle" wrap="wrap">Codex ставится, когда демон свободен; Antigravity проверяется запуском до замены и откатывается при ошибке.</Text>
+            <Text size="caption" color="subtle" wrap="wrap">Codex ставится, когда демон свободен.</Text>
           </Box>
         </Box>
       )

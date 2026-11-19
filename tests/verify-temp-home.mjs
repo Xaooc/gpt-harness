@@ -32,7 +32,7 @@ function runInstaller(home, { platform = 'win32', check = false, dryRun = false 
     ...args,
   ], {
     cwd: REPO_ROOT, encoding: 'utf8', windowsHide: true, timeout: TIMEOUT, maxBuffer: 32 * 1024 * 1024,
-    env: { ...process.env, HOME: home, USERPROFILE: home },
+    env: { ...process.env, HOME: home, USERPROFILE: home, LUNA_INSTALL_NO_SUPERVISOR: '1' },
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);

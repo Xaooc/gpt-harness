@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { home as userHome, killTree, listProcesses, platform } from './lib/platform.mjs';
+import { run as runSupervised, startMaintenanceWatchdog } from '../lib/supervised-run.mjs';
 
 const updater = 'https://antigravity-cli-auto-updater-974169037036.us-central1.run.app';
 const registry = 'https://registry.npmjs.org/@openai%2Fcodex/latest';
@@ -57,9 +58,9 @@ function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       env: options.env || process.env, detached: platform !== 'win32',
-      stdio: ['pipe', options.stdoutFd ?? 'pipe', 'pipe']
+      stdio: ['ignore', options.stdoutFd ?? 'pipe', 'pipe']
     });
-    let stdout = '', stderr = '', failure = null, matched = false;
+    let stdout = '', stderr = '', failure = null;
     const stop = () => { try { killTree(child, 'SIGKILL'); } catch { child.kill('SIGKILL'); } };
     const timer = setTimeout(() => {
       failure = new Error(`${path.basename(command)} timed out after ${options.timeout || 10_000} ms`);
@@ -68,18 +69,25 @@ function run(command, args, options = {}) {
     child.stdout?.on('data', (chunk) => {
       stdout += chunk.toString();
       if (stdout.length > 4 * 1024 * 1024) { failure = new Error('command output too large'); stop(); }
-      else if (options.stopWhen?.(stdout)) { matched = true; stop(); }
     });
     child.stderr.on('data', (chunk) => { stderr = (stderr + chunk.toString()).slice(-8192); });
-    child.stdin.on('error', () => {});
     child.once('error', (error) => { failure = error; });
     child.once('close', (code) => {
       clearTimeout(timer);
       if (failure) reject(failure);
-      else resolve({ code: matched ? 0 : code, stdout, stderr });
+      else resolve({ code, stdout, stderr });
     });
-    child.stdin.end(options.input || '');
   });
+}
+
+async function runProbe(command, args, { timeout = 10_000, env, input, stopWhen } = {}) {
+  let matched = false;
+  const result = await runSupervised([command, ...args], {
+    deadlineMs: timeout, env, input, stopWhen: stopWhen && ((stdout) => (matched = stopWhen(stdout)))
+  });
+  if (result.timedOut) throw new Error(`${path.basename(command)} timed out after ${timeout} ms`);
+  if (result.truncated) throw new Error('command output too large');
+  return matched ? { ...result, code: 0 } : result;
 }
 
 function succeeded(result, label) {
@@ -108,7 +116,7 @@ async function fetchOfficial(value, output, redirects = 0) {
     '--proto', '=https', '--max-time', '20', '--write-out', '\n%{http_code}\n%{redirect_url}'];
   if (output) args.push('--output', output);
   args.push('--url', url.href);
-  const response = succeeded(await run('curl', args, { timeout: 20_000 }), 'download');
+  const response = succeeded(await runProbe('curl', args, { timeout: 20_000 }), 'download');
   const match = /\n(\d{3})\n([^\n]*)$/.exec(response);
   if (!match) throw new Error('invalid HTTP response');
   const status = Number(match[1]);
@@ -177,7 +185,7 @@ async function codexCommand() {
 }
 
 async function codexVersion() {
-  const text = succeeded(await run(await codexCommand(), ['--version']), 'codex --version');
+  const text = succeeded(await runProbe(await codexCommand(), ['--version']), 'codex --version');
   const version = /^codex(?:-cli)?\s+(\S+)/m.exec(text)?.[1];
   if (!versionPattern.test(version)) throw new Error('cannot parse codex --version');
   return version;
@@ -228,7 +236,7 @@ async function codexBusy() {
     const script = path.join(home(), '.claude', 'scripts', 'luna-daemon.mjs');
     if (await exists(script)) {
       for (const profile of ['default', 'net']) {
-        const response = await run(process.execPath, [script, '--status', '--profile', profile]);
+        const response = await runProbe(process.execPath, [script, '--status', '--profile', profile]);
         const parsed = daemonJobs(response.stdout);
         jobs += parsed.jobs.length;
         if (parsed.jobs.length) reasons.push(`${profile} daemon has running or queued jobs`);
@@ -302,7 +310,7 @@ async function agyVersion(sha256) {
   const input = `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize',
     params: { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'cli-update', version: '1.0' } } })}\n`;
   let version = null;
-  const response = await run(path.join(agyDir(), 'run-agy'), ['acp'], {
+  const response = await runProbe(path.join(agyDir(), 'run-agy'), ['acp'], {
     env: agyEnvironment(), input,
     stopWhen(text) {
       for (const line of text.split('\n').slice(0, -1)) {
@@ -575,4 +583,7 @@ export async function main(args = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) process.exitCode = await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  startMaintenanceWatchdog();
+  process.exitCode = await main();
+}

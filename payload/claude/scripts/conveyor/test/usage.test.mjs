@@ -12,7 +12,6 @@ import {
 process.env.TZ = 'America/New_York';
 const timeout = 600_000;
 const cli = fileURLToPath(new URL('../usage.mjs', import.meta.url));
-const overview = fileURLToPath(new URL('../../luna-overview.mjs', import.meta.url));
 
 function write(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -31,7 +30,6 @@ function fixture(t, now = Date.parse('2026-11-03T16:00:00Z')) {
     GEMINI_GATEWAY_USAGE_LOG: path.join(root, 'gateway', 'usage.jsonl'),
     LUNA_RUN_DIR: path.join(root, '.claude', 'luna-run'), LUNA_DAEMON_HOME: path.join(root, 'daemon') };
   env.LUNA_OVERVIEW_HOME = env.LUNA_RUN_DIR;
-  env.LUNA_GEMINI_QUOTA_CMD = path.join(root, 'missing-quota.mjs');
   const paths = usagePaths(env);
   return { root, env, paths, now, collect: () => collectUsage({ env, now }),
     cache: () => JSON.parse(fs.readFileSync(paths.cache, 'utf8')) };
@@ -339,64 +337,45 @@ test('Summary has seven ordered days, today/week totals, model/project rankings,
   assert.deepEqual(run(cli, ['summary'], f.env), summary);
 });
 
-test('Luna overview reads only cache and refreshes stale usage in one detached collector', { timeout }, async (t) => {
-  const f = fixture(t, Date.now()), marker = path.join(f.root, 'collector.jsonl'), done = path.join(f.root, 'done');
-  const stop = path.join(f.root, 'stop'), fake = path.join(f.root, 'fake-collector.mjs');
+test('Luna overview collect reads the usage cache without launching any process', { timeout }, (t) => {
+  const f = fixture(t, Date.now());
   const date = localDay(f.now), at = new Date(f.now).toISOString();
   const cache = { v: 1, at, days: { [date]: { claude: { byModel: { test: {
     input: 5, output: 2, cacheRead: 3, cacheWrite: 1, total: 11, messages: 1
   } }, byProject: { repo: 11 } } } }, topJobs: [] };
   write(f.paths.cache, JSON.stringify(cache));
   write(f.paths.state, '{invalid state must never be read on the poll path');
-  write(path.join(f.paths.run, 'reap-brokers.stamp'), '');
-  write(fake, [
-    "import fs from 'node:fs';", `import { acquireUsageLock } from ${JSON.stringify(new URL('../usage.mjs', import.meta.url).href)};`,
-    'const release = acquireUsageLock();', 'if (release) {',
-    "  const stat = fs.readFileSync('/proc/self/stat', 'utf8').split(') ')[1].split(' ');",
-    `  fs.appendFileSync(${JSON.stringify(marker)}, JSON.stringify({ pid: process.pid, session: Number(stat[3]),`,
-    "    args: process.argv.slice(2) }) + '\\n');",
-    '  const timer = setInterval(() => {', `    if (!fs.existsSync(${JSON.stringify(stop)})) return;`,
-    `    release(); fs.writeFileSync(${JSON.stringify(done)}, 'done'); clearInterval(timer);`, '  }, 20);',
-    '  setTimeout(() => { release(); process.exit(1); }, 60_000).unref();', '}'
-  ].join('\n'));
-  f.env.LUNA_USAGE_COLLECTOR = fake;
-  const fresh = run(overview, [], f.env);
-  assert.deepEqual(fresh.usage, { ...summarizeUsage(cache, f.now), stale: false });
-  assert.ok(!fs.existsSync(marker));
+  const source = `
+    import assert from 'node:assert/strict';
+    import childProcess from 'node:child_process';
+    import { syncBuiltinESMExports } from 'node:module';
+    const calls = [];
+    for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
+      childProcess[name] = () => { calls.push(name); throw new Error('unexpected child process'); };
+    }
+    syncBuiltinESMExports();
+    const { collect } = await import(${JSON.stringify(new URL('../../luna-overview.mjs', import.meta.url).href)});
+    const snapshot = await collect({ now: ${f.now}, platform: 'linux', claudeHome: process.env.CLAUDE_HOME_DIR });
+    assert.deepEqual(calls, []);
+    process.stdout.write(JSON.stringify(snapshot.usage));
+  `;
+  const readUsage = () => {
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', source], {
+      env: f.env, encoding: 'utf8', timeout
+    });
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    return JSON.parse(result.stdout);
+  };
+  assert.deepEqual(readUsage(), { ...summarizeUsage(cache, f.now), stale: false });
   cache.at = new Date(f.now - 61_000).toISOString();
   write(f.paths.cache, JSON.stringify(cache));
-  assert.equal(run(overview, [], f.env).usage.stale, false);
-  assert.ok(!fs.existsSync(marker));
+  assert.equal(readUsage().stale, false);
   cache.at = new Date(f.now - 121_000).toISOString();
   write(f.paths.cache, JSON.stringify(cache));
-  let pid;
-  const waitFor = async (file) => {
-    const deadline = Date.now() + timeout;
-    while (!fs.existsSync(file) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.ok(fs.existsSync(file), `missing ${path.basename(file)}`);
-  };
-  try {
-    const stale = run(overview, [], f.env);
-    assert.equal(stale.usage.stale, true);
-    assert.equal(stale.usage.today.claude.total, 11);
-    assert.ok(!fs.existsSync(done));
-    await waitFor(marker);
-    const child = JSON.parse(fs.readFileSync(marker, 'utf8').trim());
-    pid = child.pid;
-    assert.deepEqual(child.args, ['collect']);
-    assert.equal(child.session, child.pid);
-    assert.equal(run(overview, [], f.env).usage.stale, true);
-    assert.equal(fs.readFileSync(marker, 'utf8').trim().split('\n').length, 1);
-    write(stop, '');
-    await waitFor(done);
-    pid = undefined;
-    assert.ok(!fs.existsSync(f.paths.lock));
-    // A missing cache also returns an empty stale summary immediately.
-    fs.rmSync(f.paths.cache);
-    f.env.LUNA_USAGE_COLLECTOR = path.join(f.root, 'missing-collector.mjs');
-    assert.equal(run(overview, [], f.env).usage.today.claude.total, 0);
-  } finally {
-    write(stop, '');
-    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
-  }
+  const stale = readUsage();
+  assert.equal(stale.stale, true);
+  assert.equal(stale.today.claude.total, 11);
+  assert.ok(!fs.existsSync(f.paths.lock));
+  fs.rmSync(f.paths.cache);
+  assert.equal(readUsage().today.claude.total, 0);
 });

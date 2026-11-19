@@ -336,8 +336,30 @@ async function codexUsage(now) {
   return { ...limits, ageS, stale: ageS !== null && ageS > 1800, known: ageS !== null && ageS <= 1800 };
 }
 
-async function claudeUsage(now) {
-  const dir = path.join(paths().run, 'sessions');
+async function collectorClaudeLimits(run, now) {
+  // The collector publishes under the same run directory (LUNA_RUN_DIR, default ~/.claude/luna-run): reading the real
+  // home as well would make an isolated run (tests, a second run root) see this machine's live limits.
+  const roots = new Set([run]);
+  if (process.env.CLAUDE_HOME_DIR) roots.add(path.resolve(process.env.CLAUDE_HOME_DIR, 'luna-run'));
+  const snapshots = await Promise.all([...roots].map((root) => optionalJson(path.join(root, 'collector', 'snapshot.json'))));
+  const latest = new Map();
+  for (const snapshot of snapshots) {
+    const at = stamp(snapshot?.at);
+    if (!Number.isFinite(at) || now - at > 600_000 || !Array.isArray(snapshot.claudeLimits)) continue;
+    for (const limit of snapshot.claudeLimits) {
+      if (!object(limit) || typeof limit.kind !== 'string' || !Number.isFinite(limit.percentUsed)) continue;
+      if (limit.resetsAt != null && !(stamp(limit.resetsAt) > now)) continue;
+      const observed = stamp(limit.observedAt ?? snapshot.at);
+      if (!Number.isFinite(observed)) continue;
+      const previous = latest.get(limit.kind);
+      if (!previous || observed > previous.observed) latest.set(limit.kind, { limit, observed });
+    }
+  }
+  return [...latest.values()].map(({ limit }) => limit);
+}
+
+async function heartbeatClaudeLimits(run, now) {
+  const dir = path.join(run, 'sessions');
   let names;
   try { names = (await fs.readdir(dir)).filter((name) => name.endsWith('.json')); }
   catch (error) {
@@ -351,13 +373,25 @@ async function claudeUsage(now) {
         !Array.isArray(beat.limits)) continue;
     for (const limit of beat.limits) {
       if (!object(limit) || typeof limit.kind !== 'string' || !Number.isFinite(limit.percentUsed)) continue;
+      if (limit.resetsAt != null && !(stamp(limit.resetsAt) > now)) continue;
       if (!windows.has(limit.kind) || windows.get(limit.kind).percentUsed < limit.percentUsed) {
         windows.set(limit.kind, { ...limit, sessionId: beat.sessionId, updatedAt: beat.updatedAt });
       }
     }
   }
-  return { known: windows.size > 0, nearLimit: [...windows.values()].some((limit) => limit.percentUsed >= 95),
-    windows: [...windows.values()] };
+  return [...windows.values()];
+}
+
+async function claudeUsage(now) {
+  const run = paths().run;
+  const collected = await collectorClaudeLimits(run, now);
+  const reported = new Set(collected.map(({ kind }) => kind));
+  const heartbeat = await heartbeatClaudeLimits(run, now).catch((error) => {
+    if (!collected.length) throw error;
+    return [];
+  });
+  const windows = [...collected, ...heartbeat.filter(({ kind }) => !reported.has(kind))];
+  return { known: windows.length > 0, nearLimit: windows.some((limit) => limit.percentUsed >= 95), windows };
 }
 
 const used = (window) => Number.isFinite(window?.usedPercent) && window.usedPercent >= 0 ? window.usedPercent : null;
@@ -389,7 +423,9 @@ function thresholdState(config, usage, previous) {
 
 export async function providerState(config, { now = Date.now(), persist = true } = {}) {
   config ??= await loadConfig();
-  const [codex, claude] = await Promise.all([codexUsage(now), claudeUsage(now)]);
+  const [codexRead, claudeRead] = await Promise.allSettled([codexUsage(now), claudeUsage(now)]);
+  const codex = codexRead.value ?? { known: false, ageS: null, stale: false, primary: null, secondary: null };
+  const claude = claudeRead.value ?? { known: false, nearLimit: false, windows: [] };
   const resolve = async () => {
     const marks = await readProviders();
     const threshold = thresholdState(config, codex, marks.codex?.switched);

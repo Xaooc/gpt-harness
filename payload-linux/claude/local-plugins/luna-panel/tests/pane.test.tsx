@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import type { CliStatus, Snapshot } from '../types'
 import snapshot from './snapshot.fixture'
 
 const PLUGIN = 'luna-panel'
@@ -19,34 +20,68 @@ const PANE = {
 
 type Calls = string[][]
 
-// The engine beneath the plugin: processes answered from a fixture, every exec.mjs/cli-update.mjs call recorded.
-function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, cli: unknown = null, snap: unknown = snapshot,
-  shown = true) {
-  const clock = mock.clock(on)
-  on('env.get', (_, e) => ({ value: (e as { name?: string }).name === 'HOME' ? '/home/t' : undefined }))
+const START = Date.parse(snapshot.at)
+const RUN_DIR = '/test/run'
+const TOKEN = 'ab'.repeat(16)
+const LIMITS = [{ kind: 'seven_day', percentUsed: 69, resetsAt: '2026-11-19T22:00:00.000Z' }]
+
+function engine(on: Parameters<Parameters<typeof test>[1]>[1], calls: Calls, options: {
+  snapshot?: Snapshot
+  shown?: boolean
+  snapshotAge?: number | 'missing' | 'malformed' | 'wrong-version'
+} = {}) {
+  const snap = options.snapshot ?? snapshot
+  const clock = mock.clock(on, { now: START })
+  const reads: string[] = []
+  const beats: { at: number; url: string; init: unknown }[] = []
+  const pane = { shown: options.shown ?? true, checks: 0 }
+  mock.env(on, { HOME: '/home/t', LUNA_RUN_DIR: RUN_DIR })
   on('session.id', () => ({ value: 'sess-1' }))
-  on('session.usage', () => ({
-    value: { rateLimits: [{ kind: 'seven_day', percentUsed: 69, resetsAt: '2026-11-19T22:00:00.000Z' }] },
-  }))
+  on('session.usage', () => ({ value: { startedAt: START, context: { window: 200_000 }, rateLimits: LIMITS } }))
   on('command.register', () => ({ value: { command: 'luna' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.panes', () => ({ value: [{ id: PLUGIN, title: 'Luna', isShown: shown, isPlaced: true, isFocused: false }] }))
-  on('process.run', (_, e) => {
-    const argv = (e as { argv: readonly string[] }).argv
-    if (argv.some(a => a.endsWith('luna-overview.mjs'))) {
-      return { value: { exitCode: 0, stdout: JSON.stringify(snap), stderr: '' } }
-    }
-    if (argv.some(a => a.endsWith('exec.mjs')) || argv.some(a => a.endsWith('cli-update.mjs'))) {
-      calls.push([...argv])
-      const isStatus = argv.includes('status')
-      const isRefresh = argv.includes('refresh')
-      const out = isStatus && cli ? JSON.stringify(cli)
-        : JSON.stringify({ ok: true, changed: true, note: isRefresh ? 'added codex/gpt-7-sol, claude/fable' : 'ok' })
-      return { value: { exitCode: 0, stdout: out, stderr: '' } }
-    }
-    return { value: { exitCode: 0, stdout: '/home/t', stderr: '' } }
+  on('ui.close', () => {
+    pane.shown = false
+    return { value: null as unknown as void }
   })
-  return clock
+  on('ui.panes', () => {
+    pane.checks++
+    return { value: [{ id: PLUGIN, title: 'Luna', isShown: pane.shown, isPlaced: true, isFocused: false }] }
+  })
+  on('fs.read', (_, e) => {
+    reads.push(e.path)
+    if (e.path === `${RUN_DIR}/collector/snapshot.json`) {
+      if (options.snapshotAge === 'missing') return { deny: 'file missing' }
+      if (options.snapshotAge === 'malformed') return { value: '{' }
+      const age = typeof options.snapshotAge === 'number' ? options.snapshotAge : 0
+      const publishedAt = new Date(clock.now() - age).toISOString()
+      const version = options.snapshotAge === 'wrong-version' ? 1 : snap.version
+      return { value: JSON.stringify({ ...snap, version, collector: { ...snap.collector, publishedAt } }) }
+    }
+    if (e.path === `${RUN_DIR}/collector/discovery.json`) {
+      return { value: JSON.stringify({ ...snap.collector, version: 1, port: 12345, token: TOKEN, startedAt: snap.at }) }
+    }
+    return { deny: 'ENOENT' }
+  })
+  on('fs.exists', () => ({ value: options.snapshotAge !== 'missing' }))
+  on('http.fetch', (_, e) => {
+    beats.push({ at: clock.now(), url: e.url, init: e.init })
+    return { value: { ok: true, status: 204, headers: {}, text: '' } }
+  })
+  on('process.run', (_, { argv }) => {
+    calls.push([...argv])
+    const out = argv.includes('status') && snap.cli ? snap.cli : {
+      ok: true, changed: true, note: argv.includes('refresh') ? 'added codex/gpt-7-sol, claude/fable' : 'ok',
+    }
+    return { value: {
+      exitCode: 0, stdout: JSON.stringify(out), stderr: '', isStdoutTruncated: false, isStderrTruncated: false,
+    } }
+  })
+  on('process.spawn', async function* (_, { argv }) {
+    calls.push(['spawn', ...argv])
+    return { deny: 'unexpected process.spawn' }
+  })
+  return { clock, pane, reads, beats }
 }
 
 async function opened($: Parameters<Parameters<typeof test>[1]>[0], surface: 'terminal' | 'desktop') {
@@ -62,16 +97,27 @@ test('overview: every limit window, the active executor per tier, on every surfa
     expect(await ui.find({ type: 'Text', text: /Luna/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^Claude$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^Codex$/ })).toBeTruthy()
-    expect(await ui.find({ type: 'Text', text: /^Gemini$/ })).toBeTruthy()
-    // The active executor of the complex tier is named in full, version included.
+    // Gemini is out of the owner's setup: no Gemini row in the limits.
+    expect(await ui.find({ type: 'Text', text: /^Gemini$/ })).toBeFalsy()
+    // The executors card starts collapsed: the complex tier stays visible as the summary, named in full.
     expect(await ui.find({ type: 'Text', text: /^Sol 6\.1$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^Сложное\s*$/ })).toBeTruthy()
-    // Claude's five-hour window is shown from the session heartbeats, next to the week.
+    expect(await ui.find({ type: 'Text', text: /все места работают одновременно/ })).toBeFalsy()
+    expect(await ui.find({ type: 'Text', text: /ещё \d+ уров/ })).toBeTruthy()
+    // Claude's shared five-hour window is shown next to the local week.
     expect(await ui.find({ type: 'Text', text: /^5 ч/ })).toBeTruthy()
     // Groups inside a section card are separated by a drawn rule (text, so every surface shows it).
     expect(await ui.find({ type: 'Text', text: /^┈{20,}$/ })).toBeTruthy()
-    // Panels run all their seats at once; they are listed in the overview so they are never mistaken for chains.
+    // Expanding the card lists every tier and the panels, which run all their seats at once.
+    await ui.press({ key: 'fold-exec' })
     expect(await ui.find({ type: 'Text', text: /все места работают одновременно/ })).toBeTruthy()
+    await ui.press({ key: 'fold-exec' })
+    // A session row shows its plan (progress, current step, next step) and its background work.
+    expect(await ui.find({ type: 'Text', text: /^Чиню гейт$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^1\/4$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /дальше: Прогнать тесты/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Прогон затронутых тестов/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Ревью Astra/ })).toBeTruthy()
     await ui.unmount()
   }
 })
@@ -99,32 +145,33 @@ test('settings: an effort pick sends set-entry with that effort; a preset applie
   await ui.unmount()
 })
 
-test('catalog: opening the pane looks for new Codex and Claude models and names what joined', { timeoutMs: 15_000 }, async ($, on) => {
+test('catalog: the refresh link looks for new models and names what joined', async ($, on) => {
   const calls: Calls = []
-  // A hidden pane polls every 20 s instead of 5 s, which keeps simulating two hours cheap; the hourly check runs anyway.
-  const clock = engine(on, calls, null, snapshot, false)
+  engine(on, calls)
   const ui = await opened($, 'desktop')
-  const refreshes = () => calls.filter(c => c.includes('catalog') && c.includes('refresh'))
-  expect(refreshes()[0]?.join(' ')).toContain('catalog refresh --provider all --actor panel')
+  await ui.press({ key: 'tab-settings' })
+  await ui.press({ key: 'fold-set-catalog' })
+  expect(calls).toHaveLength(0)
+  await ui.press({ key: 'catalog-refresh' })
+  expect(calls[0]?.join(' ')).toContain('catalog refresh --provider all --actor panel')
   expect(await ui.find({ type: 'Text', text: /В каталог добавлены: Sol 7, Fable/ })).toBeTruthy()
-  // While the session runs it looks again every hour, not on every 5-second poll.
-  await clock.advance(30 * 60_000)
-  expect(refreshes().length).toBe(1)
-  await clock.advance(32 * 60_000)
-  expect(refreshes().length).toBe(2)
   await ui.unmount()
 })
 
 test('updates: an update needs a second press, and the second press runs it with --confirm', async ($, on) => {
   const calls: Calls = []
-  engine(on, calls, {
-    codex: { installed: '0.164.0', latest: '0.169.0', expectedByHarness: '0.164.0', updateAvailable: true, busy: { jobs: 0, reason: null } },
-    agy: { installed: '1.5.9', latest: '1.5.9', checksumOk: true, updateAvailable: false, busy: { jobs: 0, reason: null } },
+  const cli: CliStatus = {
+    codex: { installed: '0.164.0', latest: '0.169.0', expectedByHarness: '0.164.0', updateAvailable: true },
+    agy: { installed: '1.5.9', latest: '1.5.9', checksumOk: true, updateAvailable: false },
     checkedAt: '2026-11-16T14:45:17.526Z',
-  })
+  }
+  engine(on, calls, { snapshot: { ...snapshot, cli } })
   const ui = await opened($, 'desktop')
   await ui.press({ key: 'tab-updates' })
-  expect(calls.some(c => c.includes('status'))).toBe(true)
+  expect(calls).toHaveLength(0)
+  expect(await ui.find({ key: 'upd-codex' })).toBeTruthy()
+  await ui.press({ key: 'cli-refresh' })
+  expect(calls[0]?.slice(-3)).toEqual(['status', '--json', '--refresh'])
   await ui.press({ key: 'upd-codex' })
   expect(calls.some(c => c.includes('update'))).toBe(false)
   await ui.press({ key: 'upd-codex' })
@@ -136,24 +183,133 @@ test('updates: an update needs a second press, and the second press runs it with
 test('usage: today and the week per provider, with the heaviest jobs', async ($, on) => {
   const calls: Calls = []
   const tok = (total: number) => ({ total, input: total / 2, output: total / 10, cached: total / 3 })
-  engine(on, calls, null, {
+  engine(on, calls, { snapshot: {
     ...snapshot,
     usage: {
       at: '2026-11-16T15:17:00.000Z',
       today: { claude: tok(4_200_000), codex: tok(1_900_000), gemini: tok(6_900_000) },
       week: { claude: tok(31_000_000), codex: tok(12_000_000), gemini: tok(20_000_000) },
-      days: Array.from({ length: 7 }, (_, i) => ({ date: `2026-11-${10 + i}`, claude: 1_000_000 * i, codex: 500_000, gemini: 2_000_000 })),
+      days: Array.from({ length: 7 }, (_, i) => ({
+        date: `2026-11-${10 + i}`, claude: 1_000_000 * i, codex: 500_000, gemini: 2_000_000,
+      })),
       byModel7d: [{ provider: 'codex', model: 'gpt-6.1-sol', total: 9_000_000 }],
       byProject7d: [{ project: 'rpg', total: 22_000_000 }],
-      topJobs: [{ provider: 'gemini', model: 'gemini-3.8-flash', name: 'h2fix', project: 'gpt-harness', total: 3_400_000 }],
+      topJobs: [{ provider: 'codex', model: 'gpt-6.2-sol', name: 'h2fix', project: 'gpt-harness', total: 3_400_000 },
+        { provider: 'gemini', model: 'gemini-3.8-flash', name: 'oldgem', project: 'gpt-harness', total: 5_000_000 }],
     },
-  })
+  } })
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await opened($, surface)
     await ui.press({ key: 'tab-usage' })
     expect(await ui.find({ type: 'Text', text: /^СЕГОДНЯ$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^7 ДНЕЙ$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /h2fix/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /oldgem/ })).toBeFalsy()
     await ui.unmount()
   }
+})
+
+test('collector: visible pane reads and beats for two hours without starting processes', { timeoutMs: 120_000 }, async ($, on) => {
+  const calls: Calls = []
+  const { clock, reads, beats } = engine(on, calls)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.call', () => ({ deny: 'simulated tool call' }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('agent.spawn', () => ({ model: 'test', agentId: 'test-agent' }))
+  await $.session.start({ cwd: '/test/project', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  for (let i = 0; i < 200; i++) {
+    const turnId = `turn-${i}`
+    await $.turn.start({ turnId, text: 'test' })
+    await $.tool.call({ tool: 'Bash', command: 'true' })
+    await $.agent.spawn({ prompt: 'test', description: 'test agent' })
+    await $.turn.complete({ turnId, reason: 'answer', answer: '', durationMs: 0, isAborted: false })
+  }
+  expect(reads).toHaveLength(2)
+  expect(beats).toHaveLength(1)
+  await clock.advance(2 * 60 * 60_000)
+  expect(calls).toHaveLength(0)
+  expect(reads.filter(path => path.endsWith('/snapshot.json'))).toHaveLength(1441)
+  expect(beats).toHaveLength(361)
+  expect(beats.every((beat, i) => beat.at === START + i * 20_000)).toBe(true)
+  expect(beats[0]).toEqual({
+    at: START,
+    url: 'http://127.0.0.1:12345/beat',
+    init: {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-luna-token': TOKEN },
+      body: JSON.stringify({ sessionId: 'sess-1', visible: true, limits: LIMITS }),
+    },
+  })
+})
+
+test('collector: hiding a visible pane stops reads and beats', async ($, on) => {
+  const calls: Calls = []
+  const { clock, pane, reads, beats } = engine(on, calls)
+  await $.command.run({ command: 'luna', args: '' })
+  await clock.settle()
+  expect(reads).toHaveLength(2)
+  expect(beats).toHaveLength(1)
+  pane.shown = false
+  await clock.advance(65_000)
+  expect(reads).toHaveLength(2)
+  expect(beats).toHaveLength(1)
+  expect(calls).toHaveLength(0)
+})
+
+test('collector: a stale or missing snapshot keeps the last data and shows the start hint without launching', async ($, on) => {
+  const calls: Calls = []
+  const options: { snapshotAge: number | 'missing' } = { snapshotAge: 0 }
+  const { clock } = engine(on, calls, options)
+  const ui = await opened($, 'desktop')
+  const hint = /сборщик не отвечает — запустите: node ~\/\.claude\/scripts\/luna-collector\.mjs start/
+  expect(await ui.find({ type: 'Text', text: hint })).toBeFalsy()
+  for (const age of [31_000, 'missing'] as const) {
+    options.snapshotAge = age
+    await clock.advance(60_000)
+    expect(await ui.find({ type: 'Text', text: hint })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Данные не обновляются/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^Sol 6\.1$/ })).toBeTruthy()
+  }
+  expect(calls).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('collector: malformed and unsupported snapshots show the start hint in a cold pane', async ($, on) => {
+  const calls: Calls = []
+  const options: { snapshotAge: 'malformed' | 'wrong-version' } = { snapshotAge: 'malformed' }
+  const { clock } = engine(on, calls, options)
+  const ui = await opened($, 'desktop')
+  expect(await ui.find({ type: 'Text', text: /luna-collector\.mjs start/ })).toBeTruthy()
+  options.snapshotAge = 'wrong-version'
+  await clock.advance(5000)
+  expect(await ui.find({ type: 'Text', text: /luna-collector\.mjs start/ })).toBeTruthy()
+  expect(calls).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('collector: closing the pane cancels its ticker', {
+  plugins: [{
+    name: 'close-pane',
+    register(on) {
+      on('command.run', { command: 'close-luna' }, async $ => {
+        await $.ui.close({ id: 'luna-panel' })
+        return { text: 'closed' }
+      })
+    },
+  }],
+}, async ($, on) => {
+  const calls: Calls = []
+  const { clock, pane, reads, beats } = engine(on, calls)
+  await $.command.run({ command: 'luna', args: '' })
+  await clock.advance(5_000)
+  expect(reads).toHaveLength(3)
+  await $.command.run({ command: 'close-luna', args: '' })
+  const checks = pane.checks
+  await clock.advance(65_000)
+  expect(pane.checks).toBe(checks)
+  expect(reads).toHaveLength(3)
+  expect(beats).toHaveLength(1)
+  expect(calls).toHaveLength(0)
 })

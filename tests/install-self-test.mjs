@@ -90,6 +90,8 @@ export function selfTest({
       console.error(`[FAIL] ${name}: ${error.stack}`);
     }
   };
+  const previousNoSupervisor = process.env.LUNA_INSTALL_NO_SUPERVISOR;
+  process.env.LUNA_INSTALL_NO_SUPERVISOR = '1';
   try {
     const fixture = fakePayload(temp);
     const { payload, manifest } = fixture;
@@ -967,6 +969,44 @@ if (probe.keys) {
       assert.throws(() => install(winContext(fixture.options)), /array/);
       assert.deepEqual(snapshot(fixture.ctx.home), next);
     });
+    test('environment-overridden temp-home installs and uninstalls leave both supervisors alone', () => {
+      const fixture = isolated('collector-supervisor');
+      const { options, manifest } = fixture;
+      manifest.settingsSha256 = sha256(fs.readFileSync(path.join(options.payload, manifest.settings)));
+      manifest.claudeMdSha256 = sha256(fs.readFileSync(path.join(options.payload, manifest.claudeMd)));
+      atomicWrite(path.join(options.payload, 'manifest.json'), json(manifest));
+      const calls = [];
+      const supervisorRunner = (...args) => { calls.push(args); return { status: 1 }; };
+      const linux = overrides => makeContext({ ...options, platform: 'linux', supervisorRunner, ...overrides });
+      const unit = path.join(options.home, '.config', 'systemd', 'user', 'luna-collector.service');
+      const vars = ['HOME', 'USERPROFILE', 'LUNA_INSTALL_NO_SUPERVISOR'];
+      const previous = vars.map((key) => [key, process.env[key]]);
+      try {
+        delete process.env.LUNA_INSTALL_NO_SUPERVISOR;
+        process.env.HOME = process.env.USERPROFILE = options.home;
+        assert.equal(os.homedir(), options.home);
+        assert.notEqual(os.userInfo().homedir, options.home);
+        assert.equal(install(linux({ dryRun: true }), () => {}), 0);
+        assert.equal(fs.existsSync(unit), false);
+        assert.equal(install(linux(), () => {}), 0);
+        const bytes = fs.readFileSync(unit, 'utf8');
+        const node = JSON.stringify(process.execPath.replaceAll('%', '%%'));
+        const script = path.join(fixture.ch, 'scripts/luna-collector.mjs').replaceAll('%', '%%').replaceAll('$', '$$');
+        assert.ok(bytes.split('\n').includes(`ExecStart=${node} ${JSON.stringify(script)} run`));
+        assert.equal(readJson(path.join(fixture.ch, RECORD)).collectorUnitSha256, sha256(bytes));
+        assert.equal(install(linux({ uninstall: true })), 0);
+        assert.equal(fs.existsSync(unit), false);
+        const windows = winContext({ ...options, supervisorRunner });
+        assert.equal(install(windows, () => {}), 0);
+        assert.equal(install(winContext({ ...options, supervisorRunner, uninstall: true })), 0);
+        assert.deepEqual(calls, []);
+      } finally {
+        for (const [key, value] of previous) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    });
     test('uninstall round-trip restores exact settings and CLAUDE.md bytes and foreign hooks', () => {
       const fixture = isolated('uninstall');
       const settingsPath = path.join(fixture.ch, 'settings.json');
@@ -1087,6 +1127,8 @@ if (probe.keys) {
     console.log(`${failed ? 'FAIL' : 'PASS'}: ${passed} tests, ${failed} failures`);
     return failed ? 1 : 0;
   } finally {
+    if (previousNoSupervisor === undefined) delete process.env.LUNA_INSTALL_NO_SUPERVISOR;
+    else process.env.LUNA_INSTALL_NO_SUPERVISOR = previousNoSupervisor;
     fs.rmSync(temp, { recursive: true, force: true });
   }
 }

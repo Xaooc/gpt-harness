@@ -1,22 +1,20 @@
 #!/usr/bin/env node
-// Fast Luna/Codex status with stale-index cleanup; Node 20, no dependencies; starts the detached broker reaper.
-// Usage: node luna-overview.mjs [--pretty | --human | --self-test] [--beat  (heartbeat JSON on stdin)]
-// LUNA_OVERVIEW_HOME overrides the run root; LUNA_DAEMON_HOME independently overrides daemon discovery.
+// Read the Luna collector snapshot or collect a diagnostic sample in-process.
+// Usage: node luna-overview.mjs [--json | --pretty | --human] [--collect | --self-test]
 import * as fs from 'node:fs/promises';
-import { totalmem, homedir, tmpdir, uptime } from 'node:os';
+import { freemem, totalmem, homedir, tmpdir, uptime } from 'node:os';
 import path from 'node:path';
 import { availableMemory, matchingProcess, readProcess } from './lib/luna-runtime.mjs';
 import assert from 'node:assert/strict';
-import { statSync } from 'node:fs';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   loadConfigWithSource, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
 } from './conveyor/lib/orchestration.mjs';
 import { summarizeUsage, usagePaths } from './conveyor/usage.mjs';
-import { quotaPaths, quotaRefreshLocked } from './conveyor/gemini-quota.mjs';
+import { quotaPaths } from './conveyor/gemini-quota.mjs';
 
 const DEADLINE_MS = 1750;
+const MAX_SNAPSHOT_BYTES = 3 * 1024 * 1024;
 const TAIL_BYTES = 64 * 1024;
 const ACTIVE_LIMIT = 200;
 const LEGACY_MAX_AGE_MS = 10 * 60 * 1000;
@@ -34,14 +32,28 @@ const cleanText = (value, max) => value.replace(/[\u0000-\u001f\u007f-\u009f]/g,
 const localPath = (value) => typeof value === 'string' && path.isAbsolute(value) &&
   !value.startsWith('//') && !value.includes('\0');
 
-function configuration() {
-  const home = path.resolve(process.env.HOME || homedir());
-  const run = path.resolve(process.env.LUNA_OVERVIEW_HOME || process.env.LUNA_RUN_DIR || path.join(home, '.claude', 'luna-run'));
+async function allReads(reads) {
+  const results = await Promise.allSettled(reads);
+  return results.map((result) => {
+    if (result.status === 'rejected') throw result.reason;
+    return result.value;
+  });
+}
+
+function runDirectory(claudeHome) {
+  return path.resolve(process.env.LUNA_RUN_DIR || process.env.LUNA_OVERVIEW_HOME || path.join(claudeHome, 'luna-run'));
+}
+
+function snapshotFile(run) {
+  return path.join(run, 'collector', 'snapshot.json');
+}
+
+function configuration(claudeHome = path.join(homedir(), '.claude'), platform = process.platform, run = runDirectory(claudeHome)) {
   return {
-    run, daemon: path.resolve(process.env.LUNA_DAEMON_HOME || run),
-    registry: path.join(home, '.claude', 'learning', 'jobs.jsonl'),
-    codexConfig: path.join(home, '.codex', 'config.toml'),
-    geminiStatus: '/srv/docker/compose/antigravity-parallel/data/status.json'
+    claudeHome, platform, run, localPath, daemon: path.resolve(process.env.LUNA_DAEMON_HOME || run),
+    registry: path.join(claudeHome, 'learning', 'jobs.jsonl'),
+    codexConfig: path.join(process.env.CODEX_HOME || path.join(path.dirname(claudeHome), '.codex'), 'config.toml'),
+    geminiStatus: platform === 'linux' ? '/srv/docker/compose/antigravity-parallel/data/status.json' : null
   };
 }
 
@@ -71,34 +83,27 @@ async function readText(file, limit = 1024 * 1024) {
   finally { if (handle) await handle.close().catch(() => {}); }
 }
 
-async function readJson(file) {
+async function readJson(file, limit) {
   try {
-    const value = JSON.parse(await readText(file));
+    const value = JSON.parse(await readText(file, limit));
     return object(value) ? value : null;
   } catch { return null; }
 }
 
-async function usageStatus(now) {
-  const paths = usagePaths(), cache = await readJson(paths.cache);
+async function usageStatus(now, config) {
+  const cache = await readJson(usagePaths({ ...process.env, CLAUDE_HOME_DIR: config.claudeHome }).cache);
   const usage = summarizeUsage(cache?.v === 1 ? cache : null, now);
   usage.stale = !Number.isFinite(Date.parse(usage.at)) || now - Date.parse(usage.at) > 120_000;
-  if (usage.stale) {
-    const owner = await readJson(path.join(paths.lock, 'owner.json'));
-    if (!owner || !matchingProcess(owner.pid, owner.start)) {
-      try {
-        // Override supports an isolated fake collector; real collectors serialize on usage-state.json.lock.
-        const collector = process.env.LUNA_USAGE_COLLECTOR || fileURLToPath(new URL('./conveyor/usage.mjs', import.meta.url));
-        const child = spawn(process.execPath, [collector, 'collect'], { detached: true, stdio: 'ignore', windowsHide: true });
-        child.on('error', () => {});
-        child.unref();
-      } catch {}
-    }
-  }
   return usage;
 }
 
-async function geminiQuotaStatus(now) {
-  const cache = await readJson(quotaPaths().cache);
+async function geminiQuotaStatus(now, config) {
+  if (config.platform !== 'linux') {
+    return { available: false, reason: 'live Gemini quota is Linux-only', buckets: [], at: null };
+  }
+  const cache = await readJson(quotaPaths({
+    ...process.env, CONVEYOR_HOME: process.env.CONVEYOR_HOME || path.join(config.claudeHome, 'conveyor')
+  }).cache);
   const age = now - Date.parse(cache?.at);
   const quota = {
     available: cache?.available === true, buckets: Array.isArray(cache?.buckets) ? cache.buckets.map((bucket) => ({
@@ -111,17 +116,7 @@ async function geminiQuotaStatus(now) {
     ...(string(cache?.lastExhaustedAt || cache?.proxy?.lastExhaustedAt)
       ? { lastExhaustedAt: cache.lastExhaustedAt || cache.proxy.lastExhaustedAt } : {})
   };
-  if ((!Number.isFinite(age) || age < 0 || age > 600_000) && !quotaRefreshLocked()) {
-    try {
-      const refresher = process.env.LUNA_GEMINI_QUOTA_CMD ||
-        fileURLToPath(new URL('./conveyor/gemini-quota.mjs', import.meta.url));
-      const child = spawn(process.execPath, [refresher, '--json', '--refresh'], {
-        detached: true, stdio: 'ignore', windowsHide: true
-      });
-      child.on('error', () => {});
-      child.unref();
-    } catch {}
-  }
+  if (!Number.isFinite(age) || age < 0 || age > 600_000) quota.stale = true;
   return quota;
 }
 
@@ -158,15 +153,15 @@ function statusValues(text) {
   return values;
 }
 
-async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
+async function activeJobs(run, now, boot = Date.now() - uptime() * 1000, signal) {
   const directory = path.join(run, 'active');
   let entries;
   try { entries = await fs.readdir(directory, { withFileTypes: true }); }
   catch { return []; }
   const recent = [];
   let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(8, entries.length) }, async () => {
-    while (cursor < entries.length) {
+  await allReads(Array.from({ length: Math.min(8, entries.length) }, async () => {
+    while (cursor < entries.length && !signal?.aborted) {
       const entry = entries[cursor++];
       if (!entry.isFile()) continue;
       const file = path.join(directory, entry.name);
@@ -178,8 +173,8 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
   const jobs = [];
   cursor = 0;
   // Bound filesystem concurrency even when many stale wrapper entries remain.
-  await Promise.all(Array.from({ length: Math.min(8, entries.length) }, async () => {
-    while (cursor < entries.length) {
+  await allReads(Array.from({ length: Math.min(8, entries.length) }, async () => {
+    while (cursor < entries.length && !signal?.aborted) {
       const { file } = entries[cursor++];
       const text = await readText(file, 32 * 1024);
       const [out, pidLine, pidStart] = text?.split(/\r?\n/).map((line) => line.trim()) || [];
@@ -188,26 +183,17 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
       if (pidLine) {
         const pid = Number(pidLine);
         if (Number.isSafeInteger(pid) && pid > 0) {
-          if (!matchingProcess(pid, pidStart)) {
-            await fs.unlink(file).catch(() => {});
-            continue;
-          }
+          if (!matchingProcess(pid, pidStart)) continue;
         }
       } else {
         let stat;
         try { stat = await fs.stat(`${out}.status`); } catch {}
-        if (!stat || now - stat.mtimeMs > LEGACY_MAX_AGE_MS) {
-          await fs.unlink(file).catch(() => {});
-          continue;
-        }
+        if (!stat || now - stat.mtimeMs > LEGACY_MAX_AGE_MS) continue;
       }
       const status = await readText(`${out}.status`, TAIL_BYTES);
       if (status === null) continue;
       const values = statusValues(status);
-      if (Date.parse(values.started) < boot) {
-        await fs.unlink(file).catch(() => {});
-        continue;
-      }
+      if (Date.parse(values.started) < boot) continue;
       if (terminal.has(values.state)) continue;
       const queue = values.queue_pos;
       const activity = await logActivity(`${out}.log`, now, values.state || '');
@@ -224,30 +210,22 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000) {
   return jobs.sort(newest).slice(0, 40);
 }
 
-async function geminiActiveJobs(run, now) {
-  const directory = path.join(run, 'gem-active');
+async function geminiActiveJobs(config, now, wrapperStart, signal) {
+  const directory = path.join(config.run, 'gem-active');
   let names;
   try { names = (await fs.readdir(directory)).filter((name) => name.endsWith('.json')).slice(0, ACTIVE_LIMIT); }
   catch { return { jobs: [], statuses: new Map() }; }
   const jobs = [], statuses = new Map();
   let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(8, names.length) }, async () => {
-    while (cursor < names.length) {
+  await allReads(Array.from({ length: Math.min(8, names.length) }, async () => {
+    while (cursor < names.length && !signal.aborted) {
       const file = path.join(directory, names[cursor++]);
       const pointer = await readJson(file);
-      if (!pointer || pointer.v !== 1 || !localPath(pointer.out)) continue;
-      const wrapper = readProcess(pointer.wrapper_pid);
-      if (!wrapper || wrapper.state === 'Z') {
-        await fs.unlink(file).catch(() => {});
-        continue;
-      }
+      if (!pointer || pointer.v !== 1 || !config.localPath(pointer.out)) continue;
       const text = await readText(`${pointer.out}.status`, TAIL_BYTES);
       if (text === null) continue;
       const values = statusValues(text);
-      if (values.wrapper_start && values.wrapper_start !== wrapper.started) {
-        await fs.unlink(file).catch(() => {});
-        continue;
-      }
+      if (!(await wrapperStart(pointer.wrapper_pid, values.wrapper_start))) continue;
       if (values.provider !== 'gemini') continue;
       statuses.set(pointer.out, values);
       if (terminal.has(values.state)) continue;
@@ -267,16 +245,16 @@ async function geminiActiveJobs(run, now) {
   return { jobs: jobs.sort(newest).slice(0, 40), statuses };
 }
 
-async function geminiUsage(config, now, active) {
+async function geminiUsage(config, now, active, signal) {
   const midnight = new Date(now);
   midnight.setHours(0, 0, 0, 0);
   const statuses = new Map((await active).statuses);
   const records = jsonLines(await readTail(config.registry, 64 * 1024 * 1024));
-  const outputs = [...new Set(records.filter((record) => localPath(record.out) &&
+  const outputs = [...new Set(records.filter((record) => config.localPath(record.out) &&
     !(Date.parse(record.finished) < midnight.getTime())).map((record) => record.out))];
   let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(8, outputs.length) }, async () => {
-    while (cursor < outputs.length) {
+  await allReads(Array.from({ length: Math.min(8, outputs.length) }, async () => {
+    while (cursor < outputs.length && !signal.aborted) {
       const out = outputs[cursor++];
       if (statuses.has(out)) continue;
       const text = await readText(`${out}.status`, TAIL_BYTES);
@@ -295,7 +273,8 @@ async function geminiUsage(config, now, active) {
 }
 
 async function geminiMcp(config) {
-  const [status, toml] = await Promise.all([readJson(config.geminiStatus), readText(config.codexConfig)]);
+  if (!config.geminiStatus) return null;
+  const [status, toml] = await allReads([readJson(config.geminiStatus), readText(config.codexConfig)]);
   if (!status) return null;
   return {
     configured: /^[ \t]*\[[ \t]*mcp_servers\.(?:antigravity-parallel|"antigravity-parallel"|'antigravity-parallel')[ \t]*\]/m
@@ -305,35 +284,31 @@ async function geminiMcp(config) {
   };
 }
 
-async function orchestrationStatus(snapshot, now) {
-  try {
-    const { config, source } = await loadConfigWithSource();
-    const state = await providerState(config, { now, persist: false });
-    const chains = Object.create(null), panels = Object.create(null);
-    for (const tier of Object.keys(config.tiers)) {
-      const resolved = await resolveChain(tier, { config, state, now });
-      chains[tier] = resolved.chain.map((entry) => ({ ...entry, selected: entry === resolved.selected }));
-    }
-    for (const panel of Object.keys(config.panels)) {
-      panels[panel] = (await resolvePanel(panel, { config, state, now })).seats;
-    }
-    const marks = Object.fromEntries(Object.entries(state.providers).map(([provider, mark]) => [provider, {
-      until: string(mark.until) || null, reason: string(mark.reason) || null
-    }]));
-    snapshot.orchestration = {
-      source, chains, panels, threshold: { ...config.thresholds.codex, switched: state.threshold.switched }, marks,
-      presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
-      catalog: config.catalog, configError: null
-    };
-    // Resolve an availability probe even when no configured tier or panel currently uses Gemini.
-    const model = config.catalog.gemini[0];
-    const probe = { tiers: { gemini: [{ provider: 'gemini', model: model.model, effort: model.efforts[0] }] } };
-    const entry = (await resolveChain('gemini', { config: probe, state, now })).chain[0];
-    Object.assign(snapshot.gemini, { available: entry.available, reason: entry.reason });
-  } catch (error) {
-    snapshot.orchestration.configError = cleanText(String(error.message), 500);
-    snapshot.gemini.reason = snapshot.orchestration.configError;
+async function orchestrationStatus(snapshot, now, includeGemini) {
+  const { config, source } = await loadConfigWithSource();
+  const state = await providerState(config, { now, persist: false });
+  const chains = Object.create(null), panels = Object.create(null);
+  for (const tier of Object.keys(config.tiers)) {
+    const resolved = await resolveChain(tier, { config, state, now });
+    chains[tier] = resolved.chain.map((entry) => ({ ...entry, selected: entry === resolved.selected }));
   }
+  for (const panel of Object.keys(config.panels)) {
+    panels[panel] = (await resolvePanel(panel, { config, state, now })).seats;
+  }
+  const marks = Object.fromEntries(Object.entries(state.providers).map(([provider, mark]) => [provider, {
+    until: string(mark.until) || null, reason: string(mark.reason) || null
+  }]));
+  snapshot.orchestration = {
+    source, chains, panels, threshold: { ...config.thresholds.codex, switched: state.threshold.switched }, marks,
+    presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
+    catalog: config.catalog, configError: null
+  };
+  if (!includeGemini) return;
+  // Resolve an availability probe even when no configured tier or panel currently uses Gemini.
+  const model = config.catalog.gemini[0];
+  const probe = { tiers: { gemini: [{ provider: 'gemini', model: model.model, effort: model.efforts[0] }] } };
+  const entry = (await resolveChain('gemini', { config: probe, state, now })).chain[0];
+  Object.assign(snapshot.gemini, { available: entry.available, reason: entry.reason });
 }
 
 async function switches() {
@@ -404,10 +379,10 @@ function missingActivity(state = '') {
     text: queued ? state : '', sinceS: null } };
 }
 
-async function fetchJson(info, route) {
+async function fetchJson(info, route, signal) {
   try {
     const response = await fetch(`http://127.0.0.1:${info.port}${route}`, {
-      headers: { 'X-Luna-Token': info.token }, signal: AbortSignal.timeout(1000), redirect: 'error'
+      headers: { 'X-Luna-Token': info.token }, signal, redirect: 'error'
     });
     if (!response.ok) {
       await response.body?.cancel();
@@ -416,6 +391,48 @@ async function fetchJson(info, route) {
     const value = await response.json();
     return object(value) ? value : null;
   } catch { return null; }
+}
+
+async function readDaemonJobs(info, signal) {
+  const response = await fetch(`http://127.0.0.1:${info.port}/jobs`, {
+    headers: { 'X-Luna-Token': info.token }, signal, redirect: 'error'
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`/jobs returned HTTP ${response.status}`);
+  }
+  const list = await response.json().catch(() => null);
+  if (!Array.isArray(list?.jobs) || !list.jobs.every((job) => object(job) && string(job.id) && string(job.state))) {
+    throw new Error('/jobs returned an invalid job listing');
+  }
+  return list;
+}
+
+async function sampleDaemonJobs(info, signal, now, profile, result, previous, failures) {
+  try {
+    const list = await readDaemonJobs(info, signal);
+    result.jobs = daemonJobs(list.jobs, now, profile);
+    if (object(list.owners)) {
+      result.owners = Object.entries(list.owners).map(([owner, counts]) => ({
+        owner, running: number(counts?.running), queued: number(counts?.queued)
+      }));
+    }
+  } catch (error) {
+    result.jobs = previous?.jobs ?? [];
+    result.owners = previous?.owners ?? [];
+    failures[profile] = `${profile} daemon ${error.message}`;
+  }
+}
+
+function markDaemonJobs(snapshot, previous, failures) {
+  const reasons = Object.values(failures);
+  if (!reasons.length) return;
+  const prior = previous?.sections?.jobs;
+  const existing = snapshot.sections?.jobs;
+  (snapshot.sections ??= {}).jobs = {
+    attemptAt: snapshot.at, okAt: prior?.okAt ?? null, staleAfterMs: prior?.staleAfterMs ?? DEADLINE_MS,
+    status: prior?.okAt ? 'stale' : 'unavailable', reason: [...reasons, existing?.reason].filter(Boolean).join('; ')
+  };
 }
 
 function daemonJobs(list, now, profile) {
@@ -433,7 +450,7 @@ function daemonJobs(list, now, profile) {
     })).sort(newest).slice(0, 30);
 }
 
-async function daemonStatus(directory, now, snapshot, profile) {
+async function daemonStatus(directory, now, snapshot, profile, signal, previous, failures = {}) {
   const info = await readJson(path.join(directory, 'daemon.json'));
   if (!info || !matchingProcess(info.pid, info.pid_start)) return;
   const result = {
@@ -442,11 +459,14 @@ async function daemonStatus(directory, now, snapshot, profile) {
   };
   snapshot.daemon = result;
   if (!Number.isInteger(info.port) || info.port < 1 || info.port > 65535 || typeof info.token !== 'string') {
+    failures[profile] = `${profile} daemon discovery has no valid /jobs endpoint`;
+    result.jobs = previous?.jobs ?? [];
     return;
   }
-  // The independent 1 s deadlines overlap, rather than consuming the entire 2 s budget in sequence.
-  await Promise.all([
-    fetchJson(info, '/health').then((health) => {
+  const timeout = AbortSignal.timeout(1000);
+  const fetchSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  await allReads([
+    fetchJson(info, '/health', fetchSignal).then((health) => {
       result.healthy = health?.ok === true;
       result.appServer = ['up', 'down', 'restarting'].includes(health?.appServer) ? health.appServer : null;
       result.uptimeS = number(health?.uptimeS) ?? result.uptimeS;
@@ -454,22 +474,15 @@ async function daemonStatus(directory, now, snapshot, profile) {
       result.runningJobs = number(health?.jobs?.running);
       result.queuedJobs = number(health?.jobs?.queued);
     }),
-    fetchJson(info, '/jobs').then((list) => {
-      result.jobs = daemonJobs(list?.jobs, now, profile);
-      if (object(list?.owners)) {
-        result.owners = Object.entries(list.owners).map(([owner, counts]) => ({
-          owner, running: number(counts?.running), queued: number(counts?.queued)
-        }));
-      }
-    })
+    sampleDaemonJobs(info, fetchSignal, now, profile, result, previous, failures)
   ]);
 }
 
-async function daemonProfiles(directory, now, snapshot) {
+async function daemonProfiles(directory, now, snapshot, signal, previous, failures) {
   const defaults = empty(now), net = empty(now);
-  await Promise.all([
-    daemonStatus(directory, now, defaults, 'default'),
-    daemonStatus(path.join(directory, 'daemon-net'), now, net, 'net')
+  await allReads([
+    daemonStatus(directory, now, defaults, 'default', signal, previous?.profiles?.default ?? previous, failures),
+    daemonStatus(path.join(directory, 'daemon-net'), now, net, 'net', signal, previous?.profiles?.net, failures)
   ]);
   const profiles = { default: defaults.daemon, net: net.daemon };
   const running = Object.values(profiles).filter((daemon) => daemon.running);
@@ -497,51 +510,110 @@ async function daemonProfiles(directory, now, snapshot) {
   };
 }
 
-// Claude session heartbeats written by the luna-panel plugin of each session: <run>/sessions/<sessionId>.json.
-// Beats older than 15 min are skipped (session closed or asleep); files older than a day are deleted.
-async function sessionBeats(run, now) {
-  const dir = path.join(run, 'sessions');
-  let names = [];
-  try { names = (await fs.readdir(dir)).filter((n) => /^[A-Za-z0-9._-]{1,128}.json$/.test(n)).slice(0, 100); } catch { return []; }
-  const beats = [];
-  await Promise.allSettled(names.map(async (name) => {
-    const file = path.join(dir, name);
-    const st = await fs.stat(file);
-    if (now - st.mtimeMs > 86_400_000) { await fs.unlink(file).catch(() => {}); return; }
-    if (st.size > 65_536) return;
-    const beat = JSON.parse(await fs.readFile(file, 'utf8'));
-    if (!beat || beat.v !== 1 || typeof beat.sessionId !== 'string') return;
-    if (now - Number(beat.updatedAt) > 900_000) return;
-    beats.push(beat);
+// Keep each probe's result local until it completes. An overdue probe cannot mutate the returned snapshot.
+async function collectSections(snapshot, probes, previous, signal) {
+  await allReads(probes.map(async ([name, fields, probe]) => {
+    const controller = new AbortController();
+    const probeSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error('collection deadline exceeded');
+        controller.abort(error);
+        if (!signal) reject(error);
+      }, DEADLINE_MS);
+    });
+    try {
+      const result = probe(probeSignal);
+      // A resident caller keeps ownership of an aborted read until the underlying work settles.
+      const value = await (signal ? result : Promise.race([result, timeout]));
+      probeSignal.throwIfAborted();
+      Object.assign(snapshot, value);
+    } catch (error) {
+      for (const field of fields) {
+        if (Object.hasOwn(previous || {}, field)) snapshot[field] = previous[field];
+      }
+      const prior = previous?.sections?.[name];
+      const reason = cleanText(String(error?.message || error), 500);
+      (snapshot.sections ??= {})[name] = {
+        attemptAt: snapshot.at, okAt: prior?.okAt || null, staleAfterMs: prior?.staleAfterMs ?? DEADLINE_MS,
+        status: 'stale', reason
+      };
+      if (name === 'orchestration' && !previous?.orchestration) {
+        snapshot.orchestration = { ...snapshot.orchestration, configError: reason };
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }));
-  return beats.sort((a, b) => String(a.sessionId).localeCompare(String(b.sessionId)));
 }
 
-async function collect(config, snapshot, now) {
-  try {
-    snapshot.ram = { freeMb: Math.round(availableMemory() / 1048576), totalMb: Math.round(totalmem() / 1048576) };
-  } catch {}
-  const gemini = geminiActiveJobs(config.run, now);
-  await Promise.allSettled([
-    daemonProfiles(config.daemon, now, snapshot),
-    Promise.all([activeJobs(config.run, now), gemini]).then(([jobs, active]) => {
-      snapshot.jobs = [...jobs, ...active.jobs].sort(newest).slice(0, 40);
-    }),
-    Promise.all([
-      readJson(path.join(config.run, 'codex-limits.json')),
-      readJson(path.join(config.daemon, 'daemon-net', 'codex-limits.json'))
-    ]).then((candidates) => {
-      const limits = candidates.filter(Boolean).sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0))[0];
-      snapshot.codexLimits = limits ? { ...limits, ageS: seconds(limits.at, now) } : null;
-    }),
-    sessionBeats(config.run, now).then((sessions) => { snapshot.sessions = sessions; }),
-    orchestrationStatus(snapshot, now),
-    switches().then((events) => { snapshot.switches = events; }),
-    geminiUsage(config, now, gemini).then((usage) => { Object.assign(snapshot.gemini, usage); }),
-    geminiMcp(config).then((mcp) => { snapshot.gemini.mcp = mcp; }),
-    geminiQuotaStatus(now).then((quota) => { snapshot.gemini.quota = quota; }),
-    usageStatus(now).then((usage) => { snapshot.usage = usage; })
+async function codexLimits(config, now) {
+  const candidates = await allReads([
+    readJson(path.join(config.run, 'codex-limits.json')),
+    readJson(path.join(config.daemon, 'daemon-net', 'codex-limits.json'))
   ]);
+  const [limits] = candidates.filter(Boolean).sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0));
+  return { codexLimits: limits ? { ...limits, ageS: seconds(limits.at, now) } : null };
+}
+
+function sharedProbes(config, snapshot, now, geminiActive, includeGemini) {
+  // Orchestration and Gemini share availability data. Keep the subprobes parallel and commit the Gemini fields together.
+  const routing = { orchestration: { ...snapshot.orchestration }, gemini: { ...snapshot.gemini } };
+  const orchestration = orchestrationStatus(routing, now, includeGemini);
+  const availability = orchestration.then(() => routing.gemini, (error) => ({
+    ...routing.gemini, reason: cleanText(String(error.message), 500)
+  }));
+  return [
+    ['codexLimits', ['codexLimits'], () => codexLimits(config, now)],
+    ['orchestration', ['orchestration'], async () => {
+      await orchestration;
+      return { orchestration: routing.orchestration };
+    }],
+    ['switches', ['switches'], async () => ({ switches: await switches() })],
+    ...(includeGemini ? [['gemini', ['gemini'], async (signal) => {
+      const [status, usage, mcp, quota] = await allReads([
+        availability, geminiUsage(config, now, geminiActive(signal), signal),
+        geminiMcp(config), geminiQuotaStatus(now, config)
+      ]);
+      return { gemini: { ...status, ...usage, mcp, quota } };
+    }]] : []),
+    ['usage', ['usage'], async () => ({ usage: await usageStatus(now, config) })]
+  ];
+}
+
+export async function collect({ now = Date.now(), platform = process.platform,
+  claudeHome = path.join(homedir(), '.claude'), includeGemini = true, signal, previous, runDir } = {}) {
+  return collectOverview(configuration(claudeHome, platform, runDir), Number(new Date(now)), includeGemini, { signal, previous });
+}
+
+async function collectOverview(config, now, includeGemini = true, { signal, previous } = {}) {
+  const snapshot = empty(now);
+  previous ??= await readJson(snapshotFile(config.run), MAX_SNAPSHOT_BYTES);
+  const jobsFailures = {};
+  const wrapperStart = (pid, expected) => {
+    const wrapper = readProcess(pid);
+    return wrapper && wrapper.state !== 'Z' && (!expected || expected === wrapper.started);
+  };
+  let activeGemini;
+  const geminiActive = (signal) => activeGemini ??= geminiActiveJobs(config, now, wrapperStart, signal);
+  await collectSections(snapshot, [
+    ...(signal ? [] : [['ram', ['ram'], () => ({
+      ram: { freeMb: Math.round((config.platform === 'linux' ? availableMemory() : freemem()) / 1048576),
+        totalMb: Math.round(totalmem() / 1048576) }
+    })]]),
+    ['daemon', ['daemon'], async (signal) => {
+      const result = { daemon: snapshot.daemon };
+      await daemonProfiles(config.daemon, now, result, signal, previous?.daemon, jobsFailures);
+      return result;
+    }],
+    ['jobs', ['jobs'], async (signal) => {
+      const [jobs, active] = await allReads([activeJobs(config.run, now, undefined, signal), geminiActive(signal)]);
+      return { jobs: [...jobs, ...active.jobs].sort(newest).slice(0, 40) };
+    }],
+    ...sharedProbes(config, snapshot, now, geminiActive, includeGemini).filter(([name]) => !signal || name !== 'usage')
+  ], previous, signal);
+  markDaemonJobs(snapshot, previous, jobsFailures);
   return snapshot;
 }
 
@@ -560,7 +632,7 @@ function human(snapshot) {
 
 async function selfTest() {
   const envKeys = ['LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME', 'LUNA_RUN_DIR', 'CONVEYOR_HOME',
-    'CONVEYOR_LUNA_SH', 'CONVEYOR_GEM_SH', 'LUNA_USAGE_COLLECTOR', 'LUNA_GEMINI_QUOTA_CMD'];
+    'CONVEYOR_LUNA_SH', 'CONVEYOR_GEM_SH'];
   const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
   const directory = await fs.mkdtemp(path.join(tmpdir(), 'luna-overview-test-'));
   const now = Date.now();
@@ -576,8 +648,6 @@ async function selfTest() {
     process.env.CONVEYOR_HOME = path.join(directory, 'conveyor');
     process.env.CONVEYOR_LUNA_SH = fileURLToPath(import.meta.url);
     process.env.CONVEYOR_GEM_SH = fileURLToPath(import.meta.url);
-    process.env.LUNA_USAGE_COLLECTOR = path.join(directory, 'missing-collector.mjs');
-    process.env.LUNA_GEMINI_QUOTA_CMD = path.join(directory, 'missing-quota.mjs');
     const config = configuration();
     config.registry = path.join(directory, 'jobs.jsonl');
     config.codexConfig = path.join(directory, 'config.toml');
@@ -589,22 +659,6 @@ async function selfTest() {
     await fs.writeFile(usagePaths().cache, JSON.stringify(usageCache));
     const quotaCache = { available: true, source: 'agy-statusline', at: new Date(now).toISOString(),
       buckets: [{ name: 'gemini-5h', remainingFraction: 0.75, resetAt: new Date(now + 60_000).toISOString() }] };
-    const quotaMarker = path.join(directory, 'quota-refresh.jsonl'), quotaStop = path.join(directory, 'quota-stop');
-    const quotaDone = path.join(directory, 'quota-done'), quotaFake = path.join(directory, 'fake-quota.mjs');
-    await fs.writeFile(quotaFake, [
-      "import fs from 'node:fs';",
-      `import { acquireQuotaRefreshLock } from ${JSON.stringify(new URL('./conveyor/gemini-quota.mjs', import.meta.url).href)};`,
-      'const release = acquireQuotaRefreshLock();',
-      'if (release) {',
-      `  fs.appendFileSync(${JSON.stringify(quotaMarker)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
-      '  const timer = setInterval(() => {',
-      `    if (!fs.existsSync(${JSON.stringify(quotaStop)})) return;`,
-      `    release(); fs.writeFileSync(${JSON.stringify(quotaDone)}, 'done'); clearInterval(timer);`,
-      '  }, 20);',
-      '  setTimeout(() => { release(); process.exit(1); }, 60_000).unref();',
-      '}'
-    ].join('\n'));
-    process.env.LUNA_GEMINI_QUOTA_CMD = quotaFake;
     await fs.writeFile(quotaPaths().cache, JSON.stringify(quotaCache));
 
     await fs.writeFile(orchestrationPaths().config, JSON.stringify(orchestration));
@@ -628,8 +682,11 @@ async function selfTest() {
       ].join('\n'));
     }
     await fs.writeFile(path.join(directory, 'active', '999'), path.join(directory, 'missing'));
-    const snapshot = JSON.parse(JSON.stringify(await collect(config, empty(now), now)));
+    const snapshot = JSON.parse(JSON.stringify(await collectOverview(config, now)));
+    const exported = await collect({ now, claudeHome: path.join(directory, '.claude') });
     check('root overrides', () => {
+      assert.deepEqual(exported.jobs, snapshot.jobs);
+      assert.deepEqual(exported.usage, snapshot.usage);
       assert.equal(config.run, directory);
       assert.equal(config.daemon, path.join(directory, 'daemon'));
       delete process.env.LUNA_DAEMON_HOME;
@@ -655,37 +712,18 @@ async function selfTest() {
       assert.deepEqual(snapshot.usage, { ...summarizeUsage(usageCache, now), stale: false });
       assert.equal(snapshot.usage.days.length, 7);
     });
-    check('fresh Gemini quota appears in the snapshot without spawning a refresh', () => {
+    check('fresh Gemini quota appears in the snapshot', () => {
       assert.deepEqual(snapshot.gemini.quota, {
         available: true, buckets: quotaCache.buckets, at: quotaCache.at
       });
-      assert.equal(statSync(quotaMarker, { throwIfNoEntry: false }), undefined);
     });
-    const waitForQuota = async (file) => {
-      const deadline = Date.now() + 15_000;
-      while (!statSync(file, { throwIfNoEntry: false }) && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-      assert.ok(statSync(file, { throwIfNoEntry: false }), `missing ${path.basename(file)}`);
-    };
-    try {
-      await fs.writeFile(quotaPaths().cache, JSON.stringify({ ...quotaCache,
-        at: new Date(now - 600_001).toISOString() }));
-      await geminiQuotaStatus(now);
-      await waitForQuota(quotaMarker);
-      await Promise.all(Array.from({ length: 5 }, () => geminiQuotaStatus(now)));
-      check('stale Gemini quota spawns exactly one detached refresh while the lock is held', () => {
-        assert.equal(quotaRefreshLocked(), true);
-      });
-      const calls = (await fs.readFile(quotaMarker, 'utf8')).trim().split('\n').map(JSON.parse);
-      check('quota refresher receives the CLI refresh flags once', () => {
-        assert.deepEqual(calls, [['--json', '--refresh']]);
-      });
-    } finally {
-      await fs.writeFile(quotaStop, '');
-      await waitForQuota(quotaDone);
-      await fs.writeFile(quotaPaths().cache, JSON.stringify(quotaCache));
-    }
+    const staleCache = { ...quotaCache, at: new Date(now - 600_001).toISOString() };
+    await fs.writeFile(quotaPaths().cache, JSON.stringify(staleCache));
+    const staleQuota = await geminiQuotaStatus(now, config);
+    check('stale Gemini quota retains its cached timestamp and values', () => {
+      assert.deepEqual(staleQuota, { ...snapshot.gemini.quota, at: staleCache.at, stale: true });
+    });
+    await fs.writeFile(quotaPaths().cache, JSON.stringify(quotaCache));
     check('terminal filtering and newest first', () => {
       assert.deepEqual(snapshot.jobs.map((job) => job.state), states.slice(0, 3));
       assert.deepEqual(snapshot.jobs.map((job) => job.ageS), [1, 2, 3]);
@@ -742,7 +780,7 @@ async function selfTest() {
     }));
     await fs.writeFile(orchestrationPaths().switches,
       switchEvents.map((event) => JSON.stringify(event)).join('\n') + '\n{broken\n');
-    const withGemini = await collect(config, empty(now), now);
+    const withGemini = await collectOverview(config, now);
     check('gem-active job shown with provider gemini and last_note activity', () => {
       const job = withGemini.jobs.find((entry) => entry.provider === 'gemini');
       assert.equal(job.out, gemOut);
@@ -752,8 +790,9 @@ async function selfTest() {
       assert.equal(job.activity.text, 'Read greeting.txt');
       assert.equal(withGemini.jobs.length, 4);
     });
-    check('dead Gemini pointer cleaned and finished job hidden', () => {
+    check('dead Gemini pointer and finished job are filtered', () => {
       assert.ok(!withGemini.jobs.some((job) => job.out === finishingOut));
+      assert.equal(withGemini.jobs.filter((job) => job.out === gemOut).length, 1);
     });
     check('Gemini usage deduplicates registry and includes finishing active jobs', () => {
       assert.equal(withGemini.gemini.tokensToday, 209);
@@ -766,9 +805,9 @@ async function selfTest() {
       assert.deepEqual(withGemini.switches, switchEvents.slice(-7).reverse());
     });
     const pointers = await fs.readdir(gemDir);
-    check('dead Gemini pointer removed from disk', () => assert.ok(!pointers.includes('dead.json')));
+    check('dead Gemini pointer remains on disk', () => assert.ok(pointers.includes('dead.json')));
     await fs.unlink(orchestrationPaths().config);
-    const noOrchestration = await collect(config, empty(now), now);
+    const noOrchestration = await collectOverview(config, now);
     check('missing orchestration config uses shipped defaults and preserves other sections', () => {
       assert.equal(noOrchestration.orchestration.source, 'default');
       assert.equal(noOrchestration.orchestration.configError, null);
@@ -780,7 +819,7 @@ async function selfTest() {
     });
     await fs.writeFile(orchestrationPaths().config, '{broken');
     await fs.writeFile(config.geminiStatus, '{broken');
-    const corruptOrchestration = await collect(config, empty(now), now);
+    const corruptOrchestration = await collectOverview(config, now);
     check('corrupt orchestration and gateway status degrade independently', () => {
       assert.ok(corruptOrchestration.orchestration.configError);
       assert.equal(corruptOrchestration.gemini.mcp, null);
@@ -812,10 +851,10 @@ async function selfTest() {
       assert.ok(!indexed.some((job) => rejected.includes(job.out)));
     });
     const remaining = await fs.readdir(path.join(directory, 'active'));
-    check('stale pid and legacy entries removed without touching UNC entries', () => {
-      assert.ok(!remaining.includes('dead-pid'));
-      assert.ok(!remaining.includes('legacy-stale'));
-      assert.ok(!remaining.includes('999'));
+    check('stale indices are filtered without removing any files', () => {
+      assert.ok(remaining.includes('dead-pid'));
+      assert.ok(remaining.includes('legacy-stale'));
+      assert.ok(remaining.includes('999'));
       assert.ok(remaining.includes('live-pid'));
       assert.ok(rejected.every((_, index) => remaining.includes(`unc-${index}`)));
     });
@@ -848,10 +887,10 @@ async function selfTest() {
       const jobs = await activeJobs(directory, now, boot);
       const present = (await fs.readdir(path.dirname(entry))).includes(name);
       check(`live pid ${name}: index and listing`, () => {
-        assert.equal(present, keep);
+        assert.equal(present, true);
         assert.equal(jobs.some((job) => job.out === out), keep);
       });
-      if (present) await fs.unlink(entry);
+      await fs.unlink(entry);
     }
     const scan = path.join(directory, 'scan');
     await fs.mkdir(path.join(scan, 'active'), { recursive: true });
@@ -975,8 +1014,8 @@ async function selfTest() {
     await fs.writeFile(path.join(directory, 'codex-limits.json'), '{broken');
     const missing = { ...config, run: path.join(directory, 'absent') };
     check('first occurrence wins', () => assert.equal(statusValues('x=first\nx=second\nx=third').x, 'first'));
-    const invalid = await collect(config, empty(now), now);
-    const absent = await collect(missing, empty(now), now);
+    const invalid = await collectOverview(config, now);
+    const absent = await collectOverview(missing, now);
     check('missing and corrupt inputs', () => {
       assert.equal(invalid.codexLimits, null);
       assert.deepEqual(absent.jobs, []);
@@ -1010,81 +1049,31 @@ async function selfTest() {
   return result;
 }
 
-// `--beat`: the luna-panel plugin of a Claude session sends that session's heartbeat on stdin (the plugin's own file
-// writes outside the project are not allowed, its process runs are). Stored atomically as <run>/sessions/<id>.json
-// before collecting, so the caller's own session is in the snapshot. Bad input is ignored; never fails the run.
-async function storeBeat(run, now) {
-  try {
-    const chunks = [];
-    let size = 0;
-    for await (const chunk of process.stdin) {
-      size += chunk.length;
-      if (size > 65_536) return;
-      chunks.push(chunk);
-    }
-    const beat = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (!beat || beat.v !== 1 || typeof beat.sessionId !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(beat.sessionId)) return;
-    const dir = path.join(run, 'sessions');
-    await fs.mkdir(dir, { recursive: true });
-    const file = path.join(dir, `${beat.sessionId}.json`);
-    const temp = `${file}.${process.pid}.tmp`;
-    await fs.writeFile(temp, JSON.stringify({ ...beat, updatedAt: now }), 'utf8');
-    await fs.rename(temp, file).catch(async () => { await fs.writeFile(file, JSON.stringify({ ...beat, updatedAt: now })); });
-    await fs.unlink(temp).catch(() => {});
-  } catch {}
-}
-
-function triggerReaper() {
-  if (process.argv.includes('--self-test') || process.argv.includes('--human')) return;
-  try {
-    const home = process.env.HOME || homedir();
-    const stamp = path.join(home, '.claude', 'luna-run', 'reap-brokers.stamp');
-    try {
-      if (Date.now() - statSync(stamp).mtimeMs < 600_000) return;
-    } catch (error) { if (error.code !== 'ENOENT') return; }
-    const reaper = fileURLToPath(new URL('./luna-reap-brokers.mjs', import.meta.url));
-    const child = spawn(process.execPath, [reaper], { detached: true, stdio: 'ignore', windowsHide: true });
-    child.on('error', () => {});
-    child.unref();
-  } catch {}
-}
-
-let snapshot = empty();
-let printed = false;
-let deadline;
-function finish(value = snapshot) {
-  if (printed) return;
-  printed = true;
-  clearTimeout(deadline);
-  let output;
-  try {
-    output = process.argv.includes('--human') && !process.argv.includes('--self-test')
-      ? human(value) : JSON.stringify(value, null, process.argv.includes('--pretty') ? 2 : undefined);
-  } catch { output = JSON.stringify(empty()); }
-  // Explicit exit also releases pending filesystem requests and fetch keep-alive handles at the deadline.
-  setTimeout(() => process.exit(0), 30);
-  try {
-    process.stdout.write(`${output}\n`, () => {
-      triggerReaper();
-      process.exit(0);
-    });
+async function publishedSnapshot() {
+  const run = runDirectory(path.join(homedir(), '.claude'));
+  const snapshot = await readJson(snapshotFile(run), MAX_SNAPSHOT_BYTES);
+  if (!snapshot) {
+    process.stderr.write('сборщик не отвечает — запустите: node ~/.claude/scripts/luna-collector.mjs start\n');
   }
-  catch { process.exit(0); }
+  return snapshot ?? empty();
 }
 
-process.stdout.on('error', () => process.exit(0));
-process.on('uncaughtException', () => finish());
-process.on('unhandledRejection', () => finish());
-try {
-  if (process.argv.includes('--self-test')) {
-    finish(await selfTest().catch(() => ({ passed: 0, failed: 1, errors: ['self-test setup or cleanup failed'] })));
-  } else {
-    deadline = setTimeout(finish, DEADLINE_MS);
-    const now = Date.now();
-    snapshot = empty(now);
-    const config = configuration();
-    if (process.argv.includes('--beat')) await storeBeat(config.run, now);
-    await collect(config, snapshot, now);
-    finish();
-  }
-} catch { finish(); }
+async function main(args) {
+  // Old panes may still pass --beat. The reader has no need for their stdin.
+  const testing = args.includes('--self-test');
+  const snapshot = testing ? await selfTest() : args.includes('--collect') ? await collect() : await publishedSnapshot();
+  const output = !testing && args.includes('--human')
+    ? human(snapshot) : JSON.stringify(snapshot, null, args.includes('--pretty') ? 2 : undefined);
+  process.stdout.write(output + '\n');
+  if (testing && snapshot.failed) process.exitCode = 1;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.stdout.on('error', (error) => {
+    if (error.code !== 'EPIPE') process.exitCode = 1;
+  });
+  await main(process.argv.slice(2)).catch((error) => {
+    process.stderr.write(`luna-overview: ${error.message}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -1,9 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { ChildProcess, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readProcess } from '../../lib/luna-runtime.mjs';
+import { sanitizeQuote } from '../../learning/common.mjs';
 import { CLAUSE_RULES, extractClauses, foldLedger } from '../lib/ledger.mjs';
 import { uiFile } from '../lib/profile.mjs';
 import { main as ledgerMain } from '../ledger.mjs';
@@ -19,16 +22,19 @@ async function fixture(t, text = 'Please add a safe ledger. Ensure cleanup.') {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const repo = path.join(root, 'repo'), transcript = path.join(root, 'transcript.jsonl');
   const home = path.join(root, 'conveyor'), bin = path.join(root, 'bin');
+  const luna = path.join(root, 'luna-run');
   fs.mkdirSync(repo);
   fs.mkdirSync(bin);
   fs.writeFileSync(transcript, '');
   const env = {
     ...process.env, HOME: root, CLAUDE_HOME_DIR: path.join(root, 'claude'), CONVEYOR_HOME: home,
+    LUNA_RUN_DIR: luna, LUNA_DAEMON_HOME: luna,
     CLAUDE_CODE_SESSION_ID: 'ledger-test', CLAUDE_CODE_TRANSCRIPT_PATH: transcript, CONVEYOR_GATE_MODE: 'block',
     PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_DIFF_FILE: path.join(root, 'diff.txt'),
     FAKE_PROMPT_COPY: path.join(root, 'prompt-copy.txt'), FAKE_ARGS: path.join(root, 'args.json'),
     FAKE_RESPONSE: '{"missing":[],"misread":[]}', FAKE_RC: '0'
   };
+  delete env.CONVEYOR_OVERVIEW_CMD;
   const fake = path.join(root, 'crosscheck.sh');
   fs.writeFileSync(fake, `#!/bin/bash
 ${shellLog}
@@ -255,6 +261,97 @@ async function crosscheckFixture(t) {
   return { f, original };
 }
 
+test('stop check 8 reads live owned jobs without a collector snapshot or a job lookup process', { timeout }, async (t) => {
+  const { f } = await crosscheckFixture(t);
+  const check = path.join(f.root, 'check.sh');
+  fs.writeFileSync(check, '#!/bin/sh\nprintf \'{"ok":true}\\n\'\n', { mode: 0o755 });
+  f.env.CONVEYOR_CHECK_CMD = JSON.stringify([check]);
+  fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
+  f.env.FAKE_UNTRACKED = '["worker.mjs"]';
+  await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
+  await f.command(['crosscheck']);
+  f.append({ type: 'assistant', message: { content: await f.command(['checklist']) } });
+
+  const run = f.env.LUNA_RUN_DIR;
+  const active = path.join(run, 'active');
+  fs.mkdirSync(active, { recursive: true });
+  const started = new Date().toISOString();
+  const pidStart = readProcess(process.pid).started;
+  function job(name, owner, state) {
+    const out = path.join(run, name);
+    fs.writeFileSync(`${out}.status`, `state=${state}\nowner=${owner}\nstarted=${started}\n`);
+    fs.writeFileSync(path.join(active, name), `${out}\n${process.pid}\n${pidStart}\n`);
+    return out;
+  }
+  const owned = job('owned', f.env.CLAUDE_CODE_SESSION_ID, 'running');
+  job('other-session', 'another-session', 'running');
+  assert.equal(fs.existsSync(path.join(run, 'collector', 'snapshot.json')), false);
+
+  const spawned = [];
+  const originalSpawn = ChildProcess.prototype.spawn;
+  t.mock.method(ChildProcess.prototype, 'spawn', function (options) {
+    spawned.push(options.file);
+    return originalSpawn.call(this, options);
+  });
+  const input = JSON.stringify({ session_id: f.env.CLAUDE_CODE_SESSION_ID, transcript_path: f.transcript, cwd: f.repo });
+  const blocked = await f.run(stop, [], {}, input);
+  assert.deepEqual(JSON.parse(blocked.stdout), { decision: 'block', reason: sanitizeQuote(`8. finish executor jobs: ${owned}`) });
+
+  job('owned', f.env.CLAUDE_CODE_SESSION_ID, 'done');
+  assert.equal((await f.run(stop, [], {}, input)).stdout, '');
+  assert.ok(spawned.includes(check));
+  assert.deepEqual(spawned.filter((file) => file !== 'git' && file !== check), []);
+
+  const identity = new URL('../../lib/process-identity.mjs', import.meta.url);
+  await t.test('a live Windows wrapper in the home index blocks completion', {
+    skip: !fs.existsSync(identity) && 'Windows process identity module is absent from this installation'
+  }, () => {
+    const homeIndex = path.join(f.env.HOME, '.claude', 'luna-run', 'active');
+    fs.mkdirSync(homeIndex, { recursive: true });
+    fs.rmSync(path.join(active, 'owned'));
+    fs.writeFileSync(path.join(homeIndex, 'owned'), `${owned}\n${process.pid}\n${started}\n`);
+    fs.writeFileSync(`${owned}.status`, `state=running\nowner=${f.env.CLAUDE_CODE_SESSION_ID}\nstarted=${started}\n`);
+    const powershell = path.join(f.root, 'bin', 'powershell.exe');
+    const fileTime = BigInt(Date.parse(started)) * 10_000n + 116_444_736_000_000_000n;
+    fs.writeFileSync(powershell, `#!/bin/sh\nprintf '%s\\n' '${process.pid} ${fileTime}'\n`, { mode: 0o755 });
+    const stdout = execFileSync(process.execPath, [stop], {
+      cwd: f.repo,
+      env: { ...f.env, CONVEYOR_PLATFORM: 'win32', USERPROFILE: f.env.HOME,
+        FAKE_UNTRACKED_ARGS: shellList(JSON.parse(f.env.FAKE_UNTRACKED)) },
+      input, encoding: 'utf8', timeout
+    });
+    assert.equal(stdout.trim(), JSON.stringify({ decision: 'block', reason: sanitizeQuote(`8. finish executor jobs: ${owned}`) }));
+    fs.rmSync(path.join(homeIndex, 'owned'));
+  });
+
+  await t.test('a pointer with no recorded start does not count a PID newer than the pointer', async () => {
+    const pointer = path.join(active, 'owned');
+    job('owned', f.env.CLAUDE_CODE_SESSION_ID, 'running');
+    fs.writeFileSync(pointer, `${owned}\n${process.pid}\n`);
+    const old = new Date(Date.now() - process.uptime() * 1000 - 10_000);
+    fs.utimesSync(pointer, old, old);
+    const result = await f.run(stop, [], {}, input);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, '');
+  });
+
+  await t.test('a known running job survives an unreadable index that blocks completion', async () => {
+    const pointer = path.join(active, 'owned');
+    fs.writeFileSync(pointer, `${owned}\n`);
+    const status = `${owned}.status`;
+    fs.appendFileSync(status, `wrapper_pid=${process.pid}\nwrapper_start=${pidStart}\n`);
+    const old = new Date(Date.now() - 660_000);
+    fs.utimesSync(pointer, old, old);
+    fs.utimesSync(status, old, old);
+    fs.writeFileSync(path.join(run, 'gem-active'), '');
+    const result = await f.run(stop, [], {}, input);
+    assert.match(result.stdout, /"decision":"block","reason":"8\. cannot verify executor jobs:.*gem-active/);
+    f.append({ type: 'assistant', message: { content: 'The executor is still working.' } });
+    const progress = await f.run(stop, [], {}, input);
+    assert.deepEqual(JSON.parse(progress.stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
+  });
+});
+
 test('stop check 10 audits completed reviews before complex writes and has its own calibration', { timeout }, async (t) => {
   const { f } = await crosscheckFixture(t);
   const configFile = path.join(f.home, 'orchestration.json');
@@ -263,7 +360,6 @@ test('stop check 10 audits completed reviews before complex writes and has its o
   fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
   f.env.FAKE_UNTRACKED = '["worker.mjs"]';
   f.env.CONVEYOR_CHECK_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"ok\":true}'"]);
-  f.env.CONVEYOR_OVERVIEW_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"jobs\":[]}'"]);
   await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
   await f.command(['crosscheck']);
   f.append({ type: 'assistant', message: { content: await f.command(['checklist']) } });

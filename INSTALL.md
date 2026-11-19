@@ -1,19 +1,50 @@
 # INSTALL — for the agent installing luna-harness on a new machine
 
+## What to install on a bare system
+
+Install these before cloning the repository. "Tested" is the version this setup was last verified with; "Required"
+is the rule. Pinned versions are exact on purpose: the Codex CLI version is what the harness and its plugin patches
+were verified against, so install exactly that one, not `@latest`.
+
+### Linux (tested on Debian 13)
+
+| What | Required | Tested | Install | Check |
+|---|---|---|---|---|
+| Node.js | 22.x (22 or newer) | 22.23.5 | distro package, NodeSource or nvm | `node --version` |
+| npm | comes with Node | 10.9.9 | with Node.js | `npm --version` |
+| git | 2.40 or newer | 2.47.3 | `sudo apt install git` | `git --version` |
+| bash, curl | bash 5, curl 8 | 5.2.37, 8.14.1 | `sudo apt install bash curl` | `bash --version` |
+| Python 3 | 3.11 or newer | 3.13.5 | `sudo apt install python3` | `python3 --version` |
+| uv | 0.12 or newer | 0.12.17 | `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `uv --version` |
+| Claude Code (CLI `claude`) | 2.1.310 or newer | 2.1.310 (desktop app 2.1.325) | `npm i -g @anthropic-ai/claude-code` | `claude --version` |
+| Codex CLI | **exactly 0.169.0** | 0.169.0 | `npm i -g @openai/codex@0.169.0` | `codex --version`, then `codex login` and `codex debug models \| grep gpt-6.2-sol` |
+| GitHub CLI `gh` | 2.40 or newer, only if this machine pushes | 2.46.0 | `sudo apt install gh` | `gh auth login` |
+
+### Windows 10/11
+
+| What | Required | Tested | Install | Check |
+|---|---|---|---|---|
+| Node.js | 22 LTS | 22.x | `winget install OpenJS.NodeJS.LTS` | `node --version` |
+| Git for Windows (gives Git Bash) | 2.40 or newer | 2.4x | `winget install Git.Git` | `git --version`; `ls "C:/Program Files/Git/bin/bash.exe"` |
+| Python 3 | 3.11 or newer (pytest gate for Python projects) | 3.12 | `winget install Python.Python.3.12` | `python --version` |
+| uv | 0.12 or newer | 0.12.x | `winget install astral-sh.uv` | `uv --version` |
+| PowerShell | 5.1 (built in) or 7 | 5.1 | built in | `$PSVersionTable.PSVersion` |
+| Claude Code | 2.1.310 or newer (desktop app or CLI) | 2.1.325 desktop | desktop installer, or `npm i -g @anthropic-ai/claude-code` | `claude --version` |
+| Codex CLI | **exactly 0.164.0** (the plugin patches and the custom busybox build target it) | 0.164.0 | `npm i -g @openai/codex@0.164.0` | `codex --version`, then `codex login` |
+| GitHub CLI `gh` | optional, to push | 2.4x | `winget install GitHub.cli` | `gh auth login` |
+| For the custom Codex build only (step 7) | Visual Studio Build Tools 2022 with MSVC v143 and Windows 11 SDK 10.0.26100; Rust **1.99.1** via rustup | same | see `codex-build/BUILD.md` | `rustc --version` prints `1.99.1` |
+
+The installer checks the essentials itself (`node install.mjs --dry-run` prints `[ok]`/`[warn]` per tool) and then
+installs the plugins and third-party tools from `external.json` with `--owner-setup`; sign-ins (Claude, Codex,
+GitHub) are done by the user.
+
 ## Linux installation
 
 The installer selects `payload-linux/` automatically on Linux. Steps marked **[ASK]** install software or sign in:
 ask your user for a clear "yes" first.
 
-1. **Prerequisites [ASK for anything missing]:** Node.js 22+, `git`, `bash`, `curl`, `python3`, `uv` (pytest runs go
-   through `~/.claude/scripts/pytest_gate.py`), Claude Code (CLI `claude` on `PATH`), and the GitHub CLI `gh` if this
-   machine will push. Install the stock Codex CLI and sign in (the user signs in themselves):
-
-   ```bash
-   npm i -g @openai/codex@0.169.0
-   codex login
-   codex debug models | grep 'gpt-6.2-sol'
-   ```
+1. **Prerequisites [ASK for anything missing]:** everything in the Linux table above, then sign in to Codex
+   (`codex login`; the user signs in themselves).
 
 2. **Clone and dry-run:** clone the private repo the user gives you, then from its root:
 
@@ -190,6 +221,16 @@ from `~/.claude/local-plugins/`. After a package update changes the pane, bump i
 `claude plugin marketplace update luna-local && claude plugin update luna-panel@luna-local`, then restart sessions.
 Without the update every session keeps running the old pane.
 
+On Linux, the systemd user service starts the collector at logon. Check it with
+`systemctl --user status luna-collector`. Run `node ~/.claude/scripts/luna-collector.mjs stop` or
+`node ~/.claude/scripts/luna-collector.mjs start` to stop or start it. It stays resident (about 80 MB) and
+goes quiet when no Claude sessions or pane or widget leases are active.
+
+On Windows, the installer registers a hidden Windows Script Host supervisor to start the collector at logon.
+Check it with `node ~/.claude/scripts/luna-collector.mjs status`. Use the same command with `stop` or `start`
+to stop or start it. It stays resident (about 80 MB) and goes quiet when no Claude sessions or pane or widget
+leases are active. An explicit stop on Windows applies until the next start or logon.
+
 ## 5b. Luna tray widget
 A small native Windows app, ~25 MB RAM. It shows the same view as the pane, outside Claude Code, and does not
 depend on which session is open.
@@ -241,9 +282,23 @@ Check: `<root>\dist\bin\codex.exe --version` prints `codex-cli 0.164.0`. A new r
 starts a daemon on the new binary.
 
 ## 8. Optional, user action only
-- **Windows Defender exclusions** for the project folders and `%USERPROFILE%\.claude` cut CPU load from scanning
-  `node_modules` a lot. This is a security setting: explain the trade-off and let the user do it themselves
-  (Windows Security → Virus & threat protection → Exclusions).
+- **Windows Defender exclusions (strongly recommended on this setup).** Real-time protection scans every file the
+  harness touches and every process it starts (node, bash, git, codex), which can keep the CPU saturated. The user
+  runs, in an elevated PowerShell (Run as administrator):
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File tools\windows-defender-exclusions.ps1 -ExtraPath C:\dev
+  ```
+
+  It lists what it will exclude (`%USERPROFILE%\.claude`, `%USERPROFILE%\.codex`, the npm folders, the custom Codex
+  build from `LUNA_CUSTOM_CODEX_ROOT`, the folders given with `-ExtraPath` — use the folders that hold your projects —
+  and the exact native `node`, `git`, `bash`, `codex` executables, never Windows' own binaries) and asks before
+  changing anything. What it adds is recorded in `%ProgramData%\LunaHarness\defender-exclusions.json` (only
+  administrators can change it; written before Defender is changed and reconciled afterwards), so `-Remove` takes
+  back exactly what it added and nothing you added yourself.
+  Trade-off: excluded folders and processes are not scanned, so keep only trusted folders there. This is a security
+  setting: explain it and let the user run it; never run it for them. On Windows 11 a **Dev Drive** for the project
+  folders is an alternative: Defender scans it in its lighter performance mode.
 - **Desktop apps:** if the user doesn't use the ChatGPT/Codex desktop app, closing it saves ~2 GB RAM. Our jobs don't
   need it.
 

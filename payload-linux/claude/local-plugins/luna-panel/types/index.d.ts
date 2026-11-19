@@ -1,5 +1,4 @@
-// Shapes produced by ~/.claude/scripts/luna-overview.mjs and ~/.claude/scripts/conveyor/cli-update.mjs,
-// read by the pane. Every section added for the conveyor is optional: older collectors omit it.
+// Shapes read from the Luna collector snapshot and the explicit CLI status action.
 
 export type LimitWindow = { usedPercent: number; windowMins: number | null; resetsAt: string | null }
 
@@ -54,6 +53,16 @@ export type SessionBeat = {
   turnSince: number
   idleSince: number
   agents: { id: string; description: string; since: number }[]
+  /** The session's step list (desktop update_plan / CLI TodoWrite), when it has one. */
+  plan?: {
+    total: number
+    done: number
+    current: string | null
+    items: { content: string; status: 'pending' | 'in_progress' | 'completed' }[]
+    updatedAt: number
+  } | null
+  /** Background shell commands and monitors still running in the session. */
+  background?: { id: string; kind: 'command' | 'monitor' | 'executor'; text: string; since: number }[]
   limits?: ClaudeLimit[]
 }
 
@@ -109,15 +118,31 @@ export type Usage = {
   week?: { claude?: ProviderTokens; codex?: ProviderTokens; gemini?: ProviderTokens }
   days?: { date: string; claude?: number | ProviderTokens; codex?: number | ProviderTokens; gemini?: number | ProviderTokens }[]
   byModel7d?: { provider: string; model: string; total: number }[]
-  byProject7d?: { project: string; total: number; provider?: string }[]
+  byProject7d?: { project: string; total: number; provider?: string; claude?: number; codex?: number; gemini?: number }[]
   topJobs?: { provider: string; model?: string; name: string; project?: string; total: number; at?: string }[]
   notes?: string[]
 }
 
+export type SectionName = 'ram' | 'daemon' | 'jobs' | 'sessions' | 'codexLimits' | 'orchestration' | 'usage' | 'gemini' | 'cli' | 'catalog'
+
+export type SectionStatus = {
+  attemptAt: string | null
+  okAt: string | null
+  staleAfterMs: number
+  status: 'ok' | 'stale' | 'error' | 'unavailable'
+  reason: string | null
+}
+
 export type Snapshot = {
   v: number
+  version: 2
   at: string
-  ram: { freeMb: number; totalMb: number }
+  collector: { pid: number; instance: string; seq: number; publishedAt: string }
+  sections: Record<SectionName, SectionStatus>
+  cli: CliStatus | null
+  claudeLimits: SharedClaudeLimit[]
+  truncated?: true
+  ram: { freeMb: number | null; totalMb: number | null }
   daemon: {
     running: boolean
     healthy?: boolean
@@ -140,7 +165,8 @@ export type Snapshot = {
   usage?: Usage | null
 }
 
-export type ClaudeLimit = { kind: string; percentUsed: number; resetsAt?: string }
+export type ClaudeLimit = { kind: string; percentUsed: number; resetsAt?: string | null }
+export type SharedClaudeLimit = ClaudeLimit & { resetsAt: string | null; observedAt: string; sessionId: string }
 
 export type CliStatus = {
   codex?: {
