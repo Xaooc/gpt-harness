@@ -188,7 +188,8 @@ test('usage: today and the week per provider, with the heaviest jobs', async ($,
       })),
       byModel7d: [{ provider: 'codex', model: 'gpt-6.1-sol', total: 9_000_000 }],
       byProject7d: [{ project: 'rpg', total: 22_000_000 }],
-      topJobs: [{ provider: 'gemini', model: 'gemini-3.8-flash', name: 'h2fix', project: 'gpt-harness', total: 3_400_000 }],
+      topJobs: [{ provider: 'codex', model: 'gpt-6.2-sol', name: 'h2fix', project: 'gpt-harness', total: 3_400_000 },
+        { provider: 'gemini', model: 'gemini-3.8-flash', name: 'oldgem', project: 'gpt-harness', total: 5_000_000 }],
     },
   } })
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -197,6 +198,7 @@ test('usage: today and the week per provider, with the heaviest jobs', async ($,
     expect(await ui.find({ type: 'Text', text: /^СЕГОДНЯ$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^7 ДНЕЙ$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /h2fix/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /oldgem/ })).toBeFalsy()
     await ui.unmount()
   }
 })

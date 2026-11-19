@@ -108,7 +108,7 @@ export type Usage = {
   week?: { claude?: ProviderTokens; codex?: ProviderTokens; gemini?: ProviderTokens }
   days?: { date: string; claude?: number | ProviderTokens; codex?: number | ProviderTokens; gemini?: number | ProviderTokens }[]
   byModel7d?: { provider: string; model: string; total: number }[]
-  byProject7d?: { project: string; total: number; provider?: string }[]
+  byProject7d?: { project: string; total: number; provider?: string; claude?: number; codex?: number; gemini?: number }[]
   topJobs?: { provider: string; model?: string; name: string; project?: string; total: number; at?: string }[]
   notes?: string[]
 }

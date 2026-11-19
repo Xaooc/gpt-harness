@@ -786,7 +786,8 @@ export const register: Register = on => {
       )
     }
 
-    const jobs = snap.jobs
+    // Gemini is out of the owner's setup: leftover Gemini jobs are not shown (and never labelled as another provider).
+    const jobs = (snap.jobs ?? []).filter(j => providerOf(j) !== 'gemini')
     const codex = snap.codexLimits
     const room = Math.max(4, (e.viewport?.rows ?? 40) - 30)
 
@@ -1088,6 +1089,12 @@ export const register: Register = on => {
       const pct = (a: number, b: number) => (b ? `${Math.round((a / b) * 100)}%` : '')
       const todayAll = PROV.reduce((n, p) => n + tok(today[p.key]), 0)
       const weekAll = PROV.reduce((n, p) => n + tok(week[p.key]), 0)
+      // Only the providers shown above count, so every share is a share of the displayed week (Gemini history is left out).
+      const byModel = (usage.byModel7d ?? []).filter(m => m.provider !== 'gemini')
+      const byProject = (usage.byProject7d ?? [])
+        .map(p => ({ ...p, total: p.claude === undefined && p.codex === undefined ? p.total : (p.claude ?? 0) + (p.codex ?? 0) }))
+        .filter(p => p.total > 0).sort((a, b) => b.total - a.total)
+      const topJobs = (usage.topJobs ?? []).filter(j => j.provider === 'codex' || j.provider === 'claude')
       return (
         <Box flexDirection="column">
           <Section title="Сегодня" right={<Text size="caption" color="subtle" tabular>{tokens(todayAll)} ток.{usage.stale ? ' · обновляю' : ''}</Text>}>
@@ -1118,19 +1125,19 @@ export const register: Register = on => {
           {PROV.map(p => <Row label={p.name} value={tokens(tok(week[p.key]))} sub={pct(tok(week[p.key]), weekAll)} />)}
           </Section>
 
-          {(usage.byModel7d ?? []).length ? (
+          {byModel.length ? (
             <Section title="По моделям · 7 дней">
-              {(usage.byModel7d ?? []).slice(0, 6).map(m => <Row label={modelName(m.provider, m.model).slice(0, 9)} value={tokens(m.total)} sub={pct(m.total, weekAll)} />)}
+              {byModel.slice(0, 6).map(m => <Row label={modelName(m.provider, m.model).slice(0, 9)} value={tokens(m.total)} sub={pct(m.total, weekAll)} />)}
             </Section>
           ) : null}
-          {(usage.byProject7d ?? []).length ? (
+          {byProject.length ? (
             <Section title="По проектам · 7 дней">
-              {(usage.byProject7d ?? []).slice(0, 6).map(p => <Row label={shortProject(p.project).slice(0, 9)} value={tokens(p.total)} sub={pct(p.total, weekAll)} />)}
+              {byProject.slice(0, 6).map(p => <Row label={shortProject(p.project).slice(0, 9)} value={tokens(p.total)} sub={pct(p.total, weekAll)} />)}
             </Section>
           ) : null}
-          {(usage.topJobs ?? []).length ? (
+          {topJobs.length ? (
             <Section title="Самые тяжёлые задачи">
-              {(usage.topJobs ?? []).slice(0, 5).map(j => (
+              {topJobs.slice(0, 5).map(j => (
                 <Row label={j.provider === 'codex' ? 'Codex' : 'Claude'} value={tokens(j.total)}
                   sub={`${jobTitle(j.name, j.at)}${j.project ? ` · ${shortProject(j.project)}` : ''}`} />
               ))}

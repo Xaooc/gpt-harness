@@ -281,8 +281,11 @@ starts a daemon on the new binary.
   ```
 
   It lists what it will exclude (`%USERPROFILE%\.claude`, `%USERPROFILE%\.codex`, the npm folders, the custom Codex
-  build, the folders given with `-ExtraPath` — use the folders that hold your projects — and the exact `node`, `git`,
-  `bash`, `codex` executables) and asks before changing anything; `-Remove` takes back exactly what it added.
+  build from `LUNA_CUSTOM_CODEX_ROOT`, the folders given with `-ExtraPath` — use the folders that hold your projects —
+  and the exact native `node`, `git`, `bash`, `codex` executables, never Windows' own binaries) and asks before
+  changing anything. What it adds is recorded in `%ProgramData%\LunaHarness\defender-exclusions.json` (only
+  administrators can change it; written before Defender is changed and reconciled afterwards), so `-Remove` takes
+  back exactly what it added and nothing you added yourself.
   Trade-off: excluded folders and processes are not scanned, so keep only trusted folders there. This is a security
   setting: explain it and let the user run it; never run it for them. On Windows 11 a **Dev Drive** for the project
   folders is an alternative: Defender scans it in its lighter performance mode.
