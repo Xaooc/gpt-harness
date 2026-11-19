@@ -229,7 +229,8 @@ async function runWorkerJob({ task, options, env }) {
   }
   if (task === 'sessions') {
     const { readSessions } = await import('./conveyor/lib/sessions.mjs');
-    return typeof readSessions === 'function' ? { sessions: await readSessions(options) } : null;
+    // readSessions returns { sessions, cursors }; the cursors come back to the collector for the next pass.
+    return typeof readSessions === 'function' ? await readSessions(options) : null;
   }
   const { now } = options;
   const { collectUsage, readUsageSummary } = await import('./conveyor/usage.mjs');
@@ -551,10 +552,12 @@ async function serve(config, owner) {
         if (Object.hasOwn(result, name)) values[name] = result[name];
       }
     } });
+  let sessionCursors = {};
   register({ names: ['sessions'], interval: fast, deadline: probeDeadline,
     async work(now) {
       if (!existsSync(helper('conveyor/lib/sessions.mjs'))) return null;
-      return collectInWorker('sessions', { ...probeOptions(now), runDir: config.runDir }, env, probeDeadline);
+      return collectInWorker('sessions', { ...probeOptions(now), runDir: config.runDir, cursors: sessionCursors },
+        env, probeDeadline);
     },
     merge(result, now) {
       if (result === null) {
@@ -563,6 +566,7 @@ async function serve(config, owner) {
         return;
       }
       if (!Array.isArray(result.sessions)) throw new Error('readSessions did not return a session list');
+      if (result.cursors && typeof result.cursors === 'object') sessionCursors = result.cursors;
       values.sessions = result.sessions;
       report('sessions', 'ok', now);
     } });
