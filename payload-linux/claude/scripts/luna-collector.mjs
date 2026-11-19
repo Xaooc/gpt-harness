@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from 'node:child_process';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { freemem, totalmem } from 'node:os';
@@ -33,6 +33,7 @@ function configuration() {
   const runDir = path.resolve(process.env.LUNA_RUN_DIR || path.join(claudeHome, 'luna-run'));
   const directory = path.join(runDir, 'collector'), local = path.join(claudeHome, 'luna-run', 'collector');
   return { claudeHome, runDir, directory, lock: path.join(local, 'collector.lock'), stopped: path.join(local, 'stopped'),
+    supervisorEpoch: path.join(local, 'supervisor-epoch'),
     discovery: path.join(directory, 'discovery.json'), snapshot: path.join(directory, 'snapshot.json'),
     widget: path.join(directory, 'leases', 'widget.json') };
 }
@@ -57,20 +58,35 @@ function writeAtomic(file, text) {
   } finally { remove(temp); }
 }
 
-function ownerAlive(owner) {
+function ownerPidAlive(owner) {
   return processAlive(owner?.pid) && (!owner.procStart || platform !== 'linux' ||
     String(owner.procStart) === readProcessStat(owner.pid)?.started);
 }
 
-function acquireLock(file, owner) {
+async function acquireLock(config, owner) {
+  const file = config.lock;
   const write = (target) => {
     try { writeFileSync(target, JSON.stringify(owner), { flag: 'wx', mode: 0o600 }); return true; }
     catch (error) { if (error.code === 'EEXIST') return false; throw error; }
   };
-  if (write(file)) return true;
-  const freshEmptyLock = () => Date.now() - statSync(file, { throwIfNoEntry: false })?.mtimeMs < 10 * SECOND;
+  const create = () => write(file) ? 0 : 1;
+  if (write(file)) return 0;
+  const freshEmptyLock = (stat) => Date.now() - stat?.mtimeMs < 10 * SECOND;
+  const lockStat = statSync(file, { throwIfNoEntry: false });
+  if (!lockStat) return create();
   const previous = readJson(file);
-  if (ownerAlive(previous) || !previous && freshEmptyLock()) return false;
+  if (!previous && freshEmptyLock(lockStat)) return 1;
+  if (ownerPidAlive(previous)) {
+    const maxWait = Math.min(20 * SECOND, Math.max(1, Number(process.env.LUNA_COLLECTOR_LOCK_RETRY_MS) || 20 * SECOND));
+    const until = performance.now() + maxWait;
+    do {
+      const started = performance.now();
+      if (await healthy(config, previous, Math.max(1, Math.floor(Math.min(2 * SECOND, until - started))))) return 3;
+      const remaining = until - performance.now();
+      if (remaining <= 0 || !ownerPidAlive(previous) || readJson(file)?.instance !== previous.instance) break;
+      await sleep(Math.max(0, Math.min(remaining, started + 2 * SECOND - performance.now())));
+    } while (performance.now() < until);
+  }
 
   // Serialize replacement of a dead owner's lock, including recovery if a reclaimer dies.
   const instance = (value) => /^[a-f0-9-]{36}$/i.test(value?.instance) ? value.instance : 'unknown';
@@ -85,15 +101,17 @@ function acquireLock(file, owner) {
         break;
       } catch (error) { if (error.code !== 'EEXIST') throw error; }
       const reclaimer = readJson(claim);
-      if (instance(reclaimer) === 'unknown' || ownerAlive(reclaimer)) return false;
+      if (instance(reclaimer) === 'unknown' || ownerPidAlive(reclaimer)) return 1;
       claims.push(claim);
       claim = `${file}.reclaim.${reclaimer.instance}`;
     }
     claims.push(claim);
     const current = readJson(file);
-    if (current?.instance !== previous?.instance || ownerAlive(current) || !current && freshEmptyLock()) return false;
+    const stat = statSync(file, { throwIfNoEntry: false });
+    if (!stat) return create();
+    if (current?.instance !== previous?.instance || !current && freshEmptyLock(stat)) return 1;
     remove(file);
-    return write(file);
+    return create();
   } finally {
     if (claims.length && readJson(claims.at(-1))?.instance === owner.instance) {
       for (const claim of claims) remove(claim);
@@ -102,20 +120,34 @@ function acquireLock(file, owner) {
   }
 }
 
-async function request(info, route, method = 'GET') {
+function releaseLock(config, owner) {
+  const claim = `${config.lock}.reclaim.${owner.instance}`;
+  try { linkSync(config.lock, claim); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'EEXIST') return;
+    throw error;
+  }
+  try {
+    if (readJson(config.lock)?.instance !== owner.instance) return;
+    try {
+      if (readJson(config.discovery)?.instance === owner.instance) remove(config.discovery);
+    } finally { remove(config.lock); }
+  } finally { remove(claim); }
+}
+
+async function request(info, route, method = 'GET', timeout = 2 * SECOND) {
   return fetch(`http://127.0.0.1:${info.port}${route}`, {
-    method, headers: { 'x-luna-token': info.token }, signal: AbortSignal.timeout(200), redirect: 'error'
+    method, headers: { 'x-luna-token': info.token }, signal: AbortSignal.timeout(timeout), redirect: 'error'
   });
 }
 
-async function healthy(config) {
-  const info = readJson(config.discovery);
-  const owner = readJson(config.lock);
-  if (info?.version !== 1 || info.pid !== owner?.pid || info.instance !== owner?.instance ||
-      typeof info.instance !== 'string' || !processAlive(info.pid) ||
-      !Number.isInteger(info.port) || info.port < 1 || info.port > 65535 || !/^[a-f0-9]{32}$/.test(info.token)) return null;
+async function healthy(config, owner = readJson(config.lock), timeout = 2 * SECOND) {
   try {
-    const response = await request(info, '/health');
+    const info = readJson(typeof owner?.discovery === 'string' ? owner.discovery : config.discovery);
+    if (info?.version !== 1 || info.pid !== owner?.pid || info.instance !== owner?.instance ||
+        typeof info.instance !== 'string' || !ownerPidAlive(owner) ||
+        !Number.isInteger(info.port) || info.port < 1 || info.port > 65535 || !/^[a-f0-9]{32}$/.test(info.token)) return null;
+    const response = await request(info, '/health', 'GET', timeout);
     const health = response.ok ? await response.json() : null;
     return health?.ok === true && health.instance === info.instance &&
       readJson(config.lock)?.instance === info.instance ? info : null;
@@ -383,12 +415,17 @@ async function serve(config, owner) {
         if (Object.hasOwn(result, name) && !result.sections?.[name]) values[name] = result[name];
       }
     } });
-  let sessionCursors = {};
+  let sessionCursors = {}, sessionIdentities;
   const sessions = register({ names: ['sessions'], interval: () => quiet ? QUIET_MS : fastMs, deadline: probeDeadline,
-    work: (now) => readSessions({ now, claudeHome: config.claudeHome, cursors: sessionCursors }),
+    async work(now) {
+      const result = await readSessions({ now, claudeHome: config.claudeHome, cursors: sessionCursors,
+        identities: sessionIdentities });
+      sessionIdentities = result.identities ?? sessionIdentities;
+      return result;
+    },
     merge(result, now) {
       if (!Array.isArray(result.sessions)) throw new Error('readSessions did not return a session list');
-      sessionCursors = result.cursors;
+      sessionCursors = result.cursors ?? sessionCursors;
       values.sessions = result.sessions;
       liveSession = result.sessions.length > 0;
       report('sessions', 'ok', now);
@@ -491,7 +528,10 @@ async function serve(config, owner) {
   }
 
   const poll = () => {
-    try { tick(); } catch (error) { log(error); }
+    try {
+      if (readJson(config.lock)?.instance !== owner.instance) { stop(); return; }
+      tick();
+    } catch (error) { log(error); }
     if (!stopping) timer = setTimeout(poll, SECOND);
   };
   const signals = ['SIGINT', 'SIGTERM', ...(platform === 'win32' ? ['SIGHUP'] : [])];
@@ -508,44 +548,68 @@ async function serve(config, owner) {
   } finally {
     stop();
     clearTimeout(timer);
-    server.close();
-    server.closeAllConnections();
     const grace = new AbortController();
-    await Promise.race([Promise.allSettled(pending), sleep(SHUTDOWN_GRACE_MS, undefined, { signal: grace.signal })]);
-    grace.abort();
-    dirty = true;
-    try { publish(Date.now()); } catch (error) { log(error); }
-    for (const signal of signals) process.removeListener(signal, stop);
+    try {
+      await usageWorker?.terminate();
+      await Promise.race([Promise.allSettled(pending), sleep(SHUTDOWN_GRACE_MS, undefined, { signal: grace.signal })]);
+      dirty = true;
+      if (readJson(config.lock)?.instance === owner.instance) publish(Date.now());
+    } catch (error) { log(error); }
+    finally {
+      grace.abort();
+      server.close();
+      server.closeAllConnections();
+      for (const signal of signals) process.removeListener(signal, stop);
+    }
   }
 }
 
-async function runCollector(config) {
+function newOwner(config) {
+  return { pid: process.pid, instance: randomUUID(), startedAt: iso(), discovery: config.discovery,
+    procStart: readProcessStat(process.pid)?.started };
+}
+
+function supervisorStopped(config, epoch) {
+  if (platform !== 'win32') return false;
+  if (existsSync(config.stopped)) return true;
+  if (epoch === undefined) return false;
+  let current = '-';
+  try { current = readFileSync(config.supervisorEpoch, 'utf8'); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  return current !== epoch;
+}
+
+async function runCollector(config, epoch) {
+  if (supervisorStopped(config, epoch)) return 0;
   mkdirSync(path.dirname(config.lock), { recursive: true, mode: 0o700 });
-  const owner = { pid: process.pid, instance: randomUUID(), startedAt: iso(), procStart: readProcessStat(process.pid)?.started };
-  if (!acquireLock(config.lock, owner)) return 3;
+  const owner = newOwner(config);
+  const code = await acquireLock(config, owner);
+  if (code) return code;
   try {
-    if (platform === 'win32') remove(config.stopped);
+    if (supervisorStopped(config, epoch)) return 0;
     mkdirSync(path.dirname(config.widget), { recursive: true, mode: 0o700 });
     await serve(config, owner);
-  } finally {
-    try { remove(config.discovery); } finally { remove(config.lock); }
-  }
+  } finally { releaseLock(config, owner); }
   return 0;
 }
 
+function systemctl(action) {
+  return new Promise((resolve, reject) => {
+    execFile('systemctl', ['--user', action, 'luna-collector.service'], { timeout: 30 * SECOND },
+      (error) => error ? reject(error) : resolve());
+  });
+}
+
 async function start(config) {
+  remove(config.stopped);
   if (platform === 'win32') {
     const script = path.join(HERE, 'luna-collector-supervisor.vbs');
-    remove(config.stopped);
     const child = spawn('wscript.exe', ['//B', '//NoLogo', script], { detached: true, windowsHide: true, stdio: 'ignore' });
     await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
     child.unref();
     process.stdout.write('Started the Luna collector supervisor.\n');
   } else if (platform === 'linux') {
-    await new Promise((resolve, reject) => {
-      execFile('systemctl', ['--user', 'start', 'luna-collector.service'], { timeout: 30 * SECOND },
-        (error) => error ? reject(error) : resolve());
-    });
+    await systemctl('start');
     process.stdout.write('Asked systemd to start luna-collector.service.\n');
   } else throw new Error('collector supervision is unavailable on this platform');
 }
@@ -561,28 +625,40 @@ async function main(command) {
       await start(config);
       break;
     case 'run':
-      return runCollector(config);
+      return runCollector(config, process.argv[3]);
     case 'status': {
       const data = readJson(config.snapshot, MAX_SNAPSHOT);
       const snapshot = data && { version: data.version, at: data.at, collector: data.collector, sections: data.sections,
         ...(data.truncated ? { truncated: true } : {}) };
       // The discovery token authenticates /beat and /stop: never print it.
-      const { token, ...discovery } = readJson(config.discovery) ?? {};
-      print({ discovery: Object.keys(discovery).length ? { ...discovery, token: token ? 'hidden' : null } : null, snapshot });
+      const owner = readJson(config.lock);
+      const { token, ...discovery } = readJson(owner?.discovery ?? config.discovery) ?? {};
+      print({ discovery: Object.keys(discovery).length ? { ...discovery, token: token ? 'hidden' : null } : null,
+        snapshot, running: Boolean(await healthy(config, owner)) });
       break;
     }
     case 'stop': {
       if (platform === 'win32') {
         mkdirSync(path.dirname(config.stopped), { recursive: true, mode: 0o700 });
         writeAtomic(config.stopped, '');
+        writeAtomic(config.supervisorEpoch, randomUUID());
       }
-      const info = await healthy(config);
+      if (platform === 'linux' && existsSync(path.join(path.dirname(config.claudeHome), '.config', 'systemd', 'user',
+        'luna-collector.service'))) await systemctl('stop');
+      const owner = readJson(config.lock);
+      const info = await healthy(config, owner);
       if (info) {
         if (!(await request(info, '/stop', 'POST')).ok) throw new Error('collector refused stop');
         const deadline = performance.now() + 4 * SECOND;
-        while (readJson(config.lock)?.instance === info.instance && performance.now() < deadline) await sleep(50);
-        if (readJson(config.lock)?.instance === info.instance) throw new Error('collector stop timed out');
-      } else if (ownerAlive(readJson(config.lock))) throw new Error('collector is not answering health');
+        while (ownerPidAlive(owner) && performance.now() < deadline) await sleep(50);
+        if (ownerPidAlive(owner)) throw new Error('collector stop timed out');
+      } else if (ownerPidAlive(owner)) throw new Error('collector is not answering health');
+      else if (existsSync(config.lock)) {
+        // Reclaim the dead owner's lock using the same arbitration as a foreground launch.
+        const cleanup = newOwner(config);
+        if (await acquireLock(config, cleanup)) throw new Error('collector lock changed during stop');
+        releaseLock(config, cleanup);
+      }
       break;
     }
     default:

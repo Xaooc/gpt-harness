@@ -371,6 +371,7 @@ async function heartbeatClaudeLimits(run, now) {
         !Array.isArray(beat.limits)) continue;
     for (const limit of beat.limits) {
       if (!object(limit) || typeof limit.kind !== 'string' || !Number.isFinite(limit.percentUsed)) continue;
+      if (limit.resetsAt != null && !(stamp(limit.resetsAt) > now)) continue;
       if (!windows.has(limit.kind) || windows.get(limit.kind).percentUsed < limit.percentUsed) {
         windows.set(limit.kind, { ...limit, sessionId: beat.sessionId, updatedAt: beat.updatedAt });
       }
@@ -420,7 +421,9 @@ function thresholdState(config, usage, previous) {
 
 export async function providerState(config, { now = Date.now(), persist = true } = {}) {
   config ??= await loadConfig();
-  const [codex, claude] = await Promise.all([codexUsage(now), claudeUsage(now)]);
+  const [codexRead, claudeRead] = await Promise.allSettled([codexUsage(now), claudeUsage(now)]);
+  const codex = codexRead.value ?? { known: false, ageS: null, stale: false, primary: null, secondary: null };
+  const claude = claudeRead.value ?? { known: false, nearLimit: false, windows: [] };
   const resolve = async () => {
     const marks = await readProviders();
     const threshold = thresholdState(config, codex, marks.codex?.switched);

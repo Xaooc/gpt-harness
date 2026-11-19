@@ -32,6 +32,7 @@ function hourly(directory, name, script, args) {
     // Concurrent hooks claim the same next timestamp with exclusive creation.
     fs.writeFileSync(stamp(previous + 1), '', { flag: 'wx', mode: 0o600 });
     if (previous) fs.rmSync(stamp(previous), { force: true });
+    // The detached helper owns its CLI probes and waits for tree cleanup at its deadline.
     launch(script, args, { ...process.env, LUNA_SESSION_MAINTENANCE: '1' });
   } catch {
     // Another session may have claimed or replaced the timestamp.

@@ -285,6 +285,13 @@ test('Codex threshold persists hysteresis, hands off to Sonnet, and ignores stal
     const mixedHandoff = await env.run('complex', '-r', isolatedHome);
     assert.equal(mixedHandoff.status, 4, mixedHandoff.stderr);
     assert.equal(JSON.parse(mixedHandoff.stdout).warning, 'claude near limit');
+    await fs.writeFile(path.join(sessions, 'live.json'), JSON.stringify({
+      v: 1, sessionId: 'live', updatedAt: Date.now(),
+      limits: [{ kind: 'seven_day', percentUsed: 98, resetsAt: new Date(Date.now() - 1000).toISOString() }]
+    }));
+    const resetHandoff = await env.run('complex', '-r', isolatedHome);
+    assert.equal(resetHandoff.status, 4, resetHandoff.stderr);
+    assert.equal(JSON.parse(resetHandoff.stdout).warning, undefined);
     assert.equal((await readJson(paths().providers)).codex.switched, true);
     await env.limits(78, { net: true });
     assert.equal((await resolveChain('complex')).selected.provider, 'claude');

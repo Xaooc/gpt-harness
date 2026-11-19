@@ -31,7 +31,7 @@ async function until(read, accept, description, ms = 15_000) {
   assert.fail(`timed out waiting for ${description}`);
 }
 
-async function fixture(work, { realOverview = false, hangUsage = false } = {}) {
+async function fixture(work, { realOverview = false, hangUsage = false, sessionFaults = false } = {}) {
   const root = await fs.mkdtemp(path.join(tmpdir(), 'luna-collector-test-'));
   const claude = path.join(root, '.claude'), scripts = path.join(claude, 'scripts'), sessions = path.join(claude, 'sessions');
   const runDir = path.join(root, 'run'), directory = path.join(runDir, 'collector');
@@ -40,7 +40,7 @@ async function fixture(work, { realOverview = false, hangUsage = false } = {}) {
   const snapshot = path.join(directory, 'snapshot.json'), cli = path.join(scripts, 'luna-collector.mjs');
   const env = { ...process.env, HOME: root, USERPROFILE: root, LUNA_RUN_DIR: runDir,
     CONVEYOR_HOME: path.join(claude, 'conveyor'), CLAUDE_HOME_DIR: claude, CODEX_HOME: path.join(root, '.codex') };
-  for (const name of ['CONVEYOR_PLATFORM', 'LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME']) delete env[name];
+  for (const name of ['CONVEYOR_PLATFORM', 'LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME', 'LUNA_COLLECTOR_LOCK_RETRY_MS']) delete env[name];
   const command = async (action, options = {}) => {
     const { stdout } = await execute(process.execPath, [cli, action], { env, windowsHide: true, timeout, ...options });
     return stdout.trim() ? JSON.parse(stdout) : null;
@@ -79,6 +79,17 @@ async function fixture(work, { realOverview = false, hangUsage = false } = {}) {
       await fs.mkdir(path.dirname(file), { recursive: true });
       await fs.copyFile(path.join(sources, name), file);
     }
+    if (sessionFaults) {
+      const sessionsModule = path.join(scripts, 'conveyor/lib/sessions.mjs');
+      await fs.rename(sessionsModule, path.join(path.dirname(sessionsModule), 'sessions-original.mjs'));
+      await fs.writeFile(sessionsModule, `
+        import { appendFileSync } from 'node:fs';
+        import { readSessions as sample } from './sessions-original.mjs';
+        export const readSessions = (options) => sample({ ...options, lookupStarts(pids) {
+          appendFileSync(${JSON.stringify(audit)}, JSON.stringify({ identities: pids }) + '\\n');
+          return new Map(pids.map(pid => [pid, 'fixture-start']));
+        } });`);
+    }
     if (!realOverview) await fs.writeFile(path.join(scripts, 'luna-overview.mjs'), `
       import { appendFileSync, existsSync } from 'node:fs';
       import path from 'node:path';
@@ -106,8 +117,9 @@ async function fixture(work, { realOverview = false, hangUsage = false } = {}) {
     await fs.writeFile(clock, '0');
     await fs.writeFile(preload, `
       import childProcess from 'node:child_process';
-      import { appendFileSync, readFileSync } from 'node:fs';
+      import { appendFileSync, existsSync, readFileSync } from 'node:fs';
       import { createRequire, syncBuiltinESMExports } from 'node:module';
+      import path from 'node:path';
       const audit = (value) => appendFileSync(${JSON.stringify(audit)}, JSON.stringify(value) + '\\n');
       const realNow = Date.now;
       Date.now = () => realNow() + (Number(readFileSync(${JSON.stringify(clock)}, 'utf8')) || 0);
@@ -122,6 +134,14 @@ async function fixture(work, { realOverview = false, hangUsage = false } = {}) {
           super(file, options);
         }
       };
+      if (${sessionFaults}) {
+        const fs = createRequire(import.meta.url)('node:fs/promises');
+        const denied = () => Object.assign(new Error('fixture permission denied'), { code: 'EACCES', errno: -13 });
+        const { open, readdir } = fs;
+        fs.open = (file, ...args) => path.basename(file) === 'blocked.jsonl' ? Promise.reject(denied()) : open(file, ...args);
+        fs.readdir = (dir, ...args) => dir === ${JSON.stringify(sessions)} &&
+          existsSync(${JSON.stringify(path.join(claude, 'registry-denied'))}) ? Promise.reject(denied()) : readdir(dir, ...args);
+      }
       syncBuiltinESMExports();
     `);
     await work({ command, request, launch, discover, snapshotWhen, discovery, lock, claude, env, advance, audit });
@@ -156,6 +176,35 @@ test('a second foreground collector exits with code 3 and leaves the first owner
     await assert.rejects(command('run', { env: { ...env, LUNA_RUN_DIR: path.join(env.LUNA_RUN_DIR, 'other') } }), { code: 3 });
     assert.deepEqual(await json(discovery), first);
     assert.equal((await json(lock)).instance, first.instance);
+  });
+});
+
+test('a live PID without collector health loses its stale lock after the retry window', { timeout }, async () => {
+  await fixture(async ({ launch, discover, lock, discovery, env }) => {
+    const instance = 'd2a30991-4497-4651-a4dd-df0d09014144';
+    const retryMs = 200;
+    let probedAt;
+    const server = createServer((_req, res) => {
+      probedAt ??= performance.now();
+      res.writeHead(503).end();
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    try {
+      await fs.writeFile(lock, JSON.stringify({ pid: process.pid, instance }));
+      await fs.writeFile(discovery, JSON.stringify({
+        version: 1, pid: process.pid, instance, token: 'a'.repeat(32), port: server.address().port
+      }));
+      env.LUNA_COLLECTOR_LOCK_RETRY_MS = String(retryMs);
+      const { child } = launch();
+      const replacement = await until(() => json(discovery), (info) => info?.pid === child.pid, 'replacement discovery');
+      assert.notEqual(replacement.instance, instance);
+      assert.equal((await discover()).instance, (await json(lock)).instance);
+      assert.ok(performance.now() - probedAt >= retryMs - 50);
+    } finally {
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    }
   });
 });
 
@@ -295,6 +344,30 @@ test('a running collector never launches a subprocess and reuses its usage worke
     const calls = (await fs.readFile(audit, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
     assert.deepEqual(calls, [{ worker: 'usage' }]);
   }, { realOverview: true });
+});
+
+test('session transcript and registry failures preserve the live PID identity cache', { timeout }, async () => {
+  await fixture(async ({ launch, discover, request, snapshotWhen, claude, advance, audit }) => {
+    await fs.writeFile(path.join(claude, 'sessions', `${process.pid}.json`), JSON.stringify({
+      sessionId: 'blocked', pid: process.pid, procStart: 'fixture-start', cwd: '/fixture', status: 'busy',
+      updatedAt: Date.now()
+    }));
+    launch();
+    await beat(request, await discover());
+    const first = await snapshotWhen((value) => value?.sessions[0]?.sessionId === 'blocked');
+    assert.equal(first.sessions[0].state, 'thinking');
+    assert.equal(first.sessions[0].tool, null);
+    const fault = path.join(claude, 'registry-denied');
+    await fs.writeFile(fault, '');
+    await advance(6000);
+    await snapshotWhen((value) => value?.sections.sessions.status === 'stale');
+    await fs.unlink(fault);
+    await advance(6000);
+    const recovered = await snapshotWhen((value) => value?.sections.sessions.okAt > first.sections.sessions.okAt);
+    assert.equal(recovered.sessions[0].sessionId, 'blocked');
+    const calls = (await fs.readFile(audit, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(calls.filter(call => call.identities), [{ identities: [process.pid] }]);
+  }, { sessionFaults: true });
 });
 
 test('an outstanding overview read becomes stale at its next due time without starting again', { timeout }, async () => {

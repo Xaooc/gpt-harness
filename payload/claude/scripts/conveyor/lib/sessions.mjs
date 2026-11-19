@@ -251,28 +251,33 @@ export async function readSessions({
     const statusSince = timestamp(row.statusUpdatedAt) ?? timestamp(row.updatedAt) ?? timestamp(row.startedAt) ?? 0;
     const previous = Object.hasOwn(cursors, sessionId) ? cursors[sessionId] : undefined;
     const filename = `${sessionId}.jsonl`;
-    let file = path.join(projects, cwd.replace(/[^A-Za-z0-9]/g, '-'), filename);
-    let handle = await openFile(file);
-    if (!handle && previous?.file && previous.file !== file) {
-      file = previous.file;
-      handle = await openFile(file);
-    }
-    if (!handle) {
-      // Resumed sessions can point at a cwd other than the transcript's original project.
-      projectEntries ??= (await entries(projects)).filter((entry) => entry.isDirectory());
-      for (const entry of projectEntries) {
-        file = path.join(projects, entry.name, filename);
-        handle = await openFile(file);
-        if (handle) break;
-      }
-    }
     let cursor;
-    if (handle) {
-      try {
-        cursor = await tailTranscript(file, handle, previous);
-      } finally {
-        await handle.close();
+    try {
+      let file = path.join(projects, cwd.replace(/[^A-Za-z0-9]/g, '-'), filename);
+      let handle = await openFile(file);
+      if (!handle && previous?.file && previous.file !== file) {
+        file = previous.file;
+        handle = await openFile(file);
       }
+      if (!handle) {
+        // Resumed sessions can point at a cwd other than the transcript's original project.
+        projectEntries ??= (await entries(projects)).filter((entry) => entry.isDirectory());
+        for (const entry of projectEntries) {
+          file = path.join(projects, entry.name, filename);
+          handle = await openFile(file);
+          if (handle) break;
+        }
+      }
+      if (handle) {
+        try {
+          cursor = await tailTranscript(file, handle, previous);
+        } finally {
+          await handle.close();
+        }
+      }
+    } catch (error) {
+      if (typeof error.errno !== 'number') throw error;
+      cursor = undefined;
     }
     const busy = row.status === 'busy';
     const openTools = (cursor?.tools ?? []).filter(([, tool]) => tool.backgroundId
@@ -290,7 +295,7 @@ export async function readSessions({
       tool, turnSince: busy ? statusSince : 0, idleSince: busy ? 0 : statusSince, agents
     });
   }
-  // The collector carries only the transcript cursors between samples.
+  // Callers that carry forward only cursors also keep the process identity cache.
   const nextCursorState = Object.fromEntries(nextCursors);
   Object.defineProperty(nextCursorState, sessionIdentities, { value: nextIdentities });
   return { sessions, cursors: nextCursorState, identities: nextIdentities };

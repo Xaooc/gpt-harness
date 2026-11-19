@@ -3,9 +3,19 @@ import { readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { listProcesses, processAlive, readProcessStat } from '../conveyor/lib/platform.mjs';
 
-const live = new Set();
+const live = new Map();
 const windows = process.platform === 'win32';
 const GRACE_MS = 2000;
+let closing = false;
+
+export function startMaintenanceWatchdog() {
+  if (process.env.LUNA_SESSION_MAINTENANCE !== '1') return;
+  setTimeout(async () => {
+    closing = true;
+    await Promise.allSettled([...live.values()].map((stop) => stop()));
+    process.exit(1);
+  }, 120_000).unref();
+}
 
 function signalProcess(pid, signal) {
   try { process.kill(pid, signal); return true; }
@@ -65,16 +75,19 @@ async function terminate(child, pgid) {
   while ([...members.values()].some(sameProcess) && performance.now() < until) await sleep(10);
 }
 
-export async function run(argv, { deadlineMs = 120_000, cwd, env, maxOutput = 4 * 1024 * 1024, signal } = {}) {
+export async function run(argv, {
+  deadlineMs = 120_000, cwd, env, maxOutput = 4 * 1024 * 1024, signal, input, stopWhen
+} = {}) {
+  if (closing || signal?.aborted) return { code: null, stdout: '', stderr: 'command cancelled', timedOut: false };
   const child = spawn(argv[0], argv.slice(1), {
-    cwd, env, detached: !windows, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe']
+    cwd, env, detached: !windows, windowsHide: true, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe']
   });
   const pgid = child.pid;
-  if (pgid) live.add(pgid);
-  let remaining = maxOutput;
+  let remaining = maxOutput, truncated = false;
   const capture = (stream) => {
     const chunks = [];
     stream.on('data', (chunk) => {
+      if (chunk.length > remaining) truncated = true;
       if (remaining <= 0) return;
       const part = chunk.subarray(0, remaining);
       chunks.push(part);
@@ -83,7 +96,7 @@ export async function run(argv, { deadlineMs = 120_000, cwd, env, maxOutput = 4 
     return () => Buffer.concat(chunks).toString('utf8');
   };
   const stdout = capture(child.stdout), stderr = capture(child.stderr);
-  let spawnError, timedOut = false, terminating = false, closeGrace, groupPoll;
+  let spawnError, timedOut = false, termination, closeGrace, groupPoll;
   child.once('error', (error) => { spawnError = error; });
   const destroyPipes = () => {
     child.stdout.destroy();
@@ -94,7 +107,7 @@ export async function run(argv, { deadlineMs = 120_000, cwd, env, maxOutput = 4 
   let exitCode = null;
   child.once('exit', (code) => {
     exitCode = code;
-    if (!windows) return;
+    if (!windows || termination) return;
     clearTimeout(timer);
     closeGrace = setTimeout(() => {
       destroyPipes();
@@ -103,33 +116,38 @@ export async function run(argv, { deadlineMs = 120_000, cwd, env, maxOutput = 4 
   });
   child.once('close', (code) => {
     clearTimeout(closeGrace);
-    if (terminating && !windows) return;
+    if (termination) return;
     const checkGroup = () => {
       if (windows || !pgid || !signalProcess(-pgid, 0)) finish(code);
       else groupPoll = setTimeout(checkGroup, 50);
     };
     checkGroup();
   });
-  const stop = async () => {
-    if (!pgid || terminating) return;
-    terminating = true;
+  const stop = () => {
+    if (!pgid) return result;
     clearTimeout(groupPoll);
-    try { await terminate(child, pgid); }
-    catch (error) { spawnError ??= error; }
-    finally {
+    clearTimeout(closeGrace);
+    termination ??= terminate(child, pgid).catch((error) => { spawnError ??= error; }).finally(() => {
       destroyPipes();
       finish(exitCode);
-    }
+    });
+    return termination;
   };
+  if (pgid) live.set(pgid, stop);
   const timer = setTimeout(() => {
     timedOut = true;
     void stop();
   }, deadlineMs);
-  if (signal?.aborted) void stop();
-  else signal?.addEventListener('abort', stop, { once: true });
+  signal?.addEventListener('abort', stop, { once: true });
+  if (stopWhen) child.stdout.on('data', () => { if (!termination && stopWhen(stdout())) void stop(); });
+  if (child.stdin) {
+    child.stdin.on('error', () => {});
+    child.stdin.end(input);
+  }
   try {
     const code = await result;
-    return { code, stdout: stdout(), stderr: stderr() || spawnError?.message || '', timedOut };
+    return { code, stdout: stdout(), stderr: stderr() || spawnError?.message || '', timedOut,
+      ...(truncated ? { truncated: true } : {}) };
   } finally {
     clearTimeout(timer);
     clearTimeout(closeGrace);

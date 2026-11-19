@@ -15,6 +15,7 @@ import {
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 import { hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
 import { bash, platform, processAlive, readProcessStat, scanBinary } from './lib/platform.mjs';
+import { run as runSupervised, startMaintenanceWatchdog } from '../lib/supervised-run.mjs';
 
 // Matches luna.sh's retryable_model_error deny pattern, including usage, auth and invalid-model failures.
 const quotaError = new RegExp([
@@ -642,10 +643,9 @@ async function catalogCommand(args) {
         };
         try {
           // 15 s: a stalled Codex still leaves the cache fallback and the Claude scan inside the panel's deadline.
-          const { stdout } = await execute(command[0], command.slice(1), {
-            encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024
-          });
-          models = parseModels(stdout);
+          const result = await runSupervised(command, { deadlineMs: 15_000, maxOutput: 8 * 1024 * 1024 });
+          if (result.code !== 0 || result.timedOut || result.truncated) throw new Error('codex debug models failed');
+          models = parseModels(result.stdout);
         } catch {
           try { models = parseModels(await fs.readFile(cache, 'utf8')); }
           catch { throw new Error(`codex model cache unreadable: ${cache}`); }
@@ -1133,7 +1133,7 @@ export async function main(args = process.argv.slice(2)) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  if (process.env.LUNA_SESSION_MAINTENANCE === '1') setTimeout(() => process.exit(1), 120_000).unref();
+  startMaintenanceWatchdog();
   main().then((code) => { process.exitCode = code; }).catch((error) => {
     process.stderr.write(`conveyor: ${error.message.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')}\n`);
     process.exitCode = 1;
