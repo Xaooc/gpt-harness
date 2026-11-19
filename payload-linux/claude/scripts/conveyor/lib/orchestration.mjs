@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { lockOwnerAlive, lockOwnerStart } from './platform.mjs';
+import { home, lockOwnerAlive, lockOwnerStart } from './platform.mjs';
 
 const providers = ['codex', 'gemini', 'claude'];
 const reasons = ['quota', 'region', 'auth', 'start'];
@@ -336,8 +336,28 @@ async function codexUsage(now) {
   return { ...limits, ageS, stale: ageS !== null && ageS > 1800, known: ageS !== null && ageS <= 1800 };
 }
 
-async function claudeUsage(now) {
-  const dir = path.join(paths().run, 'sessions');
+async function collectorClaudeLimits(run, now) {
+  const roots = new Set([run, path.resolve(home(), '.claude', 'luna-run')]);
+  if (process.env.CLAUDE_HOME_DIR) roots.add(path.resolve(process.env.CLAUDE_HOME_DIR, 'luna-run'));
+  const snapshots = await Promise.all([...roots].map((root) => optionalJson(path.join(root, 'collector', 'snapshot.json'))));
+  const latest = new Map();
+  for (const snapshot of snapshots) {
+    const at = stamp(snapshot?.at);
+    if (!Number.isFinite(at) || now - at > 600_000 || !Array.isArray(snapshot.claudeLimits)) continue;
+    for (const limit of snapshot.claudeLimits) {
+      if (!object(limit) || typeof limit.kind !== 'string' || !Number.isFinite(limit.percentUsed)) continue;
+      if (limit.resetsAt != null && !(stamp(limit.resetsAt) > now)) continue;
+      const observed = stamp(limit.observedAt ?? snapshot.at);
+      if (!Number.isFinite(observed)) continue;
+      const previous = latest.get(limit.kind);
+      if (!previous || observed > previous.observed) latest.set(limit.kind, { limit, observed });
+    }
+  }
+  return [...latest.values()].map(({ limit }) => limit);
+}
+
+async function heartbeatClaudeLimits(run, now) {
+  const dir = path.join(run, 'sessions');
   let names;
   try { names = (await fs.readdir(dir)).filter((name) => name.endsWith('.json')); }
   catch (error) {
@@ -356,8 +376,14 @@ async function claudeUsage(now) {
       }
     }
   }
-  return { known: windows.size > 0, nearLimit: [...windows.values()].some((limit) => limit.percentUsed >= 95),
-    windows: [...windows.values()] };
+  return [...windows.values()];
+}
+
+async function claudeUsage(now) {
+  const run = paths().run;
+  let windows = await collectorClaudeLimits(run, now);
+  if (!windows.length) windows = await heartbeatClaudeLimits(run, now);
+  return { known: windows.length > 0, nearLimit: windows.some((limit) => limit.percentUsed >= 95), windows };
 }
 
 const used = (window) => Number.isFinite(window?.usedPercent) && window.usedPercent >= 0 ? window.usedPercent : null;
