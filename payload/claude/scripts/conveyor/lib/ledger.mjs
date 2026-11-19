@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { matchingProcess, readProcess } from '../../lib/luna-runtime.mjs';
 import { entryText, isGenuineHumanEntry } from '../../learning/extract.mjs';
 import { readJsonl, sanitizeQuote } from '../../learning/common.mjs';
 import { loadConfig } from './orchestration.mjs';
@@ -722,14 +723,98 @@ function linked(state, id) {
   return !!link && (link.item === 'none' ? !!link.reason?.trim() : state.items.some((item) => item.id === link.item));
 }
 
+const liveJobState = /^(?:running|starting|pending|queued|waiting(?:-.*)?)$/;
+
+function readJobFile(file, limit = 64 * 1024) {
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size > limit) return null;
+    return { text: fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''), mtimeMs: stat.mtimeMs };
+  } catch { return null; }
+}
+
+function jobJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function indexedJobs(run, index, session, jobs) {
+  const directory = path.join(run, index);
+  const gemini = index === 'gem-active';
+  let entries;
+  try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
+  catch { return; }
+  const time = Date.now();
+  const boot = time - os.uptime() * 1000;
+  for (const entry of entries) {
+    if (!entry.isFile() || (gemini && !entry.name.endsWith('.json'))) continue;
+    const pointer = readJobFile(path.join(directory, entry.name), 32 * 1024);
+    if (!pointer) continue;
+    const gem = gemini ? jobJson(pointer.text) : null;
+    if (gemini && gem?.v !== 1) continue;
+    const [out, pid, start] = gemini ? [gem.out, gem.wrapper_pid] : pointer.text.split(/\r?\n/, 3).map((line) => line.trim());
+    if (typeof out !== 'string' || !path.isAbsolute(out) || out.startsWith('//') || out.includes('\0')) continue;
+    const status = readJobFile(`${out}.status`);
+    if (!status) continue;
+    const fields = new Map();
+    for (const line of status.text.split(/\r?\n/)) {
+      const equals = line.indexOf('=');
+      if (equals < 1) continue;
+      const key = line.slice(0, equals);
+      if (!fields.has(key)) fields.set(key, line.slice(equals + 1));
+    }
+    const state = fields.get('state');
+    if ((fields.get('owner') || gem?.owner) !== session || !liveJobState.test(state)) continue;
+    if (gemini) {
+      const wrapper = readProcess(pid);
+      const expected = fields.get('wrapper_start');
+      if (fields.get('provider') !== 'gemini' || !wrapper || wrapper.state === 'Z' || (expected && wrapper.started !== expected)) {
+        continue;
+      }
+    } else {
+      if (Date.parse(fields.get('started')) < boot) continue;
+      if (pid ? !matchingProcess(Number(pid), start) : time - status.mtimeMs > 600_000) continue;
+    }
+    jobs.set(out, { out, state, id: fields.get('daemon_job') });
+  }
+}
+
+async function daemonOwnedJobs(directory, session) {
+  const info = jobJson(readJobFile(path.join(directory, 'daemon.json'))?.text);
+  if (!info || !Number.isInteger(info.port) || info.port < 1 || info.port > 65535
+    || typeof info.token !== 'string' || !matchingProcess(info.pid, info.pid_start)) return [];
+  try {
+    const response = await fetch(`http://127.0.0.1:${info.port}/jobs`, {
+      headers: { 'X-Luna-Token': info.token }, signal: AbortSignal.timeout(1000), redirect: 'error'
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return [];
+    }
+    const list = await response.json();
+    return Array.isArray(list?.jobs)
+      ? list.jobs.filter((job) => job?.owner === session && liveJobState.test(job.state)) : [];
+  } catch { return []; }
+}
+
 async function ownedJobs(context) {
-  const command = process.env.CONVEYOR_OVERVIEW_CMD || [process.execPath, path.join(claudeHome(), 'scripts', 'luna-overview.mjs')];
-  const result = await runCommand(command, [], context.cwd);
-  if (result.rc !== 0) throw new Error(`executor overview: ${result.stderr}`);
-  const overview = JSON.parse(result.stdout);
-  if (!Array.isArray(overview.jobs)) throw new Error('executor overview has no jobs array');
-  return overview.jobs.filter((job) => job.owner === context.session
-    && /^(?:running|starting|pending|queued|waiting(?:-.*)?)$/.test(job.state));
+  const command = process.env.CONVEYOR_OVERVIEW_CMD;
+  if (command) {
+    const result = await runCommand(command, [], context.cwd);
+    if (result.rc !== 0) throw new Error(`executor overview: ${result.stderr}`);
+    const overview = JSON.parse(result.stdout);
+    if (!Array.isArray(overview.jobs)) throw new Error('executor overview has no jobs array');
+    return overview.jobs.filter((job) => job.owner === context.session && liveJobState.test(job.state));
+  }
+  const run = path.resolve(process.env.LUNA_RUN_DIR || process.env.LUNA_OVERVIEW_HOME || path.join(claudeHome(), 'luna-run'));
+  const daemon = path.resolve(process.env.LUNA_DAEMON_HOME || run);
+  const listings = await Promise.all([daemon, path.join(daemon, 'daemon-net')]
+    .map((directory) => daemonOwnedJobs(directory, context.session)));
+  // The learning registry records terminal jobs. The live indexes have no display limits here.
+  const jobs = new Map();
+  indexedJobs(run, 'active', context.session, jobs);
+  indexedJobs(run, 'gem-active', context.session, jobs);
+  const wrappedIds = new Set([...jobs.values()].map((job) => job.id).filter(Boolean));
+  return [...jobs.values(), ...listings.flat().filter((job) => !wrappedIds.has(job.id))];
 }
 
 async function cleanupProblem(context, state, repos) {

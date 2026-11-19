@@ -74,7 +74,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "3cd2110b37d25276f12c4932b15ae898b4a80dd5b3072504609eb1ca1942d47e"
+      "sha256": "5edc30affc41da5e9d99ef2fd6a7d7b796a31b7860af5b9d4b5cae9b80862703"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
@@ -86,13 +86,13 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "a4876ab241c02541fc418e257bcc37c334825c306543d20b5b148af00398dde8"
+      "sha256": "f53714d19ffef097d4556344c0a2ce10328b6230af301eb6c29904137efeea96"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",
       "dest": "local-plugins/luna-panel/tests/pane.test.tsx",
       "kind": "file",
-      "sha256": "8281f619c3f9aa6a5ff80ed7f978b8686b7403ec8722ed14949a51c098e399f9"
+      "sha256": "f8fabdd0394cda1234db1c56f43ff246c88f87faa64d6569a1a3b77a3cbc867a"
     },
     {
       "src": "claude/local-plugins/luna-panel/tsconfig.json",
@@ -104,7 +104,7 @@
       "src": "claude/local-plugins/luna-panel/types/index.d.ts",
       "dest": "local-plugins/luna-panel/types/index.d.ts",
       "kind": "file",
-      "sha256": "5613d0b1408f8918c3928c177d19e350d4cb72a4fff6c3527dcc55b4274201c3"
+      "sha256": "39782ae6b84277e30188384d542537c122fa5e8d31b0628bdfa91492a283f246"
     },
     {
       "src": "claude/scripts/disk/audit.mjs",
@@ -320,14 +320,14 @@
       "src": "claude/scripts/luna-overview.mjs",
       "dest": "scripts/luna-overview.mjs",
       "kind": "file",
-      "sha256": "8565c74f0eacab70d1bda0bbd64bdc1d0c66d15a358660562ac843b3cb661163",
+      "sha256": "baa84123fe617269d04a8d2475f4aa82243c655f852fe68c357d42036a93a5b8",
       "executable": true
     },
     {
       "src": "claude/scripts/luna-overview.sh",
       "dest": "scripts/luna-overview.sh",
       "kind": "file",
-      "sha256": "0b67fb721bc6f9ebf8e3002554f98e940e3f980750e9ad1dc71c82b05f95a393",
+      "sha256": "9814bea30548f2abb6a1ca929347792a3bf2a6e159333915dfb58fb4581b6585",
       "executable": true
     },
     {
@@ -3806,7 +3806,7 @@
       "src": "claude/scripts/conveyor/lib/ledger.mjs",
       "dest": "scripts/conveyor/lib/ledger.mjs",
       "kind": "file",
-      "sha256": "ac8a22a599027e85078e63a3ae3f71c92c5ce9c53c18be8ab48f1532aedf77e1"
+      "sha256": "a2d2ed874745b4d82fdb59327adc6ac9f49d04c4b8e6a2f17d8c83952a784b22"
     },
     {
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
@@ -3908,7 +3908,7 @@
       "src": "claude/local-plugins/luna-panel/tests/snapshot.fixture.ts",
       "dest": "local-plugins/luna-panel/tests/snapshot.fixture.ts",
       "kind": "file",
-      "sha256": "7f8976994ad9d794465833e8180964f3dce317a258a2a907a31c5fe010a708aa"
+      "sha256": "434a1539a39b0c49e5bfb566112abc9385f73f737a0a82b4785538bfe76c58fb"
     },
     {
       "src": "claude/scripts/conveyor/test/check.test.mjs",
@@ -3969,7 +3969,7 @@
       "src": "claude/scripts/conveyor/test/ledger.test.mjs",
       "dest": "scripts/conveyor/test/ledger.test.mjs",
       "kind": "file",
-      "sha256": "c9081bdffdef009c8ded351b4e8e11d8a12c76982bd423678ace57e13a812c24"
+      "sha256": "f7cf76e8ef8d4593e7538d19f14127fb6aba8c7850018569e0a928b7a8f431e0"
     },
     {
       "src": "claude/scripts/conveyor/test/metrics.test.mjs",
@@ -3993,7 +3993,7 @@
       "src": "claude/scripts/conveyor/test/usage.test.mjs",
       "dest": "scripts/conveyor/test/usage.test.mjs",
       "kind": "file",
-      "sha256": "5885bf82d55ba84731eecf6b1ef5e9e9af39377a805e8dce88304a297b5d353c"
+      "sha256": "184415b0176f43a23aabf4ada372f99a7dc57217bb4652456cd9daf6d773e097"
     },
     {
       "src": "claude/scripts/learning/test/target-fixtures.mjs",
@@ -5187,6 +5187,37 @@
       "dest": "skills/ui-ux-pro-max/scripts",
       "kind": "file",
       "sha256": "1f80a44a7c81b3d286013ba1e133581ff5966544496a9caa758291dba3e5a4f2"
+    },
+    {
+      "src": "claude/scripts/conveyor/lib/sessions.mjs",
+      "dest": "scripts/conveyor/lib/sessions.mjs",
+      "kind": "file",
+      "sha256": "b67cf0fa207f252d7d3083d8916a56201ab7fc6f87e569bc81133abe8ae8ee80"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/collector.test.mjs",
+      "dest": "scripts/conveyor/test/collector.test.mjs",
+      "kind": "file",
+      "sha256": "50190a0e93ef3adf65241b533dc04a59cf0a38297f2d7ec761b1a3719d87fddb"
+    },
+    {
+      "src": "claude/scripts/conveyor/test/sessions.test.mjs",
+      "dest": "scripts/conveyor/test/sessions.test.mjs",
+      "kind": "file",
+      "sha256": "b7f79c7699f55b915fe6231a650ac107be387448eada32b38c7d4318ed527cc9"
+    },
+    {
+      "src": "claude/scripts/lib/supervised-run.mjs",
+      "dest": "scripts/lib/supervised-run.mjs",
+      "kind": "file",
+      "sha256": "dfe2e5383ea0ad58819c04e3f65b4c56802dfc15de83555a68eef7395249c708"
+    },
+    {
+      "src": "claude/scripts/luna-collector.mjs",
+      "dest": "scripts/luna-collector.mjs",
+      "kind": "file",
+      "sha256": "a24675cf56e14610bcc61c2b3b98a21bc1c1df5f2556deb54b05d975e1ea041c",
+      "executable": true
     }
   ],
   "settings": "settings/hooks.json",
