@@ -74,7 +74,7 @@
       "src": "claude/local-plugins/luna-panel/.claude-plugin/plugin.json",
       "dest": "local-plugins/luna-panel/.claude-plugin/plugin.json",
       "kind": "file",
-      "sha256": "dc1cf6d17cc2726377b509ea17225a2dd86522d5e60847231dea57aa56852d3b"
+      "sha256": "67094471810370b69fbd8ecbbb70b33ae6e564f5456020a1be8df90d71d896af"
     },
     {
       "src": "claude/local-plugins/luna-panel/hooks/hooks.json",
@@ -3772,7 +3772,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "47bf2e3a00c4e67f9f9a77a490ac3765da43d1aa8800ee4f0297882b7b95e85c",
+      "sha256": "c227ff9b202336beedf429ddf7347cc7519399e269a6902a238f4d721a25299c",
       "executable": true
     },
     {
@@ -5272,7 +5272,7 @@
       "src": "claude/scripts/conveyor/test/mlai.test.mjs",
       "dest": "scripts/conveyor/test/mlai.test.mjs",
       "kind": "file",
-      "sha256": "d7c7fa94a55d99283e00a2569324a71d36d4e85d0663c7b72c42f3586955dc43"
+      "sha256": "087d1e7b54be985142280c3058f37aea30476a072673f30db1a685af0fd6276f"
     },
     {
       "src": "claude/scripts/mlai.sh",
@@ -5285,7 +5285,7 @@
       "src": "claude/scripts/mlai/mlai-run.mjs",
       "dest": "scripts/mlai/mlai-run.mjs",
       "kind": "file",
-      "sha256": "36779d19bc3acd0e220b0a24bbb84947ae87d5d1a73c73bed8fd76b9b1b74bd5",
+      "sha256": "c81daaf40dc6f5e779badb9f78629ce4fdd06e0a968cc3563aaa24a6433b2ec7",
       "executable": true
     }
   ],
