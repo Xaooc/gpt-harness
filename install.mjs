@@ -678,10 +678,24 @@ function installClaudeMd(ctx, source) {
     writeManaged(ctx, file, `${text.slice(0, range.start)}${block}${text.slice(range.end)}`);
   } else if (normalizedText(text) === normalizedText(payload)) {
     skip(ctx, 'CLAUDE.md already matches');
+  } else if (previousPayloadMatches(ctx, source, text)) {
+    // An unmarked file that is exactly the harness text of the previous install was never edited by hand: replace it
+    // (now with markers, so later upgrades replace only the block) instead of appending a second copy.
+    writeManaged(ctx, file, `${block}\n`);
+    report(ctx, 'ok', 'CLAUDE.md was the previous harness version, unedited: replaced');
   } else {
     writeManaged(ctx, file, `${text}${text.endsWith('\n') ? '\n' : '\n\n'}${block}\n`);
     report(ctx, 'warn', 'CLAUDE.md block appended; merge duplicates in your existing instructions if needed');
   }
+}
+
+function previousPayloadMatches(ctx, source, text) {
+  const commit = ctx.record?.repoCommit;
+  if (!commit || !/^[0-9a-f]{40}$/.test(commit)) return false;
+  const relative = path.relative(REPO_ROOT, source).split(path.sep).join('/');
+  if (!relative || relative.startsWith('..')) return false;
+  const result = runCommand('git', ['show', `${commit}:${relative}`], { cwd: REPO_ROOT });
+  return result.status === 0 && normalizedText(result.stdout) === normalizedText(text);
 }
 
 function installEnv(ctx) {

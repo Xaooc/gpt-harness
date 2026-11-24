@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// UserPromptSubmit: record genuine prompts and remind the model about new requirement clauses. Always fail open.
+// UserPromptSubmit: record genuine prompts, roll over delivered requests, and surface clause hints. Always fail open.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,10 +10,13 @@ try {
   const event = JSON.parse(input);
   const { capturePrompt } = await import('../scripts/conveyor/lib/ledger.mjs');
   const result = await capturePrompt(event);
-  if (result?.taskOpen && result.record.clauses.length) {
-    const ids = result.record.clauses.map((clause) => clause.id).join(', ');
+  if (result?.started || (result?.taskOpen && result.record.clauses.length)) {
+    const hints = result.record.clauses.map(({ id, text }) => `${id}: ${text}`).join(', ');
+    const started = result.started ? `New request ${result.started.id} started with ${result.record.id}.` : '';
+    const additionalContext = [started, hints && `possible requirements: ${hints} — record outcomes with ledger add`]
+      .filter(Boolean).join('\n');
     process.stdout.write(JSON.stringify({ hookSpecificOutput: {
-      hookEventName: 'UserPromptSubmit', additionalContext: `new requirements: ${ids}: link them in the ledger`
+      hookEventName: 'UserPromptSubmit', additionalContext
     } }) + '\n');
   }
 } catch (error) {

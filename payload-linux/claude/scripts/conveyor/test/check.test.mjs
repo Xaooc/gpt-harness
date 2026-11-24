@@ -141,6 +141,27 @@ test('file placeholders pass literal positional arguments, including legacy quot
   }
 });
 
+test('--files-from keeps commas in paths and an empty list checks no files', { timeout }, async (t) => {
+  const file = 'src/with,comma.ts';
+  const check = command(`require('node:assert/strict').deepEqual(process.argv.slice(1), [${JSON.stringify(file)}])`);
+  const env = await environment(t, { ...profile(), turn: [{ name: 'argv', run: `${check} -- {files}` }] });
+  await env.write(file, 'export {};\n');
+  await env.write('src/another.ts', 'export {};\n');
+  const list = path.join(env.root, 'files.json');
+  const args = ['run', '--level', 'turn', '--files-from', list];
+  await fs.writeFile(list, JSON.stringify([file]));
+  const scoped = await env.command(args);
+  assert.equal(scoped.status, 0, scoped.stderr || scoped.stdout);
+  assert.deepEqual(scoped.report.changed, [file]);
+  assert.equal(scoped.report.results[0].status, 'pass');
+
+  await fs.writeFile(list, '[]');
+  const empty = await env.command(args);
+  assert.equal(empty.status, 0, empty.stderr || empty.stdout);
+  assert.deepEqual(empty.report.changed, []);
+  assert.equal(empty.report.results[0].status, 'skipped');
+});
+
 test('untrusted profiles use autodetection and default hygiene until the reviewed SHA-256 is trusted', { timeout }, async (t) => {
   const env = await environment(t);
   const bin = path.join(env.root, 'bin'), log = path.join(env.root, 'npm.jsonl');

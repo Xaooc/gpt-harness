@@ -556,14 +556,14 @@
       "src": "claude/hooks/conveyor-prompt-capture.mjs",
       "dest": "hooks/conveyor-prompt-capture.mjs",
       "kind": "file",
-      "sha256": "e85807cf306fad4993da3bba744f780f3a8efb4f6a847936d398b6c7900e97f7",
+      "sha256": "9cbd48a71f8d01e97e5f90170d5c0e1c927bd47a1d1be4564a5e02742c92261d",
       "executable": true
     },
     {
       "src": "claude/hooks/conveyor-stop-gate.mjs",
       "dest": "hooks/conveyor-stop-gate.mjs",
       "kind": "file",
-      "sha256": "d421823fc0eb77f0b9a748750eed05dad9aa5f2bd47d1a25e2832cfe14d497fe",
+      "sha256": "47d919b0f1093625863cbb319bf638fb95ef400b98a4c54ca15da4ea39d18c27",
       "executable": true
     },
     {
@@ -735,7 +735,7 @@
       "src": "claude/local-plugins/pstack/docs/harness/bro-harness.md",
       "dest": "local-plugins/pstack/docs/harness/bro-harness.md",
       "kind": "file",
-      "sha256": "928286be6f5e3bc864464a01b881b926c8ac048ce43539f43fd07a55be3c5e9b"
+      "sha256": "84105b25c5f603983cce81a2873a0b959b17183e1c1fcb8a801f5641691277f9"
     },
     {
       "src": "claude/local-plugins/pstack/docs/harness/claude-code.md",
@@ -3880,7 +3880,7 @@
       "src": "claude/scripts/conveyor/check.mjs",
       "dest": "scripts/conveyor/check.mjs",
       "kind": "file",
-      "sha256": "a5bd6ac7843f290243075032392e4ac51391495a65062e82bd04c18be6c317d3",
+      "sha256": "aa8c4957f37d5c0f1a5a54de0c0a38bf968a2f9a94dd3acecc4821d4109c51a8",
       "executable": true
     },
     {
@@ -3894,7 +3894,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "892e66a2913450d5d055e860d9c771e9c8f5ff13e26e4e76514f99b2fb847082",
+      "sha256": "274d48ea1899efd8d7f8bd3441c2e81fbe2e42656edbad665aa8a19591a48676",
       "executable": true
     },
     {
@@ -3915,7 +3915,7 @@
       "src": "claude/scripts/conveyor/ledger.mjs",
       "dest": "scripts/conveyor/ledger.mjs",
       "kind": "file",
-      "sha256": "c910cc74b751c58d673dba940ccbb3a10529feb2bc8cd1616b44468469f9b396",
+      "sha256": "9876fa59146f63f0c2caad705ddce5a6e86fbfe1d157c35d433f04d8b441314a",
       "executable": true
     },
     {
@@ -3928,13 +3928,13 @@
       "src": "claude/scripts/conveyor/lib/ledger.mjs",
       "dest": "scripts/conveyor/lib/ledger.mjs",
       "kind": "file",
-      "sha256": "24799c9e05a2aa14576de4a834be27a754311039fbda53311e6943c3b2d9b17c"
+      "sha256": "865da7453ca17f20271d7b67b486a20897bef16d8d2560d8734673000a96268b"
     },
     {
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
       "dest": "scripts/conveyor/lib/orchestration.mjs",
       "kind": "file",
-      "sha256": "b24fa0f61856722d0790462bbd39d457b11cca8ae81265eb7c4fc04beb214d3f"
+      "sha256": "2f1712baee99117d993d109aea2043904f0633ca4b7895c25827208f4114072b"
     },
     {
       "src": "claude/scripts/conveyor/lib/patch-recipes.mjs",
@@ -3979,7 +3979,7 @@
       "src": "claude/scripts/conveyor/metrics.mjs",
       "dest": "scripts/conveyor/metrics.mjs",
       "kind": "file",
-      "sha256": "ad3be6e847894eb95fafdc75dc6cd7b9f21b062180e1bc032a26e3d643bc4dac",
+      "sha256": "412235fb63c68ad4c99d6a23c6e9296987362342305718535d3a6c28526a67a0",
       "executable": true
     },
     {
@@ -3992,7 +3992,7 @@
       "src": "claude/hooks/test/conveyor-stop-gate.test.mjs",
       "dest": "hooks/test/conveyor-stop-gate.test.mjs",
       "kind": "file",
-      "sha256": "d1485a602618d75d35b8a2344cbe97f9b0c0b3b8efdfba5b5f59ba4c4254c8a6"
+      "sha256": "560833ee025df2b585b5b3a8b3b4432f0db560952a357cf9e2493061b088389a"
     },
     {
       "src": "claude/hooks/test/conveyor-subagent-gate.test.mjs",
@@ -4022,7 +4022,7 @@
       "src": "claude/scripts/conveyor/test/check.test.mjs",
       "dest": "scripts/conveyor/test/check.test.mjs",
       "kind": "file",
-      "sha256": "59ec2565354aace79d6fb8209c9ded2b15b7adbf4c295de12f8bc70edd633335"
+      "sha256": "6e86fc7da8a9289933e114874ec333a2a41d059e3575cf1a4c0d16b8203af5e2"
     },
     {
       "src": "claude/scripts/conveyor/test/checks.test.mjs",
@@ -4040,7 +4040,7 @@
       "src": "claude/scripts/conveyor/test/exec.test.mjs",
       "dest": "scripts/conveyor/test/exec.test.mjs",
       "kind": "file",
-      "sha256": "9d25db242cc72ff378d57bfb841ab3acecd0f9c5aad837a85c9a41c800da3ee3"
+      "sha256": "3775db70b6905eff8d676828c53b8d5615c8322555f2f9d2f9f5233867f52ec8"
     },
     {
       "src": "claude/scripts/conveyor/test/fixtures/fake-wrapper.sh",
@@ -4077,7 +4077,7 @@
       "src": "claude/scripts/conveyor/test/ledger.test.mjs",
       "dest": "scripts/conveyor/test/ledger.test.mjs",
       "kind": "file",
-      "sha256": "b3b97eae1f945c059feb3958c729126330aa0954a627fe532b13344d4f63ec52"
+      "sha256": "58c19398647408cd45c4379161db401d4ceef1336c837621807d8d188d89fff3"
     },
     {
       "src": "claude/scripts/conveyor/test/metrics.test.mjs",
@@ -5351,11 +5351,29 @@
       "dest": "scripts/lib/codex-limits-probe.mjs",
       "kind": "file",
       "sha256": "67b50a255e4ce1c9f4bcc3b51e61d98a9ba60deb051c55cb3dce813d65bc27cd"
+    },
+    {
+      "src": "claude/scripts/conveyor/lib/delivery.mjs",
+      "dest": "scripts/conveyor/lib/delivery.mjs",
+      "kind": "file",
+      "sha256": "b59fa83c3dc482d25950b88ae67c247a43a0026e2ffc174274cfd0f6364128bd"
+    },
+    {
+      "src": "claude/scripts/conveyor/lib/request-state.mjs",
+      "dest": "scripts/conveyor/lib/request-state.mjs",
+      "kind": "file",
+      "sha256": "83e9560cb42e31926db291275ff533550685b0a38fa39680f0119005ccdd1d56"
+    },
+    {
+      "src": "claude/scripts/conveyor/lib/task-scope.mjs",
+      "dest": "scripts/conveyor/lib/task-scope.mjs",
+      "kind": "file",
+      "sha256": "f7c843d544d47673042cf105e049f177d404e02f4a31ddfa43762a0fa2364e15"
     }
   ],
   "settings": "settings/hooks.json",
   "claudeMd": "claude-md/harness-section.md",
   "pluginPatches": "codex-plugin-patches/manifest.json",
   "settingsSha256": "e64833cd668195bb9deab214dfc18a8de38034e18d1a434987a54e1f4952da4a",
-  "claudeMdSha256": "c906bf3c6c009eac38ccd7cfd83d1ee458ecd7667434ae14c508a5d89bdb0130"
+  "claudeMdSha256": "abd47f6f30033d8bc054b77b90ee5827baee01dd55f5e42d431439a3ee1f77ee"
 }
