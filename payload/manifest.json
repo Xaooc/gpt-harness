@@ -403,7 +403,7 @@
       "src": "claude/local-plugins/luna-panel/hooks/register.tsx",
       "dest": "local-plugins/luna-panel/hooks/register.tsx",
       "kind": "file",
-      "sha256": "04fdbd5070451d981bf80d04805f7c8171058554e316ef5bb438b5305c9beeba"
+      "sha256": "edd734503462ae4f8e9e6365c149d8f75b2e660007ddf2954326a75bef6614fe"
     },
     {
       "src": "claude/local-plugins/luna-panel/tests/pane.test.tsx",

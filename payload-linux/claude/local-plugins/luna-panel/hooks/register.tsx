@@ -204,6 +204,7 @@ function reasonRu(reason: string): string {
   if (/sign-in expired/i.test(r)) return 'вход истёк'
   if (/not signed in/i.test(r)) return 'нет входа'
   if (/not installed/i.test(r)) return 'не установлен'
+  if (/^start:|cannot reach|connection[ _-]?interrupted/i.test(r)) return 'сбой запуска'
   const pct = /(\d+)% ≥ (\d+)%/.exec(r)
   if (pct) return `${pct[1]}% ≥ порога ${pct[2]}%`
   if (/quota/i.test(r)) return `квота${/until (\S+)/i.test(r) ? ` до ${clock(/until (\S+)/i.exec(r)?.[1])}` : ''}`
