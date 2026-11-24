@@ -543,7 +543,7 @@
       "src": "claude/conveyor/orchestration.default.json",
       "dest": "conveyor/orchestration.default.json",
       "kind": "file",
-      "sha256": "0eb1809f0aa672fddf8ab0f4d484f1162c426083f07e0f52be2a12157a5c8fe6"
+      "sha256": "b4d6a1f542a9c8d830650c361da7202e8f99311ab1e504094e8315daa59e2d2c"
     },
     {
       "src": "claude/hooks/conveyor-hygiene-session-start.mjs",
@@ -3894,7 +3894,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "f676d70eef3d1c7cbcfde4abe925d3942608688a0511504ad4d6a6426a36a376",
+      "sha256": "80ebcf1c552266cdeea17087db097ddb064b18dc49d0c4fed785be2f13df1e71",
       "executable": true
     },
     {
@@ -5374,13 +5374,13 @@
       "src": "claude/scripts/conveyor/lib/mlai.mjs",
       "dest": "scripts/conveyor/lib/mlai.mjs",
       "kind": "file",
-      "sha256": "78227798b1f2a056d1d82fc3172723d61163fc355a865e63f9e0cdc712b961e6"
+      "sha256": "9112d3995c7a26a555c9bb0c160a3a43e7dc67c6a7007cff2d0772b08a688779"
     },
     {
       "src": "claude/scripts/conveyor/test/mlai.test.mjs",
       "dest": "scripts/conveyor/test/mlai.test.mjs",
       "kind": "file",
-      "sha256": "a3f89fac1ea3547c61490121365336f25a87abac71ab815db95cbaf115845214"
+      "sha256": "aab94635ac362e140a9c2ab8e40ab598917ded5cf12495d39d9f5bd4f159ee49"
     },
     {
       "src": "claude/scripts/mlai-accounts.mjs",

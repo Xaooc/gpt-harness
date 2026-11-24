@@ -142,6 +142,11 @@
         "provider": "codex",
         "model": "gpt-6-luna",
         "effort": "high"
+      },
+      {
+        "provider": "mlai",
+        "model": "pixis-sol",
+        "effort": "medium"
       }
     ],
     "review": [
@@ -154,6 +159,11 @@
         "provider": "codex",
         "model": "gpt-6-luna",
         "effort": "high"
+      },
+      {
+        "provider": "mlai",
+        "model": "pixis-sol",
+        "effort": "medium"
       }
     ],
     "judge": [
@@ -166,6 +176,11 @@
         "provider": "codex",
         "model": "gpt-6-luna",
         "effort": "high"
+      },
+      {
+        "provider": "mlai",
+        "model": "pixis-sol",
+        "effort": "medium"
       }
     ],
     "architect": [
@@ -178,6 +193,11 @@
         "provider": "codex",
         "model": "gpt-6.2-sol",
         "effort": "max"
+      },
+      {
+        "provider": "mlai",
+        "model": "gpt-6-astra",
+        "effort": "medium"
       }
     ]
   },

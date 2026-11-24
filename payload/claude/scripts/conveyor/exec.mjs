@@ -14,7 +14,7 @@ import {
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 import { activeTaskId, hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
-import { acquireSlot, mlaiAccounts, mlaiLogin, mlaiPaths, MLAI_EFFORT_MODELS, slotState } from './lib/mlai.mjs';
+import { acquireSlot, mlaiAccounts, mlaiLogin, mlaiPaths, MLAI_EFFORT_MODELS, usableSlotState } from './lib/mlai.mjs';
 import { accountPaths } from './lib/codex-accounts.mjs';
 import { bash, platform, processAlive, readProcessStat, scanBinary } from './lib/platform.mjs';
 import { inside } from './lib/task-scope.mjs';
@@ -1225,14 +1225,11 @@ async function runCommand(args) {
       }
       if (entry.provider === 'mlai') {
         const accounts = mlaiConfig.filter(({ id }) => !excludedMlaiAccounts.has(id));
-        slot = accounts.length ? await acquireSlot({ out }, process.env, {
-          accounts, marks: state.providers?.mlai?.accounts ?? {}, now: Date.now()
-        }) : null;
+        const reservation = { accounts, marks: state.providers?.mlai?.accounts ?? {}, now: Date.now() };
+        slot = accounts.length ? await acquireSlot({ out, mode }, process.env, reservation) : null;
         if (!slot) {
-          const fresh = await Promise.all(accounts.map((account) => slotState(process.env, account)));
-          const used = fresh.reduce((sum, state) => sum + state.used, 0);
-          const limit = fresh.reduce((sum, state) => sum + state.limit, 0);
-          busyEntries.set(index, fresh.length ? `mlai sessions busy (${used}/${limit})` : entry.reason);
+          const { used, limit } = await usableSlotState(process.env, reservation);
+          busyEntries.set(index, limit ? `mlai sessions busy (${used}/${limit})` : entry.reason);
           continue;
         }
       }

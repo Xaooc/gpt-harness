@@ -236,10 +236,23 @@ test('a snapshot that says sessions busy never outvotes the live reservation', a
       assert.equal(path.dirname(claimed.dir), bSlots);
       claimed.release();
 
+
       const result = await runJob();
       assert.equal(result.status, 0, result.stderr);
       assert.equal((await readJson(`${out}.dispatch.json`)).provider, 'mlai');
       assert.equal((await readJson(`${out}.dispatch.json`)).attempts[0].account, 'b');
+
+      // A write job avoids an account that already runs a write; a read job still fills main first.
+      await fs.rm(path.join(slots, '1'), { recursive: true, force: true });
+      const ownerFile = path.join(slots, '0', 'owner.json');
+      await fs.writeFile(ownerFile, JSON.stringify({ ...JSON.parse(await fs.readFile(ownerFile, 'utf8')), mode: 'write' }));
+      const reservation = { accounts: config.mlai_accounts, marks: {}, now: Date.now() };
+      const write = await acquireSlot({ out, mode: 'write' }, env, reservation);
+      assert.equal(write.account, 'b');
+      write.release();
+      const read = await acquireSlot({ out, mode: 'read' }, env, reservation);
+      assert.equal(read.account, 'main');
+      read.release();
     } finally {
       sleeper.kill();
       await exited;
