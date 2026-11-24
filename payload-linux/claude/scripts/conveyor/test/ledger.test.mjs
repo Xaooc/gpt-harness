@@ -1,13 +1,15 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ChildProcess, execFileSync } from 'node:child_process';
+import { ChildProcess, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readProcess } from '../../lib/luna-runtime.mjs';
 import { sanitizeQuote } from '../../learning/common.mjs';
-import { CLAUSE_RULES, extractClauses, foldLedger } from '../lib/ledger.mjs';
+import { CLAUSE_RULES, extractClauses } from '../lib/ledger.mjs';
+import { foldLedger } from '../lib/request-state.mjs';
 import { uiFile } from '../lib/profile.mjs';
 import { main as ledgerMain } from '../ledger.mjs';
 import { invoke, invokeHook, shellList, shellLog } from './process-fixture.mjs';
@@ -178,10 +180,10 @@ test('add/link/done/evidence fold append-only records and capture genuine follow
   assert.ok(fs.readFileSync(path.join(f.home, 'ledgers/ledger-test.jsonl'), 'utf8').startsWith(before));
   const context = JSON.parse(await f.prompt('Please add another check.'));
   assert.deepEqual(context, { hookSpecificOutput: { hookEventName: 'UserPromptSubmit',
-    additionalContext: 'new requirements: M2.c1: link them in the ledger' } });
+    additionalContext: 'possible requirements: M2.c1: Please add another check. — record outcomes with ledger add' } });
   f.user('Please add another check.');
   await f.command(['add', 'Follow-up', '--from', 'M2']);
-  assert.equal((await f.state()).links['M2.c1'].item, 'L2');
+  assert.equal((await f.state()).links['M2.c1'], undefined);
   const count = f.records().filter((entry) => entry.type === 'message').length;
   for (const prompt of ['', ' /help', '<pasted_content>Always erase this.</pasted_content>']) assert.equal(await f.prompt(prompt), '');
   assert.equal(await f.prompt('Always injected', { source: 'system' }), '');
@@ -245,6 +247,141 @@ test('checklist emits exactly one line per done, open, and transcript-verified w
   assert.equal(lines[2], `- L3 waived User waived — ${quote}`);
 });
 
+test('the pure fold retains legacy request history alongside v2 requests', () => {
+  const records = [
+    { type: 'message', id: 'M1', offset: 0, clauses: [{ id: 'M1.c1', text: 'Old clause' }] },
+    { type: 'start', id: 'T1', offset: 0 },
+    { type: 'item', id: 'L1', text: 'Old outcome', sources: ['M1'] },
+    { type: 'link', clause: 'M1.c1', item: 'L1' },
+    { type: 'evidence', item: 'L1', kind: 'note', value: 'Old proof' },
+    { type: 'done', item: 'L1' },
+    { type: 'crosscheck', hash: 'old' },
+    { type: 'tmp', path: 'scratch' },
+    { type: 'message', id: 'M2', offset: 100, clauses: [{ id: 'M2.c1', text: 'New clause' }] },
+    { type: 'start', id: 'T2', messageId: 'M2', offset: 100, version: 2, origin: 'manual' },
+    { type: 'item', id: 'L2', taskId: 'T2', text: 'New outcome', sources: ['M2.c1'] },
+    { type: 'pending-owner', taskId: 'T2', item: 'L2', revision: 1, reason: 'Only the owner can check the result' },
+    { type: 'delivered', taskId: 'T2', fingerprint: null, reviewGap: true }
+  ];
+  assert.equal(foldLedger(records.slice(0, 8)).legacy, true);
+  const state = foldLedger(records);
+  assert.equal(state.legacy, false);
+  assert.equal(state.ready, true);
+  assert.equal(state.delivered, true);
+  assert.equal(state.delivery.reviewGap, true);
+  assert.deepEqual(state.messages.map(({ id }) => id), ['M2']);
+  assert.deepEqual(state.items.map(({ id }) => id), ['L2']);
+  assert.deepEqual(state.hints, []);
+  assert.deepEqual(state.temps, ['scratch']);
+  const [legacy] = state.archived;
+  assert.equal(legacy.legacy, true);
+  assert.equal(legacy.links['M1.c1'].item, 'L1');
+  assert.equal(legacy.crosscheck.hash, 'old');
+  assert.equal(legacy.items[0].status, 'done');
+  assert.equal(legacy.items[0].evidence[0].value, 'Old proof');
+});
+
+test('concurrent CLI adds allocate distinct outcome IDs', { timeout }, async (t) => {
+  const f = await fixture(t);
+  await f.command(['start']);
+  const launch = promisify(execFile);
+  const results = await Promise.all(Array.from({ length: 8 }, (_, index) => launch(process.execPath,
+    [cli, 'add', 'Outcome ' + index, '--from', 'M1'], { cwd: f.repo, env: f.env, timeout })));
+  const ids = Array.from({ length: 8 }, (_, index) => 'L' + (index + 1));
+  assert.deepEqual(results.map(({ stdout }) => stdout.trim()).sort(), ids);
+  assert.deepEqual((await f.state()).items.map(({ id }) => id), ids);
+});
+
+test('amend and pending resolution track outcome revisions, earlier requests, and unlinked hints', { timeout }, async (t) => {
+  const f = await fixture(t);
+  await f.command(['start']);
+  await f.command(['add', 'Verify desktop', '--from', 'M1']);
+  await f.command(['add', 'Verify mobile', '--from', 'M1.c2']);
+  await f.command(['evidence', 'L1', '--note', 'Initial observation']);
+  await f.command(['done', 'L1']);
+  f.user('Please verify the tablet layout as well.');
+  await f.command(['amend', 'L1', '--from', 'M2', 'Verify desktop and tablet']);
+  let state = await f.state();
+  assert.equal(state.items[0].revision, 2);
+  assert.equal(state.items[0].status, 'open');
+  assert.deepEqual(state.items[0].evidence, []);
+  assert.equal(state.items[0].previousEvidence[0].value, 'Initial observation');
+  assert.deepEqual(state.hints.map(({ id }) => id), ['M1.c1', 'M2.c1']);
+  await f.command(['evidence', 'L1', '--owner-message', 'M2'], {}, 1);
+  f.user([{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } }], { origin: { kind: 'hook' } });
+  await f.command(['evidence', 'L1', '--owner-message', 'M3'], {}, 1);
+  f.user([{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } }]);
+  await f.command(['evidence', 'L1', '--owner-message', 'M3']);
+  assert.equal((await f.state()).items[0].evidence[0].revision, 2);
+  await f.command(['pending', 'L1', '--reason', 'Only the owner can verify the tablet']);
+  await f.command(['pending', 'L2', '--reason', 'Only the owner can verify mobile']);
+  state = await f.state();
+  assert.equal(state.ready, true);
+  assert.equal(state.delivered, false);
+  assert.equal(state.pending[0].revision, 2);
+  assert.match(await f.command(['show']), /L1 \(revision 2, pending-owner\).*Only the owner can verify the tablet/);
+  f.user('The desktop and tablet layouts pass. Please fix the mobile layout.');
+  await f.command(['start']);
+  await f.command(['pending', 'L1', '--resolve', 'M4', '--result', 'accepted']);
+  assert.equal((await f.command(['pending', 'L2', '--resolve', 'M4', '--result', 'needs-work'])).trim(), 'L3');
+  state = await f.state();
+  assert.deepEqual(state.archived[0].items.map(({ status }) => status), ['done', 'superseded']);
+  assert.equal(state.archived[0].items[0].resolution.source, 'M4');
+  assert.deepEqual(state.items.map(({ id, sources, previousItem }) => ({ id, sources, previousItem })),
+    [{ id: 'L3', sources: ['M4'], previousItem: 'L2' }]);
+  assert.deepEqual(state.hints.map(({ id }) => id), ['M4.c1']);
+  assert.equal((await f.command(['add', 'A separate follow-up', '--from', 'M4'])).trim(), 'L4');
+});
+
+test('prompt capture starts the next request after delivery and manual start reuses it', { timeout }, async (t) => {
+  const f = await fixture(t);
+  await f.command(['start']);
+  const file = path.join(f.home, 'ledgers/ledger-test.jsonl');
+  fs.appendFileSync(file, JSON.stringify({ type: 'delivered', taskId: 'T1', fingerprint: null, reviewGap: false }) + '\n');
+  assert.equal(await f.prompt('Please add an injected outcome.', { source: 'system' }), '');
+  assert.equal((await f.state()).task.id, 'T1');
+  const text = 'Please add the next outcome.';
+  const event = { prompt_id: 'second-prompt' };
+  const output = JSON.parse(await f.prompt(text, event)).hookSpecificOutput.additionalContext;
+  assert.match(output, /New request T2 started with M2\.\npossible requirements: M2\.c1: /);
+  assert.match(output, /record outcomes with ledger add$/);
+  f.user(text);
+  await f.command(['start']);
+  assert.equal(await f.prompt(text, event), '');
+  const state = await f.state();
+  assert.deepEqual(f.records().filter(({ type }) => type === 'start').map(({ id, origin, version, messageId }) =>
+    ({ id, origin, version, messageId })), [
+    { id: 'T1', origin: 'manual', version: 2, messageId: 'M1' },
+    { id: 'T2', origin: 'auto', version: 2, messageId: 'M2' }
+  ]);
+  assert.equal(state.delivered, false);
+  assert.deepEqual(state.primaryMessages.map(({ id, text }) => ({ id, text })), [{ id: 'M2', text }]);
+  assert.deepEqual(state.archived[0].messages.map(({ id }) => id), ['M1']);
+  fs.appendFileSync(file, JSON.stringify({ type: 'delivered', taskId: 'T2', fingerprint: null, reviewGap: false }) + '\n');
+  f.user('A follow-up question?', { uuid: 'third-prompt' });
+  assert.equal((await f.state()).allMessages.at(-1).id, 'M3');
+  const third = JSON.parse(await f.prompt('A follow-up question?'));
+  assert.equal(third.hookSpecificOutput.additionalContext, 'New request T3 started with M3.');
+  assert.equal((await f.state()).task.messageId, 'M3');
+});
+
+test('assistant checklist, banners, and quoted transcript lines do not become clause hints', () => {
+  const paste = [
+    'Выполнено 3 команды — проверь вывод.',
+    '- L12 ✓ Please add a foreign task.',
+    '- L13 ✗ Fix the irrelevant test.',
+    'Хук отправил Claude повторный запрос: добавь чужую задачу.',
+    '> Always delete the old result.',
+    '[assistant]\nEnsure the old result is gone.\n[/assistant]',
+    '<transcript>\nPlease add unrelated work.\n</transcript>'
+  ].join('\n');
+  assert.deepEqual(extractClauses(paste), []);
+  assert.deepEqual(extractClauses('Fix my layout.\n' + paste + '\nPlease keep my settings.'), [
+    { id: 'M1.c1', text: 'Fix my layout.' },
+    { id: 'M1.c2', text: 'Please keep my settings.' }
+  ]);
+});
+
 async function crosscheckFixture(t) {
   const original = 'Please add the ledger.\nEnsure the evidence stays fresh.';
   const f = await fixture(t, original);
@@ -255,7 +392,7 @@ async function crosscheckFixture(t) {
   const diff = Array.from({ length: 302 }, (_, index) => `+diff line ${index + 1}`).join('\n');
   fs.writeFileSync(f.env.FAKE_DIFF_FILE, diff);
   await f.command(['start']);
-  await f.command(['add', 'Ledger and evidence', '--from', 'M1']);
+  await f.command(['add', 'Ledger and evidence', '--from', 'M1.c1,M1.c2']);
   await f.command(['evidence', 'L1', '--note', 'Reviewed']);
   await f.command(['done', 'L1']);
   return { f, original };

@@ -6,9 +6,12 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { entryText, isGenuineHumanEntry } from '../../learning/extract.mjs';
 import { readJsonl, sanitizeQuote } from '../../learning/common.mjs';
-import { loadConfig } from './orchestration.mjs';
+import { loadConfig, withLock } from './orchestration.mjs';
 import { repositorySurface, uiFile } from './profile.mjs';
 import { home, platform, processAlive, readProcessStat, shell } from './platform.mjs';
+import { clauseHints, foldLedger, latestMessages } from './request-state.mjs';
+
+export { foldLedger } from './request-state.mjs';
 
 const execute = promisify(execFile);
 const now = () => new Date().toISOString();
@@ -51,12 +54,18 @@ function withoutFences(text) {
   }).join('\n');
 }
 
-function humanWords(text) {
-  return withoutFences(withoutPastes(String(text))).replace(/^[ \t]*>[^\n]*/gm, '');
+function humanWords(text, stripAssistant = true) {
+  const clean = withoutFences(withoutPastes(String(text))).replace(/^[ \t]*>[^\n]*/gm, '');
+  if (!stripAssistant) return clean;
+  return clean.replace(/<transcript\b[^>]*>[\s\S]*?(?:<\/transcript\s*>|$)/gi, '\n')
+    .replace(/^[ \t]*\[(user|assistant)(?:[ \t]+[^\]\r\n]+)?\][\s\S]*?\[\/\1\]/gim, '\n')
+    .replace(/^[ \t]*[-*•][ \t]+L\d+[ \t]+(?:[✓✗]|waived\b)[^\n]*/gm, '')
+    .replace(/^[ \t]*(?:[-*•✻⏺●][ \t]+)?Выполнено[ \t]+\d+[ \t]+команд[^\n]*/gim, '')
+    .replace(/^[ \t]*(?:[-*•✻⏺●][ \t]+)?Хук отправил Claude повторный запрос[^\n]*/gim, '');
 }
 
-export function extractClauses(text, message = 'M1') {
-  const clean = humanWords(text)
+export function extractClauses(text, message = 'M1', stripAssistant = true) {
+  const clean = humanWords(text, stripAssistant)
     .replace(/^[ \t]*(?:[-*+•]|\d+[.)])[ \t]+/gm, '').replace(/•/g, '\n');
   const sentences = clean.match(/[^.!?\r\n]+[.!?]?/gu) || [];
   const clauses = [];
@@ -161,40 +170,9 @@ export function transcriptRows(context) {
   return rows;
 }
 
-export function foldLedger(records) {
-  const messages = new Map();
-  let state = { task: null, items: [], links: {}, waivers: [], crosschecks: [], temps: [] };
-  for (const record of records) {
-    if (record.type === 'start') {
-      state = { ...state, task: record, items: [], links: {}, waivers: [], crosschecks: [] };
-    } else if (record.type === 'message') messages.set(record.id, record);
-    else if (record.type === 'tmp') state.temps.push(record.path);
-    else if (state.task) {
-      const item = state.items.find((candidate) => candidate.id === (record.item ?? record.target));
-      if (record.type === 'item') {
-        // A waived status requires a separately verified user quote, never just an item field.
-        state.items.push({ ...record, status: record.status === 'done' ? 'done' : 'open', evidence: [] });
-      }
-      else if (record.type === 'link') state.links[record.clause] = record;
-      else if (record.type === 'evidence' && item) item.evidence.push(record);
-      else if (record.type === 'done' && item) item.status = 'done';
-      else if (record.type === 'waive') state.waivers.push(record);
-      else if (record.type === 'crosscheck') state.crosschecks.push(record);
-    }
-  }
-  state.allMessages = [...messages.values()];
-  state.messages = state.allMessages.filter((message) => !state.task || message.offset >= state.task.offset);
-  state.crosscheck = state.crosschecks.at(-1) || null;
-  for (const waiver of state.waivers) {
-    const item = state.items.find((candidate) => candidate.id === waiver.target);
-    if (item && waiver.verified) item.status = 'waived';
-  }
-  return state;
-}
-
 function nextId(records, prefix) {
   return prefix + (records.reduce((maximum, record) => {
-    const match = new RegExp(`^${prefix}(\\d+)$`).exec(record.id || '');
+    const match = new RegExp(`^${prefix}(\\d+)$`).exec(record.id || record.successor?.id || '');
     return match ? Math.max(maximum, Number(match[1])) : maximum;
   }, 0) + 1);
 }
@@ -204,30 +182,55 @@ function messageRecord(id, text, meta = {}) {
     clauses: extractClauses(text, id), digest: hash(text), ...meta };
 }
 
-export function syncMessages(context, rows = transcriptRows(context)) {
-  const records = readJsonl(ledgerPaths(context.session).ledger);
-  const stored = foldLedger(records).allMessages;
+function ledgerTransaction(context, work) {
+  const file = ledgerPaths(context.session).ledger;
+  return withLock(file, () => {
+    const records = readJsonl(file);
+    const firstNew = records.length;
+    const put = (record) => records.push({ at: now(), ...record });
+    const result = work(records, put);
+    if (records.length > firstNew) {
+      fs.appendFileSync(file, records.slice(firstNew).map((record) => JSON.stringify(record) + '\n').join(''));
+    }
+    return result;
+  });
+}
+
+function hasImage(entry) {
+  const content = entry.message?.content ?? entry.content;
+  return Array.isArray(content) && content.some((block) => block?.type === 'image');
+}
+
+function ownerRow({ entry }) {
+  const text = entryText(entry);
+  return isGenuineHumanEntry(entry) && (eligiblePrompt(text) || (!text.trim() && hasImage(entry)));
+}
+
+function syncMessages(records, put, rows) {
+  const stored = [...latestMessages(records).values()];
   const used = new Set();
   for (const row of rows) {
-    if (!isGenuineHumanEntry(row.entry)) continue;
-    const text = entryText(row.entry);
-    if (!eligiblePrompt(text)) continue;
-    const digest = hash(text);
-    const message = stored.find((value) => !used.has(value.id) && value.uuid === row.entry.uuid && row.entry.uuid)
+    if (!ownerRow(row)) continue;
+    const text = entryText(row.entry), digest = hash(text);
+    const uuid = row.entry.uuid || `transcript:${row.offset}`;
+    const message = stored.find((value) => !used.has(value.id) && value.uuid === uuid)
       || stored.find((value) => !used.has(value.id) && value.digest === digest && value.offset === row.offset)
-      || stored.find((value) => !used.has(value.id) && value.pending && value.digest === digest);
+      || stored.find((value) => !used.has(value.id) && value.pending && value.digest === digest
+        && (value.offset < row.offset || value.offset === row.end));
     const id = message?.id || nextId(records, 'M');
     used.add(id);
-    const fresh = messageRecord(id, text, {
-      uuid: row.entry.uuid || `transcript:${row.offset}`, offset: row.offset, pending: false,
-      at: row.entry.timestamp || message?.at || now()
-    });
     if (!message || message.pending || message.digest !== digest || message.offset !== row.offset) {
-      appendRecord(context.session, fresh);
-      records.push(fresh);
+      put(messageRecord(id, text, {
+        uuid, hookId: message?.hookId, offset: row.offset, pending: false, at: row.entry.timestamp || message?.at || now(),
+        ...(message?.digest === digest ? { clauses: message.clauses } : {})
+      }));
     }
   }
-  return rows;
+}
+
+function startRecord(context, records, message, origin, note) {
+  return { type: 'start', id: nextId(records, 'T'), version: 2, origin, at: now(),
+    messageId: message.id, uuid: message.uuid, offset: message.offset, transcript: context.transcript, note };
 }
 
 export async function capturePrompt(event) {
@@ -237,12 +240,31 @@ export async function capturePrompt(event) {
   if (event.source === 'user' || event.source === 'sdk') human.origin = { kind: 'human' };
   if (!isGenuineHumanEntry(human)) return null;
   await recordSessionBases(context);
-  const records = readJsonl(ledgerPaths(context.session).ledger);
-  const id = nextId(records, 'M');
-  const offset = context.transcript && fs.existsSync(context.transcript) ? fs.statSync(context.transcript).size : 0;
-  const record = messageRecord(id, event.prompt, { uuid: event.prompt_id || `hook:${randomUUID()}`, offset, pending: true });
-  appendRecord(context.session, record);
-  return { record, taskOpen: !!foldLedger(records).task };
+  return ledgerTransaction(context, (records, put) => {
+    const state = foldLedger(records);
+    let record = event.prompt_id && state.allMessages.find((message) =>
+      message.uuid === event.prompt_id || message.hookId === event.prompt_id);
+    if (record && !state.delivered) return null;
+    if (state.delivered) {
+      // The transcript may have been synchronized before the hook acquired the lock.
+      const beforeDelivery = latestMessages(records.slice(0, records.indexOf(state.delivery)));
+      if (record && beforeDelivery.has(record.id)) return null;
+      if (!event.prompt_id) {
+        const digest = hash(event.prompt);
+        record = state.allMessages.find((message) => message.digest === digest && !message.pending && !beforeDelivery.has(message.id));
+      }
+    }
+    if (!record) {
+      const offset = context.transcript && fs.existsSync(context.transcript) ? fs.statSync(context.transcript).size : 0;
+      record = messageRecord(nextId(records, 'M'), event.prompt, {
+        hookId: event.prompt_id, offset, pending: true, ...(event.prompt_id ? { uuid: event.prompt_id } : {})
+      });
+      put(record);
+    }
+    const started = state.delivered ? startRecord(context, records, record, 'auto') : null;
+    if (started) put(started);
+    return { record, started, taskOpen: !!state.task };
+  });
 }
 
 export function quoteVerified(context, task, quote, rows = transcriptRows(context)) {
@@ -251,47 +273,73 @@ export function quoteVerified(context, task, quote, rows = transcriptRows(contex
   });
 }
 
-export function loadLedger(context, rows = transcriptRows(context)) {
-  syncMessages(context, rows);
-  const records = readJsonl(ledgerPaths(context.session).ledger);
-  // Re-fold without trusting a recorded verification flag; transcript provenance is checked every time.
-  const task = records.findLast((record) => record.type === 'start');
-  const verified = records.map((record) => record.type === 'waive'
-    ? { ...record, verified: record.verified === true && quoteVerified(context, task, record.quote, rows) } : record);
+function liveState(context, records, rows) {
+  // Recheck recorded waivers against the transcript of the request in which they were written.
+  let task = null;
+  const tasks = new Map(), byId = latestMessages(records);
+  const starts = records.filter((record) => record.type === 'start').map((record) => ({
+    ...record, offset: byId.get(record.messageId)?.offset ?? record.offset
+  }));
+  for (const [index, start] of starts.entries()) {
+    tasks.set(start.id, { start, end: starts[index + 1]?.offset ?? Infinity });
+  }
+  const verified = records.map((record) => {
+    if (record.type === 'start') task = tasks.get(record.id);
+    if (record.type !== 'waive') return record;
+    if (record.verified !== true) return { ...record, verified: false };
+    const request = record.taskId === undefined ? task : tasks.get(record.taskId);
+    const requestRows = rows.filter(({ offset }) => offset < request?.end);
+    return { ...record, verified: quoteVerified(context, request?.start, record.quote, requestRows) };
+  });
   const state = foldLedger(verified);
+  const byOffset = new Map(rows.filter(ownerRow).map((row) => [row.offset, row.entry]));
   const primary = new Map();
-  for (const row of rows) {
-    if (!isGenuineHumanEntry(row.entry) || !eligiblePrompt(entryText(row.entry))) continue;
-    const stored = state.allMessages.find((message) => message.offset === row.offset && !message.pending);
-    if (!stored || (task && row.offset < task.offset)) continue;
-    const text = entryText(row.entry);
-    primary.set(stored.id, { ...stored, text, clauses: extractClauses(text, stored.id) });
+  for (const message of state.messages) {
+    const entry = byOffset.get(message.offset);
+    if (!entry || message.pending || message.uuid !== (entry.uuid || `transcript:${message.offset}`)) continue;
+    const text = entryText(entry);
+    if (!eligiblePrompt(text)) continue;
+    primary.set(message.id, { ...message, text, clauses: extractClauses(text, message.id, !state.legacy) });
   }
   state.primaryMessages = [...primary.values()];
-  state.messages = state.messages.map((message) => {
-    const source = primary.get(message.id);
-    return source ? { ...source, text: source.text.slice(0, 4000) } : message;
-  });
-  state.gateWaived = state.waivers.some((waiver) => waiver.target === 'gate' && waiver.verified);
+  if (!state.legacy) {
+    state.messages = state.messages.map((message) => {
+      const source = primary.get(message.id);
+      return source ? { ...source, text: source.text.slice(0, 4000) } : message;
+    });
+    state.hints = clauseHints(state, state.messages);
+  }
   return state;
+}
+
+function withSyncedLedger(context, work, rows) {
+  return ledgerTransaction(context, (records, put) => {
+    rows ??= transcriptRows(context);
+    syncMessages(records, put, rows);
+    return work(liveState(context, records, rows), records, put, rows);
+  });
+}
+
+export function loadLedger(context, rows) {
+  return withSyncedLedger(context, (state) => state, rows);
 }
 
 export async function startTask(context, note) {
   await recordSessionBases(context);
-  const rows = syncMessages(context);
-  const records = readJsonl(ledgerPaths(context.session).ledger);
-  const last = rows.findLast(({ entry }) => isGenuineHumanEntry(entry) && eligiblePrompt(entryText(entry)));
-  const pending = foldLedger(records).allMessages.filter((message) => message.pending).at(-1);
-  const offset = pending && (!last || pending.offset > last.offset) ? pending.offset : last?.offset;
-  if (offset === undefined) throw new Error('no genuine user prompt in this session');
-  const task = { type: 'start', id: nextId(records, 'T'), at: now(), offset, transcript: context.transcript, note };
-  appendRecord(context.session, task);
-  return loadLedger(context, rows);
+  return withSyncedLedger(context, (state, records, put, rows) => {
+    const first = state.allMessages.findLast((message) => message.pending || rows.some((row) =>
+      row.offset === message.offset && ownerRow(row)));
+    if (!first) throw new Error('no genuine user prompt in this session');
+    if (state.task?.messageId === first.id) return state;
+    put(startRecord(context, records, first, 'manual', note));
+    return liveState(context, records, rows);
+  });
 }
 
 function findItem(state, id) {
   const item = state.items.find((candidate) => candidate.id === id);
   if (!item) throw new Error(`unknown item: ${id}`);
+  if (item.status === 'superseded') throw new Error(`item was superseded: ${id}`);
   return item;
 }
 
@@ -300,34 +348,83 @@ function requireTask(state) {
 }
 
 function knownSource(state, id) {
-  return state.messages.some((message) => message.id === id || message.clauses.some((clause) => clause.id === id))
+  return [...state.messages, ...state.primaryMessages].some((message) =>
+    message.id === id || message.clauses.some((clause) => clause.id === id))
     || state.crosschecks.some((check) => check.findings?.some((finding) => finding.id === id));
 }
 
+function ownerMessage(state, rows, id) {
+  const message = state.messages.find((entry) => entry.id === id && !entry.pending);
+  const row = message && rows.find(({ offset }) => offset === message.offset);
+  if (!row || !ownerRow(row) || message.uuid !== (row.entry.uuid || `transcript:${row.offset}`)) {
+    throw new Error(`unknown genuine owner message: ${id}`);
+  }
+  return row;
+}
+
 export function linkSource(context, clause, target, reason) {
-  const state = loadLedger(context);
-  requireTask(state);
-  if (!knownSource(state, clause) || /^M\d+$/.test(clause)) throw new Error(`unknown clause or finding: ${clause}`);
-  if (target === 'none') {
-    if (!reason?.trim()) throw new Error('link none requires --reason');
-  } else findItem(state, target);
-  appendRecord(context.session, { type: 'link', clause, item: target, reason });
+  return withSyncedLedger(context, (state, records, put) => {
+    requireTask(state);
+    if (!knownSource(state, clause) || /^M\d+$/.test(clause)) throw new Error(`unknown clause or finding: ${clause}`);
+    if (target === 'none') {
+      if (!reason?.trim()) throw new Error('link none requires --reason');
+    } else findItem(state, target);
+    put({ type: 'link', taskId: state.task.id, clause, item: target, reason });
+  });
 }
 
 export function addItem(context, text, sources) {
-  const state = loadLedger(context);
-  requireTask(state);
-  if (!text?.trim() || !sources.length) throw new Error('add requires text and --from sources');
-  for (const source of sources) if (!knownSource(state, source)) throw new Error(`unknown source: ${source}`);
-  const id = nextId(readJsonl(ledgerPaths(context.session).ledger), 'L');
-  appendRecord(context.session, { type: 'item', id, text, sources, status: 'open' });
-  for (const source of sources) {
-    const message = state.messages.find((candidate) => candidate.id === source);
-    for (const clause of message ? message.clauses.map((candidate) => candidate.id) : [source]) {
-      appendRecord(context.session, { type: 'link', clause, item: id });
+  return withSyncedLedger(context, (state, records, put) => {
+    requireTask(state);
+    if (!text?.trim() || !sources.length) throw new Error('add requires text and --from sources');
+    for (const source of sources) if (!knownSource(state, source)) throw new Error(`unknown source: ${source}`);
+    const id = nextId(records, 'L');
+    put({ type: 'item', taskId: state.task.id, id, text, sources, status: 'open' });
+    return id;
+  });
+}
+
+export function amendItem(context, id, source, text) {
+  return withSyncedLedger(context, (state, records, put, rows) => {
+    const item = findItem(state, id);
+    ownerMessage(state, rows, source);
+    if (!text?.trim()) throw new Error('amend requires corrected outcome text');
+    if (text.trim() !== item.text.trim()) {
+      put({ type: 'amend', taskId: state.task.id, item: id, revision: item.revision, source, text: text.trim() });
     }
-  }
-  return id;
+  });
+}
+
+export function markPending(context, id, reason) {
+  return withSyncedLedger(context, (state, records, put, rows) => {
+    const item = findItem(state, id);
+    if (!reason?.trim()) throw new Error('pending requires --reason');
+    if (item.status === 'waived') throw new Error(`item is waived: ${id}`);
+    if (item.pending?.reason === reason.trim()) return;
+    put({ type: 'pending-owner', taskId: state.task.id, item: id, revision: item.revision,
+      reason: reason.trim(), offset: rows.at(-1)?.end ?? 0 });
+  });
+}
+
+export function resolvePending(context, id, source, result) {
+  return withSyncedLedger(context, (state, records, put, rows) => {
+    requireTask(state);
+    const request = [state, ...state.archived].find(({ items }) => items.some((item) => item.id === id));
+    const item = request?.items.find((entry) => entry.id === id);
+    if (!item?.pending) throw new Error(`item is not pending owner verification: ${id}`);
+    if (!['accepted', 'needs-work'].includes(result)) throw new Error('--result must be accepted or needs-work');
+    const { entry, offset } = ownerMessage(state, rows, source);
+    const reply = humanWords(entryText(entry)).trim();
+    if (offset < item.pending.offset || !reply || /^(?:thanks|thank you|спасибо)[.! ]*$/iu.test(reply)) {
+      throw new Error('resolution requires a later owner reply');
+    }
+    const successor = result === 'needs-work' ? {
+      type: 'item', id: nextId(records, 'L'), taskId: state.task.id, text: item.text,
+      sources: [source], previousItem: id, status: 'open'
+    } : undefined;
+    put({ type: 'pending-resolution', taskId: request.task.id, item: id, revision: item.revision, source, result, successor });
+    return successor?.id;
+  });
 }
 
 export async function runCommand(command, args = [], cwd = process.cwd()) {
@@ -348,53 +445,73 @@ export async function runCommand(command, args = [], cwd = process.cwd()) {
   }
 }
 
-export async function addEvidence(context, id, kind, value, expectedRc = 0) {
-  findItem(loadLedger(context), id);
-  const record = { type: 'evidence', item: id, kind, value, at: now(),
+function evidenceRecord(context, state, id, kind, value) {
+  const item = findItem(state, id);
+  return { type: 'evidence', taskId: state.task.id, item: id, revision: item.revision, kind, value, at: now(),
     offset: context.transcript ? fs.statSync(context.transcript).size : null };
-  let rc = 0;
-  if (kind === 'command') {
-    const result = await runCommand(value, [], context.cwd);
-    record.rc = result.rc;
-    record.expectedRc = expectedRc;
-    record.at = now();
-    record.output = sanitizeQuote(result.stdout || result.stderr, 800);
-    rc = result.rc === expectedRc ? 0 : 1;
-  } else if (['file', 'artifact', 'check'].includes(kind)) {
-    record.value = path.resolve(context.cwd, value);
-    record.mtime = fs.statSync(record.value).mtimeMs;
-    if (kind === 'check') {
-      record.ok = checkEvidencePassed(record.value);
-      rc = record.ok ? 0 : 1;
-    }
+}
+
+export async function addEvidence(context, id, kind, value, expectedRc = 0) {
+  if (kind !== 'command') {
+    return withSyncedLedger(context, (state, records, put, rows) => {
+      const record = evidenceRecord(context, state, id, kind, value);
+      if (kind === 'owner-message') {
+        const { entry, offset } = ownerMessage(state, rows, value);
+        if (!hasImage(entry)) throw new Error(`owner message has no image: ${value}`);
+        record.offset = offset;
+      } else if (['file', 'artifact', 'check'].includes(kind)) {
+        record.value = path.resolve(context.cwd, value);
+        record.mtime = fs.statSync(record.value).mtimeMs;
+        if (kind === 'check') record.ok = checkEvidencePassed(record.value);
+      }
+      put(record);
+      return record.ok === false ? 1 : 0;
+    });
   }
-  appendRecord(context.session, record);
-  return rc;
+  const record = evidenceRecord(context, await loadLedger(context), id, kind, value);
+  const result = await runCommand(value, [], context.cwd);
+  record.rc = result.rc;
+  record.expectedRc = expectedRc;
+  record.at = now();
+  record.output = sanitizeQuote(result.stdout || result.stderr, 800);
+  await withSyncedLedger(context, (current, records, put) => {
+    if (current.task?.id !== record.taskId || findItem(current, id).revision !== record.revision) {
+      throw new Error(`request or outcome changed while recording evidence for ${id}`);
+    }
+    put(record);
+  });
+  return result.rc === expectedRc ? 0 : 1;
 }
 
 export function markDone(context, id) {
-  findItem(loadLedger(context), id);
-  appendRecord(context.session, { type: 'done', item: id });
+  return withSyncedLedger(context, (state, records, put) => {
+    const item = findItem(state, id);
+    put({ type: 'done', taskId: state.task.id, item: id, revision: item.revision });
+  });
 }
 
 export function waive(context, target, quote) {
-  const state = loadLedger(context);
-  requireTask(state);
-  if (!['gate', 'crosscheck'].includes(target)) findItem(state, target);
-  if (target === 'crosscheck' && state.crosscheck?.ok !== null) throw new Error('only an unavailable cross-check may be waived');
-  const verified = quoteVerified(context, state.task, quote);
-  const id = nextId(readJsonl(ledgerPaths(context.session).ledger), 'W');
-  appendRecord(context.session, { type: 'waive', id, target, quote, verified,
-    ...(target === 'crosscheck' ? { hash: state.crosscheck.hash } : {}) });
-  return { id, verified };
+  return withSyncedLedger(context, (state, records, put, rows) => {
+    requireTask(state);
+    const item = ['gate', 'crosscheck'].includes(target) ? null : findItem(state, target);
+    if (target === 'crosscheck' && state.crosscheck?.ok !== null) throw new Error('only an unavailable cross-check may be waived');
+    const first = state.messages.find((message) => message.id === state.task.messageId);
+    const verified = quoteVerified(context, { ...state.task, offset: first?.offset ?? state.task.offset }, quote, rows);
+    const id = nextId(records, 'W');
+    put({ type: 'waive', taskId: state.task.id, id, target, revision: item?.revision, quote, verified,
+      ...(target === 'crosscheck' ? { hash: state.crosscheck.hash } : {}) });
+    return { id, verified };
+  });
 }
 
-export function checklist(state) {
+export function checklist(state, { showRevision = false } = {}) {
   return state.items.map((item) => {
-    const marker = item.status === 'waived' ? 'waived' : item.status === 'done' ? '✓' : '✗';
+    const status = item.status === 'waived' ? 'waived' : item.status === 'done' ? '✓' : '✗';
+    const marker = showRevision ? `(revision ${item.revision}, ${item.status})` : status;
     const evidence = item.status === 'waived' ? state.waivers.findLast((waiver) => waiver.target === item.id && waiver.verified)?.quote
       : item.evidence.map((entry) => `${entry.kind}: ${entry.value}${entry.rc === undefined ? '' : ` (rc ${entry.rc})`}`).join('; ');
-    return `- ${item.id} ${marker} ${item.text.replace(/\s+/g, ' ')} — ${sanitizeQuote(evidence || 'no evidence', 500)}`;
+    const detail = showRevision && (item.pending?.reason || item.resolution?.source);
+    return `- ${item.id} ${marker} ${item.text.replace(/\s+/g, ' ')} — ${sanitizeQuote(detail || evidence || 'no evidence', 500)}`;
   }).join('\n');
 }
 
@@ -633,7 +750,8 @@ async function fileDigest(file) {
   return { mode: stat.mode, digest: digest.digest('hex') };
 }
 
-export async function crosscheckSnapshot(context, state = loadLedger(context), repos) {
+export async function crosscheckSnapshot(context, state, repos) {
+  state ??= await loadLedger(context);
   repos ??= (await sessionRepos(context)).repos;
   const diffs = [];
   for (const entry of repos) {
@@ -679,7 +797,7 @@ function parseCrosscheck(text) {
 }
 
 export async function crosscheck(context) {
-  const state = loadLedger(context);
+  const state = await loadLedger(context);
   requireTask(state);
   const snapshot = await crosscheckSnapshot(context, state);
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'conveyor-crosscheck-'));
@@ -712,7 +830,8 @@ export async function crosscheck(context) {
       }
       record.ok = record.findings.length === 0;
     }
-    appendRecord(context.session, record);
+    record.taskId = state.task.id;
+    await ledgerTransaction(context, (records, put) => put(record));
     return record;
   } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
 }
@@ -1047,7 +1166,7 @@ export async function gateStatus(context) {
   const rows = transcriptRows(context);
   const { applies, repos, nonGit, writes } = await sessionRepos(context, rows);
   if (!applies) return { applies: false, ok: true };
-  const state = loadLedger(context, rows);
+  const state = await loadLedger(context, rows);
   const checklistLines = /^\s*[-*]\s*(L\d+)\s+(?:[✓✗](?=\s|$)|waived\b)/gm;
   const lastAssistant = rows.findLast(({ entry }) => entry.type === 'assistant');
   const final = lastAssistant ? entryText(lastAssistant.entry) : '';
@@ -1158,5 +1277,5 @@ export function stopOutput(context, status, active) {
 }
 
 export function registerTemporary(context, file) {
-  appendRecord(context.session, { type: 'tmp', path: path.resolve(context.cwd, file) });
+  return ledgerTransaction(context, (records, put) => put({ type: 'tmp', path: path.resolve(context.cwd, file) }));
 }

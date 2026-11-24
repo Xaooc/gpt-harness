@@ -214,7 +214,7 @@ async function reclaimLock(lock) {
   } finally { await fs.unlink(stale); }
 }
 
-async function withLock(file, work) {
+export async function withLock(file, work) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const lock = `${file}.lock`;
   const deadline = Date.now() + 10_000;

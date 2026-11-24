@@ -122,7 +122,7 @@ exit 0
   if (writeRun) write();
   const complete = async ({ semantic = true, final = true } = {}) => {
     assert.match(await command(['start']), /requirements playback/);
-    await command(['add', 'Fix the worker', '--from', 'M1']);
+    await command(['add', 'Fix the worker', '--from', 'M1.c1']);
     await command(['evidence', 'L1', '--artifact', proof]);
     await command(['done', 'L1']);
     if (semantic) await command(['crosscheck']);
@@ -214,7 +214,7 @@ for (const [group, edits] of [
       blocked(await f.stop(), 1, 'non-git code edits: ledger checks only, turn checks unavailable');
       await f.command(['start']);
       blocked(await f.stop(), 2, 'M1.c1');
-      await f.command(['add', 'Fix the worker', '--from', 'M1']);
+      await f.command(['add', 'Fix the worker', '--from', 'M1.c1']);
       blocked(await f.stop(), 3, 'L1');
       await f.command(['evidence', 'L1', '--note', 'Reviewed']);
       await f.command(['done', 'L1']);
@@ -250,7 +250,7 @@ for (const kind of ['note', 'file', 'command', 'check']) {
     + ` (${kind})`, { timeout }, async (t) => {
     const f = await fixture(t);
     await f.command(['start']);
-    await f.command(['add', 'Fix the worker', '--from', 'M1']);
+    await f.command(['add', 'Fix the worker', '--from', 'M1.c1']);
     if (kind === 'note') await f.command(['evidence', 'L1', '--note', 'Looks correct']);
     if (kind === 'file') await f.command(['evidence', 'L1', '--file', f.proof]);
     if (kind === 'command') await f.command(['evidence', 'L1', '--cmd', 'exit 1', '--rc', '1']);
