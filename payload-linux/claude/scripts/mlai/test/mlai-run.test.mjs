@@ -24,6 +24,7 @@ async function fixture({ scenario }, verify) {
     for (const directory of [dir, home, mlaiHome, slot, state]) mkdirSync(directory, { recursive: true });
     execFileSync('git', ['init', '--quiet', dir], { env: { ...process.env, HOME: home }, timeout: 300_000 });
     mkdirSync(path.join(root, 'shared'), { recursive: true });
+    mkdirSync(path.join(root, 'projects'), { recursive: true });
     writeFileSync(path.join(root, 'shared', 'notes.txt'), 'context\n');
     writeFileSync(brief, `Update greeting.txt and summarize the changes. Context: ${path.join(root, 'shared', 'notes.txt')}.\n`);
     writeFileSync(path.join(mlaiHome, 'auth.json'), JSON.stringify({
@@ -33,7 +34,7 @@ async function fixture({ scenario }, verify) {
       env: {
         ...process.env, HOME: home, MLAI_HOME: mlaiHome, MLAI_BIN: fake, MLAI_SLOT: slot,
         LUNA_RUN_DIR: run, LUNA_NO_REGISTRY: '1', MLAI_RETRIES: '2', MLAI_RETRY_DELAY_MS: '10',
-        LUNA_IDLE_MAX_S: '30', LUNA_TIMEOUT_S: '30', FAKE_MLAI_SCENARIO: scenario, FAKE_MLAI_STATE_DIR: state
+        LUNA_IDLE_MAX_S: '30', LUNA_TIMEOUT_S: '30', MLAI_READ_ROOTS: path.join(root, 'projects'), FAKE_MLAI_SCENARIO: scenario, FAKE_MLAI_STATE_DIR: state
       },
       stdio: ['ignore', 'pipe', 'pipe'], timeout: 300_000
     });
@@ -61,6 +62,7 @@ test('a started write attempt retries after a connection interruption', { timeou
     assert.equal(status.mlai_session, 'fake-session-2');
     const args = JSON.parse(readFileSync(path.join(state, 'args-1.json'), 'utf8'));
     assert.ok(args.some((arg, i) => args[i - 1] === '--add-dir' && arg.endsWith('/shared')), 'brief path is readable');
+    assert.ok(args.some((arg, i) => args[i - 1] === '--add-dir' && arg.endsWith('/projects')), 'project root is readable');
     assert.equal(status.credits, '0.375');
     assert.equal(status.changed_files, '1');
     assert.equal(output, '## Changes\nUpdated greeting.txt.\n\n## Verification\nChecks passed.\n\n' +

@@ -2,7 +2,7 @@
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
-  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
+  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
 } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import path from 'node:path';
@@ -533,24 +533,42 @@ class Job {
     for (const directory of this.readDirs) args.push('--add-dir', directory);
     let prompt = rules + brief;
     if (Array.from(prompt).length > PROMPT_LIMIT && file) {
-      prompt = rules + `The full task brief is in the file ${file}. Read it completely first and follow it exactly.`;
-      args.push('--add-dir', path.dirname(file));
-      this.addDir = path.dirname(file);
+      // A copy in a folder of its own: the brief's real folder may be private (~/.claude, ~/.config) and must not open.
+      this.briefDir ??= mkdtempSync(path.join(tmpdir(), 'mlai-brief-'));
+      const copy = path.join(this.briefDir, path.basename(file));
+      writeFileSync(copy, brief, { mode: 0o600 });
+      prompt = rules + `The full task brief is in the file ${copy}. Read it completely first and follow it exactly.`;
+      args.push('--add-dir', this.briefDir);
+      this.addDir = this.briefDir;
     }
     if (Array.from(prompt).length > PROMPT_LIMIT) throw new Failure(`mlai: prompt exceeds ${PROMPT_LIMIT} characters`, 2);
     return { args, prompt };
   }
 
-  /** Folders outside the job directory the agent may read without an approval nobody can give in a headless run:
-   *  the worktree's git directory and the existing absolute paths the brief names, never the private home folders. */
+  /** Folders outside the job directory the agent may read without an approval nobody can give in a headless run (it
+   *  stops the run as `limited`, seen on J7b and J8): the project trees the job lives in and the existing absolute paths
+   *  the brief names, never the private home folders. `--yes` would also open ~/.claude and ~/.codex, which the CLI's
+   *  sandbox does not hide. */
   readAccess(brief) {
     const dir = this.options.dir;
+    const home = realpathSync(this.home);
     const found = new Set();
+    // The top-level home folder of a path (/home/u/dev for /home/u/dev/repo-wt/j8): sibling repos and worktrees.
+    const tree = (target) => target.startsWith(`${home}/`)
+      ? path.join(home, target.slice(home.length + 1).split('/')[0]) : null;
+    found.add(tree(dir));
     try {
       const common = execFileSync('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim();
-      if (common) found.add(common);
+      if (common) { found.add(common); found.add(tree(common)); }
     } catch {}
+    const roots = process.env.MLAI_READ_ROOTS ?? '~/dev:~/rpg:~/work';
+    for (const root of roots.split(':').filter(Boolean)) found.add(root.replace(/^~(?=\/|$)/, home));
+    found.delete(null);
+    for (const candidate of [...found]) {
+      found.delete(candidate);
+      try { if (statSync(candidate).isDirectory()) found.add(realpathSync(candidate)); } catch {}
+    }
     for (const match of brief.matchAll(/(?:^|[\s`'"(<\[=:])(\/[^\s`'")<>\],;]+)/g)) {
       let candidate = match[1].replace(/[.:]+$/, '');
       try {
@@ -560,7 +578,7 @@ class Job {
       found.add(candidate);
     }
     const dirs = [...found].filter((target) => target !== '/' && target !== dir && !target.startsWith(`${dir}/`) &&
-      !dir.startsWith(`${target}/`) && target !== realpathSync(this.home) && this.readable(target)).sort();
+      target !== home && this.readable(target)).sort();
     // Keep the outermost of nested folders, at most 12.
     const kept = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`))).slice(0, 12);
     if (kept.length) this.log(`read access: ${kept.join(' ')}`);
@@ -710,6 +728,7 @@ class Job {
       try { if (this.ownsOutput) result = this.finalize(result); }
       finally {
         if (this.activeFile) { try { unlinkSync(this.activeFile); } catch {} }
+        if (this.briefDir) { try { rmSync(this.briefDir, { recursive: true, force: true }); } catch {} }
         // The session was kept only so a step-limited run could continue it.
         try { rmSync(path.join(this.mlaiHome, 'sessions', this.sessionId), { recursive: true, force: true }); } catch {}
         try { this.outputLock?.release(); } catch {}
