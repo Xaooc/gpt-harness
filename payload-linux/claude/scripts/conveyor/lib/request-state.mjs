@@ -1,7 +1,7 @@
 function requestState(task) {
   return {
     task, legacy: !!task && task.version !== 2, items: [], links: {}, waivers: [], crosschecks: [],
-    delivered: false, delivery: null
+    reviews: [], deliveries: [], delivered: false, delivery: null
   };
 }
 
@@ -73,7 +73,9 @@ function finishRequest(state, messages) {
       item.pending = null;
     }
   }
-  return { ...state, messages, hints: clauseHints(state, messages),
+  const findings = [...new Map(state.reviews.flatMap(({ findings = [] }) => findings.map((finding) =>
+    [finding.id, finding]))).values()];
+  return { ...state, findings, messages, hints: clauseHints(state, messages),
     pending: state.items.flatMap((item) => item.pending ? [item.pending] : []),
     ready: !!state.task && state.items.filter((item) => item.status !== 'superseded')
       .every((item) => ['done', 'waived', 'pending-owner'].includes(item.status)),
@@ -102,7 +104,9 @@ export function foldLedger(records) {
     else if (record.type === 'link') request.links[record.clause] = record;
     else if (record.type === 'waive') request.waivers.push(record);
     else if (record.type === 'crosscheck') request.crosschecks.push(record);
+    else if (record.type === 'delivery-review') request.reviews.push(record);
     else if (record.type === 'delivered') {
+      request.deliveries.push(record);
       request.delivered = true;
       request.delivery = record;
     } else {

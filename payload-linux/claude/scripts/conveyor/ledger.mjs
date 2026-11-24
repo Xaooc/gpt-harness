@@ -3,8 +3,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   sessionContext, loadLedger, startTask, addItem, linkSource, addEvidence, markDone, waive,
-  crosscheck, checklist, gateStatus, gateMode, registerTemporary, amendItem, markPending, resolvePending
+  checklist, gateStatus, gateMode, registerTemporary, amendItem, markPending, resolvePending
 } from './lib/ledger.mjs';
+import { deliver } from './lib/delivery.mjs';
 
 function argumentsOf(args) {
   const flags = {}, positional = [];
@@ -30,10 +31,10 @@ export async function main(args = process.argv.slice(2)) {
   const allowed = {
     start: ['--note'], add: ['--from', '--paths'], amend: ['--from', '--paths'], pending: ['--reason', '--resolve', '--result'],
     link: ['--reason'], evidence: ['--cmd', '--rc', '--file', '--artifact', '--check', '--note', '--owner-message'],
-    done: [], waive: ['--quote'], crosscheck: [], checklist: [], show: ['--json'], status: ['--json'], tmp: []
+    done: [], waive: ['--quote'], deliver: [], crosscheck: [], checklist: [], show: ['--json'], status: ['--json'], tmp: []
   };
   if (!Object.hasOwn(allowed, command)) {
-    throw new Error('usage: ledger start|add|amend|pending|link|evidence|done|waive|crosscheck|checklist|show|status|tmp');
+    throw new Error('usage: ledger start|add|amend|pending|link|evidence|done|waive|deliver|checklist|show|status|tmp');
   }
   for (const flag of Object.keys(flags)) {
     if (flag !== '--session' && !allowed[command].includes(flag)) throw new Error(`unknown option: ${flag}`);
@@ -46,7 +47,7 @@ export async function main(args = process.argv.slice(2)) {
     const state = await startTask(context, flags['--note']);
     print(`${state.task.id}: requirements playback\n` + state.messages.map((message) => {
       return `${message.id}: ${message.text}\n${message.clauses.map((clause) => `- ${clause.id}: ${clause.text}`).join('\n')}`;
-    }).join('\n') + '\nLink every clause, then include ledger checklist in the final message.');
+    }).join('\n') + '\nRecord the request outcomes with ledger add.');
   } else if (command === 'add') {
     arity(1);
     print(await addItem(context, values[0], (flags['--from'] || '').split(/[\s,]+/).filter(Boolean), files));
@@ -79,17 +80,18 @@ export async function main(args = process.argv.slice(2)) {
     arity(1);
     await markDone(context, values[0]);
   } else if (command === 'waive') {
-    // `crosscheck` waives only the current unavailable snapshot; `gate` covers checks 5, 8, 9 and 10.
+    // A delivery waiver is scoped to the current unavailable review.
     arity(1);
     if (!flags['--quote']) throw new Error('waive requires --quote');
     const result = await waive(context, values[0], flags['--quote']);
     print(result);
     return result.verified ? 0 : 1;
-  } else if (command === 'crosscheck') {
+  } else if (command === 'deliver' || command === 'crosscheck') {
     arity(0);
-    const result = await crosscheck(context);
+    const result = await deliver(context);
     print(result);
-    return result.ok === false ? 1 : 0;
+    if (result.reviewGap) print('Delivery review gap: independent review was unavailable. Mention this in the final message.');
+    return result.delivered ? 0 : 1;
   } else if (command === 'checklist') {
     arity(0);
     print(checklist(await loadLedger(context)));
@@ -97,9 +99,11 @@ export async function main(args = process.argv.slice(2)) {
     arity(0);
     const state = await loadLedger(context);
     const outcomes = checklist(state, { showRevision: true });
+    const findings = state.findings.filter(({ id }) => !state.links[id]).map(({ id, kind, text }) => `- ${id} ${kind}: ${text}`);
     const hints = state.hints.map(({ id, text }) => `- ${id}: ${text}`);
     print(flags['--json'] ? state : [state.task?.id || 'no task', outcomes,
-      ...(hints.length ? ['Unlinked clause hints', ...hints] : [])].filter(Boolean).join('\n'));
+      ...(hints.length ? ['Unlinked clause hints', ...hints] : []),
+      ...(findings.length ? ['Unanswered review findings', ...findings] : [])].filter(Boolean).join('\n'));
   } else if (command === 'status') {
     arity(0);
     const result = await gateStatus(context);

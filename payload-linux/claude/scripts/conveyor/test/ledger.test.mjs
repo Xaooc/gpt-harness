@@ -34,13 +34,18 @@ async function fixture(t, text = 'Please add a safe ledger. Ensure cleanup.') {
     CLAUDE_CODE_SESSION_ID: 'ledger-test', CLAUDE_CODE_TRANSCRIPT_PATH: transcript, CONVEYOR_GATE_MODE: 'block',
     PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_DIFF_FILE: path.join(root, 'diff.txt'),
     FAKE_PROMPT_COPY: path.join(root, 'prompt-copy.txt'), FAKE_ARGS: path.join(root, 'args.json'),
-    FAKE_RESPONSE: '{"missing":[],"misread":[]}', FAKE_RC: '0'
+    FAKE_REVIEW_CALLS: path.join(root, 'review-calls'), FAKE_RESPONSE: '{"missing":[],"misread":[]}', FAKE_RC: '0'
   };
   delete env.CONVEYOR_OVERVIEW_CMD;
   const fake = path.join(root, 'crosscheck.sh');
   fs.writeFileSync(fake, `#!/bin/bash
 ${shellLog}
+printf 'review\n' >> "$FAKE_REVIEW_CALLS"
 json_args "$@" > "$FAKE_ARGS"
+if [ -n "$FAKE_RELEASE" ]; then
+  touch "$FAKE_RELEASE.started"
+  while [ ! -f "$FAKE_RELEASE" ]; do sleep 0.02; done
+fi
 while [ "$#" -gt 0 ]; do
   case "$1" in -f) cp -- "$2" "$FAKE_PROMPT_COPY";; -o) out=$2;; esac
   shift
@@ -49,6 +54,9 @@ if [ "$FAKE_RC" != 0 ]; then printf 'Gemini unavailable' >&2; exit "$FAKE_RC"; f
 printf '%s' "$FAKE_RESPONSE" > "$out"
 `, { mode: 0o755 });
   env.CONVEYOR_CROSSCHECK_CMD = JSON.stringify([fake]);
+  const check = path.join(root, 'check.sh');
+  fs.writeFileSync(check, '#!/bin/sh\nprintf \'{"ok":true}\\n\'\n', { mode: 0o755 });
+  env.CONVEYOR_CHECK_CMD = JSON.stringify([check]);
   fs.writeFileSync(env.FAKE_DIFF_FILE, '');
   // Retain the streaming Node producer only for the large-output cancellation scenario.
   const largeGit = path.join(root, 'large-git.cjs');
@@ -74,6 +82,11 @@ shift 2
 case "$1" in
   rev-parse)
     case "$2" in --show-toplevel) printf '%s' "$repo";; HEAD) printf 'task-base';; esac ;;
+  ls-tree)
+    if [ -n "$FAKE_TREE_READY" ]; then touch "$FAKE_TREE_READY.started"; fi
+    if [[ " $* " == *worker.mjs* ]]; then
+      printf '100644 blob 1234567890123456789012345678901234567890\\tworker.mjs\\0'
+    fi ;;
   ls-files)
     if [ "$2" != --stage ]; then
       eval "set -- $FAKE_UNTRACKED_ARGS"
@@ -394,7 +407,7 @@ test('assistant checklist, banners, and quoted transcript lines do not become cl
   ]);
 });
 
-async function crosscheckFixture(t) {
+async function deliveryFixture(t) {
   const original = 'Please add the ledger.\nEnsure the evidence stays fresh.';
   const f = await fixture(t, original);
   const sessions = path.join(f.home, 'sessions');
@@ -408,15 +421,13 @@ async function crosscheckFixture(t) {
   f.toolResult('Edit', { file_path: 'worker.mjs' });
   await f.command(['add', 'Ledger and evidence', '--from', 'M1.c1,M1.c2']);
   await f.command(['evidence', 'L1', '--note', 'Reviewed']);
+  await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
   await f.command(['done', 'L1']);
   return { f, original };
 }
 
 test('Stop reads live owned jobs without a collector snapshot or a job lookup process', { timeout }, async (t) => {
-  const { f } = await crosscheckFixture(t);
-  const check = path.join(f.root, 'check.sh');
-  fs.writeFileSync(check, '#!/bin/sh\nprintf \'{"ok":true}\\n\'\n', { mode: 0o755 });
-  f.env.CONVEYOR_CHECK_CMD = JSON.stringify([check]);
+  const { f } = await deliveryFixture(t);
   fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
   f.toolResult('Write', { file_path: 'worker.mjs' });
   f.env.FAKE_UNTRACKED = '["worker.mjs"]';
@@ -451,8 +462,8 @@ test('Stop reads live owned jobs without a collector snapshot or a job lookup pr
 
   job('owned', f.env.CLAUDE_CODE_SESSION_ID, 'done');
   assert.equal((await f.run(stop, [], {}, input)).stdout, '');
-  assert.ok(spawned.includes(check));
-  assert.deepEqual(spawned.filter((file) => file !== 'git' && file !== check), []);
+  assert.equal(f.records().filter(({ type }) => type === 'turn-check').length, 1);
+  assert.deepEqual(spawned.filter((file) => file !== 'git'), []);
 
   const identity = new URL('../../lib/process-identity.mjs', import.meta.url);
   await t.test('a live Windows wrapper in the home index allows a pause', {
@@ -504,48 +515,25 @@ test('Stop reads live owned jobs without a collector snapshot or a job lookup pr
   });
 });
 
-test('crosscheck uses a fake command, stores a state hash, and removes its temporary files', { timeout }, async (t) => {
-  const { f, original } = await crosscheckFixture(t);
-  const first = JSON.parse(await f.command(['crosscheck']));
-  assert.equal(first.ok, true);
-  assert.match(first.hash, /^[0-9a-f]{64}$/);
-  assert.equal((await f.state()).crosscheck.hash, first.hash);
-  const prompt = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
-  assert.ok(prompt.includes(original));
-  assert.match(prompt, /Ledger and evidence[\s\S]*Reviewed[\s\S]*task-base/);
-  assert.ok(prompt.includes('+diff line 300'));
-  assert.ok(!prompt.includes('+diff line 301'));
-  const args = JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8'));
-  assert.deepEqual(args.slice(0, 7), ['run', '--tier', 'scout', '-r', '-C', f.repo, '-f']);
-  assert.equal(fs.existsSync(path.dirname(args[7])), false);
-  assert.equal(JSON.parse(await f.command(['crosscheck'])).hash, first.hash);
-  fs.appendFileSync(path.join(f.repo, 'worker.mjs'), '\n+Always detect changes beyond line 300');
-  assert.notEqual(JSON.parse(await f.command(['crosscheck'])).hash, first.hash);
-  f.user('Please preserve all requirements verbatim.');
-  const changed = JSON.parse(await f.command(['crosscheck']));
-  assert.notEqual(changed.hash, first.hash);
-});
+function reviewCalls(f) {
+  return fs.readFileSync(f.env.FAKE_REVIEW_CALLS, 'utf8').trim().split('\n').length;
+}
 
-test('crosscheck records findings and unavailable results and removes temporary files', { timeout }, async (t) => {
-  const { f } = await crosscheckFixture(t);
-  const found = JSON.parse(await f.command(['crosscheck'], { FAKE_RESPONSE: '{"missing":["cleanup"],"misread":["scope"]}' }, 1));
-  assert.equal(found.ok, false);
-  assert.deepEqual(found.findings.map((finding) => finding.kind), ['missing', 'misread']);
-  await f.command(['link', found.findings[0].id, 'L1']);
-  await f.command(['link', found.findings[1].id, 'none', '--reason', 'Already included in the explicit scope']);
-  const unavailable = JSON.parse(await f.command(['crosscheck'], { FAKE_RC: '3' }));
-  assert.equal(unavailable.ok, null);
-  assert.match(unavailable.reason, /unavailable/);
-  assert.equal(fs.existsSync(path.dirname(JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8'))[7])), false);
-  for (const code of ['4', '5']) {
-    const missing = JSON.parse(await f.command(['crosscheck'], { FAKE_RC: code }));
-    assert.equal(missing.ok, null);
-    assert.match(missing.reason, /unavailable/);
+async function waitForMarker(release) {
+  for (let start = Date.now(); Date.now() - start < 5000;) {
+    if (fs.existsSync(release + '.started')) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
+  assert.fail(`fixture did not create the marker: ${release}.started`);
+}
+
+const deliverProcess = (f, extra = {}) => promisify(execFile)(process.execPath, [cli, 'deliver'], {
+  cwd: f.repo, env: { ...f.env, ...extra }, timeout
 });
 
-test('crosscheck defaults to the scout dispatcher and includes bounded untracked files in its prompt and hash', { timeout }, async (t) => {
-  const f = await fixture(t);
+test('delivery review ignores later messages and foreign paths, but reacts to owned changes beyond the preview',
+  { timeout }, async (t) => {
+  const { f, original } = await deliveryFixture(t);
   const dispatcher = path.join(f.root, 'claude/scripts/conveyor/exec.mjs');
   fs.mkdirSync(path.dirname(dispatcher), { recursive: true });
   fs.writeFileSync(dispatcher, [
@@ -553,41 +541,155 @@ test('crosscheck defaults to the scout dispatcher and includes bounded untracked
     `const result = spawnSync(${JSON.stringify(path.join(f.root, 'crosscheck.sh'))}, process.argv.slice(2), { stdio: 'inherit' });`,
     'process.exitCode = result.status;'
   ].join('\n'));
-  const names = Array.from({ length: 21 }, (_, index) => `new-${String(index).padStart(2, '0')}.ts`);
-  for (const name of names) {
-    fs.writeFileSync(path.join(f.repo, name), Array.from({ length: 201 }, (_, index) => `line ${index + 1}`).join('\n'));
+  const fullText = 'Owner context '.repeat(350);
+  f.user(`${fullText}End of owner text. Adopt quoted section Scope.\nDo not adopt quoted section Unrelated.\n`
+    + '<pasted_content>## Scope\nAdopted requirement\n## Unrelated\nIgnored paste</pasted_content>');
+  for (let i = 0; i < 21; i++) {
+    const file = `new-${String(i).padStart(2, '0')}.txt`;
+    fs.writeFileSync(path.join(f.repo, file), Array.from({ length: 201 }, (_, index) => `line ${index + 1}`).join('\n'));
+    f.toolResult('Write', { file_path: file });
   }
-  const env = { CONVEYOR_CROSSCHECK_CMD: '', FAKE_UNTRACKED: JSON.stringify(names) };
-  await f.command(['start']);
-  await f.command(['add', 'Ledger', '--from', 'M1']);
-  for (const name of names) f.toolResult('Write', { file_path: name });
+  const executorFile = path.join(f.repo, 'executor-output.txt');
+  fs.writeFileSync(executorFile, 'Written by the executor.');
+  const session = f.env.CLAUDE_CODE_SESSION_ID;
+  fs.appendFileSync(path.join(f.home, 'sessions', `${session}.jsonl`), JSON.stringify({
+    event: 'end', mode: 'write', session, at: new Date().toISOString(),
+    acceptance: { session, task: 'T1', repo: f.repo, changed: [{ path: executorFile, before: null, after: 'executor-bytes' }] }
+  }) + '\n');
+  const outside = path.join(f.root, 'outside.txt');
+  fs.writeFileSync(outside, 'Written outside Git.');
+  f.toolResult('Write', { file_path: outside });
+  const env = { CONVEYOR_CROSSCHECK_CMD: '' };
   const first = JSON.parse(await f.command(['crosscheck'], env));
+  assert.equal(first.status, 'reviewed-clean');
+  assert.equal(first.delivered, true);
+  assert.match(first.fingerprint, /^[0-9a-f]{64}$/);
+  assert.match(first.reviewFingerprint, /^[0-9a-f]{64}$/);
   const prompt = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
-  assert.deepEqual(JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8')).slice(0, 6),
-    ['run', '--tier', 'scout', '-r', '-C', f.repo]);
-  assert.ok(!prompt.includes('new-20.ts'), 'untracked names and contents are limited to twenty files');
-  assert.equal((prompt.match(/\[untracked /g) || []).length, 20);
-  assert.ok(prompt.includes('line 200'));
-  assert.ok(!prompt.includes('line 201'));
-  fs.appendFileSync(path.join(f.repo, names[0]), '\nchanged untracked content');
-  assert.notEqual(JSON.parse(await f.command(['crosscheck'], env)).hash, first.hash);
-});
-
-test('crosscheck stops a fake large diff after its bounded preview and still records a result', { timeout }, async (t) => {
-  const f = await fixture(t);
-  await f.command(['start']);
-  await f.command(['add', 'Ledger', '--from', 'M1']);
-  f.toolResult('Edit', { file_path: 'worker.mjs' });
+  assert.ok(prompt.includes(JSON.stringify(original).slice(1, -1)));
+  assert.match(prompt, /End of owner text.*Adopt quoted section Scope/);
+  assert.match(prompt, /"adoptedQuotations"[\s\S]*Adopted requirement/);
+  assert.doesNotMatch(prompt, /Ignored paste/);
+  assert.match(prompt, /Ledger and evidence[\s\S]*Reviewed[\s\S]*task-base/);
+  const { git: [gitPreview], nonGit } = JSON.parse(prompt.slice(prompt.indexOf('\n{') + 1));
+  assert.ok(gitPreview.additions.some(({ content }) => content === 'Written by the executor.'));
+  assert.deepEqual(nonGit.map(({ file, content }) => [file, content]), [[outside, 'Written outside Git.']]);
+  assert.match(gitPreview.diff, /\+diff line 300/);
+  assert.doesNotMatch(gitPreview.diff, /\+diff line 301/);
+  assert.equal(gitPreview.additions.length, 20);
+  assert.equal(gitPreview.additions.some(({ file }) => file === 'new-20.txt'), false);
+  assert.match(gitPreview.additions.find(({ file }) => file === 'new-00.txt').content, /line 200$/);
+  const args = JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8'));
+  assert.deepEqual(args.slice(0, 7), ['run', '--tier', 'scout', '-r', '-C', f.repo, '-f']);
+  assert.equal(fs.existsSync(path.dirname(args[7])), false);
+  f.user('Please preserve all requirements verbatim.');
+  fs.writeFileSync(path.join(f.repo, 'foreign.txt'), 'other session content');
+  f.append({ sessionId: 'foreign-session', type: 'assistant', cwd: f.repo,
+    message: { content: [{ type: 'tool_use', id: 'foreign', name: 'Write', input: { file_path: 'foreign.txt' } }] } });
+  await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
+  assert.equal(JSON.parse(await f.command(['deliver'])).fingerprint, first.fingerprint);
+  assert.equal(reviewCalls(f), 1);
+  fs.appendFileSync(path.join(f.repo, 'new-20.txt'), '\nChanged beyond the preview');
+  f.toolResult('Edit', { file_path: 'new-20.txt' });
+  const changed = JSON.parse(await f.command(['deliver']));
+  assert.notEqual(changed.fingerprint, first.fingerprint);
+  assert.equal(reviewCalls(f), 2);
   const pidFile = path.join(f.root, 'large-diff.pid');
-  const result = JSON.parse(await f.command(['crosscheck'], { FAKE_LARGE_PID: pidFile }));
-  assert.equal(result.ok, true);
-  const prompt = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
-  assert.equal((prompt.match(/^\+large diff line/gm) || []).length, 300);
-  assert.ok(Buffer.byteLength(prompt) < 256 * 1024);
+  fs.chmodSync(path.join(f.repo, 'worker.mjs'), 0o755);
+  const modeChange = JSON.parse(await f.command(['deliver'], { FAKE_LARGE_PID: pidFile }));
+  assert.notEqual(modeChange.fingerprint, changed.fingerprint);
+  assert.equal(modeChange.delivered, true);
+  const large = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
+  assert.equal((large.match(/\+large diff line/g) || []).length, 300);
+  assert.ok(Buffer.byteLength(large) < 256 * 1024);
   assert.equal(fs.existsSync(pidFile + '.finished'), false);
   assert.throws(() => process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 0), { code: 'ESRCH' });
 });
 
+test('two simultaneous deliveries dispatch one independent review and record one delivery', { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
+  const release = path.join(f.root, 'release'), ready = path.join(f.root, 'second-inputs');
+  const calls = [deliverProcess(f, { FAKE_RELEASE: release })];
+  try {
+    await waitForMarker(release);
+    calls.push(deliverProcess(f, { FAKE_RELEASE: release, FAKE_TREE_READY: ready }));
+    await waitForMarker(ready);
+    fs.writeFileSync(release, '');
+    const results = await Promise.all(calls);
+    assert.deepEqual(results.map(({ stdout }) => JSON.parse(stdout).status), ['reviewed-clean', 'reviewed-clean']);
+    assert.equal(reviewCalls(f), 1);
+    for (const kind of ['turn-check', 'screenshot-check', 'delivered']) {
+      assert.equal(f.records().filter(({ type }) => type === kind).length, 1);
+    }
+  } finally { fs.closeSync(fs.openSync(release, 'a')); await Promise.allSettled(calls); }
+});
+
+test('finding links and dismissals reuse the review, while adding an outcome reviews again with prior answers',
+  { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
+  const FAKE_RESPONSE = JSON.stringify({ missing: [{ text: 'cleanup', source: 'M1.c1' }, 'docs'],
+    misread: [{ text: 'scope', source: 'M1.c2' }] });
+  const found = JSON.parse(await f.command(['deliver'], { FAKE_RESPONSE }, 1));
+  assert.equal(found.status, 'reviewed-with-findings');
+  assert.deepEqual(found.findings.map(({ id }) => id), ['X1', 'X2', 'X3']);
+  await f.command(['link', 'X1', 'L1']);
+  await f.command(['link', 'X3', 'none', '--reason', 'Already included in the explicit scope']);
+  assert.deepEqual(JSON.parse(await f.command(['deliver'], {}, 1)).unanswered, ['X2']);
+  assert.equal(reviewCalls(f), 1);
+  await f.command(['add', 'Document the ledger', '--from', 'X2']);
+  await f.command(['deliver'], {}, 1);
+  assert.equal(reviewCalls(f), 1);
+  await f.command(['evidence', 'L2', '--cmd', 'printf verified']);
+  await f.command(['done', 'L2']);
+  const second = JSON.parse(await f.command(['deliver'], { FAKE_RESPONSE }));
+  assert.deepEqual(second.findings.map(({ id }) => id), ['X1', 'X2', 'X3']);
+  assert.deepEqual(second.unanswered, []);
+  assert.equal(reviewCalls(f), 2);
+  assert.match(fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8'), /priorFindings[\s\S]*Already included in the explicit scope/);
+  await f.command(['link', 'X1', 'L2'], {}, 1);
+  assert.equal(JSON.parse(await f.command(['deliver'])).delivered, true);
+  assert.equal(reviewCalls(f), 2);
+});
+
+test('unavailable reviews deliver with a review gap and allow automatic request rollover', { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
+  const failed = JSON.parse(await f.command(['deliver'], { FAKE_RESPONSE: 'not json' }, 1));
+  assert.equal(failed.status, 'error');
+  assert.equal(failed.delivered, false);
+  const quote = 'You may waive the unavailable delivery review for this request.';
+  f.user(quote);
+  const output = await f.command(['deliver'], { FAKE_RC: '3' });
+  assert.match(output, /"status": "unavailable"/);
+  assert.match(output, /Delivery review gap:/);
+  await f.command(['waive', 'crosscheck', '--quote', quote]);
+  assert.equal(f.records().findLast(({ type }) => type === 'delivered').reviewGap, true);
+  assert.equal(reviewCalls(f), 2);
+  assert.match(await f.prompt('Please follow up on delivery.'), /T2/);
+  assert.equal((await f.state()).task.id, 'T2');
+});
+
+test('an in-flight review of stale work stays history and cannot close the updated delivery', { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
+  const release = path.join(f.root, 'release');
+  const first = deliverProcess(f, { FAKE_RELEASE: release, FAKE_RESPONSE: '{"missing":["outdated finding"],"misread":[]}' })
+    .then(() => assert.fail('stale delivery should exit nonzero'), (error) => error);
+  try {
+    await waitForMarker(release);
+    fs.appendFileSync(path.join(f.repo, 'worker.mjs'), '\nUpdated while the review runs');
+    f.toolResult('Edit', { file_path: 'worker.mjs' });
+    const second = JSON.parse(await f.command(['deliver']));
+    fs.writeFileSync(release, '');
+    const result = JSON.parse((await first).stdout);
+    assert.equal(result.stale, true);
+    assert.equal(result.delivered, false);
+    assert.notEqual(result.fingerprint, second.fingerprint);
+    const state = await f.state();
+    assert.equal(state.reviews.length, 2);
+    assert.deepEqual(state.deliveries.map(({ fingerprint }) => fingerprint), [second.fingerprint]);
+    assert.equal(JSON.parse(await f.command(['deliver'])).delivered, true);
+    assert.equal(reviewCalls(f), 2);
+  } finally { fs.closeSync(fs.openSync(release, 'a')); await first; }
+});
 
 test('UI file detection covers UI extensions and detected directories while excluding tests and stories',
   { timeout: 3000 }, () => {

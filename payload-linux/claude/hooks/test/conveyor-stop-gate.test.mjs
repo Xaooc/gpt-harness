@@ -141,10 +141,10 @@ exit 0
     await command(['add', 'Fix the worker', '--from', 'M1.c1']);
     await command(['evidence', 'L1', '--artifact', proof]);
     await command(['done', 'L1']);
-    if (semantic) await command(['crosscheck']);
+    if (semantic) await command(['deliver']);
   };
   return { root, repo, home, transcript, worker, proof, session, env, append, user, assistant, command, stop, write, complete,
-    editResult,
+    editResult, runLedger: (args, extra) => run(cli, args, extra),
     calls: (kind) => fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse)
       .filter((entry) => entry.kind === kind) : [] };
 }
@@ -209,7 +209,7 @@ test('prompt capture records the earliest base and ledger start fills missing re
   f.env.FAKE_HEAD = 'later-head';
   await f.command(['start']);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { [f.repo]: 'task-base' });
-  assert.equal(await f.stop(), null);
+  blocked(await f.stop(), 6, 'run ledger deliver');
   fs.rmSync(file);
   await f.command(['start']);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { [f.repo]: 'later-head' });
@@ -240,8 +240,8 @@ for (const [group, edits] of [
       await f.command(['done', 'L1']);
       blocked(await f.stop(), 4, 'evidence required');
       await f.command(['evidence', 'L1', '--artifact', f.proof]);
-      blocked(await f.stop(), 6, 'run ledger crosscheck');
-      await f.command(['crosscheck']);
+      blocked(await f.stop(), 6, 'run ledger deliver');
+      await f.command(['deliver']);
       assert.equal(await f.stop(), null);
       assert.equal(f.calls('check').length, 0);
     });
@@ -282,38 +282,39 @@ for (const kind of ['note', 'file', 'command', 'check']) {
     else if (kind === 'check') {
       fs.writeFileSync(f.proof, '{"code":0,"gate":{"status":"pass"}}');
       await f.command(['evidence', 'L1', '--check', f.proof]);
-      blocked(await f.stop(), 6, 'run ledger crosscheck');
+      blocked(await f.stop(), 6, 'run ledger deliver');
       fs.writeFileSync(f.proof, 'malformed dispatch JSON');
       blocked(await f.stop(), 4, 'check evidence is red');
     } else {
       await f.command(['evidence', 'L1', '--cmd', 'printf verified']);
-      blocked(await f.stop(), 6, 'run ledger crosscheck');
+      blocked(await f.stop(), 6, 'run ledger deliver');
     }
   });
 }
 
 for (const code of ['4', '5']) {
-  test(`unavailable scout crosschecks keep check 6 blocking (exit ${code})`, { timeout }, async (t) => {
+  test(`unavailable scout reviews allow delivery with a gap (exit ${code})`, { timeout }, async (t) => {
     const f = await fixture(t);
     await f.complete({ semantic: false });
-    await f.command(['crosscheck'], { FAKE_CROSSCHECK_RC: code });
-    blocked(await f.stop(), 6, 'cross-check unavailable: scout unavailable; run it again or waive');
+    blocked(await f.stop(), 6, 'run ledger deliver');
+    assert.equal(f.calls('crosscheck').length, 0);
+    assert.match(await f.command(['deliver'], { FAKE_CROSSCHECK_RC: code }), /Delivery review gap:/);
+    assert.equal(await f.stop(), null);
   });
 }
 
-test('unavailable scout crosschecks require a verified snapshot-specific waiver', { timeout }, async (t) => {
+test('an unavailable review waiver only applies to the fingerprint quoted by the owner', { timeout }, async (t) => {
   const f = await fixture(t);
   await f.complete({ semantic: false });
-  await f.command(['crosscheck'], { FAKE_CROSSCHECK_RC: '5' });
+  await f.command(['deliver'], { FAKE_CROSSCHECK_RC: '5' });
   const quote = 'You may waive the unavailable cross-check for this task.';
+  await f.command(['waive', 'deliver', '--quote', quote], {}, 1);
   f.user(quote);
-  await f.command(['waive', 'gate', '--quote', quote]);
-  await f.command(['crosscheck'], { FAKE_CROSSCHECK_RC: '5' });
-  blocked(await f.stop(), 6, 'cross-check unavailable');
-  await f.command(['waive', 'crosscheck', '--quote', quote]);
+  await f.command(['waive', 'deliver', '--quote', quote]);
   assert.equal(await f.stop(), null);
   fs.appendFileSync(f.worker, '// new content\n');
-  blocked(await f.stop(), 6, 'cross-check unavailable');
+  blocked(await f.stop(), 6, 'run ledger deliver');
+  await f.command(['waive', 'deliver', '--quote', quote], {}, 1);
 });
 
 test('check 4 requires any current proof to qualify and uses actual artifact times', { timeout }, async (t) => {
@@ -328,22 +329,23 @@ test('check 4 requires any current proof to qualify and uses actual artifact tim
   assert.equal(f.calls('check').length, 0);
   const fresh = new Date();
   fs.utimesSync(f.proof, fresh, fresh);
-  blocked(await f.stop(), 6, 'run ledger crosscheck');
+  blocked(await f.stop(), 6, 'run ledger deliver');
   const dispatch = path.join(f.root, 'dispatch.json');
   fs.writeFileSync(dispatch, '{"code":0}');
   await f.command(['evidence', 'L1', '--check', dispatch], {}, 1);
+  blocked(await f.stop(), 6, 'run ledger deliver');
   assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 6\./);
   fs.writeFileSync(dispatch, '{"code":0,"gate":{"status":"pass"}}');
   await f.command(['evidence', 'L1', '--check', dispatch]);
-  assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 6\./);
+  blocked(await f.stop(), 6, 'run ledger deliver');
   const rerun = ['evidence', 'L1', '--cmd', 'test "$CONVEYOR_EVIDENCE_OK" = yes'];
   await f.command(rerun, { CONVEYOR_EVIDENCE_OK: 'no' }, 1);
-  assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 6\./);
+  blocked(await f.stop(), 6, 'run ledger deliver');
   fs.rmSync(f.proof);
   fs.rmSync(dispatch);
   blocked(await f.stop(), 4, 'refresh evidence');
   await f.command(rerun, { CONVEYOR_EVIDENCE_OK: 'yes' });
-  blocked(await f.stop(), 6, 'run ledger crosscheck');
+  blocked(await f.stop(), 6, 'run ledger deliver');
 });
 
 test('a v2 request checks owned changes in order 1, 3, 4, then 5', { timeout }, async (t) => {
@@ -421,14 +423,14 @@ test('registered temporary paths and expired owned worktrees block cleanup on re
 
 test('verified gate waivers cover checks 5 and 8, and verified item waivers count as done', { timeout }, async (t) => {
   const f = await fixture(t);
-  await f.complete();
+  await f.complete({ semantic: false });
   const quote = 'You may skip turn checks and cleanup for this task.';
   await f.command(['waive', 'gate', '--quote', quote], {}, 1);
   const red = { FAKE_CHECK_OK: '0', FAKE_CHECK_RC: '1' };
   blocked(await f.stop(red), 5, 'fix red turn checks');
   f.user(quote);
   await f.command(['waive', 'gate', '--quote', quote]);
-  await f.command(['crosscheck']);
+  await f.command(['deliver']);
   const checks = f.calls('check').length, overviews = f.calls('overview').length;
   const scratch = path.join(f.root, 'scratch.txt');
   fs.writeFileSync(scratch, 'registered');
@@ -439,8 +441,8 @@ test('verified gate waivers cover checks 5 and 8, and verified item waivers coun
   await f.command(['add', 'Explicit extra item', '--from', 'M1']);
   blocked(await f.stop(red), 3, 'open items: L2');
   await f.command(['waive', 'L2', '--quote', quote]);
-  blocked(await f.stop(red), 6, 'run ledger crosscheck');
-  await f.command(['crosscheck']);
+  blocked(await f.stop(red), 6, 'run ledger deliver');
+  await f.command(['deliver']);
   assert.equal(await f.stop(red), null);
 });
 
@@ -514,23 +516,27 @@ async function uiFixture(t) {
   const old = new Date(Date.now() - 10_000);
   fs.utimesSync(page, old, old);
   f.editResult({ name: 'Edit', input: { file_path: page } });
-  await f.complete();
+  await f.complete({ semantic: false });
   return f;
 }
 
 test('UI changes require image artifacts on reason 9, with warning mode and actionable placeholders',
   { timeout: 3000 }, async (t) => {
     const f = await uiFixture(t);
-    blocked(await f.stop(), 9, 'user-facing change without a screenshot');
-    const warning = await f.stop({ CONVEYOR_GATE_MODE: 'warn' });
-    assert.match(warning.systemMessage, /9\. user-facing change without a screenshot/);
+    blocked(await f.stop(), 6, 'run ledger deliver');
+    assert.equal(f.calls('crosscheck').length, 0);
+    const missing = await f.runLedger(['deliver']);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /9\. user-facing change without a screenshot/);
     const image = path.join(f.root, 'desktop.png');
     fs.writeFileSync(image, 'fake screenshot');
     await f.command(['evidence', 'L1', '--file', image]);
-    await f.command(['crosscheck']);
-    assert.match((await f.stop()).systemMessage, /ledger evidence <L> --artifact <screenshot>/);
+    const result = await f.runLedger(['deliver']);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /ledger evidence <L> --artifact <screenshot>/);
+    assert.equal(f.calls('crosscheck').length, 0);
     await f.command(['evidence', 'L1', '--artifact', image]);
-    await f.command(['crosscheck']);
+    await f.command(['deliver']);
     assert.equal(await f.stop(), null);
   });
 
@@ -540,13 +546,15 @@ test('stale image artifacts fail reason 9 even when another artifact satisfies i
     const image = path.join(f.root, 'desktop.webp');
     fs.writeFileSync(image, 'fake screenshot');
     await f.command(['evidence', 'L1', '--artifact', image]);
+    await f.command(['deliver']);
     const old = new Date(fs.statSync(f.worker).mtimeMs - 1000);
     fs.utimesSync(image, old, old);
-    await f.command(['crosscheck']);
     blocked(await f.stop(), 9, 'user-facing change without a screenshot');
+    const warning = await f.stop({ CONVEYOR_GATE_MODE: 'warn' });
+    assert.match(warning.systemMessage, /9\. user-facing change without a screenshot/);
     fs.utimesSync(image, new Date(), new Date());
-    await f.command(['crosscheck']);
     assert.equal(await f.stop(), null);
+    assert.equal(f.calls('crosscheck').length, 1);
   });
 
 test('a later conversation turn preserves a fresh image artifact for the same outcome', { timeout: 3000 }, async (t) => {
@@ -555,7 +563,7 @@ test('a later conversation turn preserves a fresh image artifact for the same ou
   fs.writeFileSync(image, 'fake screenshot');
   await f.command(['evidence', 'L1', '--artifact', image]);
   f.user('Thanks.');
-  await f.command(['crosscheck']);
+  await f.command(['deliver']);
   assert.equal(await f.stop(), null);
 });
 
@@ -575,14 +583,16 @@ test('detected UI directories require screenshots, test and story changes do not
     await f.complete();
     assert.equal(await f.stop(), null);
     f.editResult({ name: 'Edit', input: { file_path: 'frontend/view.js' } });
-    await f.command(['crosscheck']);
-    blocked(await f.stop(), 9, 'user-facing change without a screenshot');
+    const missing = await f.runLedger(['deliver']);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /9\. user-facing change without a screenshot/);
+    blocked(await f.stop(), 6, 'run ledger deliver');
     const quote = 'You may skip screenshots for this task.';
     await f.command(['waive', 'gate', '--quote', quote], {}, 1);
-    assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 9\./);
+    assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 6\./);
     f.user(quote);
     await f.command(['waive', 'gate', '--quote', quote]);
-    await f.command(['crosscheck']);
+    await f.command(['deliver']);
     assert.equal(await f.stop(), null);
   });
 
@@ -594,18 +604,21 @@ test('an owner image covers only its linked UI outcome and revision', { timeout 
     f.editResult({ name: 'Edit', input: { file_path: file } });
     const id = (await f.command(['add', `Verify ${file}`, '--from', 'M1', '--paths', file])).trim();
     await f.command(['evidence', id, '--cmd', 'printf verified']);
+    await f.command(['done', id]);
   }
   f.user([{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aW1hZ2U=' } }]);
   await f.command(['evidence', 'L1', '--owner-message', 'M2']);
-  await f.command(['crosscheck']);
-  const missing = await f.stop();
-  blocked(missing, 9, 'without a screenshot: L2.');
-  assert.doesNotMatch(missing.reason, /L1/);
+  const missing = await f.runLedger(['deliver']);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /9\. .*without a screenshot: L2\./);
+  assert.doesNotMatch(missing.stderr, /L1/);
   await f.command(['pending', 'L2', '--reason', 'Owner must verify the second UI outcome']);
-  await f.command(['crosscheck']);
+  await f.command(['deliver']);
   assert.equal(await f.stop(), null);
   await f.command(['amend', 'L1', '--from', 'M2', 'Verify the revised outcome A']);
   await f.command(['evidence', 'L1', '--cmd', 'printf verified']);
-  await f.command(['crosscheck']);
-  blocked(await f.stop(), 9, 'without a screenshot: L1.');
+  await f.command(['done', 'L1']);
+  const revised = await f.runLedger(['deliver']);
+  assert.equal(revised.status, 1);
+  assert.match(revised.stderr, /9\. .*without a screenshot: L1\./);
 });
