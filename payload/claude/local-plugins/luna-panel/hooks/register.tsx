@@ -2,7 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type {
-  ChainEntry, ClaudeLimit, CliStatus, Collapsed, Job, PanelData, SessionBeat, Snapshot, View,
+  ChainEntry, ClaudeLimit, CliStatus, CodexAccount, CodexLimits, Collapsed, Job, LimitWindow, PanelData, SessionBeat,
+  Snapshot, View,
 } from '../types'
 
 // The Luna pane, conveyor edition: limits of every provider, the executor chains with the active one marked, every
@@ -62,10 +63,34 @@ function duration(totalS: number): string {
   return `${Math.floor(h / 24)}д ${h % 24}ч`
 }
 
-function resetsIn(iso: string | null | undefined, now: number): string {
-  if (!iso) return ''
-  const t = Date.parse(iso)
-  return Number.isFinite(t) ? `сброс через ${duration((t - now) / 1000)}` : ''
+/** Time left with minutes even across days, leading empty units dropped: "6д 2ч 13м", "4ч 0м", "37м", "<1м". */
+function timeLeft(totalS: number): string {
+  const m = Math.floor(Math.max(0, totalS) / 60)
+  if (m < 1) return '<1м'
+  const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60
+  return d ? `${d}д ${h}ч ${mm}м` : h ? `${h}ч ${mm}м` : `${mm}м`
+}
+
+const dayStart = (t: Date) => new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime()
+
+/** A reset as the local wall clock: "15:57" today, "завтра 09:00", "пн 15:57" within the week, else "1 дек 15:57". */
+function wallClock(t: number, now: number): string {
+  const at = new Date(t)
+  const time = at.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+  const days = Math.round((dayStart(at) - dayStart(new Date(now))) / 86_400_000)
+  if (days <= 0) return time
+  if (days === 1) return `завтра ${time}`
+  if (days < 6) return `${at.toLocaleDateString('ru-RU', { weekday: 'short' })} ${time}`
+  return `${at.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }).replace('.', '')} ${time}`
+}
+
+type Reset = { at: string; left: string }
+
+/** When a limit window resets and how long until then; null when unknown or already past. */
+function resetOf(iso: string | null | undefined, now: number): Reset | null {
+  const t = iso ? Date.parse(iso) : NaN
+  if (!Number.isFinite(t) || t <= now) return null
+  return { at: wallClock(t, now), left: timeLeft((t - now) / 1000) }
 }
 
 function clock(iso: string | null | undefined): string {
@@ -189,6 +214,12 @@ function projectOfJobs(jobs: Job[]): string {
 
 type Alert = { level: 'error' | 'warning'; text: string }
 
+/** The snapshot's Codex accounts with the fields the pane reads; a malformed entry is dropped, not guessed. */
+function codexAccountsOf(s: Snapshot): CodexAccount[] {
+  return (Array.isArray(s.codexAccounts) ? s.codexAccounts : [])
+    .filter((a): a is CodexAccount => !!a && typeof a.id === 'string' && typeof a.label === 'string')
+}
+
 function attentionItems(d: PanelData): Alert[] {
   const s = d.snapshot
   const out: Alert[] = []
@@ -217,7 +248,13 @@ function attentionItems(d: PanelData): Alert[] {
       out.push({ level: 'error', text: `Claude · ${windowName(l.kind, null)}: ${Math.round(l.percentUsed)}%` })
     }
   }
-  if (s.codexLimits?.reached) out.push({ level: 'error', text: 'Лимит Codex исчерпан' })
+  const accounts = codexAccountsOf(s)
+  if (accounts.length > 1) {
+    for (const a of accounts) if (!a.loggedIn) out.push({ level: 'warning', text: `Codex «${a.label || a.id}»: нет входа` })
+    if (accounts.every(a => a.exhausted || !a.loggedIn)) {
+      out.push({ level: 'warning', text: 'Все аккаунты Codex на пороге: задачи идут на Claude' })
+    }
+  } else if (s.codexLimits?.reached) out.push({ level: 'error', text: 'Лимит Codex исчерпан' })
   if (d.error) out.push({ level: 'warning', text: `Данные не обновляются: ${d.error.slice(0, 80)}` })
   return out.sort((a, b) => (a.level === 'error' ? 0 : 1) - (b.level === 'error' ? 0 : 1))
 }
@@ -706,7 +743,7 @@ export const register: Register = on => {
     const thresholdPct = o?.threshold?.switch_percent ?? 80
     const ThresholdRow = () => (
       <Box flexDirection="row" alignItems="center" gap={1} flexWrap="wrap">
-        <Text size="footnote">Codex → Claude при</Text>
+        <Text size="footnote">{accounts.length > 1 ? 'Смена аккаунта Codex при' : 'Codex → Claude при'}</Text>
         <Select key="threshold" value={String(thresholdPct)}
           options={[50, 60, 70, 75, 80, 85, 90, 95, 100].map(p => ({ value: String(p), label: `${p}%` }))}
           onSelect={value => void act($, 'threshold', ['config', 'threshold', '--percent', value], `Порог ${value}%`)} />
@@ -769,60 +806,106 @@ export const register: Register = on => {
 
     // Gemini is out of the owner's setup: leftover Gemini jobs are not shown (and never labelled as another provider).
     const jobs = (snap.jobs ?? []).filter(j => providerOf(j) !== 'gemini')
-    const codex = snap.codexLimits
+    const accounts = codexAccountsOf(snap)
+    const codex = snap.codexLimits ?? accounts[0]?.limits ?? null
     const room = Math.max(4, (e.viewport?.rows ?? 40) - 30)
 
     // ---- Overview ----
 
-    // Every limit window on its own line: provider · window · percent · thin bar · when it resets.
-    const LimitLine = ({ provider, window: win, pct, right, color, showName }: {
-      provider: string; window: string; pct: number | null; right?: string; color?: 'success' | 'warning' | 'error'; showName: boolean
+    // Every limit window on its own line: provider · window · percent · thin bar · when it resets and how long until.
+    // The fixed columns take ~35 cells and the reset ("через 6д 2ч 13м · пн 15:57") ~28 more, so a narrower pane
+    // puts the reset on its own line under the row: both the time left and the wall clock always stay visible.
+    const cols = (e.props as { bodyColumns?: number } | undefined)?.bodyColumns ?? 44
+    const resetInline = cols >= 64
+    const resetText = (r: Reset) => `через ${r.left} · ${r.at}`
+    const LimitLine = ({ provider, window: win, pct, reset, note, color, showName }: {
+      provider: string; window: string; pct: number | null; reset?: Reset | null; note?: string
+      color?: 'success' | 'warning' | 'error'; showName: boolean
     }) => {
       const c = color ?? severity(pct ?? 0)
+      const right = [note, reset && resetInline ? resetText(reset) : ''].filter(Boolean).join(' · ')
       return (
-        <Box flexDirection="row" alignItems="center" gap={1}>
-          <Box width={7} flexShrink={0}><Text size="footnote" weight={showName ? 'medium' : 'regular'}>{showName ? provider : ''}</Text></Box>
-          <Box width={7} flexShrink={0}><Text size="caption" color="subtle">{win}</Text></Box>
-          <Box width={5} flexShrink={0} justifyContent="flex-end">
-            <Text size="footnote" weight="medium" color={pct === null ? 'subtle' : c} tabular>{pct === null ? '—' : `${Math.round(pct)}%`}</Text>
+        <Box flexDirection="column">
+          <Box flexDirection="row" alignItems="center" gap={1}>
+            <Box width={7} flexShrink={0}><Text size="footnote" weight={showName ? 'medium' : 'regular'}>{showName ? provider : ''}</Text></Box>
+            <Box width={7} flexShrink={0}><Text size="caption" color="subtle">{win}</Text></Box>
+            <Box width={5} flexShrink={0} justifyContent="flex-end">
+              <Text size="footnote" weight="medium" color={pct === null ? 'subtle' : c} tabular>{pct === null ? '—' : `${Math.round(pct)}%`}</Text>
+            </Box>
+            <Box flexShrink={0}>{pct === null ? <Text size="caption"> </Text> : <Bar pct={pct} color={c} />}</Box>
+            <Box flexGrow={1} flexShrink={1}><Text size="caption" color="subtle" wrap="truncate-end">{right}</Text></Box>
           </Box>
-          <Box flexShrink={0}>{pct === null ? <Text size="caption"> </Text> : <Bar pct={pct} color={c} />}</Box>
-          <Box flexGrow={1} flexShrink={1}><Text size="caption" color="subtle" wrap="truncate-end">{right ?? ''}</Text></Box>
+          {reset && !resetInline ? (
+            <Box paddingLeft={8}><Text size="caption" color="subtle" wrap="truncate-end">↻ {resetText(reset)}</Text></Box>
+          ) : null}
         </Box>
       )
     }
 
-    const resetShort = (iso: string | null | undefined) => {
-      const t = iso ? Date.parse(iso) : NaN
-      if (!Number.isFinite(t)) return ''
-      const left = (t - now) / 1000
-      if (left <= 0) return ''
-      if (left < 86400) return `↻ ${new Date(t).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`
-      return `↻ ${new Date(t).toLocaleDateString('ru-RU', { weekday: 'short' })} ${new Date(t).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}`
+    const hysteresisPct = o?.threshold?.hysteresis_percent ?? 5
+    const windowsOf = (l: CodexLimits | null | undefined) => [l?.primary, l?.secondary]
+      .filter((x): x is LimitWindow => !!x).sort((a, b) => (a.windowMins ?? 0) - (b.windowMins ?? 0))
+    const CodexWindows = ({ limits, showName }: { limits: CodexLimits | null | undefined; showName: boolean }) => {
+      const windows = windowsOf(limits)
+      if (limits?.reached) {
+        // An exhausted account still says when it comes back: the fullest window is the one holding it.
+        const binding = [...windows].sort((a, b) => b.usedPercent - a.usedPercent)[0]
+        return <LimitLine provider="Codex" showName={showName} window={binding ? windowName('', binding.windowMins) : ''} pct={100}
+          color="error" note="исчерпан" reset={resetOf(binding?.resetsAt, now)} />
+      }
+      if (!windows.length) return <LimitLine provider="Codex" showName={showName} window="" pct={null} note="нет данных" />
+      return (
+        <Box flexDirection="column">
+          {windows.map((w, i) => (
+            <LimitLine provider="Codex" showName={showName && i === 0} window={windowName('', w.windowMins)} pct={w.usedPercent}
+              color={w.usedPercent >= thresholdPct ? 'warning' : severity(w.usedPercent)} reset={resetOf(w.resetsAt, now)} />
+          ))}
+        </Box>
+      )
+    }
+
+    // What an account is doing now, in the words of the selection rule: working, in reserve, past the threshold,
+    // held by hysteresis, or marked after a quota/auth error.
+    const accountState = (a: CodexAccount): { text: string; color: 'success' | 'warning' | 'error' | 'subtle' } => {
+      if (!a.loggedIn) return { text: 'нет входа', color: 'warning' }
+      if (a.mark && Date.parse(a.mark.until) > now) {
+        return { text: `${a.mark.reason === 'auth' ? 'ошибка входа' : 'квота'} до ${clock(a.mark.until)}`, color: 'error' }
+      }
+      if (a.exhausted) {
+        const top = Math.max(0, ...windowsOf(a.limits).map(w => w.usedPercent))
+        return { text: top >= thresholdPct ? `≥ порога ${thresholdPct}%` : `ждёт ≤ ${thresholdPct - hysteresisPct}%`, color: 'warning' }
+      }
+      return a.active ? { text: '● сейчас', color: 'success' } : { text: 'в запасе', color: 'subtle' }
     }
 
     const Limits = () => {
       const claude = d.claude.filter(l => l.kind !== 'spend_limit' || l.percentUsed > 0)
         .sort((a, b) => (a.kind === 'five_hour' ? -1 : b.kind === 'five_hour' ? 1 : 0))
-      const cx = [codex?.primary, codex?.secondary].filter((x): x is NonNullable<typeof x> => !!x)
-        .sort((a, b) => (a.windowMins ?? 0) - (b.windowMins ?? 0))
       const today = usage?.today
       return (
         <Section title="Лимиты">
           <Box flexDirection="column">
           {claude.length ? claude.map((l, i) => (
-            <LimitLine provider="Claude" showName={i === 0} window={windowName(l.kind, null)} pct={l.percentUsed} right={resetShort(l.resetsAt)} />
-          )) : <LimitLine provider="Claude" showName window="" pct={null} right="после первого ответа" />}
+            <LimitLine provider="Claude" showName={i === 0} window={windowName(l.kind, null)} pct={l.percentUsed} reset={resetOf(l.resetsAt, now)} />
+          )) : <LimitLine provider="Claude" showName window="" pct={null} note="после первого ответа" />}
           </Box>
           <Rule />
-          <Box flexDirection="column">
-          {codex?.reached ? <LimitLine provider="Codex" showName window="" pct={100} color="error" right="исчерпан" />
-            : cx.length ? cx.map((w, i) => (
-              <LimitLine provider="Codex" showName={i === 0} window={windowName('', w.windowMins)} pct={w.usedPercent}
-                color={w.usedPercent >= thresholdPct ? 'warning' : severity(w.usedPercent)}
-                right={w.usedPercent >= thresholdPct ? `≥ порога ${thresholdPct}%` : resetShort(w.resetsAt) || `порог ${thresholdPct}%`} />
-            )) : <LimitLine provider="Codex" showName window="" pct={null} right="нет данных" />}
-          </Box>
+          {accounts.length > 1 ? accounts.map((a, i) => {
+            const state = accountState(a)
+            const age = !a.known && a.limits ? ` · замер ${duration(a.limits.ageS)} назад` : ''
+            return (
+              <Box flexDirection="column" key={`acct-${a.id}`}>
+                <Box flexDirection="row" alignItems="center" gap={1}>
+                  <Box width={7} flexShrink={0}><Text size="footnote" weight="medium">{i === 0 ? 'Codex' : ''}</Text></Box>
+                  <Box flexShrink={1}><Text size="footnote" wrap="truncate-end">{a.label || a.id}</Text></Box>
+                  <Box flexGrow={1} flexShrink={1}>
+                    <Text size="caption" color={state.color} wrap="truncate-end">{state.text}<Text color="subtle">{age}</Text></Text>
+                  </Box>
+                </Box>
+                <CodexWindows limits={a.limits} showName={false} />
+              </Box>
+            )
+          }) : <CodexWindows limits={codex} showName />}
           {today ? (
             <Box paddingTop={0}>
               <Button key="today-usage" plain onPress={() => void setView({ tab: 'usage' })}>
@@ -1196,14 +1279,34 @@ export const register: Register = on => {
           <Fold id="set-auto" title="Автопереключение и пресеты" byDefault>
             <ThresholdRow />
             <Box flexDirection="row" alignItems="center" gap={1} flexWrap="wrap">
-              <Text size="footnote">Обратно на Codex при</Text>
-              <Select key="hysteresis" value={String(o.threshold?.hysteresis_percent ?? 5)}
+              <Text size="footnote">{accounts.length > 1 ? 'Аккаунт снова в работе при' : 'Обратно на Codex при'}</Text>
+              <Select key="hysteresis" value={String(hysteresisPct)}
                 options={[0, 3, 5, 10, 15].map(p => ({ value: String(p), label: `≤ ${thresholdPct - p}%` }))}
-                onSelect={value => void act($, 'hyst', ['config', 'threshold', '--percent', String(thresholdPct), '--hysteresis', value], `Обратно на Codex при ≤ ${thresholdPct - Number(value)}%`)} />
+                onSelect={value => void act($, 'hyst', ['config', 'threshold', '--percent', String(thresholdPct), '--hysteresis', value], `Обратно при ≤ ${thresholdPct - Number(value)}%`)} />
             </Box>
             <Text size="caption" color="subtle" wrap="wrap">
-              {`Когда лимит Codex доходит до ${thresholdPct}%, задачи Codex уходят на Claude (Sol → Sonnet, Luna → Haiku). Назад на Codex — когда расход опустится до ${thresholdPct - (o.threshold?.hysteresis_percent ?? 5)}%: запас не даёт прыгать туда-сюда у самого порога.`}
+              {accounts.length > 1
+                ? `Задачи Codex идут на первый аккаунт, пока его лимит ниже ${thresholdPct}%, потом на следующий; когда все дошли до ${thresholdPct}%, задачи уходят на Claude (Sol → Sonnet, Luna → Haiku). Аккаунт возвращается в работу, когда расход опустится до ${thresholdPct - hysteresisPct}%. Начатая задача всегда доделывается на своём аккаунте.`
+                : `Когда лимит Codex доходит до ${thresholdPct}%, задачи Codex уходят на Claude (Sol → Sonnet, Luna → Haiku). Назад на Codex — когда расход опустится до ${thresholdPct - hysteresisPct}%: запас не даёт прыгать туда-сюда у самого порога.`}
             </Text>
+            <Box flexDirection="column" paddingTop={1}>
+              <Text size="footnote" weight="medium">Аккаунты Codex</Text>
+              {accounts.length ? accounts.map((a, i) => {
+                const state = accountState(a)
+                return (
+                  <Box flexDirection="row" gap={1} key={`set-acct-${a.id}`}>
+                    <Text size="footnote" color="subtle" tabular>{`${i + 1}.`}</Text>
+                    <Box flexShrink={1}><Text size="footnote" wrap="truncate-end">{a.label || a.id}</Text></Box>
+                    <Text size="caption" color={state.color}>{state.text}</Text>
+                  </Box>
+                )
+              }) : <Text size="footnote" color="subtle">один, основной (~/.codex)</Text>}
+              {accounts.length < 2 ? (
+                <Text size="caption" color="subtle" wrap="wrap">
+                  Второй аккаунт: node ~/.claude/scripts/codex-accounts.mjs add second, затем вход по команде, которую она напечатает.
+                </Text>
+              ) : null}
+            </Box>
             <Box paddingTop={1}><PresetRow /></Box>
             <Box paddingTop={1}>
               <Input key="preset-name" placeholder="сохранить как пресет…" value={v.presetName}
