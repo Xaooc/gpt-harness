@@ -25,7 +25,7 @@ const quotaError = new RegExp([
 const unavailableReasons = ['quota', 'region', 'auth', 'start'];
 // "Your workspace is out of credits" is what a business seat with a depleted credit pool returns (seen 2026-11-24).
 const codexQuotaError = /\busage limit\b|\bquota\b|\binsufficient_quota\b|\brate[ _]limit[ _]reached\b|\bout of credits\b|\bcredits[ _]depleted\b/i;
-const codexAuthError = /\b(?:unauthorized|401|403|not logged in|login|token expired)\b/i;
+const codexAuthError = /\b(?:unauthorized|forbidden|401|403|not logged in|login|token expired)\b/i;
 const execute = promisify(execFile);
 const gitOptions = { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 };
 export const gateInstruction = 'Fix the root cause in the code. Do not weaken, skip or delete checks, ' +

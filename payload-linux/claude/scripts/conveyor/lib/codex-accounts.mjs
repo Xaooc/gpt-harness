@@ -33,9 +33,14 @@ export function accountPaths(id, env = process.env) {
   const userHome = home(env);
   // LUNA_RUN_DIR isolates a whole run root (tests, a second root): an account read there never sees this machine's.
   const base = path.resolve(env.LUNA_DAEMON_HOME || env.LUNA_RUN_DIR || path.join(userHome, '.claude', 'luna-run'));
+  const accountsHome = path.join(userHome, '.codex-accounts');
+  // main keeps a CODEX_HOME the caller set, as before accounts existed, unless it is another account's home that a
+  // pinned wrapper exported to its children.
+  const inherited = env.CODEX_HOME && !path.resolve(env.CODEX_HOME).startsWith(accountsHome + path.sep)
+    ? env.CODEX_HOME : null;
   return id === 'main'
-    ? { codexHome: path.resolve(env.LUNA_CODEX_MAIN_HOME || path.join(userHome, '.codex')), runRoot: base }
-    : { codexHome: path.join(userHome, '.codex-accounts', id), runRoot: path.join(base, 'accounts', id) };
+    ? { codexHome: path.resolve(env.LUNA_CODEX_MAIN_HOME || inherited || path.join(userHome, '.codex')), runRoot: base }
+    : { codexHome: path.join(accountsHome, id), runRoot: path.join(base, 'accounts', id) };
 }
 
 export function loggedIn(id) {
@@ -45,14 +50,15 @@ export function loggedIn(id) {
 export const used = (window) => Number.isFinite(window?.usedPercent) && window.usedPercent >= 0 ? window.usedPercent : null;
 export const stamp = (value) => typeof value === 'number' ? value : Date.parse(value);
 
-function thresholdState({ switch_percent: threshold, hysteresis_percent: hysteresis, windows }, usage, previous) {
+function thresholdState({ switch_percent: threshold, hysteresis_percent: hysteresis, windows }, usage, previous, now) {
   const switched = previous === true;
   const readings = windows.map((name) => ({ name, window: usage[name], percent: used(usage[name]) }));
   const fresh = usage.known === true && !usage.stale;
   // A depleted business seat reports `reached` (workspace_member_credits_depleted) and refuses work whatever the
-  // windows say; it stays out until a fresh reading clears the flag.
-  if (fresh && typeof usage.reached === 'string' && usage.reached) {
-    return { switched: true, exhausted: true, known: true, reason: `codex limit reached (${usage.reached})` };
+  // windows say. It stays out until a fresh reading clears the flag; a stale one holds it until a window resets.
+  const resetPending = readings.some(({ window }) => stamp(window?.resetsAt) > now);
+  if (typeof usage.reached === 'string' && usage.reached && (fresh || resetPending)) {
+    return { switched: true, exhausted: true, known: fresh, reason: `codex limit reached (${usage.reached})` };
   }
   const known = fresh && readings.some((reading) => reading.percent !== null);
   if (!known) {
@@ -75,7 +81,7 @@ export function selectAccount({ accounts, usage, marks, previousActive, threshol
     const reading = (Object.hasOwn(usage, id) ? usage[id] : null) ?? {};
     const mark = (Object.hasOwn(marks, id) ? marks[id] : null) ?? {};
     const login = reading.loggedIn ?? id === 'main';
-    const state = thresholdState(threshold, reading, mark.switched);
+    const state = thresholdState(threshold, reading, mark.switched, now);
     const until = stamp(mark.until);
     if (!login) {
       Object.assign(state, { exhausted: true, switched: mark.switched === true, reason: 'not logged in' });

@@ -298,8 +298,10 @@ if account_selection=$(node "$SCRIPT_DIR/codex-accounts.mjs" "${account_args[@]}
   eval "$account_selection"
 else
   picker_rc=$?
-  if [ "$picker_rc" = 2 ] && [ -n "${LUNA_CODEX_ACCOUNT:-}" ]; then
-    die 2 "unknown Codex account: $LUNA_CODEX_ACCOUNT"
+  # A pinned job never runs on another account: without its paths it stops before launching Codex.
+  if [ -n "${LUNA_CODEX_ACCOUNT:-}" ]; then
+    [ "$picker_rc" = 2 ] && die 2 "unknown Codex account: $LUNA_CODEX_ACCOUNT"
+    die 2 "Codex account picker failed for pinned account $LUNA_CODEX_ACCOUNT"
   fi
   echo "luna.sh: Codex account picker failed; using main" >&2
   LUNA_ACCOUNT=main

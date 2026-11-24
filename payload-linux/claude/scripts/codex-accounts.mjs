@@ -69,7 +69,18 @@ async function pick({ json, shell, account: pin }) {
     console.error(`codex-accounts: unknown Codex account: ${pin}`);
     return 2;
   }
-  const state = await providerState(config, { persist: pin === undefined });
+  // A pin was chosen by the dispatcher already: printing its paths needs no usage state, so a damaged providers.json
+  // can never turn a job pinned to one account into a job on another.
+  if (pin !== undefined) {
+    const { codexHome, runRoot } = accountPaths(pin);
+    const fields = shell
+      ? { LUNA_ACCOUNT: pin, LUNA_ACCOUNT_HOME: codexHome, LUNA_ACCOUNT_RUN: runRoot, LUNA_ACCOUNT_EXHAUSTED: 0 }
+      : { id: pin, codex_home: codexHome, run_root: runRoot, exhausted: 0 };
+    if (json) print(fields);
+    else for (const [key, value] of Object.entries(fields)) console.log(`${key}=${shell ? shellQuote(value) : value}`);
+    return 0;
+  }
+  const state = await providerState(config);
   const { active, accounts } = state.threshold;
   let id = pin ?? active;
   if (id === null) {
