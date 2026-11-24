@@ -51,7 +51,8 @@ export function recordJob(out, opts = {}) {
       started: values.started ?? "",
       finished: values.finished ?? "",
       state: values.state,
-      provider: values.provider === "gemini" || Object.hasOwn(values, "acp_model") ? "gemini" : "codex",
+      provider: values.provider === "mlai" ? values.provider
+        : values.provider === "gemini" || Object.hasOwn(values, "acp_model") ? "gemini" : "codex",
       model: values.acp_model || values.model || "",
       effort: values.effort ?? "",
       dir: values.dir ?? "",

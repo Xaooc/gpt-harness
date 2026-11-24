@@ -3,17 +3,18 @@
 import * as fs from 'node:fs/promises';
 import { readFileSync, writeFileSync, rmSync, statSync, watch, constants } from 'node:fs';
 import path from 'node:path';
-import { constants as osConstants, homedir } from 'node:os';
+import { constants as osConstants, homedir, tmpdir } from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
-  loadConfig, saveConfig, updateConfig, providerState, resolveChain, resolvePanel, markUnavailable,
+  loadConfig, updateConfig, upgradeConfig, providerState, resolveChain, resolvePanel, markUnavailable,
   recordSwitch, renderRoles, validateConfig, wrapperPath, writeJsonAtomic, paths, withLock
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 import { activeTaskId, hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
+import { acquireSlot, mlaiLogin, mlaiPaths, MLAI_EFFORT_MODELS, slotState } from './lib/mlai.mjs';
 import { accountPaths } from './lib/codex-accounts.mjs';
 import { bash, platform, processAlive, readProcessStat, scanBinary } from './lib/platform.mjs';
 import { inside } from './lib/task-scope.mjs';
@@ -417,7 +418,7 @@ async function appendRunRecord(record) {
   }
 }
 
-async function finishGate(gate, dispatch, entry, dir, out, acceptance, account) {
+async function finishGate(gate, dispatch, entry, dir, out, acceptance, account, extraEnv) {
   if (!gate || gate.mode === 'off') return 0;
   const append = (text) => fs.appendFile(out, `${text}\n`);
   const report = async (text) => {
@@ -464,8 +465,16 @@ async function finishGate(gate, dispatch, entry, dir, out, acceptance, account) 
       const brief = `${out}.gate-${rounds}.brief.md`, fixOut = `${out}.gate-${rounds}.out.md`;
       await fs.writeFile(brief, gate.brief + '\n\n## The work above is done but failed the project\'s checks\n\n' +
         `${gateDetails(last, true)}\n${budgetOnly ? '' : `\n${gateInstruction}\n`}`);
-      const result = await recordWriteAttempt(acceptance, gate, dir, () => launch(entry,
-        ['-w', '-m', entry.model, '-e', entry.effort, '-C', dir, '-f', brief, '-o', fixOut], dir, account));
+      const tracker = entry.provider === 'mlai' ? trackStatus(`${fixOut}.status`) : null;
+      let result, observed;
+      try {
+        result = await recordWriteAttempt(acceptance, gate, dir, () => launch(entry,
+          ['-w', '-m', entry.model, '-e', entry.effort, '-C', dir, '-f', brief, '-o', fixOut], dir, account, extraEnv));
+      } finally { observed = tracker?.finish(); }
+      if (observed) {
+        const failure = failureReason(result, observed.values, account, entry.provider);
+        if (failure) await markUnavailable(entry.provider, failure.reason, failure.note);
+      }
       const after = await protectedFiles(gate.repo);
       const tests = modifiedTests(before, after, budgetOnly);
       const forbiddenTests = budgetOnly ? tests.filter((file) => !files.includes(file)) : tests;
@@ -570,10 +579,17 @@ function actorArguments(args) {
   return { actor, args: rest };
 }
 
-async function saveResult(config, previous, actor, note) {
-  const changed = !isDeepStrictEqual(previous, config);
-  await saveConfig(config, { actor, note });
-  process.stdout.write(`${JSON.stringify({ ok: true, changed, note })}\n`);
+async function saveResult(change, actor, printConfig = false) {
+  let result, changed;
+  const note = await updateConfig(async (config) => {
+    const previous = structuredClone(config);
+    result = config;
+    const note = await change(config);
+    changed = !isDeepStrictEqual(previous, config);
+    return note;
+  }, { actor });
+  if (printConfig) print(result);
+  else process.stdout.write(`${JSON.stringify({ ok: true, changed, note })}\n`);
   return 0;
 }
 
@@ -624,99 +640,124 @@ async function undoTarget() {
 async function configCommand(args) {
   const parsed = actorArguments(args), actor = parsed.actor;
   const [action, ...rest] = parsed.args;
-  const config = await loadConfig(), previous = structuredClone(config);
   if (action === 'get' && rest.length <= 1) {
+    const config = await loadConfig();
     print(rest.length ? valueAt(config, jsonPath(rest[0])) : config);
     return 0;
   }
   if (action === 'validate' && !rest.length) {
+    await loadConfig();
     process.stdout.write('valid\n');
     return 0;
   }
-  let note;
-  if (action === 'set' && rest.length === 2) {
-    const [key, raw] = rest;
-    const parts = jsonPath(key);
-    const parent = parts.length === 1 ? config : valueAt(config, parts.slice(0, -1));
-    if (!parent || typeof parent !== 'object') throw new Error('json-path parent must be an object or array');
-    const last = parts.at(-1);
-    if (Array.isArray(parent) && (!/^(0|[1-9]\d*)$/.test(last) || Number(last) > parent.length)) {
-      throw new Error('json-path array index must address an entry or append one');
-    }
-    let value;
-    try { value = JSON.parse(raw); }
-    catch { throw new Error('config set value must be valid JSON (quote string values)'); }
-    Object.defineProperty(parent, last, { value, enumerable: true, configurable: true, writable: true });
-    await saveConfig(config, { actor, note: `set ${key}` });
-    print(config);
-    return 0;
-  } else if (action === 'preset' && rest.length === 1) {
-    const [name] = rest;
-    if (!Object.hasOwn(config.presets, name)) throw new Error(`unknown preset: ${name}`);
-    for (const [tier, chain] of Object.entries(config.presets[name].tiers)) {
-      config.tiers[tier] = structuredClone(chain);
-    }
-    note = `preset ${name}`;
-  } else if (action === 'save-preset') {
-    const opts = options(rest, { '--name': true, '--label': true });
-    required(opts, ['--name', '--label']);
-    const name = opts['--name'];
-    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new Error('--name must be a lowercase slug');
-    config.presets[name] = { label: opts['--label'], tiers: structuredClone(config.tiers) };
-    note = `save-preset ${name}`;
-  } else if (action === 'threshold') {
-    const opts = options(rest, { '--percent': true, '--hysteresis': true });
-    required(opts, ['--percent']);
-    for (const [flag, key] of [['--percent', 'switch_percent'], ['--hysteresis', 'hysteresis_percent']]) {
-      if (opts[flag] !== undefined) {
-        if (!/^\d+(?:\.\d+)?$/.test(opts[flag])) throw new Error(`${flag} must be a decimal number`);
-        config.thresholds.codex[key] = Number(opts[flag]);
+  return saveResult(async (config) => {
+    if (action === 'set' && rest.length === 2) {
+      const [key, raw] = rest;
+      const parts = jsonPath(key);
+      const parent = parts.length === 1 ? config : valueAt(config, parts.slice(0, -1));
+      if (!parent || typeof parent !== 'object') throw new Error('json-path parent must be an object or array');
+      const last = parts.at(-1);
+      if (Array.isArray(parent) && (!/^(0|[1-9]\d*)$/.test(last) || Number(last) > parent.length)) {
+        throw new Error('json-path array index must address an entry or append one');
       }
-    }
-    if (config.thresholds.codex.hysteresis_percent >= config.thresholds.codex.switch_percent) {
-      validateConfig(config);
-      throw new Error('hysteresis_percent must be less than switch_percent');
-    }
-    note = 'threshold';
-  } else if (action === 'undo' && !rest.length) {
-    const target = await undoTarget();
-    return saveResult(target.before, previous, actor, `undo ${target.id}`);
-  } else if (['set-entry', 'add-entry', 'remove-entry', 'move-entry'].includes(action)) {
-    const allowed = { '--tier': true, '--panel': true };
-    if (action !== 'add-entry') Object.assign(allowed, { '--index': true, '--seat': true });
-    if (action === 'set-entry' || action === 'add-entry') {
-      Object.assign(allowed, { '--provider': true, '--model': true, '--effort': true });
-    }
-    if (action === 'add-entry') allowed['--at'] = true;
-    if (action === 'move-entry') allowed['--to'] = true;
-    const opts = options(rest, allowed), chain = chainFor(config, opts, true);
-    const panel = Boolean(opts['--panel']);
-    const flag = panel ? '--seat' : '--index';
-    if (opts[panel ? '--index' : '--seat'] !== undefined) throw new Error(`use ${flag} for this target`);
-    if (action === 'add-entry') {
-      const at = opts['--at'] === undefined ? chain.length : entryIndex(opts['--at'], chain.length, '--at');
-      chain.splice(at, 0, entryOptions(opts));
-    } else {
-      const index = entryIndex(opts[flag], chain.length - 1, flag);
-      if (action === 'set-entry') chain[index] = entryOptions(opts);
-      else if (action === 'remove-entry') {
-        if (chain.length === 1) {
-          throw new Error(panel ? 'cannot remove the last seat in a panel' : 'cannot remove the last entry in a chain');
+      let value;
+      try { value = JSON.parse(raw); }
+      catch { throw new Error('config set value must be valid JSON (quote string values)'); }
+      Object.defineProperty(parent, last, { value, enumerable: true, configurable: true, writable: true });
+      return `set ${key}`;
+    } else if (action === 'preset' && rest.length === 1) {
+      const [name] = rest;
+      if (!Object.hasOwn(config.presets, name)) throw new Error(`unknown preset: ${name}`);
+      for (const [tier, chain] of Object.entries(config.presets[name].tiers)) {
+        config.tiers[tier] = structuredClone(chain);
+      }
+      return `preset ${name}`;
+    } else if (action === 'save-preset') {
+      const opts = options(rest, { '--name': true, '--label': true });
+      required(opts, ['--name', '--label']);
+      const name = opts['--name'];
+      if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) throw new Error('--name must be a lowercase slug');
+      config.presets[name] = { label: opts['--label'], tiers: structuredClone(config.tiers) };
+      return `save-preset ${name}`;
+    } else if (action === 'threshold') {
+      const opts = options(rest, { '--percent': true, '--hysteresis': true });
+      required(opts, ['--percent']);
+      for (const [flag, key] of [['--percent', 'switch_percent'], ['--hysteresis', 'hysteresis_percent']]) {
+        if (opts[flag] !== undefined) {
+          if (!/^\d+(?:\.\d+)?$/.test(opts[flag])) throw new Error(`${flag} must be a decimal number`);
+          config.thresholds.codex[key] = Number(opts[flag]);
         }
-        chain.splice(index, 1);
-      } else {
-        const to = entryIndex(opts['--to'], chain.length - 1, '--to');
-        chain.splice(to, 0, chain.splice(index, 1)[0]);
       }
+      if (config.thresholds.codex.hysteresis_percent >= config.thresholds.codex.switch_percent) {
+        validateConfig(config);
+        throw new Error('hysteresis_percent must be less than switch_percent');
+      }
+      return 'threshold';
+    } else if (action === 'undo' && !rest.length) {
+      const target = await undoTarget();
+      const before = validateConfig(await upgradeConfig(target.before));
+      for (const key of Object.keys(config)) {
+        if (!Object.hasOwn(before, key)) delete config[key];
+      }
+      Object.assign(config, before);
+      return `undo ${target.id}`;
+    } else if (['set-entry', 'add-entry', 'remove-entry', 'move-entry'].includes(action)) {
+      const allowed = { '--tier': true, '--panel': true };
+      if (action !== 'add-entry') Object.assign(allowed, { '--index': true, '--seat': true });
+      if (action === 'set-entry' || action === 'add-entry') {
+        Object.assign(allowed, { '--provider': true, '--model': true, '--effort': true });
+      }
+      if (action === 'add-entry') allowed['--at'] = true;
+      if (action === 'move-entry') allowed['--to'] = true;
+      const opts = options(rest, allowed), chain = chainFor(config, opts, true);
+      const panel = Boolean(opts['--panel']);
+      const flag = panel ? '--seat' : '--index';
+      if (opts[panel ? '--index' : '--seat'] !== undefined) throw new Error(`use ${flag} for this target`);
+      if (action === 'add-entry') {
+        const at = opts['--at'] === undefined ? chain.length : entryIndex(opts['--at'], chain.length, '--at');
+        chain.splice(at, 0, entryOptions(opts));
+      } else {
+        const index = entryIndex(opts[flag], chain.length - 1, flag);
+        if (action === 'set-entry') chain[index] = entryOptions(opts);
+        else if (action === 'remove-entry') {
+          if (chain.length === 1) {
+            throw new Error(panel ? 'cannot remove the last seat in a panel' : 'cannot remove the last entry in a chain');
+          }
+          chain.splice(index, 1);
+        } else {
+          const to = entryIndex(opts['--to'], chain.length - 1, '--to');
+          chain.splice(to, 0, chain.splice(index, 1)[0]);
+        }
+      }
+      return `${action} ${panel ? 'panel' : 'tier'} ${opts['--panel'] || opts['--tier']}`;
+    } else throw new Error('usage: exec.mjs config get | set | ' +
+      'set-entry (--tier <name> --index <n>|--panel <name> --seat <n>) --provider <name> --model <name> --effort <name> | ' +
+      'add-entry (--tier <name>|--panel <name>) [--at <n>] --provider <name> --model <name> --effort <name> | ' +
+      'remove-entry (--tier <name> --index <n>|--panel <name> --seat <n>) | ' +
+      'move-entry (--tier <name> --index <n>|--panel <name> --seat <n>) --to <n> | ' +
+      'threshold | preset | save-preset | undo | validate');
+  }, actor, action === 'set');
+}
+
+async function discoverMlaiModels() {
+  const { bin } = mlaiPaths();
+  const cwd = await fs.mkdtemp(path.join(tmpdir(), 'conveyor-mlai-models-'));
+  try {
+    const result = await runSupervised([bin, '-p', 'x', '-m', '__list_models__', '--output-format', 'json', '--no-session-persistence'], {
+      deadlineMs: 30_000, cwd, env: { ...process.env, MLAI_NO_UPDATE_CHECK: '1', MLAI_AUTO_UPDATE: '0', MLAI_NO_TUI: '1' }
+    });
+    if (result.code === 2 && !result.timedOut && !result.truncated) {
+      let error;
+      try { error = JSON.parse(result.stdout.trim() || result.stderr.trim())?.error; }
+      catch { /* Report a stable discovery error without printing CLI output. */ }
+      const ids = typeof error === 'string' && /\(ids: ([^)]+)\)/.exec(error)?.[1];
+      const models = ids ? ids.split(',').map((id) => id.trim()).filter((id) => /^[a-z0-9][a-z0-9.-]*$/.test(id)) : [];
+      if (models.length) return models.map((model) => ({
+        name: 'mlai', model, efforts: MLAI_EFFORT_MODELS.has(model) ? ['low', 'medium', 'high', 'max'] : ['medium']
+      }));
     }
-    note = `${action} ${panel ? 'panel' : 'tier'} ${opts['--panel'] || opts['--tier']}`;
-  } else throw new Error('usage: exec.mjs config get | set | ' +
-    'set-entry (--tier <name> --index <n>|--panel <name> --seat <n>) --provider <name> --model <name> --effort <name> | ' +
-    'add-entry (--tier <name>|--panel <name>) [--at <n>] --provider <name> --model <name> --effort <name> | ' +
-    'remove-entry (--tier <name> --index <n>|--panel <name> --seat <n>) | ' +
-    'move-entry (--tier <name> --index <n>|--panel <name> --seat <n>) --to <n> | ' +
-    'threshold | preset | save-preset | undo | validate');
-  return saveResult(config, previous, actor, note);
+    throw new Error('mlai model list could not be read from CLI response');
+  } finally { await fs.rm(cwd, { recursive: true, force: true }); }
 }
 
 async function catalogCommand(args) {
@@ -730,10 +771,11 @@ async function catalogCommand(args) {
   required(opts, ['--provider']);
   const provider = opts['--provider'];
   if (action === 'refresh') {
-    if (!['codex', 'claude', 'gemini', 'all'].includes(provider)) {
+    if (!['codex', 'claude', 'gemini', 'mlai', 'all'].includes(provider)) {
       throw new Error(`unknown provider: ${provider}`);
     }
     const providers = provider === 'all' ? ['codex', 'claude'] : [provider];
+    if (provider === 'all' && (await mlaiLogin()).installed) providers.push('mlai');
     const candidates = [];
     const problems = [];
     if (providers.includes('codex')) {
@@ -860,6 +902,13 @@ async function catalogCommand(args) {
         candidates.push({ name: 'gemini', model, efforts: ['low', 'medium', 'high'] });
       }
     }
+    if (providers.includes('mlai')) {
+      try { candidates.push(...await discoverMlaiModels()); }
+      catch (error) {
+        problems.push(error.message);
+        if (provider === 'mlai') throw error;
+      }
+    }
 
     // Discovery is done; the config is read, extended and written under one lock, so a setting another process
     // saved meanwhile is kept, never replaced by an older copy.
@@ -880,21 +929,22 @@ async function catalogCommand(args) {
     return 0;
   }
 
-  const config = await loadConfig(), previous = structuredClone(config);
-  if (!Object.hasOwn(config.catalog, provider)) throw new Error(`unknown provider: ${provider}`);
-  const catalog = config.catalog[provider];
-  required(opts, action === 'add' ? ['--model', '--efforts'] : ['--model']);
-  const model = opts['--model'];
-  if (action === 'add') catalog.push({ model, efforts: opts['--efforts'].split(',') });
-  else {
-    const inUse = [...Object.values(config.tiers), ...Object.values(config.panels)]
-      .some((chain) => chain.some((entry) => entry.provider === provider && entry.model === model));
-    if (inUse) throw new Error(`model ${provider}/${model} is in use by a tier or panel`);
-    const index = catalog.findIndex((entry) => entry.model === model);
-    if (index < 0) throw new Error(`unknown model: ${provider}/${model}`);
-    catalog.splice(index, 1);
-  }
-  return saveResult(config, previous, actor, `${action} ${provider}/${model}`);
+  return saveResult((config) => {
+    if (!Object.hasOwn(config.catalog, provider)) throw new Error(`unknown provider: ${provider}`);
+    const catalog = config.catalog[provider];
+    required(opts, action === 'add' ? ['--model', '--efforts'] : ['--model']);
+    const model = opts['--model'];
+    if (action === 'add') catalog.push({ model, efforts: opts['--efforts'].split(',') });
+    else {
+      const inUse = [...Object.values(config.tiers), ...Object.values(config.panels)]
+        .some((chain) => chain.some((entry) => entry.provider === provider && entry.model === model));
+      if (inUse) throw new Error(`model ${provider}/${model} is in use by a tier or panel`);
+      const index = catalog.findIndex((entry) => entry.model === model);
+      if (index < 0) throw new Error(`unknown model: ${provider}/${model}`);
+      catalog.splice(index, 1);
+    }
+    return `${action} ${provider}/${model}`;
+  }, actor);
 }
 
 function statusValues(text) {
@@ -943,12 +993,12 @@ function trackStatus(file) {
   };
 }
 
-async function launch(entry, args, dir, account) {
+async function launch(entry, args, dir, account, extraEnv) {
   const wrapper = wrapperPath(entry.provider);
   try { await fs.access(wrapper, constants.R_OK); }
   catch (error) { return { code: 127, launchError: error.message }; }
   return new Promise((resolve) => {
-    const env = account ? { ...process.env, LUNA_CODEX_ACCOUNT: account } : process.env;
+    const env = { ...process.env, ...extraEnv, ...(account ? { LUNA_CODEX_ACCOUNT: account } : {}) };
     const child = spawn(bash(), [wrapper, ...args], { cwd: dir, stdio: 'inherit', env });
     const forward = (signal) => child.kill(signal);
     const onInt = () => forward('SIGINT');
@@ -992,8 +1042,13 @@ async function switchProvider(tier, from, to, reason, out) {
   process.stderr.write(`conveyor: ${tier}: ${from} → ${to} (${reason})\n`);
 }
 
-function failureReason(result, status, account) {
+function failureReason(result, status, account, provider) {
   if (result.launchError) return { reason: 'start', note: result.launchError };
+  if (provider === 'mlai') {
+    const reason = status?.unavailable_reason;
+    if (['auth', 'quota', 'start'].includes(reason)) return { reason, note: status.error || reason };
+    return result.code === 3 ? { reason: 'start', note: status?.error || 'wrapper exited 3' } : null;
+  }
   if (account && result.code !== 0) {
     const explicit = status?.unavailable_reason;
     const error = status?.error || explicit || '';
@@ -1094,7 +1149,7 @@ async function runCommand(args) {
   if (opts['--waive']) dispatch.waive = opts['--waive'];
   if (opts['--no-gate']) dispatch.noGate = true;
   const saveDispatch = () => writeJsonAtomic(`${out}.dispatch.json`, dispatch);
-  let lock, acceptance, code = 1, reviewRefused = false;
+  let lock, slot, acceptance, code = 1, reviewRefused = false;
   try {
     lock = mode === 'write' ? await acquireWriteLock(dir, out, brief) : null;
     if (lock && !lock.release) {
@@ -1112,7 +1167,11 @@ async function runCommand(args) {
     const refresh = () => providerState(config, { excludeCodexAccounts: excludedAccounts });
     let state = await refresh(), resolution = await resolve(state);
     let cursor = -1, from = null, failedReason = null;
+    const busyEntries = new Map();
     while (true) {
+      for (const [index, reason] of busyEntries) {
+        Object.assign(resolution.chain[index], { available: false, reason });
+      }
       const index = resolution.chain.findIndex((entry, position) => position > cursor && entry.available);
       dispatch.chain = resolution.chain;
       if (index < 0) {
@@ -1142,6 +1201,15 @@ async function runCommand(args) {
         resolution = await resolve(state);
         continue;
       }
+      if (entry.provider === 'mlai') {
+        slot = await acquireSlot({ out });
+        if (!slot) {
+          const { used, limit } = await slotState();
+          busyEntries.set(index, `mlai sessions busy (${used}/${limit})`);
+          continue;
+        }
+      }
+      const extraEnv = slot ? { MLAI_SLOT: slot.dir } : undefined;
       const skipped = resolution.chain.slice(cursor + 1, index);
       const reason = [failedReason, ...skipped.map((candidate) => candidate.reason)]
         .filter(Boolean).join('; ') || entry.reason;
@@ -1172,7 +1240,7 @@ async function runCommand(args) {
       let result, observed;
       try {
         const launchAttempt = () => launch(entry, [mode === 'write' ? '-w' : '-r', '-m', entry.model, '-e', entry.effort,
-          '-C', dir, '-f', brief, '-o', out], dir, account);
+          '-C', dir, '-f', brief, '-o', out], dir, account, extraEnv);
         if (gate) {
           acceptance ??= {
             session: session || 'unknown', task: activeTaskId(session), runId: randomUUID(),
@@ -1186,7 +1254,7 @@ async function runCommand(args) {
         account = attempt.account = 'main';
         triedAccounts.add(account);
       }
-      const failure = failureReason(result, observed.values, account);
+      const failure = failureReason(result, observed.values, account, entry.provider);
       Object.assign(attempt, {
         code: result.code, state: observed.values?.state ?? null, error: observed.values?.error ?? null,
         reached_running: observed.reachedRunning
@@ -1194,9 +1262,12 @@ async function runCommand(args) {
       dispatch.code = result.code;
       if (failure) await markUnavailable(entry.provider, failure.reason, failure.note, { config, account: failure.account });
       const retryable = result.code === 3 || Boolean(failure && !result.launchError);
-      const canRetry = retryable && !(mode === 'write' && observed.reachedRunning) && !result.signal;
+      const started = observed.reachedRunning && (mode === 'write' || entry.provider === 'mlai');
+      const canRetry = retryable && !started && !result.signal;
       let retryAccount = false;
       if (canRetry && (failure?.account || !panel)) {
+        slot?.release();
+        slot = null;
         if (account && observed.reachedRunning) {
           for (const id of Object.keys(state.usage.codexAccounts)) excludedAccounts.add(id);
         } else if (failure?.account) {
@@ -1209,7 +1280,7 @@ async function runCommand(args) {
       if (!canRetry || (panel && !retryAccount)) {
         attempt.retry = false;
         if (result.code === 0 && ['done', 'incomplete'].includes(observed.values?.state)) {
-          dispatch.code = await finishGate(gate, dispatch, entry, dir, out, acceptance, account);
+          dispatch.code = await finishGate(gate, dispatch, entry, dir, out, acceptance, account, extraEnv);
         }
         await saveDispatch();
         return code = dispatch.code;
@@ -1230,7 +1301,10 @@ async function runCommand(args) {
         gate: dispatch.gate ? { status: dispatch.gate.status, rounds: dispatch.gate.rounds ?? null } : null,
         ...(acceptance && { acceptance: { ...acceptance, changed: [...acceptance.changed.values()].flat() } })
       });
-    } finally { lock?.release?.(); }
+    } finally {
+      try { slot?.release(); }
+      finally { lock?.release?.(); }
+    }
   }
 }
 
