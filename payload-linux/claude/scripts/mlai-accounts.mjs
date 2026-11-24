@@ -11,7 +11,10 @@ const print = (value) => console.log(JSON.stringify(value, null, 2));
 function signInCommands(account) {
   const { home, bin } = mlaiPaths(process.env, account);
   const prefix = [`MLAI_HOME=${shellQuote(home)}`, 'MLAI_KEYCHAIN=file', 'NODE_USE_ENV_PROXY=1'];
-  if (account.proxy) prefix.push(`HTTPS_PROXY=${shellQuote(account.proxy)}`, `HTTP_PROXY=${shellQuote(account.proxy)}`);
+  // Every case: the bundled Node prefers lowercase https_proxy, so an inherited one (bro-env.sh sets it) would win.
+  if (account.proxy) {
+    for (const name of ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy']) prefix.push(`${name}=${shellQuote(account.proxy)}`);
+  }
   prefix.push('MLAI_NO_BROWSER=1');
   const env = prefix.join(' ');
   console.log(`${env} ${shellQuote(bin)} login`);

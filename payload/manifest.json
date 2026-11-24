@@ -5386,7 +5386,7 @@
       "src": "claude/scripts/mlai-accounts.mjs",
       "dest": "scripts/mlai-accounts.mjs",
       "kind": "file",
-      "sha256": "52bff357de67e0bb4bb47cd64c5c439ba5eed55680e2b043bfdb3eddbe7c29e2",
+      "sha256": "8cf617e5af8cb18313ff9d2b88a94ec1b68774df3b689859456b4b31f9ddc2e1",
       "executable": true
     }
   ],
