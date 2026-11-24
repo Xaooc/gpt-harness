@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -44,7 +44,7 @@ async function fixture({ scenario }, verify) {
     });
     const status = Object.fromEntries(readFileSync(`${out}.status`, 'utf8').trimEnd().split('\n')
       .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
-    verify({ rc, stdout, stderr, status, output: readFileSync(out, 'utf8'), slot, state });
+    verify({ rc, stdout, stderr, status, output: readFileSync(out, 'utf8'), slot, state, mlaiHome });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -79,5 +79,22 @@ test('a sign-in failure before the agent starts is unavailable', { timeout: 300_
     assert.equal(status.state, 'unavailable');
     assert.equal(status.unavailable_reason, 'auth');
     assert.notEqual(status.reached_running, '1');
+  });
+});
+
+test('a run stopped by the step limit continues the same session and then removes it', { timeout: 300_000 }, async () => {
+  await fixture({ scenario: 'steps' }, ({ rc, stderr, status, output, state, mlaiHome }) => {
+    assert.equal(rc, 0, stderr);
+    assert.equal(status.state, 'done');
+    assert.equal(status.attempts, '2');
+    assert.equal(status.continues, '1');
+    const first = JSON.parse(readFileSync(path.join(state, 'args-1.json'), 'utf8'));
+    const second = JSON.parse(readFileSync(path.join(state, 'args-2.json'), 'utf8'));
+    const id = first[first.indexOf('--session-id') + 1];
+    assert.equal(second[second.indexOf('--resume') + 1], id);
+    assert.equal(first.includes('--no-session-persistence'), false);
+    assert.match(readFileSync(path.join(state, 'prompt-2.md'), 'utf8'), /^continue/);
+    assert.match(output, /^## Changes$/m);
+    assert.equal(existsSync(path.join(mlaiHome, 'sessions', id)), false);
   });
 });

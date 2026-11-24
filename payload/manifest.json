@@ -525,7 +525,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "cc81bc9643435c32ef1a0fbce9bc888bb6965f0aa5ef0f4420136de38617f4b6"
+      "sha256": "39e4850262ece1acf026b118d065229971b0f9aba9450a08e00954d52351b8d0"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
