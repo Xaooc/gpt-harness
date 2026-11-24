@@ -30,7 +30,10 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   the user edits it in the Luna panel. Do not hand-edit it; `exec.mjs config …` exists for scripted changes.
 - **Automatic fallbacks:** Codex is skipped at 80 % usage (panel setting, hysteresis); a provider that returned a
   quota/region/auth/checksum error is skipped for its TTL; the dispatcher prints one `conveyor:` line per switch
-  (tell the user). A write job that already started is never re-run on another provider.
+  (tell the user). A write job that already started is never re-run on another provider. ML AI Code (`mlai`) runs
+  at most 2 sessions at once; a job that finds both busy goes to the next chain entry at once, without a mark.
+  `mlai` retries its own `connection_interrupted` failures; its exit 7 ("needs the owner's decision") comes back as a
+  non-zero code without gate fix rounds: read the answer and decide.
 - **Exit codes of `exec.mjs run`:** 0 done; 4 hand-off: read `<out>.dispatch.json` and spawn the `Agent` tool
   with its `model` and the same brief; 5 no provider available; 6 the executor gate stayed red (project checks or
   hygiene ratchet failed after 2 fix rounds; read `## Gate` in the result); 7 another write job already runs in the
@@ -52,9 +55,10 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
 - **Executor gate:** every write job is followed by `check.mjs` fast+turn on the job's own changes (profile
   `.claude/conveyor.json`, autodetected when absent); failures go back to the same executor as fix rounds.
 - **Providers are the owner's choice**: the dispatcher picks them from the Luna panel's chains and panels
-  (`exec.mjs status` shows the live setting). Never call `gem.sh` or `luna.sh` yourself for delegated work; a
-  PreToolUse guard blocks `gem.sh` (diagnostic only: prefix `CONVEYOR_DIRECT_PROVIDER=1`).
-- **Don't use `gpt-6-astra`** (user decision, 2026-09-30). Never the fast tier unless the user asks.
+  (`exec.mjs status` shows the live setting). Never call `gem.sh`, `mlai.sh` or `luna.sh` yourself for delegated
+  work; a PreToolUse guard blocks `gem.sh` and `mlai.sh` (diagnostic only: prefix `CONVEYOR_DIRECT_PROVIDER=1`).
+- **Don't use `gpt-6-astra` on Codex** (user decision, 2026-09-30). Through ML AI Code it is allowed (owner,
+  2026-11-24): `mlai/gpt-6-astra` is that provider's Astra. Never the fast tier unless the user asks.
 - **Best-of-2 for the riskiest pieces**: pstack `arena` with the `design` panel (one seat per worktree).
 - **Reviews**: pstack `interrogate` on the `review` panel seats; persona critics from `luna-critics` for UI work.
 
