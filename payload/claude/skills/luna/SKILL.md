@@ -33,7 +33,8 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   (tell the user). A write job that already started is never re-run on another provider. ML AI Code (`mlai`) runs
   at most 2 sessions at once; a job that finds both busy goes to the next chain entry at once, without a mark.
   `mlai` retries its own `connection_interrupted` failures; its exit 7 ("needs the owner's decision") comes back as a
-  non-zero code without gate fix rounds: read the answer and decide.
+  non-zero code without gate fix rounds: read the answer and decide. An mlai run that stopped early without changing any
+  file goes to the next chain entry; one that stopped early with changes returns non-zero, never 0.
 - **Exit codes of `exec.mjs run`:** 0 done; 4 hand-off: read `<out>.dispatch.json` and spawn the `Agent` tool
   with its `model` and the same brief; 5 no provider available; 6 the executor gate stayed red (project checks or
   hygiene ratchet failed after 2 fix rounds; read `## Gate` in the result); 7 another write job already runs in the
