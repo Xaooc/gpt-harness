@@ -585,6 +585,15 @@ class Job {
     return kept;
   }
 
+  gitOutside() {
+    const dir = this.options.dir;
+    try {
+      const gitDir = realpathSync(execFileSync('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-dir'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim());
+      return gitDir !== dir && !gitDir.startsWith(`${dir}/`);
+    } catch { return false; }
+  }
+
   /** The same session, resumed after it used all its steps for one turn (CLI exit 3, subtype error_max_turns). */
   continuation() {
     const { write, model, effort } = this.options;
@@ -646,6 +655,13 @@ class Job {
     let invocation = this.invocation(brief);
     const binary = this.precheck();
     const env = agentEnvironment(this.home);
+    // The engine's step checkpoints write refs and objects into the repository's git directory. A worktree keeps it in
+    // the main repo, outside the folder the CLI's sandbox lets the agent write, so every checkpoint failed
+    // (checkpoint_error: Read-only file system; the engine goes on). Off there; on where .git sits in the job folder.
+    if (this.gitOutside()) {
+      env.MINI_STEP_CHECKPOINTS = '0';
+      this.log('step checkpoints off: the git directory is outside the job folder');
+    }
     for (let retry = 0; ; retry += 1) {
       this.signal.throwIfAborted();
       const { args, prompt } = invocation;

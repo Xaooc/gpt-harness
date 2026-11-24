@@ -10,7 +10,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const entry = path.resolve(here, '../../mlai.sh');
 const fake = path.join(here, 'fake-mlai.mjs');
 
-async function fixture({ scenario }, verify) {
+async function fixture({ scenario, worktree = false }, verify) {
   const root = mkdtempSync(path.join(tmpdir(), 'mlai-test-'));
   const dir = path.join(root, 'project with spaces');
   const out = path.join(root, 'result.md');
@@ -22,7 +22,15 @@ async function fixture({ scenario }, verify) {
   const state = path.join(root, 'fake');
   try {
     for (const directory of [dir, home, mlaiHome, slot, state]) mkdirSync(directory, { recursive: true });
-    execFileSync('git', ['init', '--quiet', dir], { env: { ...process.env, HOME: home }, timeout: 300_000 });
+    if (worktree) {
+      // A worktree keeps its git directory in the main repo, outside the job folder.
+      const main = path.join(root, 'main');
+      const git = (...args) => execFileSync('git', args, { env: { ...process.env, HOME: home }, timeout: 300_000 });
+      git('init', '--quiet', main);
+      git('-C', main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--quiet', '--allow-empty', '-m', 'base');
+      rmSync(dir, { recursive: true, force: true });
+      git('-C', main, 'worktree', 'add', '--quiet', '--detach', dir);
+    } else execFileSync('git', ['init', '--quiet', dir], { env: { ...process.env, HOME: home }, timeout: 300_000 });
     mkdirSync(path.join(root, 'shared'), { recursive: true });
     mkdirSync(path.join(root, 'projects'), { recursive: true });
     writeFileSync(path.join(root, 'shared', 'notes.txt'), 'context\n');
@@ -63,6 +71,7 @@ test('a started write attempt retries after a connection interruption', { timeou
     const args = JSON.parse(readFileSync(path.join(state, 'args-1.json'), 'utf8'));
     assert.ok(args.some((arg, i) => args[i - 1] === '--add-dir' && arg.endsWith('/shared')), 'brief path is readable');
     assert.ok(args.some((arg, i) => args[i - 1] === '--add-dir' && arg.endsWith('/projects')), 'project root is readable');
+    assert.equal(readFileSync(path.join(state, 'checkpoints-1.txt'), 'utf8'), 'unset', 'checkpoints stay on in a plain repo');
     assert.equal(status.credits, '0.375');
     assert.equal(status.changed_files, '1');
     assert.equal(output, '## Changes\nUpdated greeting.txt.\n\n## Verification\nChecks passed.\n\n' +
@@ -89,7 +98,8 @@ test('a sign-in failure before the agent starts is unavailable', { timeout: 300_
 });
 
 test('a run stopped by the step limit continues the same session and then removes it', { timeout: 300_000 }, async () => {
-  await fixture({ scenario: 'steps' }, ({ rc, stderr, status, output, state, mlaiHome }) => {
+  await fixture({ scenario: 'steps', worktree: true }, ({ rc, stderr, status, output, state, mlaiHome }) => {
+    assert.equal(readFileSync(path.join(state, 'checkpoints-1.txt'), 'utf8'), '0', 'checkpoints off in a worktree');
     assert.equal(rc, 0, stderr);
     assert.equal(status.state, 'done');
     assert.equal(status.attempts, '2');

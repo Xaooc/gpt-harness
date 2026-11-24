@@ -12,6 +12,7 @@ process.stdin.setEncoding('utf8');
 for await (const chunk of process.stdin) prompt += chunk;
 writeFileSync(path.join(state, `prompt-${attempt}.md`), prompt);
 writeFileSync(path.join(state, `args-${attempt}.json`), JSON.stringify(process.argv.slice(2)));
+writeFileSync(path.join(state, `checkpoints-${attempt}.txt`), process.env.MINI_STEP_CHECKPOINTS ?? 'unset');
 
 const send = (event) => process.stdout.write(JSON.stringify(event) + '\n');
 send({ type: 'stage', content: 'Loading project context' });
