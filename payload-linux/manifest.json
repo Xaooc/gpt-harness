@@ -396,7 +396,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "cc81bc9643435c32ef1a0fbce9bc888bb6965f0aa5ef0f4420136de38617f4b6"
+      "sha256": "39e4850262ece1acf026b118d065229971b0f9aba9450a08e00954d52351b8d0"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
@@ -5285,7 +5285,7 @@
       "src": "claude/scripts/mlai/mlai-run.mjs",
       "dest": "scripts/mlai/mlai-run.mjs",
       "kind": "file",
-      "sha256": "978625f82bdfbde20534ae0ff6ee14baccab4a78aa4d0600411d709ab0540300",
+      "sha256": "7991f417dc0b41008d9de4883d3d99c68014bda4ae9fbf322cea22f5b01f9f6b",
       "executable": true
     },
     {

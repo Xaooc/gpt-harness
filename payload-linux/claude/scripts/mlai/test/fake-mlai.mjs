@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const state = process.env.FAKE_MLAI_STATE_DIR;
@@ -11,6 +11,7 @@ let prompt = '';
 process.stdin.setEncoding('utf8');
 for await (const chunk of process.stdin) prompt += chunk;
 writeFileSync(path.join(state, `prompt-${attempt}.md`), prompt);
+writeFileSync(path.join(state, `args-${attempt}.json`), JSON.stringify(process.argv.slice(2)));
 
 const send = (event) => process.stdout.write(JSON.stringify(event) + '\n');
 send({ type: 'stage', content: 'Loading project context' });
@@ -28,6 +29,22 @@ switch (process.env.FAKE_MLAI_SCENARIO) {
       const text = '## Changes\nUpdated greeting.txt.\n\n## Verification\nChecks passed.\n\n' +
         '## Deviations\nNone\n\n## Not done\nNone\n';
       send({ type: 'answer', content: text });
+      send({ type: 'result', exitCode: 0, text, credits: 0.25, changedFiles: ['greeting.txt'] });
+    }
+    break;
+  }
+  case 'steps': {
+    send({ type: 'stage', content: 'Starting the agent' });
+    send({ type: 'tool', name: 'edit_file', target: 'greeting.txt' });
+    if (attempt === 1) {
+      const args = process.argv.slice(2);
+      const id = args[args.indexOf('--session-id') + 1];
+      mkdirSync(path.join(process.env.MLAI_HOME, 'sessions', id), { recursive: true });
+      send({ type: 'result', exitCode: 3, subtype: 'error_max_turns', text: 'Done so far: half.',
+        credits: 0.5, changedFiles: ['greeting.txt'] });
+      process.exitCode = 3;
+    } else {
+      const text = 'Changes:\nFinished greeting.txt.\n\nVerification:\nChecks passed.\n\nDeviations:\nNone\n\nNot done:\nNone\n';
       send({ type: 'result', exitCode: 0, text, credits: 0.25, changedFiles: ['greeting.txt'] });
     }
     break;

@@ -1,10 +1,8 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
-  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync,
-  lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync,
-  writeFileSync, writeSync
+  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
 } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import path from 'node:path';
@@ -363,6 +361,8 @@ class Job {
     this.home = homedir();
     this.claudeHome = process.env.CLAUDE_HOME_DIR || path.join(this.home, '.claude');
     this.mlaiHome = process.env.MLAI_HOME || path.join(this.home, '.mlai');
+    this.sessionId = randomUUID();
+    this.maxSteps = 160;
     this.started = performance.now();
     this.controller = new AbortController();
     this.signal = this.controller.signal;
@@ -375,7 +375,7 @@ class Job {
       sandbox: options.write ? 'workspace-write' : 'read-only', dir: path.resolve(options.dir),
       engine: 'mlai', provider: 'mlai', account: process.env.MLAI_ACCOUNT || 'main', error: '', last_note: '',
       unavailable_reason: '', elapsed_s: 0,
-      mlai_session: '', credits: 0, changed_files: 0, attempts: 0, reached_running: 0
+      mlai_session: '', credits: 0, changed_files: 0, attempts: 0, continues: 0, reached_running: 0
     };
   }
 
@@ -514,13 +514,29 @@ class Job {
     const rules = preamble(this.options, write && this.values.reached_running === 1);
     const args = ['-p', '--mode', write ? 'auto' : 'plan', '-m', model];
     if (model === 'pixis-opus') args.push('--effort', effort === 'xhigh' ? 'max' : effort);
-    args.push('--output-format', 'stream-json', '--no-session-persistence');
+    // An own session id (not --no-session-persistence) so a run stopped by the step limit can be continued; the
+    // session is removed when the wrapper ends.
+    args.push('--max-steps', String(this.maxSteps), '--session-id', this.sessionId, '--output-format', 'stream-json');
     let prompt = rules + brief;
     if (Array.from(prompt).length > PROMPT_LIMIT && file) {
       prompt = rules + `The full task brief is in the file ${file}. Read it completely first and follow it exactly.`;
       args.push('--add-dir', path.dirname(file));
+      this.addDir = path.dirname(file);
     }
     if (Array.from(prompt).length > PROMPT_LIMIT) throw new Failure(`mlai: prompt exceeds ${PROMPT_LIMIT} characters`, 2);
+    return { args, prompt };
+  }
+
+  /** The same session, resumed after it used all its steps for one turn (CLI exit 3, subtype error_max_turns). */
+  continuation() {
+    const { write, model, effort } = this.options;
+    const args = ['-p', '--resume', this.sessionId, '--mode', write ? 'auto' : 'plan', '-m', model];
+    if (model === 'pixis-opus') args.push('--effort', effort === 'xhigh' ? 'max' : effort);
+    args.push('--max-steps', String(this.maxSteps), '--output-format', 'stream-json');
+    if (this.addDir) args.push('--add-dir', this.addDir);
+    const prompt = 'continue: you stopped at the step limit. Pick up exactly where you left off and finish the whole task.' +
+      (write ? ' End with the four headings ## Changes, ## Verification, ## Deviations, ## Not done covering the whole ' +
+        'task, not only this part.' : '');
     return { args, prompt };
   }
 
@@ -567,7 +583,7 @@ class Job {
     }
   }
 
-  async execute(brief, retries, retryDelay) {
+  async execute(brief, retries, retryDelay, continues) {
     let invocation = this.invocation(brief);
     const binary = this.precheck();
     const env = agentEnvironment(this.home);
@@ -591,6 +607,16 @@ class Job {
       const transient = /connection[ _-]?interrupted|Cannot reach the ML AI Code server/i;
       const interrupted = code === 1 && (result?.usage?.errorCode === 'connection_interrupted' ||
         transient.test(result?.error ?? '') || transient.test(text) || (!result && transient.test(stderr)));
+      // The step limit ends one turn, not the task: resume the same session, a few times at most.
+      if (code === 3 && result?.subtype === 'error_max_turns' && this.values.continues < continues) {
+        this.values.continues += 1;
+        this.log(`mlai: step limit reached, continuing the session (${this.values.continues}/${continues})`);
+        this.values.last_note = `step limit: continuing (${this.values.continues}/${continues})`;
+        this.status();
+        invocation = this.continuation();
+        retry -= 1;
+        continue;
+      }
       if (!interrupted) return this.mapResult(outcome);
       // Before the agent starts, one retry is enough: the job then moves on down the chain instead of waiting
       // three CLI connect timeouts (about 45 s each) while the server is unreachable.
@@ -620,6 +646,8 @@ class Job {
       const idle = integerEnv('LUNA_IDLE_MAX_S', 900);
       const total = integerEnv('LUNA_TIMEOUT_S', 28800);
       const retries = integerEnv('MLAI_RETRIES', 2);
+      const continues = integerEnv('MLAI_CONTINUES', 3);
+      this.maxSteps = Math.min(160, Math.max(1, integerEnv('MLAI_MAX_STEPS', 160)));
       const retryDelay = integerEnv('MLAI_RETRY_DELAY_MS', 5000);
       const launched = performance.now();
       watchdog = setInterval(() => {
@@ -630,7 +658,7 @@ class Job {
           this.abort(new Failure(`exceeded total timeout ${total}s`, 124, 'stalled'));
         }
       }, 100);
-      result = await this.execute(brief, retries, retryDelay);
+      result = await this.execute(brief, retries, retryDelay, continues);
     } catch (error) {
       const failure = this.signal.aborted ? this.signal.reason : error;
       result = { state: failure.state ?? 'failed', rc: failure.rc ?? 1, error: oneLine(failure.message),
@@ -641,6 +669,8 @@ class Job {
       try { if (this.ownsOutput) result = this.finalize(result); }
       finally {
         if (this.activeFile) { try { unlinkSync(this.activeFile); } catch {} }
+        // The session was kept only so a step-limited run could continue it.
+        try { rmSync(path.join(this.mlaiHome, 'sessions', this.sessionId), { recursive: true, force: true }); } catch {}
         try { this.outputLock?.release(); } catch {}
         for (const fd of [this.outputFd, this.logFd]) {
           if (fd !== undefined) { try { closeSync(fd); } catch {} }
