@@ -36,6 +36,8 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   non-zero code without gate fix rounds: read the answer and decide. An mlai run that stopped early without changing any
   file goes to the next chain entry; one that stopped early with changes returns non-zero, never 0. A run that used all its steps
   for one turn (`error_max_turns`) is continued in the same session automatically, up to 3 times (`MLAI_CONTINUES`).
+  mlai jobs may read, without an approval, their project trees (`~/dev`, `~/rpg`, `~/work`, `MLAI_READ_ROOTS`) and the
+  paths a brief names; private folders (`~/.claude` except skills/scripts, `~/.codex`, `~/.config`, `~/.ssh`) stay closed.
 - **Exit codes of `exec.mjs run`:** 0 done; 4 hand-off: read `<out>.dispatch.json` and spawn the `Agent` tool
   with its `model` and the same brief; 5 no provider available; 6 the executor gate stayed red (project checks or
   hygiene ratchet failed after 2 fix rounds; read `## Gate` in the result); 7 another write job already runs in the

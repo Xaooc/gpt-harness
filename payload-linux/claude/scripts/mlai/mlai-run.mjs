@@ -541,16 +541,30 @@ class Job {
     return { args, prompt };
   }
 
-  /** Folders outside the job directory the agent may read without an approval nobody can give in a headless run:
-   *  the worktree's git directory and the existing absolute paths the brief names, never the private home folders. */
+  /** Folders outside the job directory the agent may read without an approval nobody can give in a headless run (it
+   *  stops the run as `limited`, seen on J7b and J8): the project trees the job lives in and the existing absolute paths
+   *  the brief names, never the private home folders. `--yes` would also open ~/.claude and ~/.codex, which the CLI's
+   *  sandbox does not hide. */
   readAccess(brief) {
     const dir = this.options.dir;
+    const home = realpathSync(this.home);
     const found = new Set();
+    // The top-level home folder of a path (/home/u/dev for /home/u/dev/repo-wt/j8): sibling repos and worktrees.
+    const tree = (target) => target.startsWith(`${home}/`)
+      ? path.join(home, target.slice(home.length + 1).split('/')[0]) : null;
+    found.add(tree(dir));
     try {
       const common = execFileSync('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim();
-      if (common) found.add(common);
+      if (common) { found.add(common); found.add(tree(common)); }
     } catch {}
+    const roots = process.env.MLAI_READ_ROOTS ?? '~/dev:~/rpg:~/work';
+    for (const root of roots.split(':').filter(Boolean)) found.add(root.replace(/^~(?=\/|$)/, home));
+    found.delete(null);
+    for (const candidate of [...found]) {
+      found.delete(candidate);
+      try { if (statSync(candidate).isDirectory()) found.add(realpathSync(candidate)); } catch {}
+    }
     for (const match of brief.matchAll(/(?:^|[\s`'"(<\[=:])(\/[^\s`'")<>\],;]+)/g)) {
       let candidate = match[1].replace(/[.:]+$/, '');
       try {
@@ -560,7 +574,7 @@ class Job {
       found.add(candidate);
     }
     const dirs = [...found].filter((target) => target !== '/' && target !== dir && !target.startsWith(`${dir}/`) &&
-      !dir.startsWith(`${target}/`) && target !== realpathSync(this.home) && this.readable(target)).sort();
+      target !== home && this.readable(target)).sort();
     // Keep the outermost of nested folders, at most 12.
     const kept = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`))).slice(0, 12);
     if (kept.length) this.log(`read access: ${kept.join(' ')}`);
