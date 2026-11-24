@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
   loadConfig, saveConfig, updateConfig, providerState, resolveChain, resolvePanel, markUnavailable,
-  recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
+  recordSwitch, renderRoles, validateConfig, wrapperPath, writeJsonAtomic, paths
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 import { hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
@@ -23,6 +23,9 @@ const quotaError = new RegExp([
   'model_not_found|not supported|invalid|context window|context_length|too long'
 ].join('|'), 'i');
 const unavailableReasons = ['quota', 'region', 'auth', 'start'];
+// "Your workspace is out of credits" is what a business seat with a depleted credit pool returns (seen 2026-11-24).
+const codexQuotaError = /\busage limit\b|\bquota\b|\binsufficient_quota\b|\brate[ _]limit[ _]reached\b|\bout of credits\b|\bcredits[ _]depleted\b/i;
+const codexAuthError = /\b(?:unauthorized|401|403|not logged in|login|token expired)\b/i;
 const execute = promisify(execFile);
 const gitOptions = { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 };
 export const gateInstruction = 'Fix the root cause in the code. Do not weaken, skip or delete checks, ' +
@@ -308,7 +311,7 @@ async function appendRunRecord(record) {
   }
 }
 
-async function finishGate(gate, dispatch, entry, dir, out) {
+async function finishGate(gate, dispatch, entry, dir, out, account) {
   if (!gate || gate.mode === 'off') return 0;
   const append = (text) => fs.appendFile(out, `${text}\n`);
   const report = async (text) => {
@@ -356,7 +359,7 @@ async function finishGate(gate, dispatch, entry, dir, out) {
       await fs.writeFile(brief, gate.brief + '\n\n## The work above is done but failed the project\'s checks\n\n' +
         `${gateDetails(last, true)}\n${budgetOnly ? '' : `\n${gateInstruction}\n`}`);
       const result = await launch(entry, ['-w', '-m', entry.model, '-e', entry.effort,
-        '-C', dir, '-f', brief, '-o', fixOut], dir);
+        '-C', dir, '-f', brief, '-o', fixOut], dir, account);
       const after = await protectedFiles(gate.repo);
       const tests = modifiedTests(before, after, budgetOnly);
       const forbiddenTests = budgetOnly ? tests.filter((file) => !files.includes(file)) : tests;
@@ -563,6 +566,10 @@ async function configCommand(args) {
         if (!/^\d+(?:\.\d+)?$/.test(opts[flag])) throw new Error(`${flag} must be a decimal number`);
         config.thresholds.codex[key] = Number(opts[flag]);
       }
+    }
+    if (config.thresholds.codex.hysteresis_percent >= config.thresholds.codex.switch_percent) {
+      validateConfig(config);
+      throw new Error('hysteresis_percent must be less than switch_percent');
     }
     note = 'threshold';
   } else if (action === 'undo' && !rest.length) {
@@ -808,7 +815,7 @@ function trackStatus(file) {
     try {
       if (signature(file) === previous) return;
       values = statusValues(readFileSync(file, 'utf8'));
-      if (values.state === 'running') reachedRunning = true;
+      if (values.state === 'running' || values.reached_running === '1') reachedRunning = true;
     } catch { /* An atomic status replacement can briefly remove the file. */ }
   };
   // The final state overwrites running; retain every running observation during the foreground job.
@@ -830,12 +837,13 @@ function trackStatus(file) {
   };
 }
 
-async function launch(entry, args, dir) {
+async function launch(entry, args, dir, account) {
   const wrapper = wrapperPath(entry.provider);
   try { await fs.access(wrapper, constants.R_OK); }
   catch (error) { return { code: 127, launchError: error.message }; }
   return new Promise((resolve) => {
-    const child = spawn(bash(), [wrapper, ...args], { cwd: dir, stdio: 'inherit' });
+    const env = account ? { ...process.env, LUNA_CODEX_ACCOUNT: account } : process.env;
+    const child = spawn(bash(), [wrapper, ...args], { cwd: dir, stdio: 'inherit', env });
     const forward = (signal) => child.kill(signal);
     const onInt = () => forward('SIGINT');
     const onTerm = () => forward('SIGTERM');
@@ -878,8 +886,19 @@ async function switchProvider(tier, from, to, reason, out) {
   process.stderr.write(`conveyor: ${tier}: ${from} → ${to} (${reason})\n`);
 }
 
-function failureReason(result, status) {
+function failureReason(result, status, account) {
   if (result.launchError) return { reason: 'start', note: result.launchError };
+  if (account && result.code !== 0) {
+    const explicit = status?.unavailable_reason;
+    const error = status?.error || explicit || '';
+    if (!['region', 'start'].includes(explicit)) {
+      const auth = codexAuthError.exec(error);
+      const quota = codexQuotaError.exec(error);
+      if (auth) return { account, reason: 'auth', note: auth[0] };
+      if (quota) return { account, reason: 'quota', note: quota[0] };
+      if (!status?.error && explicit === 'auth') return { account, reason: 'auth', note: explicit };
+    }
+  }
   if (result.code === 3) {
     const reason = unavailableReasons.includes(status?.unavailable_reason) ? status.unavailable_reason
       : quotaError.test(status?.error || '') ? 'quota' : 'start';
@@ -953,19 +972,18 @@ async function runCommand(args) {
   const enforceReview = reviewSkip === undefined && mode === 'write' && !panel
     && tier === 'complex' && hasApproachReviewTiers(config);
   if (enforceReview && refuseUnreviewedWrite(session)) return 8;
-  let state = await providerState(config);
-  const resolve = async () => {
+  const resolve = async (state) => {
     if (!panel) return resolveChain(tier, { config, state });
     const resolved = await resolvePanel(panel, { config, state });
     const seat = resolved.seats[Number(opts['--seat'])];
     if (!seat) throw new Error(`unknown seat ${opts['--seat']} for panel ${panel}`);
     return { ...resolved, chain: [seat] };
   };
-  let resolution = await resolve();
+  const triedAccounts = new Set(), excludedAccounts = new Set();
   const dispatch = {
     at: new Date().toISOString(), ...(panel ? { panel, seat: Number(opts['--seat']) } : { tier }),
     ...(role ? { role } : {}), brief, out, mode, dir,
-    action: 'resolve', selected: null, chain: resolution.chain, attempts: []
+    action: 'resolve', selected: null, chain: [], attempts: []
   };
   if (opts['--waive']) dispatch.waive = opts['--waive'];
   if (opts['--no-gate']) dispatch.noGate = true;
@@ -985,6 +1003,8 @@ async function runCommand(args) {
     reviewRefused = enforceReview && refuseUnreviewedWrite(session);
     if (reviewRefused) return 8;
     const gate = mode === 'write' ? await prepareGate(dir, brief, out, tier, panel, opts['--no-gate'], reviewSkip) : null;
+    const refresh = () => providerState(config, { excludeCodexAccounts: excludedAccounts });
+    let state = await refresh(), resolution = await resolve(state);
     let cursor = -1, from = null, failedReason = null;
     while (true) {
       const index = resolution.chain.findIndex((entry, position) => position > cursor && entry.available);
@@ -1021,26 +1041,48 @@ async function runCommand(args) {
       const attempt = {
         provider: entry.provider, model: entry.model, effort: entry.effort, at: new Date().toISOString()
       };
+      let account = entry.active;
+      if (account) {
+        attempt.account = account;
+        triedAccounts.add(account);
+      }
       dispatch.attempts.push(attempt);
       await saveDispatch();
       const tracker = trackStatus(`${out}.status`);
       let result, observed;
       try {
         result = await launch(entry, [mode === 'write' ? '-w' : '-r', '-m', entry.model, '-e', entry.effort,
-          '-C', dir, '-f', brief, '-o', out], dir);
+          '-C', dir, '-f', brief, '-o', out], dir, account);
       } finally { observed = tracker.finish(); }
-      const failure = failureReason(result, observed.values);
+      // The wrapper can fall back to main if its account picker fails.
+      if (account && observed.values?.account === 'main') {
+        account = attempt.account = 'main';
+        triedAccounts.add(account);
+      }
+      const failure = failureReason(result, observed.values, account);
       Object.assign(attempt, {
         code: result.code, state: observed.values?.state ?? null, error: observed.values?.error ?? null,
         reached_running: observed.reachedRunning
       });
       dispatch.code = result.code;
-      if (failure) await markUnavailable(entry.provider, failure.reason, failure.note, { config });
-      const retryable = result.code === 3 || (result.code !== 0 && quotaError.test(observed.values?.error || ''));
-      if (panel || !retryable || (mode === 'write' && observed.reachedRunning) || result.signal) {
+      if (failure) await markUnavailable(entry.provider, failure.reason, failure.note, { config, account: failure.account });
+      const retryable = result.code === 3 || Boolean(failure && !result.launchError);
+      const canRetry = retryable && !(mode === 'write' && observed.reachedRunning) && !result.signal;
+      let retryAccount = false;
+      if (canRetry && (failure?.account || !panel)) {
+        if (account && observed.reachedRunning) {
+          for (const id of Object.keys(state.usage.codexAccounts)) excludedAccounts.add(id);
+        } else if (failure?.account) {
+          for (const id of triedAccounts) excludedAccounts.add(id);
+        }
+        state = await refresh();
+        resolution = await resolve(state);
+        retryAccount = Boolean(failure?.account && !observed.reachedRunning && resolution.chain[index].available);
+      }
+      if (!canRetry || (panel && !retryAccount)) {
         attempt.retry = false;
         if (result.code === 0 && ['done', 'incomplete'].includes(observed.values?.state)) {
-          dispatch.code = await finishGate(gate, dispatch, entry, dir, out);
+          dispatch.code = await finishGate(gate, dispatch, entry, dir, out, account);
         }
         await saveDispatch();
         return code = dispatch.code;
@@ -1049,11 +1091,9 @@ async function runCommand(args) {
       attempt.reason = `${failure.reason}: ${failure.note}`;
       attempt.archive = await archiveAttempt(out, entry.provider);
       await saveDispatch();
-      cursor = index;
-      from = entry.provider;
+      cursor = retryAccount ? index - 1 : index;
+      from = retryAccount ? null : entry.provider;
       failedReason = attempt.reason;
-      state = await providerState(config);
-      resolution = await resolve();
     }
   } finally {
     try {

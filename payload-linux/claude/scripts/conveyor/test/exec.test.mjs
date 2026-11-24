@@ -292,14 +292,14 @@ test('Codex threshold persists hysteresis, hands off to Sonnet, and ignores stal
     const resetHandoff = await env.run('complex', '-r', isolatedHome);
     assert.equal(resetHandoff.status, 4, resetHandoff.stderr);
     assert.equal(JSON.parse(resetHandoff.stdout).warning, undefined);
-    assert.equal((await readJson(paths().providers)).codex.switched, true);
+    assert.equal((await readJson(paths().providers)).codex.accounts.main.switched, true);
     await env.limits(78, { net: true });
     assert.equal((await resolveChain('complex')).selected.provider, 'claude');
     await env.limits(75, { net: true });
     assert.equal((await resolveChain('complex')).selected.provider, 'claude');
     await env.limits(74, { net: true });
     assert.equal((await resolveChain('complex')).selected.provider, 'codex');
-    assert.equal((await readJson(paths().providers)).codex.switched, false);
+    assert.equal((await readJson(paths().providers)).codex.accounts.main.switched, false);
     await env.limits(10, { net: true, secondary: 85 });
     assert.equal((await resolveChain('complex')).selected.provider, 'claude');
     const stale = new Date(Date.now() - 1801_000).toISOString();
@@ -368,7 +368,7 @@ test('a write wrapper that runs, edits a file and hits quota is never retried', 
     assert.equal(dispatch.attempts[0].reached_running, true);
     assert.equal(dispatch.attempts[0].retry, false);
     assert.equal(dispatch.code, 17);
-    assert.equal((await readJson(paths().providers)).codex.reason, 'quota');
+    assert.equal((await readJson(paths().providers)).codex.accounts.main.reason, 'quota');
     await assert.rejects(fs.stat(paths().switches), { code: 'ENOENT' });
     assert.doesNotMatch(run.stdout, /claude-subagent/);
   } finally { await env.cleanup(); }

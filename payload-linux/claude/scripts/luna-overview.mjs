@@ -8,8 +8,9 @@ import { availableMemory, matchingProcess, readProcess } from './lib/luna-runtim
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import {
-  loadConfigWithSource, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
+  codexLimitsSnapshot, loadConfigWithSource, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
 } from './conveyor/lib/orchestration.mjs';
+import { codexAccounts, validAccountId } from './conveyor/lib/codex-accounts.mjs';
 import { summarizeUsage, usagePaths } from './conveyor/usage.mjs';
 import { quotaPaths } from './conveyor/gemini-quota.mjs';
 
@@ -61,7 +62,7 @@ function empty(now = Date.now()) {
   return {
     v: 1, at: new Date(now).toISOString(),
     ram: { freeMb: null, totalMb: null },
-    daemon: { running: false, appServer: null, healthy: false }, jobs: [], codexLimits: null, build: null,
+    daemon: { running: false, appServer: null, healthy: false }, jobs: [], codexLimits: null, codexAccounts: [], build: null,
     sessions: [],
     orchestration: { source: null, chains: {}, panels: {}, threshold: null, marks: {}, presets: [], catalog: {}, configError: null },
     switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null,
@@ -203,7 +204,8 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000, signal)
         dir: values.dir || '', error: values.error || '',
         queuePos: /^\d+$/.test(queue || '') && Number.isSafeInteger(Number(queue)) ? Number(queue) : null,
         owner: values.owner || '', idleS: activity.idleS, activity: activity.activity, provider: 'codex',
-        ...(values.daemon_profile ? { daemonProfile: values.daemon_profile } : {})
+        ...(values.daemon_profile ? { daemonProfile: values.daemon_profile } : {}),
+        ...(values.account !== 'main' && validAccountId(values.account) ? { account: values.account } : {})
       });
     }
   }));
@@ -284,9 +286,9 @@ async function geminiMcp(config) {
   };
 }
 
-async function orchestrationStatus(snapshot, now, includeGemini) {
+async function orchestrationStatus(snapshot, now, includeGemini, codexDirectories) {
   const { config, source } = await loadConfigWithSource();
-  const state = await providerState(config, { now, persist: false });
+  const state = await providerState(config, { now, persist: false, codexDirectories });
   const chains = Object.create(null), panels = Object.create(null);
   for (const tier of Object.keys(config.tiers)) {
     const resolved = await resolveChain(tier, { config, state, now });
@@ -303,12 +305,13 @@ async function orchestrationStatus(snapshot, now, includeGemini) {
     presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
     catalog: config.catalog, configError: null
   };
-  if (!includeGemini) return;
+  if (!includeGemini) return state;
   // Resolve an availability probe even when no configured tier or panel currently uses Gemini.
   const model = config.catalog.gemini[0];
   const probe = { tiers: { gemini: [{ provider: 'gemini', model: model.model, effort: model.efforts[0] }] } };
   const entry = (await resolveChain('gemini', { config: probe, state, now })).chain[0];
   Object.assign(snapshot.gemini, { available: entry.available, reason: entry.reason });
+  return state;
 }
 
 async function switches() {
@@ -408,10 +411,10 @@ async function readDaemonJobs(info, signal) {
   return list;
 }
 
-async function sampleDaemonJobs(info, signal, now, profile, result, previous, failures) {
+async function sampleDaemonJobs(info, signal, now, profile, result, previous, failures, account) {
   try {
     const list = await readDaemonJobs(info, signal);
-    result.jobs = daemonJobs(list.jobs, now, profile);
+    result.jobs = daemonJobs(list.jobs, now, profile.split('/').at(-1), account);
     if (object(list.owners)) {
       result.owners = Object.entries(list.owners).map(([owner, counts]) => ({
         owner, running: number(counts?.running), queued: number(counts?.queued)
@@ -435,7 +438,7 @@ function markDaemonJobs(snapshot, previous, failures) {
   };
 }
 
-function daemonJobs(list, now, profile) {
+function daemonJobs(list, now, profile, account) {
   if (!Array.isArray(list)) return [];
   return list.filter((job) => object(job) &&
     (job.state === 'running' || job.state === 'queued' || string(job.state).startsWith('waiting-')))
@@ -446,11 +449,11 @@ function daemonJobs(list, now, profile) {
       idleS: null, activity: { kind: job.state === 'queued' || string(job.state).startsWith('waiting-')
         ? 'queued' : 'unknown', text: job.state === 'queued' || string(job.state).startsWith('waiting-')
           ? string(job.state) : '', sinceS: null }, provider: 'codex',
-      ...(profile ? { daemonProfile: profile } : {})
+      ...(profile ? { daemonProfile: profile } : {}), ...(account ? { account } : {})
     })).sort(newest).slice(0, 30);
 }
 
-async function daemonStatus(directory, now, snapshot, profile, signal, previous, failures = {}) {
+async function daemonStatus(directory, now, snapshot, profile, signal, previous, failures = {}, account) {
   const info = await readJson(path.join(directory, 'daemon.json'));
   if (!info || !matchingProcess(info.pid, info.pid_start)) return;
   const result = {
@@ -474,22 +477,28 @@ async function daemonStatus(directory, now, snapshot, profile, signal, previous,
       result.runningJobs = number(health?.jobs?.running);
       result.queuedJobs = number(health?.jobs?.queued);
     }),
-    sampleDaemonJobs(info, fetchSignal, now, profile, result, previous, failures)
+    sampleDaemonJobs(info, fetchSignal, now, profile, result, previous, failures, account)
   ]);
 }
 
 async function daemonProfiles(directory, now, snapshot, signal, previous, failures) {
-  const defaults = empty(now), net = empty(now);
-  await allReads([
-    daemonStatus(directory, now, defaults, 'default', signal, previous?.profiles?.default ?? previous, failures),
-    daemonStatus(path.join(directory, 'daemon-net'), now, net, 'net', signal, previous?.profiles?.net, failures)
-  ]);
-  const profiles = { default: defaults.daemon, net: net.daemon };
+  const { config } = await loadConfigWithSource().catch(() => ({ config: {} }));
+  const roots = [['main', directory], ...codexAccounts(config).filter(({ id }) => id !== 'main')
+    .map(({ id }) => [id, path.join(directory, 'accounts', id)])];
+  const locations = roots.flatMap(([id, root]) => [
+    ['default', root], ['net', path.join(root, 'daemon-net')]
+  ].map(([profile, dir]) => id === 'main' ? [profile, dir] : [`${id}/${profile}`, dir, id]));
+  const profiles = Object.fromEntries(await allReads(locations.map(async ([profile, dir, account]) => {
+    const sample = { daemon: { running: false, appServer: null, healthy: false } };
+    const prior = previous?.profiles?.[profile] ?? (profile === 'default' ? previous : undefined);
+    await daemonStatus(dir, now, sample, profile, signal, prior, failures, account);
+    return [profile, sample.daemon];
+  })));
   const running = Object.values(profiles).filter((daemon) => daemon.running);
   if (!running.length) return;
   const sum = (key) => running.every((daemon) => typeof daemon[key] === 'number')
     ? running.reduce((total, daemon) => total + daemon[key], 0) : null;
-  const primary = defaults.daemon.running ? defaults.daemon : net.daemon;
+  const [primary] = running;
   const owners = new Map();
   for (const daemon of running) {
     for (const entry of daemon.owners) {
@@ -551,21 +560,26 @@ async function collectSections(snapshot, probes, previous, signal) {
 async function codexLimits(config, now) {
   const candidates = await allReads([
     readJson(path.join(config.run, 'codex-limits.json')),
-    readJson(path.join(config.daemon, 'daemon-net', 'codex-limits.json'))
+    readJson(path.join(config.daemon, 'codex-limits.json')),
+    readJson(path.join(config.daemon, 'daemon-net', 'codex-limits.json')),
+    readJson(path.join(config.daemon, 'codex-limits.probe.json'))
   ]);
   const [limits] = candidates.filter(Boolean).sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0));
   return { codexLimits: limits ? { ...limits, ageS: seconds(limits.at, now) } : null };
 }
 
-function sharedProbes(config, snapshot, now, geminiActive, includeGemini) {
+function sharedProbes(config, snapshot, now, geminiActive, includeGemini, standalone) {
   // Orchestration and Gemini share availability data. Keep the subprobes parallel and commit the Gemini fields together.
   const routing = { orchestration: { ...snapshot.orchestration }, gemini: { ...snapshot.gemini } };
-  const orchestration = orchestrationStatus(routing, now, includeGemini);
+  const orchestration = orchestrationStatus(routing, now, includeGemini, standalone ? config : undefined);
   const availability = orchestration.then(() => routing.gemini, (error) => ({
     ...routing.gemini, reason: cleanText(String(error.message), 500)
   }));
   return [
-    ['codexLimits', ['codexLimits'], () => codexLimits(config, now)],
+    ...(standalone ? [['codexLimits', ['codexLimits', 'codexAccounts'], async () => {
+      const state = await orchestration.catch(() => null);
+      return state ? codexLimitsSnapshot(state) : codexLimits(config, now);
+    }]] : []),
     ['orchestration', ['orchestration'], async () => {
       await orchestration;
       return { orchestration: routing.orchestration };
@@ -578,7 +592,7 @@ function sharedProbes(config, snapshot, now, geminiActive, includeGemini) {
       ]);
       return { gemini: { ...status, ...usage, mcp, quota } };
     }]] : []),
-    ['usage', ['usage'], async () => ({ usage: await usageStatus(now, config) })]
+    ...(standalone ? [['usage', ['usage'], async () => ({ usage: await usageStatus(now, config) })]] : [])
   ];
 }
 
@@ -611,7 +625,7 @@ async function collectOverview(config, now, includeGemini = true, { signal, prev
       const [jobs, active] = await allReads([activeJobs(config.run, now, undefined, signal), geminiActive(signal)]);
       return { jobs: [...jobs, ...active.jobs].sort(newest).slice(0, 40) };
     }],
-    ...sharedProbes(config, snapshot, now, geminiActive, includeGemini).filter(([name]) => !signal || name !== 'usage')
+    ...sharedProbes(config, snapshot, now, geminiActive, includeGemini, !signal)
   ], previous, signal);
   markDaemonJobs(snapshot, previous, jobsFailures);
   return snapshot;
@@ -694,7 +708,8 @@ async function selfTest() {
     });
     check('JSON shape', () => {
       assert.deepEqual(Object.keys(snapshot), [
-        'v', 'at', 'ram', 'daemon', 'jobs', 'codexLimits', 'build', 'sessions', 'orchestration', 'switches', 'gemini', 'usage'
+        'v', 'at', 'ram', 'daemon', 'jobs', 'codexLimits', 'codexAccounts', 'build', 'sessions', 'orchestration', 'switches',
+        'gemini', 'usage'
       ]);
       assert.equal(snapshot.v, 1);
       assert.equal(snapshot.at, new Date(now).toISOString());
@@ -1055,7 +1070,7 @@ async function publishedSnapshot() {
   if (!snapshot) {
     process.stderr.write('сборщик не отвечает — запустите: node ~/.claude/scripts/luna-collector.mjs start\n');
   }
-  return snapshot ?? empty();
+  return snapshot ? { codexAccounts: [], ...snapshot } : empty();
 }
 
 async function main(args) {

@@ -48,6 +48,7 @@
 # LUNA_DAEMON_BUSY_MAX_S=300: maximum unresponsive seconds while the same daemon process is alive.
 # The daemon owns turn admission; existing daemons accept submissions without a client RAM gate.
 # LUNA_DAEMON_HOME: tests-only state directory override (default ~/.claude/luna-run).
+# LUNA_CODEX_ACCOUNT: pin the job to a registered account. LUNA_CODEX_MAIN_HOME overrides ~/.codex.
 # LUNA_DAEMON_APP_SERVER_CMD: tests-only JSON argv array replacing the app-server.
 # Daemon MCP policy matches luna-pool: LUNA_POOL_ALLOW_MCP=1 preserves configured MCP;
 # plugins/apps stay disabled; LUNA_FULL/LUNA_MCP only affect exec mode.
@@ -86,14 +87,15 @@ EXEC_SESSION_OFFSET=""
 EXEC_LAST_ERROR=""
 EXEC_ERROR=""
 RETRY_SLEEP_PID=""
-DAEMON_SCRIPT="$(cd "$(dirname "$0")" && pwd)/luna-daemon.mjs"
-LEASE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/account-lease.mjs"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DAEMON_SCRIPT="$SCRIPT_DIR/luna-daemon.mjs"
+LEASE_SCRIPT="$SCRIPT_DIR/account-lease.mjs"
 LEASE_ID=""
 LEASE_HEARTBEAT=""
 ACCOUNT_NOTE=""
-DAEMON_BASE="${LUNA_DAEMON_HOME:-$HOME/.claude/luna-run}"
-DAEMON_HOME="$DAEMON_BASE"
 DAEMON_PROFILE=default
+LUNA_ACCOUNT=""
+REACHED_RUNNING=0
 HEAVY_GATE_JS="$HOME/.claude/scripts/heavy-gate.mjs"
 if [ "${LUNA_DAEMON:-1}" != 0 ] && [ ! -e "$HOME/.claude/luna-daemon-off" ] &&
     command -v node >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
@@ -211,10 +213,6 @@ while getopts "wrC:o:f:e:m:t:" opt; do
   esac
 done
 shift $((OPTIND - 1))
-if [ "$SANDBOX" = workspace-write ] && [ "${LUNA_NET:-1}" != 0 ]; then
-  DAEMON_PROFILE=net
-  DAEMON_HOME="$DAEMON_BASE/daemon-net"
-fi
 
 # Absolutize paths before anything can fail, so the status file lands next to <out>.
 abs() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$PWD/$1" ;; esac; }
@@ -251,8 +249,10 @@ monotonic_s() {
 STARTED="$(now)"
 status() { # status <state> [extra key=value lines...]
   local state="$1"; shift
+  [ "$state" != running ] || REACHED_RUNNING=1
   {
     echo "state=$state"
+    echo "reached_running=$REACHED_RUNNING"
     echo "pid=${CPID:-}"
     echo "wrapper_pid=$$"
     echo "wrapper_start=$WRAPPER_START"
@@ -267,6 +267,7 @@ status() { # status <state> [extra key=value lines...]
     echo "codex_bin=$CODEX_BIN"
     echo "shell=bash"
     echo "engine=$ENGINE"
+    echo "account=$LUNA_ACCOUNT"
     if [ -n "${USAGE_TOTAL:-}" ]; then
       echo "usage_input=${USAGE_INPUT:-0}"
       echo "usage_cached=${USAGE_CACHED:-0}"
@@ -290,6 +291,28 @@ die() { # die <rc> <message> вЂ” setup failures are visible on stderr AND in
   status failed "rc=$1" "finished=$(now)" "error=$2"
   exit "$1"
 }
+
+account_args=(pick --shell)
+if [ -n "${LUNA_CODEX_ACCOUNT:-}" ]; then account_args+=("--account=$LUNA_CODEX_ACCOUNT"); fi
+if account_selection=$(node "$SCRIPT_DIR/codex-accounts.mjs" "${account_args[@]}" 2>/dev/null); then
+  eval "$account_selection"
+else
+  picker_rc=$?
+  if [ "$picker_rc" = 2 ] && [ -n "${LUNA_CODEX_ACCOUNT:-}" ]; then
+    die 2 "unknown Codex account: $LUNA_CODEX_ACCOUNT"
+  fi
+  echo "luna.sh: Codex account picker failed; using main" >&2
+  LUNA_ACCOUNT=main
+  LUNA_ACCOUNT_HOME="${LUNA_CODEX_MAIN_HOME:-$HOME/.codex}"
+  LUNA_ACCOUNT_RUN="${LUNA_DAEMON_HOME:-$HOME/.claude/luna-run}"
+fi
+export CODEX_HOME="$LUNA_ACCOUNT_HOME"
+DAEMON_BASE="$LUNA_ACCOUNT_RUN"
+DAEMON_HOME="$DAEMON_BASE"
+if [ "$SANDBOX" = workspace-write ] && [ "${LUNA_NET:-1}" != 0 ]; then
+  DAEMON_PROFILE=net
+  DAEMON_HOME="$DAEMON_BASE/daemon-net"
+fi
 
 non_negative_safe() {
   local value="$1"
@@ -726,7 +749,7 @@ daemon_ensure() {
   fi
   mkdir -p "$DAEMON_HOME" || return 1
   # No inherited terminal or pipe: Node creates a detached process.
-  LUNA_DAEMON_PROFILE="$DAEMON_PROFILE" node -e '
+  LUNA_DAEMON_HOME="$DAEMON_BASE" LUNA_DAEMON_PROFILE="$DAEMON_PROFILE" node -e '
     const fs = require("fs"), path = require("path"), cp = require("child_process");
     const log = fs.openSync(path.join(process.argv[2], "daemon.log"), "a");
     const child = cp.spawn(process.execPath, [process.argv[1], "--serve"], {
@@ -871,6 +894,7 @@ daemon_marker() {
         case "$value" in ''|*[!0-9]*) ;; *) MODEL_RETRY_COUNT="$value" ;; esac ;;
     esac
   done < "$OUT.daemon"
+  [ -z "$DAEMON_STARTED" ] || REACHED_RUNNING=1
   case "$DAEMON_STATE:$DAEMON_RC" in
     completed:0|failed:1|cancelled:130|stalled:124) return 0 ;; *) return 1 ;;
   esac

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { canonicalRepo, projectKeyForCwd } from '../learning/common.mjs';
+import { accountPaths, codexAccounts, validateAccounts } from './lib/codex-accounts.mjs';
 import { home as userHome, lockOwnerAlive, lockOwnerStart } from './lib/platform.mjs';
 
 const providers = ['claude', 'codex', 'gemini'];
@@ -59,6 +60,16 @@ function readJson(file, fallback = null) {
     if (error.code === 'ENOENT' || error instanceof SyntaxError) return fallback;
     throw error;
   }
+}
+
+export function codexSessionRoots(conveyorHome, env = process.env) {
+  const config = readJson(path.join(conveyorHome, 'orchestration.json'), {});
+  let accounts = codexAccounts(config ?? {});
+  try { validateAccounts(accounts); }
+  catch { accounts = codexAccounts({}); }
+  const homes = accounts.map(({ id }) => accountPaths(id, env).codexHome);
+  if (env.CODEX_HOME) homes.push(env.CODEX_HOME);
+  return [...new Set(homes.map((home) => path.resolve(home, 'sessions')))];
 }
 
 const messageKeys = ['input', 'output', 'cacheRead', 'cacheWrite', 'total', 'messages', 'at', 'model'];
@@ -135,6 +146,12 @@ function walk(directory, visit) {
     if (entry.isDirectory()) walk(file, visit);
     else if (entry.isFile()) visit(file);
   }
+}
+
+function walkCodexSessions(roots, visit) {
+  for (const root of roots) walk(root, (file) => {
+    if (/^rollout-.*\.jsonl$/.test(path.basename(file))) visit(file, 'codex');
+  });
 }
 
 function fields(text) {
@@ -488,10 +505,11 @@ export function collectUsage({ env = process.env, now = Date.now(), lockNonce } 
   const started = performance.now(), paths = usagePaths(env), release = acquireUsageLock(paths, lockNonce);
   if (!release) return { locked: true, bytesRead: 0 };
   try {
+    const sessions = codexSessionRoots(paths.home, env);
     const index = readStateIndex(paths.state);
     let inspected;
     if (index && localDay(index.at) === localDay(now)) {
-      const stats = inspected = inspectSources(index, paths);
+      const stats = inspected = inspectSources(index, paths, sessions);
       const cache = stats.changedFiles ? null : readJson(paths.cache);
       if (cache?.v === 1 && cacheDigest(cache) === index.digest) {
         cache.at = new Date(now).toISOString();
@@ -531,7 +549,7 @@ export function collectUsage({ env = process.env, now = Date.now(), lockNonce } 
       scan(paths.registry, 'registry');
       scan(paths.gateway, 'gateway');
       walk(paths.projects, (file) => { if (file.endsWith('.jsonl')) scan(file, 'claude'); });
-      walk(paths.sessions, (file) => { if (/^rollout-.*\.jsonl$/.test(path.basename(file))) scan(file, 'codex'); });
+      walkCodexSessions(sessions, scan);
       walk(paths.run, (file) => {
         if (file.endsWith('.status') || file.endsWith('.daemon')) outputs.add(file.replace(/\.(?:status|daemon)$/, ''));
         else if (jobLog(file)) outputs.add(file.slice(0, -4));
@@ -616,7 +634,7 @@ function readStateIndex(file) {
   finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
-function inspectSources(index, paths) {
+function inspectSources(index, paths, sessions) {
   const stats = { locked: false, files: 0, changedFiles: 0, bytesRead: 0, scannedBytes: 0, skippedLines: 0 }, seen = new Set();
   const outputs = new Set(index.outputs), sources = new Map(), missing = new Set();
   Object.defineProperties(stats, { sources: { value: sources }, outputs: { value: outputs }, missing: { value: missing } });
@@ -642,7 +660,7 @@ function inspectSources(index, paths) {
   inspect(paths.registry, 'registry');
   inspect(paths.gateway, 'gateway');
   walk(paths.projects, (file) => { if (file.endsWith('.jsonl')) inspect(file, 'claude'); });
-  walk(paths.sessions, (file) => { if (/^rollout-.*\.jsonl$/.test(path.basename(file))) inspect(file, 'codex'); });
+  walkCodexSessions(sessions, inspect);
   walk(paths.run, (file) => {
     if (file.endsWith('.status') || file.endsWith('.daemon')) outputs.add(file.replace(/\.(?:status|daemon)$/, ''));
     else if (jobLog(file)) outputs.add(file.slice(0, -4));

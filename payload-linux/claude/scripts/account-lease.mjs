@@ -372,9 +372,22 @@ function daemonHealth(info, route = '/account-idle') {
   });
 }
 
-async function daemonIdle() {
+function daemonRoots() {
   const base = path.resolve(process.env.LUNA_DAEMON_HOME || run);
-  for (const root of [base, path.join(base, 'daemon-net')]) {
+  const accounts = path.join(base, 'accounts');
+  let roots;
+  try {
+    roots = fs.readdirSync(accounts, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory()).map(({ name }) => path.join(accounts, name));
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    roots = [];
+  }
+  return [base, ...roots].flatMap((root) => [root, path.join(root, 'daemon-net')]);
+}
+
+async function daemonIdle() {
+  for (const root of daemonRoots()) {
     const discovery = path.join(root, 'daemon.json');
     const info = readJson(discovery);
     if (!info) {
@@ -439,8 +452,7 @@ function managedDaemonProcesses(rows) {
     if (!children.has(row.ppid)) children.set(row.ppid, []);
     children.get(row.ppid).push(row.pid);
   }
-  const base = path.resolve(process.env.LUNA_DAEMON_HOME || run);
-  for (const root of [base, path.join(base, 'daemon-net')]) {
+  for (const root of daemonRoots()) {
     const info = readJson(path.join(root, 'daemon.json'));
     if (!info || !matchingProcess(info.pid, info.pid_start)) continue;
     const server = matchingProcess(info.appServerPid, info.appServerStart);
