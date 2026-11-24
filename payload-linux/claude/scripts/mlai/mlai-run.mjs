@@ -575,7 +575,9 @@ class Job {
       const interrupted = code === 1 && (result?.usage?.errorCode === 'connection_interrupted' ||
         transient.test(result?.error ?? '') || transient.test(text) || (!result && transient.test(stderr)));
       if (!interrupted) return this.mapResult(outcome);
-      if (retry >= retries) {
+      // Before the agent starts, one retry is enough: the job then moves on down the chain instead of waiting
+      // three CLI connect timeouts (about 45 s each) while the server is unreachable.
+      if (retry >= (this.values.reached_running === 1 ? retries : Math.min(retries, 1))) {
         return this.providerFailure(`mlai: connection interrupted (after ${this.values.attempts} attempts)`);
       }
       this.log(`mlai: connection interrupted, retrying (attempt ${this.values.attempts + 1})`);

@@ -37,6 +37,10 @@ set -eu
 while getopts 'wrm:e:C:f:o:' opt; do
   case "$opt" in o) out=$OPTARG;; esac
 done
+if [ -f "$(dirname "$out")/netfail" ]; then
+  printf 'provider=mlai\nstate=unavailable\nunavailable_reason=start\nerror=mlai: connection interrupted (after 2 attempts)\n' > "$out.status"
+  exit 3
+fi
 printf '%s\n' "$MLAI_SLOT" > "$out"
 printf 'provider=mlai\nstate=done\nreached_running=1\n' > "$out.status"
 `, { mode: 0o755 });
@@ -76,8 +80,15 @@ test('two live mlai slots skip to Codex without marking mlai unavailable', async
   });
 });
 
-test('mlai receives a free slot and releases it when the dispatch ends', async () => {
-  await withEnvironment(async ({ slots, out, runJob }) => {
+test('mlai receives a free slot and releases it; a network failure before start falls through without a mark', async () => {
+  await withEnvironment(async ({ home, slots, out, runJob }) => {
+    await fs.writeFile(path.join(path.dirname(out), 'netfail'), '');
+    const failed = await runJob();
+    assert.equal(failed.status, 0, failed.stderr);
+    assert.deepEqual((await readJson(`${out}.dispatch.json`)).attempts.map(({ provider }) => provider), ['mlai', 'codex']);
+    assert.equal(Object.hasOwn(await readJson(path.join(home, 'providers.json')).catch(() => ({})), 'mlai'), false);
+    assert.deepEqual(await fs.readdir(slots), []);
+    await fs.rm(path.join(path.dirname(out), 'netfail'));
     const result = await runJob();
     assert.equal(result.status, 0, result.stderr);
     const slot = (await fs.readFile(out, 'utf8')).trim();

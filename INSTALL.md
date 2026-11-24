@@ -121,6 +121,9 @@ when absent do not count as drift.
 
 After editing the package, run `node tools/manifest-sync.mjs && node tools/sync-windows.mjs` to refresh both manifests
 and the generated Windows payload, then the same two commands with `--check` (exit 1 means changes are needed).
+A change under `local-plugins/<plugin>/` needs a new version in its `.claude-plugin/plugin.json`: Claude Code loads
+plugins from its cache and refreshes it only for a new version, so `manifest-sync` fails until the version is bumped
+(it records each plugin's version and content hash in `payload-linux/local-plugins.lock.json`).
 Shared files are edited only in `payload-linux/`; `payload/` holds generated copies plus the Windows exceptions in
 `tools/windows-exceptions.json`.
 

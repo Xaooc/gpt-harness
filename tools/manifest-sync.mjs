@@ -95,6 +95,33 @@ export function buildManifest(manifest, relatives, readSource, changed = () => {
 
 export const manifestText = manifest => `${JSON.stringify(manifest, null, 2)}\n`;
 
+/** Claude Code loads a local plugin from its cache, which `claude plugin update` refreshes only for a new version:
+ *  a changed plugin with the same version never reaches the running pane (2026-11-24, the mlai panel rows).
+ *  Returns the next lock and the problems; a changed plugin must carry a new version. */
+export function pluginVersions(pluginsRoot, lock) {
+  const next = {}, problems = [], changes = [];
+  if (!fs.existsSync(pluginsRoot)) return { next, problems, changes };
+  for (const name of fs.readdirSync(pluginsRoot).sort()) {
+    const meta = path.join(pluginsRoot, name, '.claude-plugin', 'plugin.json');
+    if (!fs.existsSync(meta)) continue;
+    const { version } = JSON.parse(fs.readFileSync(meta, 'utf8'));
+    const content = createHash('sha256');
+    for (const rel of payloadFiles(path.join(pluginsRoot, name)).sort()) {
+      if (rel === '.claude-plugin/plugin.json') continue;
+      content.update(`${rel}\0`).update(fs.readFileSync(path.join(pluginsRoot, name, rel)));
+    }
+    const contentSha256 = content.digest('hex');
+    next[name] = { version, contentSha256 };
+    const previous = lock[name];
+    if (previous?.contentSha256 === contentSha256 && previous.version === version) continue;
+    if (previous && previous.contentSha256 !== contentSha256 && previous.version === version) {
+      problems.push(`${name} changed but its version is still ${version}: bump local-plugins/${name}/.claude-plugin/plugin.json` +
+        ' (the Claude plugin cache refreshes only on a new version)');
+    } else changes.push(`Record ${name} ${version}`);
+  }
+  return { next, problems, changes };
+}
+
 function main() {
   const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const payload = path.join(repo, 'payload-linux');
@@ -118,6 +145,17 @@ function main() {
   else if (original !== next) fs.writeFileSync(manifestPath, next);
   console.log(changes.length ? `${changes.length} manifest changes${check ? ' needed' : ' applied'}.`
     : 'Linux manifest is up to date.');
+
+  const lockPath = path.join(payload, 'local-plugins.lock.json');
+  const lockText = readOptional(lockPath)?.toString('utf8');
+  const plugins = pluginVersions(path.join(payload, 'claude', 'local-plugins'), lockText ? JSON.parse(lockText) : {});
+  for (const problem of plugins.problems) console.error(problem);
+  for (const change of plugins.changes) console.log(change);
+  if (plugins.problems.length) process.exitCode = 1;
+  else if (plugins.changes.length) {
+    if (check) process.exitCode = 1;
+    else fs.writeFileSync(lockPath, `${JSON.stringify(plugins.next, null, 2)}\n`);
+  }
 
   if (fs.existsSync(windowsPayload)) {
     const result = spawnSync(process.execPath, [path.join(repo, 'tools/sync-windows.mjs'), '--check'], { stdio: 'inherit' });
