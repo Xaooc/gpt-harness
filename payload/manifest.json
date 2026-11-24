@@ -5380,7 +5380,7 @@
       "src": "claude/scripts/conveyor/test/mlai.test.mjs",
       "dest": "scripts/conveyor/test/mlai.test.mjs",
       "kind": "file",
-      "sha256": "86668122f9c55ab2c20776d4948f08ee800ee69e0414abf5f8c88958f94e7e39"
+      "sha256": "f8c40ad66179b4232f3aa81d8bcb1d623c5dfad51d42ca516247ec4b12bb4390"
     }
   ],
   "settings": "settings/hooks.json",

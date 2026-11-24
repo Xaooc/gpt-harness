@@ -89,7 +89,7 @@ test('two live mlai slots skip to Codex without marking mlai unavailable', async
   });
 });
 
-test('mlai receives a free slot and releases it; a network failure before start falls through without a mark', async () => {
+test('mlai slot release; a network failure, or an unfinished write run with no changes, moves on unmarked; one with changes exits 1', async () => {
   await withEnvironment(async ({ home, dir, slots, out, runJob }) => {
     await fs.writeFile(path.join(path.dirname(out), 'netfail'), '');
     const failed = await runJob();
