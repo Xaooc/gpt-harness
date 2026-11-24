@@ -82,9 +82,10 @@ blocks `gem.sh` and `mlai.sh`; a diagnostic may prefix `CONVEYOR_DIRECT_PROVIDER
   Through ML AI Code the owner allows `gpt-6-astra` (2026-11-24): `mlai/gpt-6-astra` is the Astra seat of that provider.
   Never `ultra` effort (it delegates to sub-agents). Never the fast tier (`-t fast`) unless the user asks.
 - **ML AI Code** (`mlai`, owner 2026-11-24) is the first entry of each chain: `pixis-sol`/`pixis-opus` in the Sol role,
-  `gpt-6-astra` as Astra, `pixis` as Luna. At most 2 mlai sessions run at once; when both are busy the dispatcher goes
-  straight to the next chain entry (one `conveyor:` line, no unavailability mark). Its sign-in lasts 7 days; the Luna
-  panel warns before it expires (sign in: `MLAI_NO_BROWSER=1 ~/.claude/tools/mlai/node_modules/.bin/mlai login`).
+  `gpt-6-astra` as Astra, `pixis` as Luna. Its slots are always filled first: each account runs 2 sessions, accounts in
+  order; only when all are busy does the dispatcher go to the next chain entry (one `conveyor:` line, no mark). An
+  account may have its own VPN exit (proxy). Sign-ins last 7 days; the Luna panel warns before one expires
+  (`node ~/.claude/scripts/mlai-accounts.mjs add <id>` prints that account's sign-in command).
 - Briefs are self-contained and exhaustive: executors are literal and see only the brief (see the `luna` skill,
   "The executors are literal"). Every write brief ends with "Edit files only. Do NOT run git add / commit / push".
   Claude verifies every result (diff, gates, spot-checks) and commits itself.

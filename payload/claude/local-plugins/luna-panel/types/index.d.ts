@@ -53,6 +53,8 @@ export type Job = {
   owner: string
   /** `codex` (Sol, Luna), `mlai` (ML AI Code) or `gemini`; absent from older collectors (then Codex). */
   provider?: string
+  /** The executor account when it is not the main one. */
+  account?: string
   idleS?: number | null
   activity?: { kind: 'command' | 'thinking' | 'editing' | 'writing' | 'starting' | 'queued' | 'unknown'; text: string; sinceS: number }
 }
@@ -129,7 +131,21 @@ export type GeminiState = {
   } | null
 }
 
-/** ML AI Code (`mlai`): sign-in, the two session slots, today's jobs. Billed in credits, not tokens. */
+/** One ML AI Code account: its own sign-in, two session slots and, optionally, its own VPN exit (proxy). */
+export type MlaiAccount = {
+  id: string
+  label: string
+  home?: string
+  proxy?: string | null
+  signedIn: boolean
+  expiresAt: string | null
+  reason: string | null
+  slots: { limit: number; used: number; holders?: { index: number; out: string | null; at: string | null }[] }
+  mark: { reason: string; until: string } | null
+}
+
+/** ML AI Code (`mlai`): sign-in, the session slots, today's jobs. Billed in credits, not tokens. The top-level fields
+ *  sum every account; `accounts` is absent from collectors older than the multi-account release. */
 export type MlaiState = {
   installed: boolean
   signedIn: boolean
@@ -144,6 +160,7 @@ export type MlaiState = {
   mark: { reason: string; until: string } | null
   jobsToday: number
   creditsToday: number
+  accounts?: MlaiAccount[]
 }
 
 export type ProviderTokens ={ total: number; input?: number; output?: number; cached?: number }

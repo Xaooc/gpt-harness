@@ -1,6 +1,6 @@
 {
   "name": "luna-panel",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Live pane: limits of Claude, every Codex account and ML AI Code sessions, executor chains and settings, every executor job, token usage, CLI updates",
   "types": "./types/index.d.ts"
 }

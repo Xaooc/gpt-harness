@@ -242,7 +242,8 @@ async function providerActiveJobs(config, provider, now, wrapperStart, signal) {
         sandbox: values.sandbox || '', engine: values.engine || '', ageS: seconds(values.started || pointer.started, now),
         dir: values.dir || '', error: values.error || '', queuePos: null, owner: values.owner || string(pointer.owner),
         idleS, activity: { kind: queued ? 'queued' : values.state === 'starting' ? 'starting' : note ? 'writing' : 'unknown',
-          text: note, sinceS: idleS }, provider
+          text: note, sinceS: idleS }, provider,
+        ...(provider === 'mlai' && values.account && values.account !== 'main' ? { account: values.account } : {})
       });
     }
   }));
@@ -318,10 +319,20 @@ async function orchestrationStatus(snapshot, now, includeGemini, codexDirectorie
     const entry = probe ? (await resolveChain('mlai', { config: probe, state, now })).chain[0] : null;
     const mark = state.providers.mlai;
     const until = new Date(stamp(mark?.until));
-    const { installed, signedIn, expiresAt, reason, slots } = state.mlai;
+    const { installed, signedIn, expiresAt, reason, slots, accounts } = state.mlai;
     snapshot.mlai = {
       installed, signedIn, expiresAt, reason,
       slots: { ...slots, holders: slots.holders.map(({ index, out, at }) => ({ index, out: string(out), at: string(at) })) },
+      accounts: (accounts ?? []).map(({ id, label, home, proxy, signedIn: accountSignedIn, expiresAt: accountExpiresAt,
+        reason: accountReason, slots: accountSlots, mark }) => ({
+        id, label, home, proxy: proxy ?? null, signedIn: accountSignedIn, expiresAt: accountExpiresAt ?? null,
+        reason: accountReason ?? null,
+        slots: {
+          limit: accountSlots.limit, used: accountSlots.used,
+          holders: accountSlots.holders.map(({ index, out, at }) => ({ index, out: string(out), at: string(at) }))
+        },
+        mark: mark ? { reason: string(mark.reason), until: string(mark.until) } : null
+      })),
       available: entry?.available ?? false, availability: entry?.reason ?? 'no mlai models in catalog',
       mark: until.getTime() > now ? { reason: string(mark.reason), until: string(mark.until) || until.toISOString() } : null
     };
