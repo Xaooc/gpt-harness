@@ -28,7 +28,8 @@ const quotaError = new RegExp([
 const unavailableReasons = ['quota', 'region', 'auth', 'start'];
 // "Your workspace is out of credits" is what a business seat with a depleted credit pool returns (seen 2026-11-24).
 const codexQuotaError = /\busage limit\b|\bquota\b|\binsufficient_quota\b|\brate[ _]limit[ _]reached\b|\bout of credits\b|\bcredits[ _]depleted\b/i;
-const mlaiNetworkError = /connection[ _-]?interrupted|Cannot reach the ML AI Code server/i;
+// Failures of one job, not of the provider: a network blip, or a directory the wrapper will not hand to mlai.
+const mlaiJobError = /connection[ _-]?interrupted|Cannot reach the ML AI Code server|refuses this project directory/i;
 const codexAuthError = /\b(?:unauthorized|forbidden|401|403|not logged in|login|token expired)\b/i;
 const execute = promisify(execFile);
 const gitOptions = { encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 };
@@ -1047,9 +1048,9 @@ function failureReason(result, status, account, provider) {
   if (result.launchError) return { reason: 'start', note: result.launchError };
   if (provider === 'mlai') {
     const reason = status?.unavailable_reason;
-    // A network failure before the agent started moves this job on but does not take mlai out of the chain: the owner
-    // wants its slots filled first, and the next job may reach the server (2026-11-24, proxy blips to code.ml.ai).
-    if (reason === 'start' && mlaiNetworkError.test(status?.error || '')) return { reason, note: status.error, mark: false };
+    // Such a failure before the agent started moves this job on but does not take mlai out of the chain: the owner wants
+    // its slots filled first, and the next job may reach the server or run in a project folder (2026-11-24).
+    if (reason === 'start' && mlaiJobError.test(status?.error || '')) return { reason, note: status.error, mark: false };
     if (['auth', 'quota', 'start'].includes(reason)) return { reason, note: status.error || reason };
     return result.code === 3 ? { reason: 'start', note: status?.error || 'wrapper exited 3' } : null;
   }
