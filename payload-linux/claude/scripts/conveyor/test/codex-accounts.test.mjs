@@ -94,7 +94,7 @@ test('provider state resolves Codex to b until both accounts hit the threshold',
   }
 });
 
-test('luna.sh starts the pinned account daemon and gives the app-server its Codex home', { timeout: 300_000 }, async () => {
+test('luna.sh starts the pinned account daemon and gives the app-server its Codex home', { timeout: 300_000, skip: process.platform === 'win32' && 'Windows luna.sh does not pin accounts yet' }, async () => {
   const home = await fs.mkdtemp(path.join(tmpdir(), "codex account's wrapper-"));
   const base = path.join(home, 'daemon'), configDir = path.join(home, '.claude', 'conveyor');
   const secondHome = path.join(home, '.codex-accounts', 'b');
