@@ -101,6 +101,9 @@ test('overview: every limit window, the active executor per tier, on every surfa
     expect(await ui.find({ type: 'Text', text: /^ML AI$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^1\/2$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^вход до / })).toBeTruthy()
+    // A second account gets its own row with its proxy.
+    expect(await ui.find({ type: 'Text', text: /^второй$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /прокси :10820/ })).toBeTruthy()
     // Gemini is out of the owner's setup: no Gemini row in the limits.
     expect(await ui.find({ type: 'Text', text: /^Gemini$/ })).toBeFalsy()
     // The executors card starts collapsed: the complex tier stays visible as the summary, named in full.

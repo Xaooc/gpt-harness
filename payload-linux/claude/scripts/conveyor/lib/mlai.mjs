@@ -9,19 +9,64 @@ import { processAlive, readProcessStat } from './platform.mjs';
 
 export const MLAI_EFFORT_MODELS = new Set(['pixis-opus']);
 
-export function mlaiPaths(env = process.env) {
+export const MLAI_DEFAULT_ACCOUNTS = [{ id: 'main', label: 'основной' }];
+
+export function mlaiAccounts(config) {
+  return config?.mlai_accounts ?? MLAI_DEFAULT_ACCOUNTS;
+}
+
+const mlaiAccountKeys = ['id', 'label', 'home', 'proxy'];
+const controlChars = /[\u0000-\u001f\u007f-\u009f]/;
+
+export function validateMlaiAccounts(accounts) {
+  if (!Array.isArray(accounts)) throw new Error('mlai_accounts must be an array');
+  const ids = new Set();
+  accounts.forEach((account, index) => {
+    const where = `mlai_accounts[${index}]`;
+    if (account === null || typeof account !== 'object' || Array.isArray(account)) {
+      throw new Error(`${where} must be an object`);
+    }
+    for (const key of Object.keys(account)) {
+      if (!mlaiAccountKeys.includes(key)) throw new Error(`${where}: unknown key: ${key}`);
+    }
+    const { id, label, home, proxy } = account;
+    if (typeof id !== 'string' || !/^[a-z][a-z0-9-]{0,23}$/.test(id)) {
+      throw new Error(`${where}: id must match ^[a-z][a-z0-9-]{0,23}$`);
+    }
+    if (ids.has(id)) throw new Error(`duplicate mlai account: ${id}`);
+    ids.add(id);
+    if (typeof label !== 'string' || label.length < 1 || label.length > 40 || controlChars.test(label)) {
+      throw new Error(`${where}: label must be 1-40 characters without control characters`);
+    }
+    if (home !== undefined && (typeof home !== 'string' || !path.isAbsolute(home))) {
+      throw new Error(`${where}: home must be an absolute path`);
+    }
+    if (proxy !== undefined && (typeof proxy !== 'string' || !/^https?:\/\/[A-Za-z0-9.-]+:\d{1,5}$/.test(proxy))) {
+      throw new Error(`${where}: proxy must match http://host:port`);
+    }
+  });
+  if (!accounts.length || accounts[0].id !== 'main') throw new Error('mlai_accounts must start with the main account');
+}
+
+export function mlaiPaths(env = process.env, account) {
   const run = path.resolve(env.LUNA_RUN_DIR || path.join(homedir(), '.claude', 'luna-run'));
   const claude = env.CLAUDE_HOME_DIR || path.join(homedir(), '.claude');
-  const home = path.resolve(env.MLAI_HOME || path.join(homedir(), '.mlai'));
+  const id = account?.id ?? 'main';
+  const fallback = id === 'main' ? env.MLAI_HOME || path.join(homedir(), '.mlai')
+    : path.join(homedir(), '.mlai-accounts', id);
+  const home = path.resolve(account?.home || fallback);
   return {
-    run, slots: path.join(run, 'mlai', 'slots'), active: path.join(run, 'mlai-active'),
+    id, run,
+    // Main keeps its original directory so running jobs and the panel keep reading it.
+    slots: id === 'main' ? path.join(run, 'mlai', 'slots') : path.join(run, 'mlai', 'accounts', id, 'slots'),
+    active: path.join(run, 'mlai-active'),
     bin: path.resolve(env.MLAI_BIN || path.join(claude, 'tools', 'mlai', 'node_modules', '.bin', 'mlai')),
     home, auth: path.join(home, 'auth.json'), limit: Number(env.CONVEYOR_MLAI_SLOTS) || 2
   };
 }
 
-export async function mlaiLogin(now = Date.now(), env = process.env) {
-  const { bin, auth } = mlaiPaths(env);
+export async function mlaiLogin(now = Date.now(), env = process.env, account) {
+  const { bin, auth } = mlaiPaths(env, account);
   try {
     await fs.access(bin, constants.X_OK);
     if (!(await fs.stat(bin)).isFile()) throw new Error('not a regular file');
@@ -65,8 +110,8 @@ async function inspectSlot(dir) {
   return { stat, owner, stale: ownerGone && !childMayBeLive(dir) };
 }
 
-export async function slotState(env = process.env) {
-  const { slots, limit } = mlaiPaths(env);
+export async function slotState(env = process.env, account) {
+  const { slots, limit } = mlaiPaths(env, account);
   const holders = [];
   for (let index = 0; index < limit; index++) {
     const state = await inspectSlot(path.join(slots, String(index)));
@@ -86,8 +131,7 @@ async function reclaimSlot(dir, { stat }) {
   else await fs.rm(stale, { recursive: true, force: true });
 }
 
-export async function acquireSlot({ out }, env = process.env) {
-  const { slots, limit } = mlaiPaths(env);
+async function claimSlot({ slots, limit }, out) {
   // Serialize reclamation and publication so a contender cannot rename a successor's slot.
   return withLock(path.join(slots, '.acquire'), async () => {
     for (let index = 0; index < limit; index++) {
@@ -130,4 +174,29 @@ export async function acquireSlot({ out }, env = process.env) {
     }
     return null;
   });
+}
+
+function markActive(mark, now) {
+  if (!mark || (mark.reason !== 'auth' && mark.reason !== 'quota')) return false;
+  const until = Date.parse(mark.until);
+  return !Number.isFinite(until) || now < until;
+}
+
+export async function acquireSlot({ out }, env = process.env, { accounts, marks, now } = {}) {
+  const list = accounts?.length ? accounts : MLAI_DEFAULT_ACCOUNTS;
+  now ??= Date.now();
+  for (const account of list) {
+    const login = await mlaiLogin(now, env, account);
+    if (!login.installed || !login.signedIn) continue;
+    const mark = marks && Object.hasOwn(marks, account.id) ? marks[account.id] : null;
+    if (markActive(mark, now)) continue;
+    const paths = mlaiPaths(env, account);
+    const claimed = await claimSlot(paths, out);
+    if (!claimed) continue;
+    return {
+      account: account.id, label: account.label, index: claimed.index, dir: claimed.dir,
+      home: paths.home, proxy: account.proxy ?? null, release: claimed.release
+    };
+  }
+  return null;
 }

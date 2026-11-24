@@ -1,7 +1,7 @@
 {
   "luna-panel": {
-    "version": "0.9.0",
-    "contentSha256": "2d1cc5498bfb71fd2e18cc6cbccdcad4beb0b7776a89bb3416aae66cdd9a42e4"
+    "version": "0.10.0",
+    "contentSha256": "c6ddd0c4b93fe814b6e436b753e2e7719d80881eac5e227027d7038e4921bd57"
   },
   "pstack": {
     "version": "0.15.42-bro.7",

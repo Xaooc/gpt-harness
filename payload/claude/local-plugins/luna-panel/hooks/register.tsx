@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type {
-  ChainEntry, ClaudeLimit, CliStatus, CodexAccount, CodexLimits, Collapsed, Job, LimitWindow, MlaiState, PanelData,
+  ChainEntry, ClaudeLimit, CliStatus, CodexAccount, CodexLimits, Collapsed, Job, LimitWindow, MlaiAccount, MlaiState, PanelData,
   SessionBeat, Snapshot, View,
 } from '../types'
 
@@ -157,10 +157,12 @@ function providerOf(j: Job): 'mlai' | 'codex' | 'gemini' {
 }
 
 /** How the ML AI Code sign-in stands: it lasts 7 days, so the pane warns two days ahead. */
-function mlaiSignIn(m: MlaiState | null | undefined, now: number):
+type MlaiSignInFields = { installed?: boolean; signedIn: boolean; reason: string | null; expiresAt: string | null }
+
+function mlaiSignIn(m: MlaiSignInFields | null | undefined, now: number):
   { text: string; level: 'ok' | 'soon' | 'warning' | 'error'; leftS: number | null } | null {
   if (!m) return null
-  if (!m.installed) return { text: 'не установлен', level: 'warning', leftS: null }
+  if (m.installed === false) return { text: 'не установлен', level: 'warning', leftS: null }
   if (!m.signedIn) {
     return m.reason === 'sign-in expired'
       ? { text: 'вход истёк', level: 'error', leftS: 0 }
@@ -173,7 +175,15 @@ function mlaiSignIn(m: MlaiState | null | undefined, now: number):
   return { text: `вход до ${wallClock(t, now)}`, level: leftS < 48 * 3600 ? 'soon' : 'ok', leftS }
 }
 
-const MLAI_LOGIN = 'MLAI_NO_BROWSER=1 ~/.claude/tools/mlai/node_modules/.bin/mlai login'
+/** The accounts the snapshot lists, or the single main account older collectors describe at the top level. */
+function mlaiAccountsOf(m: MlaiState): MlaiAccount[] {
+  const listed = Array.isArray(m.accounts) ? m.accounts.filter(a => a && typeof a.id === 'string') : []
+  return listed.length ? listed : [{ id: 'main', label: 'основной', signedIn: m.signedIn, expiresAt: m.expiresAt,
+    reason: m.reason, slots: m.slots, mark: m.mark }]
+}
+
+// The sign-in command differs per account (its home, its proxy); the accounts tool prints the exact one.
+const mlaiLoginHint = (id: string) => `node ~/.claude/scripts/mlai-accounts.mjs add ${id}`
 
 function jobName(out: string): string {
   const parts = out.split(/[\\/]/).filter(Boolean)
@@ -307,12 +317,20 @@ function attentionItems(d: PanelData): Alert[] {
   } else if (s.codexLimits?.reached) out.push({ level: 'error', text: 'Лимит Codex исчерпан' })
   // ML AI Code matters only while some chain or panel uses it.
   const usesMlai = [...Object.values(o?.chains ?? {}), ...Object.values(o?.panels ?? {})].some(c => c.some(x => x.provider === 'mlai'))
-  const sign = usesMlai ? mlaiSignIn(s.mlai, d.polledAt || Date.now()) : null
-  if (sign && sign.level !== 'ok') {
-    const text = sign.level === 'soon' ? `ML AI: вход истекает через ${timeLeft(sign.leftS ?? 0)}, войдите заново`
-      : sign.text === 'не установлен' ? 'ML AI не установлен: задачи идут на Codex'
-      : `ML AI: ${sign.text}, задачи идут на Codex`
-    out.push({ level: sign.level === 'error' ? 'error' : 'warning', text })
+  if (usesMlai && s.mlai) {
+    const at = d.polledAt || Date.now()
+    if (s.mlai.installed === false) out.push({ level: 'warning', text: 'ML AI не установлен: задачи идут на Codex' })
+    else {
+      const accounts = mlaiAccountsOf(s.mlai)
+      for (const a of accounts) {
+        const sign = mlaiSignIn(a, at)
+        if (!sign || sign.level === 'ok') continue
+        const who = accounts.length > 1 ? `ML AI «${a.label || a.id}»` : 'ML AI'
+        const text = sign.level === 'soon' ? `${who}: вход истекает через ${timeLeft(sign.leftS ?? 0)}, войдите заново`
+          : `${who}: ${sign.text}${accounts.length > 1 ? '' : ', задачи идут на Codex'}`
+        out.push({ level: sign.level === 'error' ? 'error' : 'warning', text })
+      }
+    }
   }
   if (d.error) out.push({ level: 'warning', text: `Данные не обновляются: ${d.error.slice(0, 80)}` })
   return out.sort((a, b) => (a.level === 'error' ? 0 : 1) - (b.level === 'error' ? 0 : 1))
@@ -939,34 +957,44 @@ export const register: Register = on => {
       return a.active ? { text: '● сейчас', color: 'success' } : { text: 'в запасе', color: 'subtle' }
     }
 
-    // ML AI Code has no usage windows: what limits it is two sessions at a time and a 7-day sign-in. One row in the
-    // same columns as the limit rows (name · what · count · bar · state), a hint under it only when action is needed.
+    // ML AI Code has no usage windows: what limits it is two sessions per account and a 7-day sign-in. One row per
+    // account in the same columns as the limit rows (name · account · count · bar · state); a hint only when needed.
     const MlaiLines = ({ m }: { m: MlaiState }) => {
-      const sign = mlaiSignIn(m, now)
-      const limit = m.slots?.limit ?? 2
-      const used = Math.min(m.slots?.used ?? 0, limit)
-      const full = used >= limit
-      const mark = m.mark && Date.parse(m.mark.until) > now ? m.mark : null
-      const markText = mark ? `${mark.reason === 'auth' ? 'ошибка входа' : mark.reason === 'quota' ? 'лимит тарифа' : 'сбой запуска'} до ${clock(mark.until)}` : ''
-      const stateColor = mark || sign?.level === 'error' ? 'error' : sign && sign.level !== 'ok' ? 'warning' : 'subtle'
+      const accounts = mlaiAccountsOf(m)
+      const many = accounts.length > 1
+      const total = accounts.reduce((n, a) => n + (a.slots?.limit ?? 2), 0)
+      const busy = accounts.reduce((n, a) => n + Math.min(a.slots?.used ?? 0, a.slots?.limit ?? 2), 0)
       return (
         <Box flexDirection="column">
-          <Box flexDirection="row" alignItems="center" gap={1}>
-            <Box width={7} flexShrink={0}><Text size="footnote" weight="medium">ML AI</Text></Box>
-            <Box width={7} flexShrink={0}><Text size="caption" color="subtle">сессии</Text></Box>
-            <Box width={5} flexShrink={0} justifyContent="flex-end">
-              <Text size="footnote" weight="medium" color={full ? 'warning' : 'success'} tabular>{`${used}/${limit}`}</Text>
-            </Box>
-            <Box flexShrink={0}><Bar pct={limit ? (used / limit) * 100 : 0} color={full ? 'warning' : 'success'} /></Box>
-            <Box flexGrow={1} flexShrink={1}>
-              <Text size="caption" color={stateColor} wrap="truncate-end">{markText || sign?.text || ''}</Text>
-            </Box>
-          </Box>
-          {full ? (
-            <Box paddingLeft={8}><Text size="caption" color="subtle" wrap="truncate-end">обе заняты: новые задачи идут дальше по цепочке</Text></Box>
-          ) : null}
-          {m.installed && sign && sign.level !== 'ok' ? (
-            <Box paddingLeft={8}><Text size="caption" color="subtle" wrap="wrap">войти: {MLAI_LOGIN}</Text></Box>
+          {accounts.map((a, i) => {
+            const sign = m.installed === false ? mlaiSignIn(m, now) : mlaiSignIn(a, now)
+            const limit = a.slots?.limit ?? 2
+            const used = Math.min(a.slots?.used ?? 0, limit)
+            const full = used >= limit
+            const mark = a.mark && Date.parse(a.mark.until) > now ? a.mark : null
+            const markText = mark ? `${mark.reason === 'auth' ? 'ошибка входа' : mark.reason === 'quota' ? 'лимит тарифа' : 'сбой запуска'} до ${clock(mark.until)}` : ''
+            const stateColor = mark || sign?.level === 'error' ? 'error' : sign && sign.level !== 'ok' ? 'warning' : 'subtle'
+            const port = a.proxy ? /:(\d+)$/.exec(a.proxy)?.[1] : null
+            const state = [markText || sign?.text || '', port ? `прокси :${port}` : ''].filter(Boolean).join(' · ')
+            return (
+              <Box flexDirection="column" key={`mlai-${a.id}`}>
+                <Box flexDirection="row" alignItems="center" gap={1}>
+                  <Box width={7} flexShrink={0}><Text size="footnote" weight="medium">{i === 0 ? 'ML AI' : ''}</Text></Box>
+                  <Box width={7} flexShrink={0}><Text size="caption" color="subtle" wrap="truncate-end">{many ? a.label || a.id : 'сессии'}</Text></Box>
+                  <Box width={5} flexShrink={0} justifyContent="flex-end">
+                    <Text size="footnote" weight="medium" color={full ? 'warning' : 'success'} tabular>{`${used}/${limit}`}</Text>
+                  </Box>
+                  <Box flexShrink={0}><Bar pct={limit ? (used / limit) * 100 : 0} color={full ? 'warning' : 'success'} /></Box>
+                  <Box flexGrow={1} flexShrink={1}><Text size="caption" color={stateColor} wrap="truncate-end">{state}</Text></Box>
+                </Box>
+                {m.installed !== false && sign && sign.level !== 'ok' ? (
+                  <Box paddingLeft={8}><Text size="caption" color="subtle" wrap="wrap">войти: {mlaiLoginHint(a.id)}</Text></Box>
+                ) : null}
+              </Box>
+            )
+          })}
+          {total && busy >= total ? (
+            <Box paddingLeft={8}><Text size="caption" color="subtle" wrap="truncate-end">{`заняты все ${total}: новые задачи идут дальше по цепочке`}</Text></Box>
           ) : null}
         </Box>
       )
@@ -1100,7 +1128,7 @@ export const register: Register = on => {
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Text size="footnote" wrap="truncate-end" dimColor={!isRunning}>
               <Text color={quiet ?? (isRunning ? 'success' : 'warning')}>{isRunning ? '▶' : '◷'} </Text>
-              <Text color="subtle">{PROVIDER_RU[providerOf(j)] ?? 'Codex'} </Text>
+              <Text color="subtle">{PROVIDER_RU[providerOf(j)] ?? 'Codex'}{j.account ? ` ${j.account}` : ''} </Text>
               <Text weight="medium">{modelName(j.provider, j.model)}</Text>
               <Text color="subtle"> {j.effort} </Text>{jobName(j.out)}
             </Text>
@@ -1414,7 +1442,7 @@ export const register: Register = on => {
                 <Text size="footnote" weight="medium">ML AI Code</Text>
                 <MlaiLines m={mlai} />
                 <Text size="caption" color="subtle" wrap="wrap">
-                  {`Стоит в цепочке там, куда его поставили (обычно первым). Одновременно идут не больше ${mlai.slots?.limit ?? 2} сессий: когда все заняты, задача сразу идёт к следующему в цепочке, без ожидания. Вход действует 7 дней. Начатая задача на другого исполнителя не переносится.`}
+                  {`Стоит в цепочке первым. У каждого аккаунта по 2 сессии, всего ${mlai.slots?.limit ?? 2}: сначала заполняется первый аккаунт, потом следующий, и только когда заняты все, задача идёт дальше по цепочке, без ожидания. Вход действует 7 дней, у каждого аккаунта свой. Начатая задача на другой аккаунт или исполнитель не переносится.`}
                 </Text>
               </Box>
             ) : null}

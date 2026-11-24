@@ -420,6 +420,12 @@ const snapshot = {
     installed: true, signedIn: true, expiresAt: '2026-11-21T10:00:00.000Z', reason: null,
     slots: { limit: 2, used: 1, holders: [{ index: 0, out: '/tmp/a.out.md', at }] },
     available: true, availability: 'available', mark: null, jobsToday: 2, creditsToday: 0.11,
+    accounts: [
+      { id: 'main', label: 'основной', signedIn: true, expiresAt: '2026-11-21T10:00:00.000Z', reason: null,
+        slots: { limit: 2, used: 1 }, mark: null },
+      { id: 'b', label: 'второй', proxy: 'http://127.0.0.1:10820', signedIn: true, expiresAt: '2026-11-22T10:00:00.000Z',
+        reason: null, slots: { limit: 2, used: 0 }, mark: null },
+    ],
   },
   usage: null,
 } satisfies Snapshot

@@ -198,9 +198,16 @@ function agentEnvironment(home) {
   // code.ml.ai, bypassing the VPN, and failed now and then as "Cannot reach the ML AI Code server" while its Python
   // engine used the proxy (2026-11-24: 2 more proxied connections per run with it; none during the failures).
   // MLAI_ENGINE_UPDATES=0 keeps the engine on the version the pinned CLI bundles.
-  const env = { ...process.env, NODE_USE_ENV_PROXY: '1', MLAI_NO_UPDATE_CHECK: '1', MLAI_AUTO_UPDATE: '0',
-    MLAI_ENGINE_UPDATES: '0', MLAI_NO_BROWSER: '1', MLAI_NO_TUI: '1' };
-  if (env.HTTPS_PROXY !== undefined || env.https_proxy !== undefined) return env;
+  // MLAI_KEYCHAIN=file: the CLI otherwise keeps the sign-in in one system keychain entry shared by every home on Linux.
+  // MLAI_TOKEN is dropped: an inherited token would sign every account in as the dispatcher's own.
+  const env = { ...process.env, NODE_USE_ENV_PROXY: '1', MLAI_KEYCHAIN: 'file', MLAI_NO_UPDATE_CHECK: '1',
+    MLAI_AUTO_UPDATE: '0', MLAI_ENGINE_UPDATES: '0', MLAI_NO_BROWSER: '1', MLAI_NO_TUI: '1' };
+  delete env.MLAI_TOKEN;
+  if (env.HTTPS_PROXY !== undefined || env.https_proxy !== undefined) {
+    const proxy = env.HTTPS_PROXY ?? env.https_proxy;
+    env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxy;
+    return env;
+  }
   // Same lookup as the other wrappers (INSTALL.md): an explicit file, the harness default, then the legacy file.
   const files = env.LUNA_PROXY_ENV_FILE ? [env.LUNA_PROXY_ENV_FILE]
     : [path.join(home, '.config/luna-proxy.env'), path.join(home, '.config/bro-env.sh')];
@@ -210,7 +217,7 @@ function agentEnvironment(home) {
   }
   if (config === undefined) return env;
   const proxy = /(?:^|[\s;])HTTPS_PROXY=["']?([^"'\s;$]+)/m.exec(config)?.[1];
-  if (proxy) env.HTTPS_PROXY = env.HTTP_PROXY = proxy;
+  if (proxy) env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxy;
   return env;
 }
 
@@ -366,7 +373,8 @@ class Job {
       started: new Date().toISOString(),
       finished: '', rc: '', model: options.model, effort: options.effort,
       sandbox: options.write ? 'workspace-write' : 'read-only', dir: path.resolve(options.dir),
-      engine: 'mlai', provider: 'mlai', error: '', last_note: '', unavailable_reason: '', elapsed_s: 0,
+      engine: 'mlai', provider: 'mlai', account: process.env.MLAI_ACCOUNT || 'main', error: '', last_note: '',
+      unavailable_reason: '', elapsed_s: 0,
       mlai_session: '', credits: 0, changed_files: 0, attempts: 0, reached_running: 0
     };
   }

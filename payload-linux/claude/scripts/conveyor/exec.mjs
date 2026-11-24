@@ -14,7 +14,7 @@ import {
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 import { activeTaskId, hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
-import { acquireSlot, mlaiLogin, mlaiPaths, MLAI_EFFORT_MODELS, slotState } from './lib/mlai.mjs';
+import { acquireSlot, mlaiAccounts, mlaiLogin, mlaiPaths, MLAI_EFFORT_MODELS, slotState } from './lib/mlai.mjs';
 import { accountPaths } from './lib/codex-accounts.mjs';
 import { bash, platform, processAlive, readProcessStat, scanBinary } from './lib/platform.mjs';
 import { inside } from './lib/task-scope.mjs';
@@ -475,7 +475,10 @@ async function finishGate(gate, dispatch, entry, dir, out, acceptance, account, 
       } finally { observed = tracker?.finish(); }
       if (observed) {
         const failure = failureReason(result, observed.values, account, entry.provider);
-        if (failure && failure.mark !== false) await markUnavailable(entry.provider, failure.reason, failure.note);
+        if (failure && failure.mark !== false) {
+          await markUnavailable(entry.provider, failure.reason, failure.note,
+            failure.account ? { account: failure.account } : {});
+        }
       }
       const after = await protectedFiles(gate.repo);
       const tests = modifiedTests(before, after, budgetOnly);
@@ -1001,7 +1004,7 @@ async function launch(entry, args, dir, account, extraEnv) {
   try { await fs.access(wrapper, constants.R_OK); }
   catch (error) { return { code: 127, launchError: error.message }; }
   return new Promise((resolve) => {
-    const env = { ...process.env, ...extraEnv, ...(account ? { LUNA_CODEX_ACCOUNT: account } : {}) };
+    const env = { ...process.env, ...extraEnv, ...(account && entry.provider === 'codex' ? { LUNA_CODEX_ACCOUNT: account } : {}) };
     const child = spawn(bash(), [wrapper, ...args], { cwd: dir, stdio: 'inherit', env });
     const forward = (signal) => child.kill(signal);
     const onInt = () => forward('SIGINT');
@@ -1054,10 +1057,12 @@ function failureReason(result, status, account, provider) {
   if (result.launchError) return { reason: 'start', note: result.launchError };
   if (provider === 'mlai') {
     const reason = status?.unavailable_reason;
+    const owner = status?.account || account || 'main';
     // Such a failure before the agent started moves this job on but does not take mlai out of the chain: the owner wants
     // its slots filled first, and the next job may reach the server or run in a project folder (2026-11-24).
     if (reason === 'start' && mlaiJobError.test(status?.error || '')) return { reason, note: status.error, mark: false };
-    if (['auth', 'quota', 'start'].includes(reason)) return { reason, note: status.error || reason };
+    if (['auth', 'quota'].includes(reason)) return { account: owner, reason, note: status.error || reason };
+    if (reason === 'start') return { reason, note: status.error || reason };
     return result.code === 3 ? { reason: 'start', note: status?.error || 'wrapper exited 3' } : null;
   }
   if (account && result.code !== 0) {
@@ -1152,6 +1157,8 @@ async function runCommand(args) {
     return { ...resolved, chain: [seat] };
   };
   const triedAccounts = new Set(), excludedAccounts = new Set(), probedAccounts = new Set();
+  const mlaiConfig = mlaiAccounts(config);
+  const excludedMlaiAccounts = new Set();
   const dispatch = {
     at: new Date().toISOString(), ...(panel ? { panel, seat: Number(opts['--seat']) } : { tier }),
     ...(role ? { role } : {}), brief, out, mode, dir,
@@ -1183,7 +1190,11 @@ async function runCommand(args) {
       for (const [index, reason] of busyEntries) {
         Object.assign(resolution.chain[index], { available: false, reason });
       }
-      const index = resolution.chain.findIndex((entry, position) => position > cursor && entry.available);
+      // The snapshot can say "sessions busy" while a slot has just opened: an mlai entry that is only busy is still
+      // tried, and the live reservation decides.
+      const index = resolution.chain.findIndex((entry, position) => position > cursor &&
+        (entry.available || (!busyEntries.has(position) && entry.provider === 'mlai' &&
+          /^mlai sessions busy/.test(entry.reason ?? ''))));
       dispatch.chain = resolution.chain;
       if (index < 0) {
         dispatch.action = 'unavailable';
@@ -1213,14 +1224,24 @@ async function runCommand(args) {
         continue;
       }
       if (entry.provider === 'mlai') {
-        slot = await acquireSlot({ out });
+        const accounts = mlaiConfig.filter(({ id }) => !excludedMlaiAccounts.has(id));
+        slot = accounts.length ? await acquireSlot({ out }, process.env, {
+          accounts, marks: state.providers?.mlai?.accounts ?? {}, now: Date.now()
+        }) : null;
         if (!slot) {
-          const { used, limit } = await slotState();
-          busyEntries.set(index, `mlai sessions busy (${used}/${limit})`);
+          const fresh = await Promise.all(accounts.map((account) => slotState(process.env, account)));
+          const used = fresh.reduce((sum, state) => sum + state.used, 0);
+          const limit = fresh.reduce((sum, state) => sum + state.limit, 0);
+          busyEntries.set(index, fresh.length ? `mlai sessions busy (${used}/${limit})` : entry.reason);
           continue;
         }
       }
-      const extraEnv = slot ? { MLAI_SLOT: slot.dir } : undefined;
+      const extraEnv = slot ? {
+        MLAI_SLOT: slot.dir, MLAI_HOME: slot.home, MLAI_ACCOUNT: slot.account,
+        ...(slot.proxy ? {
+          HTTPS_PROXY: slot.proxy, HTTP_PROXY: slot.proxy, https_proxy: slot.proxy, http_proxy: slot.proxy
+        } : {})
+      } : undefined;
       const skipped = resolution.chain.slice(cursor + 1, index);
       const reason = [failedReason, ...skipped.map((candidate) => candidate.reason)]
         .filter(Boolean).join('; ') || entry.reason;
@@ -1240,7 +1261,7 @@ async function runCommand(args) {
       const attempt = {
         provider: entry.provider, model: entry.model, effort: entry.effort, at: new Date().toISOString()
       };
-      let account = entry.active;
+      let account = entry.provider === 'mlai' ? slot?.account : entry.active;
       if (account) {
         attempt.account = account;
         triedAccounts.add(account);
@@ -1261,7 +1282,7 @@ async function runCommand(args) {
         } else result = await launchAttempt();
       } finally { observed = tracker.finish(); }
       // The wrapper can fall back to main if its account picker fails.
-      if (account && observed.values?.account === 'main') {
+      if (entry.provider === 'codex' && account && observed.values?.account === 'main') {
         account = attempt.account = 'main';
         triedAccounts.add(account);
       }
@@ -1286,7 +1307,9 @@ async function runCommand(args) {
       if (canRetry && (failure?.account || !panel)) {
         slot?.release();
         slot = null;
-        if (account && observed.reachedRunning) {
+        if (entry.provider === 'mlai') {
+          if (failure?.account) excludedMlaiAccounts.add(failure.account);
+        } else if (account && observed.reachedRunning) {
           for (const id of Object.keys(state.usage.codexAccounts)) excludedAccounts.add(id);
         } else if (failure?.account) {
           for (const id of triedAccounts) excludedAccounts.add(id);

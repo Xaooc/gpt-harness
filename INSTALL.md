@@ -96,12 +96,21 @@ installs the CLI under `~/.claude/tools/mlai` (external entry `mlai-code`, pinne
 in a browser; the sign-in lasts 7 days and lives in `~/.mlai`:
 
 ```bash
-MLAI_NO_BROWSER=1 ~/.claude/tools/mlai/node_modules/.bin/mlai login
-~/.claude/tools/mlai/node_modules/.bin/mlai whoami
+node ~/.claude/scripts/mlai-accounts.mjs add main    # prints the sign-in and whoami commands for this account
 ```
 
-At most 2 mlai sessions run at once (`CONVEYOR_MLAI_SLOTS` overrides it); a job that finds both busy goes to the next
-chain entry. Without the CLI or a valid sign-in the dispatcher skips mlai, and the Luna panel shows why. The account's
+Each account runs at most 2 sessions at once (`CONVEYOR_MLAI_SLOTS` overrides it). Accounts are filled in their order;
+a job goes to the next chain entry only when every account is busy. A second account, optionally through its own VPN
+exit (an HTTP proxy, e.g. an xray inbound pinned to one location):
+
+```bash
+node ~/.claude/scripts/mlai-accounts.mjs add b --label "второй" --proxy http://127.0.0.1:10820
+node ~/.claude/scripts/mlai-accounts.mjs list
+```
+
+`add` prints that account's sign-in command (its own `MLAI_HOME`, `MLAI_KEYCHAIN=file`, `NODE_USE_ENV_PROXY=1` and the
+proxy); approve it in a browser signed in to that ML AI account. The CLI's bundled Node uses proxy variables only with
+`NODE_USE_ENV_PROXY=1`, which the harness always sets. Without the CLI or a valid sign-in the dispatcher skips mlai, and the Luna panel shows why. The account's
 `mlai_sk_` API key is for the HTTP API only; the CLI does not use it.
 
 An existing `~/.claude/conveyor/orchestration.json` gains the mlai model catalog on its next load but keeps its own

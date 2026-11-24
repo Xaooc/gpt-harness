@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { lockOwnerAlive, lockOwnerStart } from './platform.mjs';
 import { accountPaths, codexAccounts, loggedIn, selectAccount, stamp, validateAccounts } from './codex-accounts.mjs';
-import { mlaiLogin, slotState } from './mlai.mjs';
+import { mlaiAccounts, mlaiLogin, mlaiPaths, slotState, validateMlaiAccounts } from './mlai.mjs';
 
 const providers = ['codex', 'gemini', 'claude', 'mlai'];
 const reasons = ['quota', 'region', 'auth', 'start'];
@@ -97,8 +97,9 @@ function validateTiers(tiers, catalog, label, partial = false, knownTiers = tier
 
 export function validateConfig(config) {
   const required = ['version', 'tiers', 'panels', 'catalog', 'thresholds', 'unavailable_ttl_s', 'roles', 'presets'];
-  keys(config, required, 'config', ['codex_accounts']);
+  keys(config, required, 'config', ['codex_accounts', 'mlai_accounts']);
   if (own(config, 'codex_accounts')) validateAccounts(config.codex_accounts);
+  if (own(config, 'mlai_accounts')) validateMlaiAccounts(config.mlai_accounts);
   if (config.version !== 1) throw new Error('version must be 1');
   if (!object(config.catalog)) throw new Error('catalog must be an object');
   for (const provider of Object.keys(config.catalog)) {
@@ -343,23 +344,29 @@ export async function markUnavailable(provider, reason, note, { account, config,
   if (!providers.includes(provider)) throw new Error(`unknown provider: ${provider}`);
   if (!reasons.includes(reason)) throw new Error(`unknown unavailable reason: ${reason}`);
   config ??= await loadConfig();
-  if (account !== undefined && (provider !== 'codex' || !['quota', 'auth'].includes(reason) ||
-      !codexAccounts(config).some(({ id }) => id === account))) {
+  const accountIds = (name) => (name === 'codex' ? codexAccounts(config) : mlaiAccounts(config));
+  if (account !== undefined && (!['codex', 'mlai'].includes(provider) || !['quota', 'auth'].includes(reason) ||
+      !accountIds(provider).some(({ id }) => id === account))) {
     throw new Error(`invalid unavailable mark for ${provider} account ${account}: ${reason}`);
   }
   return withLock(paths().providers, async () => {
     const marks = await readProviders();
     if (provider === 'codex') marks.codex = codexMarks(marks.codex);
+    if (provider === 'mlai') marks.mlai = mlaiMarks(marks.mlai);
     const mark = {
       until: new Date(now + config.unavailable_ttl_s[reason] * 1000).toISOString(),
       reason, note, at: new Date(now).toISOString()
     };
     if (account === undefined) marks[provider] = { ...marks[provider], ...mark };
+    else if (provider === 'mlai') marks.mlai.accounts[account] = {
+      ...(own(marks.mlai.accounts, account) ? marks.mlai.accounts[account] : {}), ...mark
+    };
     else marks.codex.accounts[account] = {
       switched: false, ...(own(marks.codex.accounts, account) ? marks.codex.accounts[account] : {}), ...mark
     };
     await writeJsonAtomic(paths().providers, marks);
-    return account === undefined ? marks[provider] : marks.codex.accounts[account];
+    if (account === undefined) return marks[provider];
+    return provider === 'mlai' ? marks.mlai.accounts[account] : marks.codex.accounts[account];
   });
 }
 
@@ -447,13 +454,58 @@ async function claudeUsage(now) {
   return { known: windows.length > 0, nearLimit: windows.some((limit) => limit.percentUsed >= 95), windows };
 }
 
+function mlaiMarks(provider = {}) {
+  const state = { ...provider, accounts: { ...(provider.accounts ?? {}) } };
+  // A provider-level auth/quota mark written before accounts existed is main's mark; the provider field stays readable.
+  if (!own(provider, 'accounts') && ['auth', 'quota'].includes(provider.reason)) {
+    state.accounts.main = { until: provider.until, reason: provider.reason, note: provider.note, at: provider.at };
+  }
+  return state;
+}
+
+function mlaiState(accounts, logins, slots, marks, now) {
+  const entries = accounts.map((account, index) => {
+    const login = logins[index], slot = slots[index];
+    const stored = marks && own(marks, account.id) ? marks[account.id] : null;
+    const until = stamp(stored?.until);
+    const mark = stored && now < until ? { reason: stored.reason, until: new Date(until).toISOString() } : null;
+    const reason = !login.installed ? 'not installed' : mark ? mark.reason : login.reason ?? null;
+    return {
+      id: account.id, label: account.label, home: mlaiPaths(process.env, account).home, proxy: account.proxy ?? null,
+      signedIn: login.signedIn, expiresAt: login.expiresAt, reason, mark,
+      slots: {
+        limit: slot.limit, used: slot.used,
+        holders: slot.holders.map((holder) => ({ ...holder, account: account.id }))
+      }
+    };
+  });
+  const expiring = entries.filter((entry) => entry.signedIn && entry.expiresAt);
+  const usable = entries.filter((entry) => !entry.reason);
+  return {
+    installed: logins[0]?.installed ?? false,
+    signedIn: entries.some((entry) => entry.signedIn),
+    expiresAt: expiring.length
+      ? expiring.map((entry) => entry.expiresAt).sort((a, b) => Date.parse(a) - Date.parse(b))[0] : null,
+    reason: usable.length ? null : entries.length === 1 ? entries[0].reason
+      : `mlai accounts unavailable: ${entries.map((entry) => `${entry.id} ${entry.reason}`).join(', ')}`,
+    slots: {
+      limit: entries.reduce((sum, entry) => sum + entry.slots.limit, 0),
+      used: entries.reduce((sum, entry) => sum + entry.slots.used, 0),
+      holders: entries.flatMap((entry) => entry.slots.holders)
+    },
+    accounts: entries
+  };
+}
+
 export async function providerState(config, { now = Date.now(), persist = true, excludeCodexAccounts, codexDirectories } = {}) {
   config ??= await loadConfig();
   const accounts = codexAccounts(config);
-  const [readings, claude, login, slots] = await Promise.all([
+  const mlaiConfig = mlaiAccounts(config);
+  const [readings, claude, mlaiLogins, mlaiSlots] = await Promise.all([
     Promise.all(accounts.map(async ({ id }) => [id, { ...await codexUsage(id, now, codexDirectories), loggedIn: loggedIn(id) }])),
     claudeUsage(now).catch(() => ({ known: false, nearLimit: false, windows: [] })),
-    mlaiLogin(now), slotState()
+    Promise.all(mlaiConfig.map((account) => mlaiLogin(now, process.env, account))),
+    Promise.all(mlaiConfig.map((account) => slotState(process.env, account)))
   ]);
   const usage = Object.fromEntries(readings);
   const resolve = async () => {
@@ -472,7 +524,8 @@ export async function providerState(config, { now = Date.now(), persist = true, 
     const { active, allExhausted, reason, accounts: statuses } = eligible.length === accounts.length
       ? selected : selectAccount({ ...input, previousActive: codex.active, accounts: eligible });
     const threshold = { switched: allExhausted, skip: allExhausted, reason, active, accounts: statuses };
-    return { providers: marks, threshold };
+    const mlai = mlaiState(mlaiConfig, mlaiLogins, mlaiSlots, mlaiMarks(marks.mlai).accounts, now);
+    return { providers: marks, threshold, mlai };
   };
   const state = await (persist ? withLock(paths().providers, resolve) : resolve());
   const wrappers = Object.create(null);
@@ -486,7 +539,30 @@ export async function providerState(config, { now = Date.now(), persist = true, 
   }
   const codex = { ...usage.main };
   delete codex.loggedIn;
-  return { ...state, usage: { codex, codexAccounts: usage, claude }, mlai: { ...login, slots }, wrappers, now };
+  return { ...state, usage: { codex, codexAccounts: usage, claude }, wrappers, now };
+}
+
+function mlaiEntryReason(mlai) {
+  const { installed, signedIn, slots, accounts } = mlai;
+  if (!installed) return 'mlai not installed';
+  if (accounts) {
+    const usable = accounts.filter((account) => !account.reason);
+    if (!usable.length) {
+      if (accounts.length === 1) {
+        const [account] = accounts;
+        if (account.reason === 'sign-in expired') return 'mlai sign-in expired';
+        if (account.reason === 'not signed in') return 'mlai not signed in';
+        if (account.mark) return `mlai unavailable until ${account.mark.until}: ${account.mark.reason}`;
+      }
+      return mlai.reason ?? 'mlai accounts unavailable';
+    }
+    const used = usable.reduce((sum, account) => sum + account.slots.used, 0);
+    const limit = usable.reduce((sum, account) => sum + account.slots.limit, 0);
+    return limit > 0 && used >= limit ? `mlai sessions busy (${used}/${limit})` : 'available';
+  }
+  if (!signedIn) return mlai.reason === 'sign-in expired' ? 'mlai sign-in expired' : 'mlai not signed in';
+  if (slots.used >= slots.limit) return `mlai sessions busy (${slots.used}/${slots.limit})`;
+  return 'available';
 }
 
 function resolveEntries(entries, state, now) {
@@ -504,10 +580,7 @@ function resolveEntries(entries, state, now) {
       available = false;
       reason = state.wrappers[entry.provider];
     } else if (entry.provider === 'mlai' && state.mlai) {
-      const { installed, signedIn, reason: loginReason, slots } = state.mlai;
-      if (!installed) reason = 'mlai not installed';
-      else if (!signedIn) reason = loginReason === 'sign-in expired' ? 'mlai sign-in expired' : 'mlai not signed in';
-      else if (slots.used >= slots.limit) reason = `mlai sessions busy (${slots.used}/${slots.limit})`;
+      reason = mlaiEntryReason(state.mlai);
       available = reason === 'available';
     } else if (entry.provider === 'codex') reason = state.threshold.reason;
     return { ...entry, available, reason, ...(entry.provider === 'codex' ? { active: state.threshold.active } : {}) };
