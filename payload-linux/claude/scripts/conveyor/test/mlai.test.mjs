@@ -70,6 +70,10 @@ if [ -f "$flags/partial" ]; then
   printf 'provider=mlai\nstate=incomplete\nreached_running=1\nchanged_files=1\nerror=mlai: stopped early (exit 3: error_max_turns)\n' > "$out.status"
   exit 1
 fi
+if [ -f "$flags/routefail-${'$'}{MLAI_ACCOUNT:-main}" ]; then
+  printf 'provider=mlai\nstate=unavailable\nunavailable_reason=start\nerror=mlai: http_error\naccount=%s\n' "${'$'}{MLAI_ACCOUNT:-main}" > "$out.status"
+  exit 3
+fi
 if [ -f "$(dirname "$out")/netfail" ]; then
   printf 'provider=mlai\nstate=unavailable\nunavailable_reason=start\nerror=mlai: connection interrupted (after 2 attempts)\n' > "$out.status"
   exit 3
@@ -167,6 +171,18 @@ test('account b is filled after main, and Codex is reached only when both accoun
     };
     try {
       await once(sleeper, 'spawn');
+      // main's own route fails before the start: only main is marked and the job runs on b, not on Codex.
+      await fs.writeFile(path.join(root, 'routefail-main'), '');
+      const rerouted = await runJob();
+      assert.equal(rerouted.status, 0, rerouted.stderr);
+      const moved = await readJson(`${out}.dispatch.json`);
+      assert.deepEqual(moved.attempts.map(({ provider, account }) => `${provider}/${account}`), ['mlai/main', 'mlai/b']);
+      const marks = await readJson(path.join(home, 'providers.json'));
+      assert.equal(marks.mlai.accounts.main.reason, 'start');
+      assert.equal(marks.mlai.until, undefined);
+      await fs.rm(path.join(root, 'routefail-main'));
+      await fs.rm(path.join(home, 'providers.json'));
+
       for (const index of [0, 1]) await hold(path.join(slots, String(index)), index);
       const first = await runJob();
       assert.equal(first.status, 0, first.stderr);

@@ -2,7 +2,7 @@
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
-  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
+  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
 } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import path from 'node:path';
@@ -15,7 +15,17 @@ const PROMPT_LIMIT = 28_000;
 const START_EVENTS = new Set(['inference_progress', 'tool', 'command', 'answer']);
 const USAGE = 'usage: mlai.sh [-w|-r] [-C dir] [-o out.md] [-e low|medium|high|xhigh|max] ' +
   '[-m model] (-f prompt.md | "prompt text")';
-const oneLine = (text) => String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu, ' ').trim();
+// The CLI's result.error can be an object ({code, message}); String() would log it as "[object Object]".
+const errorText = (value) => value && typeof value === 'object'
+  ? [value.code, value.message].filter(Boolean).join(': ') || JSON.stringify(value) : value;
+// The CLI can report an error as the literal text "[object Object]" next to a code (http_error): keep the code then.
+const cliError = (result) => {
+  const text = oneLine(result?.error);
+  const code = oneLine(result?.code);
+  if (!text || text === '[object Object]') return code ? `mlai: ${code}` : '';
+  return code && !text.includes(code) ? `${code}: ${text}` : text;
+};
+const oneLine = (text) => String(errorText(text) ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu, ' ').trim();
 const clip = (text, length) => Array.from(oneLine(text)).slice(0, length).join('');
 const fields = (text) => Object.fromEntries(text.split(/\r?\n/).filter((line) => line.includes('='))
   .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
@@ -282,7 +292,7 @@ class Attempt {
       case 'finished': detail = event.state; break;
       case 'result':
         this.result = event;
-        detail = [event.subtype, event.error ?? event.state].filter(Boolean).join(' ');
+        detail = [event.subtype, cliError(event) || event.state].filter(Boolean).join(' ');
         break;
     }
 
@@ -579,10 +589,32 @@ class Job {
     }
     const dirs = [...found].filter((target) => target !== '/' && target !== dir && !target.startsWith(`${dir}/`) &&
       target !== home && this.readable(target)).sort();
-    // Keep the outermost of nested folders, at most 12.
-    const kept = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`))).slice(0, 12);
+    // Keep the outermost of nested folders.
+    const outer = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`)));
+    // The CLI mounts each --add-dir read-only over everything inside it, the job folder included (2026-11-24: with
+    // ~/dev readable every write in a ~/dev worktree failed with "Read-only file system"). A folder that holds the job
+    // folder is replaced by its other subfolders, level by level down to the job folder; shallow ones first, at most 64.
+    const split = (target) => {
+      if (!dir.startsWith(`${target}/`)) return [target];
+      const next = path.join(target, dir.slice(target.length + 1).split('/')[0]);
+      let entries = [];
+      try { entries = readdirSync(target, { withFileTypes: true }); } catch {}
+      return entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(target, entry.name)).sort()
+        .flatMap((child) => child === dir ? [] : child === next ? split(child) : this.readable(child) ? [child] : []);
+    };
+    const depth = (target) => target.split('/').length;
+    const kept = outer.flatMap(split).sort((a, b) => depth(a) - depth(b) || a.localeCompare(b)).slice(0, 64);
     if (kept.length) this.log(`read access: ${kept.join(' ')}`);
     return kept;
+  }
+
+  gitOutside() {
+    const dir = this.options.dir;
+    try {
+      const gitDir = realpathSync(execFileSync('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-dir'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim());
+      return gitDir !== dir && !gitDir.startsWith(`${dir}/`);
+    } catch { return false; }
   }
 
   /** The same session, resumed after it used all its steps for one turn (CLI exit 3, subtype error_max_turns). */
@@ -609,7 +641,9 @@ class Job {
 
   mapResult({ code, result, text, spawnError }) {
     if (spawnError) return this.providerFailure(`mlai: could not start CLI (${spawnError.code ?? 'spawn error'})`);
-    const error = clip(result?.error, 300) || `mlai exited ${code}`;
+    const error = clip(cliError(result), 300) || `mlai exited ${code}`;
+    // An account has 100 task starts a day (reset 00:00 UTC, seen 2026-11-24); it comes as exit 1 before the start.
+    if (code !== 0 && /daily_run_limit|daily limit of \d+ task starts/i.test(error)) return this.providerFailure(error, 'quota');
     switch (code) {
       case 0: {
         if (this.options.write) text = contractHeadings(text);
@@ -646,6 +680,13 @@ class Job {
     let invocation = this.invocation(brief);
     const binary = this.precheck();
     const env = agentEnvironment(this.home);
+    // The engine's step checkpoints write refs and objects into the repository's git directory. A worktree keeps it in
+    // the main repo, outside the folder the CLI's sandbox lets the agent write, so every checkpoint failed
+    // (checkpoint_error: Read-only file system; the engine goes on). Off there; on where .git sits in the job folder.
+    if (this.gitOutside()) {
+      env.MINI_STEP_CHECKPOINTS = '0';
+      this.log('step checkpoints off: the git directory is outside the job folder');
+    }
     for (let retry = 0; ; retry += 1) {
       this.signal.throwIfAborted();
       const { args, prompt } = invocation;
@@ -665,7 +706,7 @@ class Job {
       // a 45 s timeout while the proxy answered normally a moment later).
       const transient = /connection[ _-]?interrupted|Cannot reach the ML AI Code server/i;
       const interrupted = code === 1 && (result?.usage?.errorCode === 'connection_interrupted' ||
-        transient.test(result?.error ?? '') || transient.test(text) || (!result && transient.test(stderr)));
+        transient.test(oneLine(result?.error)) || transient.test(text) || (!result && transient.test(stderr)));
       // The step limit ends one turn, not the task: resume the same session, a few times at most.
       if (code === 3 && result?.subtype === 'error_max_turns' && this.values.continues < continues) {
         this.values.continues += 1;
