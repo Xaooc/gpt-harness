@@ -39,6 +39,8 @@
   "claude/scripts/luna-swap-when-idle.sh": "Windows swap uses the Git Bash runtime.",
   "claude/scripts/luna-watch.sh": "Windows watcher recognizes both MSYS and native Windows PIDs.",
   "claude/scripts/luna.sh": "Windows launcher uses Git Bash and the custom busybox-enabled Codex build.",
+  "claude/scripts/mlai.sh": "Linux entry point for the ML AI Code adapter; Windows support is a later slice.",
+  "claude/scripts/mlai/": "Linux ML AI Code adapter and tests; Windows support is a later slice.",
   "claude/scripts/pytest_gate.py": "Windows pytest gate uses native locking.",
   "claude-md/harness-section.md": "Windows instructions are generated from the local preamble and the shared Linux sections.",
   "claude-md/windows-preamble.md": "Windows instructions use their own machine, source and network preamble.",

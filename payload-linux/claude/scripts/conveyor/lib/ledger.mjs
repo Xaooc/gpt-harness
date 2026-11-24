@@ -858,12 +858,12 @@ async function jobProcessCheck(pids) {
   };
 }
 
-function indexedJob(directory, entry, gemini, session) {
+function indexedJob(directory, entry, provider, session) {
   const pointer = readJobFile(path.join(directory, entry), 32 * 1024);
   if (!pointer) return;
-  const gem = gemini ? JSON.parse(pointer.text) : null;
-  if (gemini && gem?.v !== 1) throw new Error(`invalid Gemini pointer: ${entry}`);
-  const [out, pid, start] = gemini ? [gem.out, gem.wrapper_pid] : pointer.text.split(/\r?\n/, 3).map((line) => line.trim());
+  const job = provider ? JSON.parse(pointer.text) : null;
+  if (provider && job?.v !== 1) throw new Error(`invalid ${provider === 'gemini' ? 'Gemini' : 'mlai'} pointer: ${entry}`);
+  const [out, pid, start] = provider ? [job.out, job.wrapper_pid] : pointer.text.split(/\r?\n/, 3).map((line) => line.trim());
   if (typeof out !== 'string' || !path.isAbsolute(out) || out.startsWith('//') || out.includes('\0')) {
     throw new Error(`invalid output path: ${entry}`);
   }
@@ -881,8 +881,8 @@ function indexedJob(directory, entry, gemini, session) {
   }
   const state = fields.get('state');
   if (!state) throw new Error(`missing job state: ${out}.status`);
-  if ((fields.get('owner') || gem?.owner) !== session || !liveJobState.test(state)) return;
-  if (gemini && (fields.get('provider') !== 'gemini' || !pid)) return;
+  if ((fields.get('owner') || job?.owner) !== session || !liveJobState.test(state)) return;
+  if (provider && (fields.get('provider') !== provider || !pid)) return;
 
   const statusPid = fields.get('wrapper_pid');
   const wrapperPid = Number(pid || statusPid);
@@ -899,7 +899,7 @@ function indexedJob(directory, entry, gemini, session) {
 
 async function indexedJobs(run, index, session) {
   const directory = path.join(run, index);
-  const gemini = index === 'gem-active';
+  const provider = { 'gem-active': 'gemini', 'mlai-active': 'mlai' }[index];
   const jobs = [], errors = [];
   let entries;
   try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
@@ -908,9 +908,9 @@ async function indexedJobs(run, index, session) {
     throw new Error(`live ${index} index: ${error.message}`);
   }
   for (const entry of entries) {
-    if (!entry.isFile() || (gemini && !entry.name.endsWith('.json'))) continue;
+    if (!entry.isFile() || (provider && !entry.name.endsWith('.json'))) continue;
     try {
-      const job = indexedJob(directory, entry.name, gemini, session);
+      const job = indexedJob(directory, entry.name, provider, session);
       if (job) jobs.push(job);
     } catch (error) {
       errors.push(`${index}/${entry.name}: ${error.message}`);
@@ -989,7 +989,7 @@ async function ownedJobs(context) {
     const [discoveries, indexes] = await Promise.all([
       Promise.allSettled(directories.map(daemonDiscovery)),
       Promise.allSettled([...new Set([run, defaultRun])].flatMap((root) =>
-        ['active', 'gem-active'].map((index) => indexedJobs(root, index, context.session))))
+        ['active', 'gem-active', 'mlai-active'].map((index) => indexedJobs(root, index, context.session))))
     ]);
     const daemons = settled(discoveries);
     const indexed = settled(indexes).flatMap((index) => {

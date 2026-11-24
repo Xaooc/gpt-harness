@@ -194,13 +194,13 @@ test('validation rejects invalid schema; atomic saves journal a diff', { timeout
       change(copy);
       assert.throws(() => validateConfig(copy), message);
     };
-    invalid((copy) => { copy.tiers.complex[0].model = 'gpt-6-astra'; }, /gpt-6-astra is forbidden by user rule/);
+    invalid((copy) => { copy.tiers.complex[1].model = 'gpt-6-astra'; }, /gpt-6-astra is forbidden by user rule/);
     invalid((copy) => { copy.catalog.codex[0].model = 'gpt-6-astra'; }, /gpt-6-astra is forbidden by user rule/);
     invalid((copy) => { copy.tiers.complex[0].provider = 'other'; }, /unknown provider other/);
     invalid((copy) => { copy.tiers.complex[0].effort = 'ultra'; }, /effort ultra is not in catalog/);
     invalid((copy) => { copy.extra = true; }, /unknown top-level key: extra/);
     invalid((copy) => { copy.tiers.complex = []; }, /tiers.complex must be a non-empty array/);
-    invalid((copy) => { copy.tiers.complex[0].model = 'missing'; }, /model codex\/missing is not in catalog/);
+    invalid((copy) => { copy.tiers.complex[1].model = 'missing'; }, /model codex\/missing is not in catalog/);
     invalid((copy) => { copy.thresholds.codex.switch_percent = 101; }, /switch_percent must be between 1 and 100/);
     invalid((copy) => { copy.thresholds.codex.hysteresis_percent = -1; },
       /hysteresis_percent must be between 0 and 50/);
@@ -1409,7 +1409,7 @@ test('catalog refresh keeps a settings save that lands between its read and its 
       return rename(source, destination);
     };
     syncBuiltinESMExports();
-    config.tiers.complex[0].effort = 'low';
+    config.tiers.complex[1].effort = 'low';
     const writer = saveConfig(config, { actor: 'panel', note: 'owner sets low' });
     await ready;
     // The refresh reaches the lock while the save is still in flight.
@@ -1423,7 +1423,7 @@ test('catalog refresh keeps a settings save that lands between its read and its 
     try { await execMain(['catalog', 'refresh', '--provider', 'codex', '--actor', 'panel']); }
     finally { process.stdout.write = stdout; }
     const after = await loadConfig();
-    assert.equal(after.tiers.complex[0].effort, 'low');
+    assert.equal(after.tiers.complex[1].effort, 'low');
     assert.ok(after.catalog.codex.some((entry) => entry.model === 'gpt-9-sol'));
   } finally {
     fsDefault.rename = rename;

@@ -89,6 +89,25 @@ CODEX_HOME="$HOME/.codex-accounts/b" codex login status
 Executors switch automatically at the usage threshold set in the Luna panel. The Codex review gate and Codex plugin
 stay on the main account. Windows support for a second account is pending.
 
+### ML AI Code (optional executor, Linux)
+
+The `mlai` provider runs ML AI Code (code.ml.ai) jobs before Codex in the shipped chains. `install.mjs --owner-setup`
+installs the CLI under `~/.claude/tools/mlai` (external entry `mlai-code`, pinned `mlai-code@0.3.23`). Sign in once
+in a browser; the sign-in lasts 7 days and lives in `~/.mlai`:
+
+```bash
+MLAI_NO_BROWSER=1 ~/.claude/tools/mlai/node_modules/.bin/mlai login
+~/.claude/tools/mlai/node_modules/.bin/mlai whoami
+```
+
+At most 2 mlai sessions run at once (`CONVEYOR_MLAI_SLOTS` overrides it); a job that finds both busy goes to the next
+chain entry. Without the CLI or a valid sign-in the dispatcher skips mlai, and the Luna panel shows why. The account's
+`mlai_sk_` API key is for the HTTP API only; the CLI does not use it.
+
+An existing `~/.claude/conveyor/orchestration.json` gains the mlai model catalog on its next load but keeps its own
+chains: put mlai first in the Luna panel, or with `node ~/.claude/scripts/conveyor/exec.mjs config add-entry --tier
+<tier> --at 0 --provider mlai --model <id> --effort <effort>` (journaled; `config undo` reverts it).
+
 The Linux payload includes the whole conveyor: tier dispatcher with approach review, project checks with the test
 budget, the acceptance ledger and prompt/subagent/Stop gates, `interrogate`, harness hygiene, usage accounting, the
 vendored pstack and the Luna panel.

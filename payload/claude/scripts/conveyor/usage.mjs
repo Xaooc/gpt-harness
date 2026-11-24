@@ -413,15 +413,17 @@ function aggregate(state, paths, now, since, allJobs = false) {
   }
   candidates.push(...claudeJobs.values());
   const claimed = new Set();
-  const metered = new Set([...jobs.values()].filter(hasUsage)
+  const metered = new Set([...jobs.values()].filter((values) => values.provider !== 'mlai' && hasUsage(values))
     .map((values) => values.thread || state.files[`${values.out}.log`]?.session).filter(Boolean));
   for (const values of jobs.values()) {
+    const provider = values.provider === 'mlai' ? values.provider
+      : values.provider === 'gemini' || Object.hasOwn(values, 'acp_model') ? 'gemini' : 'codex';
+    if (provider === 'mlai') continue;
     const out = values.out;
     const log = state.files[`${out}.log`];
     const at = values.finished || values.started || (log?.total !== undefined ? new Date(log.mtimeMs).toISOString() : null);
     const session = values.thread || log?.session;
     const rollout = session && codex.get(session);
-    const provider = values.provider === 'gemini' || Object.hasOwn(values, 'acp_model') ? 'gemini' : 'codex';
     let usage;
     if (hasUsage(values)) {
       usage = { ...counters(), input: numeric(values.usage_input), output: numeric(values.usage_output),

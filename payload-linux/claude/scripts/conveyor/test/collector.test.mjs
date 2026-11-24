@@ -67,7 +67,7 @@ async function fixture(work, { realOverview = false, hangUsage = false, sessionF
   try {
     await Promise.all([sessions, directory, path.dirname(lock)].map(dir => fs.mkdir(dir, { recursive: true })));
     const files = ['luna-collector.mjs', 'conveyor/lib/platform.mjs', 'conveyor/lib/sessions.mjs',
-      'conveyor/lib/codex-accounts.mjs', 'conveyor/lib/orchestration.mjs', 'lib/codex-limits-probe.mjs', 'lib/luna-runtime.mjs'];
+      'conveyor/lib/codex-accounts.mjs', 'conveyor/lib/orchestration.mjs', 'conveyor/lib/mlai.mjs', 'lib/codex-limits-probe.mjs', 'lib/luna-runtime.mjs'];
     if (process.platform === 'linux') files.push('account-lease.mjs');
     if (process.platform === 'win32') files.push('lib/process-identity.mjs');
     await fs.mkdir(env.CONVEYOR_HOME, { recursive: true });

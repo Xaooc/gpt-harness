@@ -3,6 +3,11 @@
   "tiers": {
     "complex": [
       {
+        "provider": "mlai",
+        "model": "pixis-sol",
+        "effort": "medium"
+      },
+      {
         "provider": "codex",
         "model": "gpt-6.2-sol",
         "effort": "high"
@@ -14,6 +19,11 @@
       }
     ],
     "simple": [
+      {
+        "provider": "mlai",
+        "model": "pixis",
+        "effort": "medium"
+      },
       {
         "provider": "codex",
         "model": "gpt-6-luna",
@@ -27,6 +37,11 @@
     ],
     "review": [
       {
+        "provider": "mlai",
+        "model": "pixis",
+        "effort": "medium"
+      },
+      {
         "provider": "codex",
         "model": "gpt-6-luna",
         "effort": "high"
@@ -39,6 +54,11 @@
     ],
     "scout": [
       {
+        "provider": "mlai",
+        "model": "pixis",
+        "effort": "medium"
+      },
+      {
         "provider": "codex",
         "model": "gpt-6-luna",
         "effort": "medium"
@@ -50,6 +70,11 @@
       }
     ],
     "architect": [
+      {
+        "provider": "mlai",
+        "model": "gpt-6-astra",
+        "effort": "medium"
+      },
       {
         "provider": "codex",
         "model": "gpt-6.2-astra",
@@ -68,6 +93,11 @@
     ],
     "approach": [
       {
+        "provider": "mlai",
+        "model": "pixis-opus",
+        "effort": "max"
+      },
+      {
         "provider": "codex",
         "model": "gpt-6.2-sol",
         "effort": "max"
@@ -79,6 +109,11 @@
       }
     ],
     "planner": [
+      {
+        "provider": "mlai",
+        "model": "gpt-6-astra",
+        "effort": "medium"
+      },
       {
         "provider": "codex",
         "model": "gpt-6.2-astra",
@@ -240,6 +275,71 @@
           "low",
           "medium",
           "high"
+        ]
+      }
+    ],
+    "mlai": [
+      {
+        "model": "pixis",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "pixis-sol",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "gpt-6-astra",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "ml-ai-forge",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "grok-4.7",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "mlai-coder",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "glm-5.3",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "claude-sonnet-5.5",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "claude-fable-5.2",
+        "efforts": [
+          "medium"
+        ]
+      },
+      {
+        "model": "pixis-opus",
+        "efforts": [
+          "low",
+          "medium",
+          "high",
+          "max"
         ]
       }
     ]

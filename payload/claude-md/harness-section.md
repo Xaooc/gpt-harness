@@ -54,8 +54,8 @@ node ~/.claude/scripts/conveyor/exec.mjs run --tier <complex|simple|review|scout
 
 Which provider, model and effort serve each tier and panel is the owner's choice in the **Luna panel**; the
 session-start digest prints the current setting and `node ~/.claude/scripts/conveyor/exec.mjs status` shows it live.
-Never name a provider yourself: no direct `gem.sh`/`luna.sh` calls for delegated work (a PreToolUse guard blocks
-`gem.sh`; a diagnostic may prefix `CONVEYOR_DIRECT_PROVIDER=1`).
+Never name a provider yourself: no direct `gem.sh`/`mlai.sh`/`luna.sh` calls for delegated work (a PreToolUse guard
+blocks `gem.sh` and `mlai.sh`; a diagnostic may prefix `CONVEYOR_DIRECT_PROVIDER=1`).
 
 - The chains, models, efforts, panels and pstack roles live in `~/.claude/conveyor/orchestration.json`; the user
   edits them in the **Luna panel** (model and effort per task kind, presets). Do not hand-edit it.
@@ -64,8 +64,13 @@ Never name a provider yourself: no direct `gem.sh`/`luna.sh` calls for delegated
   another provider. Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`; exit 5: no provider
   available; exit 6: the project's checks stayed red after the fix rounds; exit 7: another write job already runs in
   that repository, so start the slice in its own worktree (`wt-new.mjs`) or wait for it.
-- Never `gpt-6-astra`. `gpt-6.2-astra` is allowed (owner 2026-11-18) and serves the `architect` tier. Never `ultra` effort
-  (it delegates to sub-agents). Never the fast tier (`-t fast`) unless the user asks.
+- Never `gpt-6-astra` on Codex. `gpt-6.2-astra` is allowed there (owner 2026-11-18) and serves the `architect` tier.
+  Through ML AI Code the owner allows `gpt-6-astra` (2026-11-24): `mlai/gpt-6-astra` is the Astra seat of that provider.
+  Never `ultra` effort (it delegates to sub-agents). Never the fast tier (`-t fast`) unless the user asks.
+- **ML AI Code** (`mlai`, owner 2026-11-24) is the first entry of each chain: `pixis-sol`/`pixis-opus` in the Sol role,
+  `gpt-6-astra` as Astra, `pixis` as Luna. At most 2 mlai sessions run at once; when both are busy the dispatcher goes
+  straight to the next chain entry (one `conveyor:` line, no unavailability mark). Its sign-in lasts 7 days; the Luna
+  panel warns before it expires (sign in: `MLAI_NO_BROWSER=1 ~/.claude/tools/mlai/node_modules/.bin/mlai login`).
 - Briefs are self-contained and exhaustive: executors are literal and see only the brief (see the `luna` skill,
   "The executors are literal"). Every write brief ends with "Edit files only. Do NOT run git add / commit / push".
   Claude verifies every result (diff, gates, spot-checks) and commits itself.

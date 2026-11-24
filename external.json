@@ -323,5 +323,45 @@
     "purpose": "Install the owner's GSD Core workflows, hooks, and status line.",
     "evidence": "The installed gsd-core/VERSION pins 1.4.4, and gsd-core/workflows/update.md records the Claude global command.",
     "required": false
+  },
+  {
+    "id": "mlai-code",
+    "kind": "npm-installer",
+    "platforms": [
+      "linux"
+    ],
+    "argv": [
+      "npm",
+      "install",
+      "--prefix",
+      "{{CLAUDE_HOME}}/tools/mlai",
+      "--no-fund",
+      "--no-audit",
+      "mlai-code@0.3.23"
+    ],
+    "probe": [
+      {
+        "path": ".claude/tools/mlai/node_modules/mlai-code/package.json"
+      }
+    ],
+    "purpose": "Install the ML AI Code CLI used by the mlai executor provider.",
+    "evidence": "The mlai adapter expects the npm-installed mlai executable under .claude/tools/mlai/node_modules/.bin.",
+    "required": false
+  },
+  {
+    "id": "mlai-login",
+    "kind": "manual",
+    "platforms": [
+      "linux"
+    ],
+    "argv": [],
+    "probe": [
+      {
+        "path": ".mlai/auth.json"
+      }
+    ],
+    "purpose": "Sign in to ML AI Code once on this machine: MLAI_NO_BROWSER=1 ~/.claude/tools/mlai/node_modules/.bin/mlai login (the sign-in lasts 7 days; the Luna panel warns before it expires).",
+    "evidence": "The mlai provider reads the expiry timestamp from .mlai/auth.json to check the sign-in.",
+    "required": false
   }
 ]

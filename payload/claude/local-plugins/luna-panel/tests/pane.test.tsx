@@ -97,6 +97,10 @@ test('overview: every limit window, the active executor per tier, on every surfa
     expect(await ui.find({ type: 'Text', text: /Luna/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^Claude$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /^Codex$/ })).toBeTruthy()
+    // ML AI Code: its two sessions and when the 7-day sign-in ends.
+    expect(await ui.find({ type: 'Text', text: /^ML AI$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^1\/2$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^вход до / })).toBeTruthy()
     // Gemini is out of the owner's setup: no Gemini row in the limits.
     expect(await ui.find({ type: 'Text', text: /^Gemini$/ })).toBeFalsy()
     // The executors card starts collapsed: the complex tier stays visible as the summary, named in full.

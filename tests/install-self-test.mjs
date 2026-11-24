@@ -402,7 +402,7 @@ export function selfTest({
       manifest.settingsSha256 = sha256(fs.readFileSync(path.join(options.payload, manifest.settings)));
       manifest.claudeMdSha256 = sha256(fs.readFileSync(path.join(options.payload, manifest.claudeMd)));
       atomicWrite(path.join(options.payload, 'manifest.json'), json(manifest));
-      for (const cli of ['claude', 'npx']) {
+      for (const cli of ['claude', 'npx', 'npm']) {
         const file = path.join(bin, cli);
         atomicWrite(file, `#!/usr/bin/env node
 const assert = require('node:assert/strict');

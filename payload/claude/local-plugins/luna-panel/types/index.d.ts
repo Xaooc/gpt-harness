@@ -51,7 +51,7 @@ export type Job = {
   error: string
   queuePos: number | null
   owner: string
-  /** `codex` (Sol, Luna) or `gemini`; absent from older collectors (then Codex). */
+  /** `codex` (Sol, Luna), `mlai` (ML AI Code) or `gemini`; absent from older collectors (then Codex). */
   provider?: string
   idleS?: number | null
   activity?: { kind: 'command' | 'thinking' | 'editing' | 'writing' | 'starting' | 'queued' | 'unknown'; text: string; sinceS: number }
@@ -129,7 +129,24 @@ export type GeminiState = {
   } | null
 }
 
-export type ProviderTokens = { total: number; input?: number; output?: number; cached?: number }
+/** ML AI Code (`mlai`): sign-in, the two session slots, today's jobs. Billed in credits, not tokens. */
+export type MlaiState = {
+  installed: boolean
+  signedIn: boolean
+  /** When the device sign-in expires (7 days after `mlai login`). */
+  expiresAt: string | null
+  /** 'not installed' | 'not signed in' | 'sign-in expired' | null */
+  reason: string | null
+  slots: { limit: number; used: number; holders: { index: number; out: string; at: string }[] }
+  /** Whether a chain entry on mlai would run now, and why not. */
+  available: boolean
+  availability: string
+  mark: { reason: string; until: string } | null
+  jobsToday: number
+  creditsToday: number
+}
+
+export type ProviderTokens ={ total: number; input?: number; output?: number; cached?: number }
 
 export type Usage = {
   at?: string
@@ -143,7 +160,7 @@ export type Usage = {
   notes?: string[]
 }
 
-export type SectionName = 'ram' | 'daemon' | 'jobs' | 'sessions' | 'codexLimits' | 'orchestration' | 'usage' | 'gemini' | 'cli' | 'catalog'
+export type SectionName = 'ram' | 'daemon' | 'jobs' | 'sessions' | 'codexLimits' | 'orchestration' | 'usage' | 'gemini' | 'mlai' | 'cli' | 'catalog'
 
 export type SectionStatus = {
   attemptAt: string | null
@@ -184,6 +201,8 @@ export type Snapshot = {
   orchestration?: Orchestration | null
   switches?: Switch[]
   gemini?: GeminiState | null
+  /** Absent from collectors older than the ML AI Code release. */
+  mlai?: MlaiState | null
   usage?: Usage | null
 }
 
@@ -227,7 +246,7 @@ export type Collapsed = Record<string, boolean>
 export type View = {
   tab: 'overview' | 'usage' | 'settings' | 'updates'
   editTier: string | null
-  filter: 'all' | 'codex' | 'gemini' | 'claude'
+  filter: 'all' | 'mlai' | 'codex' | 'gemini' | 'claude'
   confirm: { key: string; until: number } | null
   busy: string | null
   note: { text: string; level: 'success' | 'warning' | 'error'; at: number } | null

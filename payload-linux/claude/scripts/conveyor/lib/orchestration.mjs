@@ -6,8 +6,9 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { lockOwnerAlive, lockOwnerStart } from './platform.mjs';
 import { accountPaths, codexAccounts, loggedIn, selectAccount, stamp, validateAccounts } from './codex-accounts.mjs';
+import { mlaiLogin, slotState } from './mlai.mjs';
 
-const providers = ['codex', 'gemini', 'claude'];
+const providers = ['codex', 'gemini', 'claude', 'mlai'];
 const reasons = ['quota', 'region', 'auth', 'start'];
 const defaultFile = new URL('../../../conveyor/orchestration.default.json', import.meta.url);
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -33,6 +34,9 @@ export function wrapperPath(provider) {
   if (provider === 'gemini') {
     return path.resolve(process.env.CONVEYOR_GEM_SH || path.join(homedir(), '.claude/scripts/gem.sh'));
   }
+  if (provider === 'mlai') {
+    return path.resolve(process.env.CONVEYOR_MLAI_SH || path.join(homedir(), '.claude/scripts/mlai.sh'));
+  }
   throw new Error(`No shell wrapper for ${provider}`);
 }
 
@@ -54,9 +58,9 @@ function text(value, label) {
   }
 }
 
-function modelName(value, label) {
+function modelName(value, label, provider) {
   text(value, label);
-  if (/^gpt-6-astra$/i.test(value)) throw new Error(`${label}: gpt-6-astra is forbidden by user rule`);
+  if (provider !== 'mlai' && /^gpt-6-astra$/i.test(value)) throw new Error(`${label}: gpt-6-astra is forbidden by user rule`);
 }
 
 function nonemptyArray(value, label) {
@@ -81,7 +85,7 @@ function validateTiers(tiers, catalog, label, partial = false, knownTiers = tier
       const where = `${label}.${tier}.${index}`;
       keys(entry, ['provider', 'model', 'effort'], where);
       if (!providers.includes(entry.provider)) throw new Error(`${where}: unknown provider ${entry.provider}`);
-      modelName(entry.model, `${where}.model`);
+      modelName(entry.model, `${where}.model`, entry.provider);
       const model = catalog[entry.provider].find((candidate) => candidate.model === entry.model);
       if (!model) throw new Error(`${where}: model ${entry.provider}/${entry.model} is not in catalog`);
       if (!model.efforts.includes(entry.effort)) {
@@ -105,7 +109,7 @@ export function validateConfig(config) {
     const seen = new Set();
     for (const entry of config.catalog[provider]) {
       keys(entry, ['model', 'efforts'], `catalog.${provider} entry`);
-      modelName(entry.model, `catalog.${provider}.model`);
+      modelName(entry.model, `catalog.${provider}.model`, provider);
       if (seen.has(entry.model)) throw new Error(`catalog.${provider}: duplicate model ${entry.model}`);
       seen.add(entry.model);
       nonemptyArray(entry.efforts, `catalog.${provider}.${entry.model}.efforts`);
@@ -168,9 +172,17 @@ export async function loadConfig() {
   return (await loadConfigWithSource()).config;
 }
 
+export async function upgradeConfig(config) {
+  if (object(config?.catalog) && !own(config.catalog, 'mlai')) {
+    const defaults = JSON.parse(await fs.readFile(defaultFile, 'utf8'));
+    config.catalog.mlai = defaults.catalog.mlai;
+  }
+  return config;
+}
+
 export async function loadConfigWithSource() {
   const userConfig = await readJson(paths().config, undefined);
-  if (userConfig !== undefined) return { config: validateConfig(userConfig), source: 'user' };
+  if (userConfig !== undefined) return { config: validateConfig(await upgradeConfig(userConfig)), source: 'user' };
   const config = JSON.parse(await fs.readFile(defaultFile, 'utf8'));
   return { config: validateConfig(config), source: 'default' };
 }
@@ -438,9 +450,10 @@ async function claudeUsage(now) {
 export async function providerState(config, { now = Date.now(), persist = true, excludeCodexAccounts, codexDirectories } = {}) {
   config ??= await loadConfig();
   const accounts = codexAccounts(config);
-  const [readings, claude] = await Promise.all([
+  const [readings, claude, login, slots] = await Promise.all([
     Promise.all(accounts.map(async ({ id }) => [id, { ...await codexUsage(id, now, codexDirectories), loggedIn: loggedIn(id) }])),
-    claudeUsage(now).catch(() => ({ known: false, nearLimit: false, windows: [] }))
+    claudeUsage(now).catch(() => ({ known: false, nearLimit: false, windows: [] })),
+    mlaiLogin(now), slotState()
   ]);
   const usage = Object.fromEntries(readings);
   const resolve = async () => {
@@ -463,7 +476,7 @@ export async function providerState(config, { now = Date.now(), persist = true, 
   };
   const state = await (persist ? withLock(paths().providers, resolve) : resolve());
   const wrappers = Object.create(null);
-  for (const provider of ['codex', 'gemini']) {
+  for (const provider of ['codex', 'gemini', 'mlai']) {
     try {
       const file = wrapperPath(provider);
       await fs.access(file, constants.R_OK);
@@ -473,7 +486,7 @@ export async function providerState(config, { now = Date.now(), persist = true, 
   }
   const codex = { ...usage.main };
   delete codex.loggedIn;
-  return { ...state, usage: { codex, codexAccounts: usage, claude }, wrappers, now };
+  return { ...state, usage: { codex, codexAccounts: usage, claude }, mlai: { ...login, slots }, wrappers, now };
 }
 
 function resolveEntries(entries, state, now) {
@@ -490,6 +503,12 @@ function resolveEntries(entries, state, now) {
     } else if (state.wrappers[entry.provider]) {
       available = false;
       reason = state.wrappers[entry.provider];
+    } else if (entry.provider === 'mlai' && state.mlai) {
+      const { installed, signedIn, reason: loginReason, slots } = state.mlai;
+      if (!installed) reason = 'mlai not installed';
+      else if (!signedIn) reason = loginReason === 'sign-in expired' ? 'mlai sign-in expired' : 'mlai not signed in';
+      else if (slots.used >= slots.limit) reason = `mlai sessions busy (${slots.used}/${slots.limit})`;
+      available = reason === 'available';
     } else if (entry.provider === 'codex') reason = state.threshold.reason;
     return { ...entry, available, reason, ...(entry.provider === 'codex' ? { active: state.threshold.active } : {}) };
   });

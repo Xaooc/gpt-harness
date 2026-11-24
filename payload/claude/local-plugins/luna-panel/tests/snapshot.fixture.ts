@@ -416,6 +416,11 @@ const snapshot = {
   },
   switches: [],
   gemini: {"available": true, "reason": "available", "tokensToday": 6914214, "jobsToday": 6, "mcp": null},
+  mlai: {
+    installed: true, signedIn: true, expiresAt: '2026-11-21T10:00:00.000Z', reason: null,
+    slots: { limit: 2, used: 1, holders: [{ index: 0, out: '/tmp/a.out.md', at }] },
+    available: true, availability: 'available', mark: null, jobsToday: 2, creditsToday: 0.11,
+  },
   usage: null,
 } satisfies Snapshot
 
