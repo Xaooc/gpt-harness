@@ -194,7 +194,11 @@ function preamble(options, recovering) {
 }
 
 function agentEnvironment(home) {
-  const env = { ...process.env, MLAI_NO_UPDATE_CHECK: '1', MLAI_AUTO_UPDATE: '0', MLAI_NO_BROWSER: '1', MLAI_NO_TUI: '1' };
+  // MLAI_ENGINE_UPDATES=0: the CLI otherwise downloads a newer coding engine at the start of some runs, and when that
+  // download drops the run fails as "Cannot reach the ML AI Code server" (2026-11-24: staging dirs left at each failure).
+  // The engine then changes only with the CLI version the installer pins.
+  const env = { ...process.env, MLAI_NO_UPDATE_CHECK: '1', MLAI_AUTO_UPDATE: '0', MLAI_ENGINE_UPDATES: '0',
+    MLAI_NO_BROWSER: '1', MLAI_NO_TUI: '1' };
   if (env.HTTPS_PROXY !== undefined || env.https_proxy !== undefined) return env;
   // Same lookup as the other wrappers (INSTALL.md): an explicit file, the harness default, then the legacy file.
   const files = env.LUNA_PROXY_ENV_FILE ? [env.LUNA_PROXY_ENV_FILE]

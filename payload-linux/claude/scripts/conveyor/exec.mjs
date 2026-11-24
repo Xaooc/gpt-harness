@@ -746,7 +746,7 @@ async function discoverMlaiModels() {
   const cwd = await fs.mkdtemp(path.join(tmpdir(), 'conveyor-mlai-models-'));
   try {
     const result = await runSupervised([bin, '-p', 'x', '-m', '__list_models__', '--output-format', 'json', '--no-session-persistence'], {
-      deadlineMs: 30_000, cwd, env: { ...process.env, MLAI_NO_UPDATE_CHECK: '1', MLAI_AUTO_UPDATE: '0', MLAI_NO_TUI: '1' }
+      deadlineMs: 30_000, cwd, env: { ...process.env, MLAI_NO_UPDATE_CHECK: '1', MLAI_AUTO_UPDATE: '0', MLAI_ENGINE_UPDATES: '0', MLAI_NO_TUI: '1' }
     });
     if (result.code === 2 && !result.timedOut && !result.truncated) {
       let error;
