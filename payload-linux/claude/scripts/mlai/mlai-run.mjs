@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
   accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
@@ -455,8 +455,20 @@ class Job {
       .map((name) => path.join(home, name))).map((directory) => {
       try { return realpathSync(directory); } catch { return directory; }
     });
+    // Claude sessions without a project folder work in their own folder under ~/.config/Claude: those folders (and the
+    // sessions' notes) are not secrets, unlike the rest of ~/.config.
+    // Harness code the briefs point at (skills, scripts, plugin code) is readable, never a job folder; ~/.claude itself
+    // holds credentials.
+    const sessionRoots = [...homes].flatMap((home) => ['scratch-workspaces', 'side-session-notes']
+      .map((name) => path.join(home, '.config', 'Claude', name)));
+    const codeRoots = [...homes].flatMap((home) => ['skills', 'scripts', 'plugins/cache']
+      .map((name) => path.join(home, '.claude', name)));
+    const inside = (target, root) => target === root || target.startsWith(`${root}/`);
+    const within = (target, roots) => roots.some((root) => inside(target, root));
+    const open = (target) => !privateDirs.some((dir) => inside(target, dir)) || within(target, sessionRoots);
+    this.readable = (target) => open(target) || within(target, codeRoots);
     if (options.dir === '/' || [...homes].some((home) => options.dir === home || home.startsWith(`${options.dir}/`)) ||
-        privateDirs.some((dir) => options.dir === dir || options.dir.startsWith(`${dir}/`))) {
+        !open(options.dir)) {
       // Exit 3 so the dispatcher runs this job on the next chain entry (Codex) instead of failing it: sessions without
       // a project folder work under ~/.config, which mlai's own sandbox must not get.
       throw new Failure(`mlai: refuses this project directory: ${options.dir}`, 3, 'unavailable', 'start');
@@ -517,6 +529,8 @@ class Job {
     // An own session id (not --no-session-persistence) so a run stopped by the step limit can be continued; the
     // session is removed when the wrapper ends.
     args.push('--max-steps', String(this.maxSteps), '--session-id', this.sessionId, '--output-format', 'stream-json');
+    this.readDirs ??= this.readAccess(brief);
+    for (const directory of this.readDirs) args.push('--add-dir', directory);
     let prompt = rules + brief;
     if (Array.from(prompt).length > PROMPT_LIMIT && file) {
       prompt = rules + `The full task brief is in the file ${file}. Read it completely first and follow it exactly.`;
@@ -527,6 +541,32 @@ class Job {
     return { args, prompt };
   }
 
+  /** Folders outside the job directory the agent may read without an approval nobody can give in a headless run:
+   *  the worktree's git directory and the existing absolute paths the brief names, never the private home folders. */
+  readAccess(brief) {
+    const dir = this.options.dir;
+    const found = new Set();
+    try {
+      const common = execFileSync('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim();
+      if (common) found.add(common);
+    } catch {}
+    for (const match of brief.matchAll(/(?:^|[\s`'"(<\[=:])(\/[^\s`'")<>\],;]+)/g)) {
+      let candidate = match[1].replace(/[.:]+$/, '');
+      try {
+        const stat = statSync(candidate);
+        candidate = realpathSync(stat.isDirectory() ? candidate : path.dirname(candidate));
+      } catch { continue; }
+      found.add(candidate);
+    }
+    const dirs = [...found].filter((target) => target !== '/' && target !== dir && !target.startsWith(`${dir}/`) &&
+      !dir.startsWith(`${target}/`) && target !== realpathSync(this.home) && this.readable(target)).sort();
+    // Keep the outermost of nested folders, at most 12.
+    const kept = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`))).slice(0, 12);
+    if (kept.length) this.log(`read access: ${kept.join(' ')}`);
+    return kept;
+  }
+
   /** The same session, resumed after it used all its steps for one turn (CLI exit 3, subtype error_max_turns). */
   continuation() {
     const { write, model, effort } = this.options;
@@ -534,6 +574,7 @@ class Job {
     if (model === 'pixis-opus') args.push('--effort', effort === 'xhigh' ? 'max' : effort);
     args.push('--max-steps', String(this.maxSteps), '--output-format', 'stream-json');
     if (this.addDir) args.push('--add-dir', this.addDir);
+    for (const directory of this.readDirs ?? []) args.push('--add-dir', directory);
     const prompt = 'continue: you stopped at the step limit. Pick up exactly where you left off and finish the whole task.' +
       (write ? ' End with the four headings ## Changes, ## Verification, ## Deviations, ## Not done covering the whole ' +
         'task, not only this part.' : '');

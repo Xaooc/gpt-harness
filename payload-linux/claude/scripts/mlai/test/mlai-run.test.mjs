@@ -23,7 +23,9 @@ async function fixture({ scenario }, verify) {
   try {
     for (const directory of [dir, home, mlaiHome, slot, state]) mkdirSync(directory, { recursive: true });
     execFileSync('git', ['init', '--quiet', dir], { env: { ...process.env, HOME: home }, timeout: 300_000 });
-    writeFileSync(brief, 'Update greeting.txt and summarize the changes.\n');
+    mkdirSync(path.join(root, 'shared'), { recursive: true });
+    writeFileSync(path.join(root, 'shared', 'notes.txt'), 'context\n');
+    writeFileSync(brief, `Update greeting.txt and summarize the changes. Context: ${path.join(root, 'shared', 'notes.txt')}.\n`);
     writeFileSync(path.join(mlaiHome, 'auth.json'), JSON.stringify({
       expires: Date.now() + 86_400_000
     }));
@@ -57,6 +59,8 @@ test('a started write attempt retries after a connection interruption', { timeou
     assert.equal(status.attempts, '2');
     assert.equal(status.reached_running, '1');
     assert.equal(status.mlai_session, 'fake-session-2');
+    const args = JSON.parse(readFileSync(path.join(state, 'args-1.json'), 'utf8'));
+    assert.ok(args.some((arg, i) => args[i - 1] === '--add-dir' && arg.endsWith('/shared')), 'brief path is readable');
     assert.equal(status.credits, '0.375');
     assert.equal(status.changed_files, '1');
     assert.equal(output, '## Changes\nUpdated greeting.txt.\n\n## Verification\nChecks passed.\n\n' +

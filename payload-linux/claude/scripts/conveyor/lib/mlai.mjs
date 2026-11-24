@@ -131,7 +131,7 @@ async function reclaimSlot(dir, { stat }) {
   else await fs.rm(stale, { recursive: true, force: true });
 }
 
-async function claimSlot({ slots, limit }, out) {
+async function claimSlot({ slots, limit }, out, mode) {
   // Serialize reclamation and publication so a contender cannot rename a successor's slot.
   return withLock(path.join(slots, '.acquire'), async () => {
     for (let index = 0; index < limit; index++) {
@@ -149,7 +149,7 @@ async function claimSlot({ slots, limit }, out) {
         const file = path.join(dir, 'owner.json');
         const owner = {
           pid: process.pid, pid_start: readProcessStat(process.pid)?.started ?? null,
-          token: randomUUID(), out, at: new Date().toISOString()
+          token: randomUUID(), out, mode: mode ?? null, at: new Date().toISOString()
         };
         try { writeFileSync(file, `${JSON.stringify(owner)}\n`, { flag: 'wx', mode: 0o600 }); }
         catch (error) { await fs.rm(dir, { recursive: true, force: true }); throw error; }
@@ -182,21 +182,54 @@ function markActive(mark, now) {
   return !Number.isFinite(until) || now < until;
 }
 
-export async function acquireSlot({ out }, env = process.env, { accounts, marks, now } = {}) {
+async function writing(paths) {
+  for (let index = 0; index < paths.limit; index++) {
+    const state = await inspectSlot(path.join(paths.slots, String(index)));
+    if (state && !state.stale && state.owner?.mode === 'write') return true;
+  }
+  return false;
+}
+
+/** The first usable account with a free slot, in configured order. A write job first looks for an account that runs
+ *  no other write (owner's request 2026-11-24: spread writes over accounts), then takes any free slot. */
+export async function acquireSlot({ out, mode }, env = process.env, { accounts, marks, now } = {}) {
   const list = accounts?.length ? accounts : MLAI_DEFAULT_ACCOUNTS;
   now ??= Date.now();
+  const usable = [];
   for (const account of list) {
     const login = await mlaiLogin(now, env, account);
     if (!login.installed || !login.signedIn) continue;
     const mark = marks && Object.hasOwn(marks, account.id) ? marks[account.id] : null;
     if (markActive(mark, now)) continue;
-    const paths = mlaiPaths(env, account);
-    const claimed = await claimSlot(paths, out);
-    if (!claimed) continue;
-    return {
-      account: account.id, label: account.label, index: claimed.index, dir: claimed.dir,
-      home: paths.home, proxy: account.proxy ?? null, release: claimed.release
-    };
+    usable.push({ account, paths: mlaiPaths(env, account) });
+  }
+  const passes = mode === 'write' ? [true, false] : [false];
+  for (const spread of passes) {
+    for (const { account, paths } of usable) {
+      if (spread && await writing(paths)) continue;
+      const claimed = await claimSlot(paths, out, mode);
+      if (!claimed) continue;
+      return {
+        account: account.id, label: account.label, index: claimed.index, dir: claimed.dir,
+        home: paths.home, proxy: account.proxy ?? null, release: claimed.release
+      };
+    }
   }
   return null;
+}
+
+/** Slot usage over the accounts a job could use now (signed in, not marked); what "sessions busy" reports. */
+export async function usableSlotState(env = process.env, { accounts, marks, now } = {}) {
+  const list = accounts?.length ? accounts : MLAI_DEFAULT_ACCOUNTS;
+  now ??= Date.now();
+  let used = 0, limit = 0;
+  for (const account of list) {
+    const login = await mlaiLogin(now, env, account);
+    const mark = marks && Object.hasOwn(marks, account.id) ? marks[account.id] : null;
+    if (!login.installed || !login.signedIn || markActive(mark, now)) continue;
+    const state = await slotState(env, account);
+    used += state.used;
+    limit += state.limit;
+  }
+  return { used, limit };
 }
