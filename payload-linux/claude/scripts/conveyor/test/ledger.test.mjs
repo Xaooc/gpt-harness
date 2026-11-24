@@ -808,3 +808,54 @@ test('an external artifact compares only with owned writes, including non-Git ed
   await f.command(['done', 'L1']);
   assert.equal(await check(), 6);
 });
+
+function replayFixture(t, records, stops, transcript = []) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'conveyor-replay-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const ledger = path.join(root, 'ledger.jsonl'), log = path.join(root, 'transcript.jsonl');
+  const before = '2026-11-20T12:00:00.000Z', at = '2026-11-20T12:01:00.000Z';
+  const hook = 'node "/example/hooks/conveyor-stop-gate.mjs"';
+  const write = (file, rows) => fs.writeFileSync(file, rows.map((row) => JSON.stringify(row) + '\n').join(''));
+  write(ledger, records.map((record) => ({ at: before, ...record })));
+  const rows = transcript.slice();
+  for (const [index, reason] of stops.entries()) {
+    const toolUseID = `stop-${index + 1}`;
+    const summary = { type: 'system', subtype: 'stop_hook_summary', toolUseID, hookInfos: [{ command: hook }] };
+    const attachment = { type: 'attachment', attachment: { type: 'hook_blocking_error', hookEvent: 'Stop', toolUseID,
+      blockingError: { command: hook, blockingError: reason } } };
+    rows.push(summary, attachment, ...(index === 0 ? [structuredClone(attachment)] : []));
+  }
+  write(log, rows.map((row) => ({ sessionId: 'replay-fixture', timestamp: at, ...row })));
+  const replay = fileURLToPath(new URL('../../../../../tools/replay-acceptance.mjs', import.meta.url));
+  return execFileSync(process.execPath, [replay, '--ledger', ledger, '--transcript', log], { encoding: 'utf8', timeout });
+}
+
+test('acceptance replay counts a Stop summary and duplicate conveyor attachments once', { timeout }, (t) => {
+  const report = replayFixture(t, [], ['1. start the ledger']);
+  assert.match(report, /Recovered 1 Stop checkpoints across 1 sessions, including 1 conveyor summaries/);
+  assert.match(report, /\| replay-fixture \| 1 \| 1 \| 0 \/ 0 \|/);
+});
+
+test('acceptance replay reports an old-proven artifact reopened by an attributed write', { timeout }, (t) => {
+  const artifact = '/example/proof.html';
+  const report = replayFixture(t, [
+    { type: 'start', id: 'T1', offset: 0 },
+    { type: 'item', id: 'L1', paths: [artifact], text: 'Produce proof' },
+    { type: 'evidence', item: 'L1', kind: 'artifact', value: artifact, mtime: Date.parse('2026-11-20T12:00:00.000Z') },
+    { type: 'done', item: 'L1' }
+  ], ['6. run ledger crosscheck'], [
+    { type: 'assistant', cwd: '/example', message: { content: [
+      { type: 'tool_use', id: 'write-proof', name: 'Write', input: { file_path: artifact, content: 'updated' } }
+    ] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'write-proof', content: 'Success' }] } }
+  ]);
+  assert.match(report, /\| T1\/L1 \| 2026-11-20T12:01:00\.000Z \(stop-1\) \| artifact \| artifact registration predates/);
+});
+
+test('acceptance replay allows the second and third unchanged blocks', { timeout }, (t) => {
+  const report = replayFixture(t, [
+    { type: 'start', id: 'T1', offset: 0 },
+    { type: 'item', id: 'L1', text: 'Finish the outcome' }
+  ], Array(3).fill('3. finish or obtain a user waiver for open items: L1'));
+  assert.match(report, /\| replay-fixture \| 3 \| 3 \| 0 \/ 0 \| 0 \/ 0 \/ 0 \| 1 \| 0 \| 2 \| 0 \/ 2 \| 0 \|/);
+});
