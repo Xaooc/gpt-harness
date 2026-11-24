@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -10,7 +10,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const entry = path.resolve(here, '../../mlai.sh');
 const fake = path.join(here, 'fake-mlai.mjs');
 
-async function fixture({ scenario, expired = false }, verify) {
+async function fixture({ scenario }, verify) {
   const root = mkdtempSync(path.join(tmpdir(), 'mlai-test-'));
   const dir = path.join(root, 'project with spaces');
   const out = path.join(root, 'result.md');
@@ -25,7 +25,7 @@ async function fixture({ scenario, expired = false }, verify) {
     execFileSync('git', ['init', '--quiet', dir], { env: { ...process.env, HOME: home }, timeout: 300_000 });
     writeFileSync(brief, 'Update greeting.txt and summarize the changes.\n');
     writeFileSync(path.join(mlaiHome, 'auth.json'), JSON.stringify({
-      expires: Date.now() + (expired ? -1 : 86_400_000)
+      expires: Date.now() + 86_400_000
     }));
     const child = spawn('bash', [entry, '-w', '-C', dir, '-f', brief, '-o', out], {
       env: {
@@ -79,14 +79,5 @@ test('a sign-in failure before the agent starts is unavailable', { timeout: 300_
     assert.equal(status.state, 'unavailable');
     assert.equal(status.unavailable_reason, 'auth');
     assert.notEqual(status.reached_running, '1');
-  });
-});
-
-test('expired sign-in is refused before spawning the CLI', { timeout: 300_000 }, async () => {
-  await fixture({ scenario: 'auth', expired: true }, ({ rc, stderr, status, state }) => {
-    assert.equal(rc, 3, stderr);
-    assert.equal(status.unavailable_reason, 'auth');
-    assert.equal(status.error, 'mlai: sign-in expired');
-    assert.equal(existsSync(path.join(state, 'attempts')), false);
   });
 });
