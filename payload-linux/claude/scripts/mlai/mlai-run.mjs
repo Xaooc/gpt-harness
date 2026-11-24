@@ -596,7 +596,7 @@ class Job {
       let outcome;
       try { outcome = await attempt.run([binary, ...args], prompt, env); }
       finally {
-        this.values.credits += attempt.credits;
+        this.values.credits = Math.round((this.values.credits + attempt.credits) * 1e6) / 1e6;
         this.attempt = undefined;
       }
       this.signal.throwIfAborted();
