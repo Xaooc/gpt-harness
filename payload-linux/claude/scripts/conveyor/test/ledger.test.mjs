@@ -7,7 +7,6 @@ import { promisify } from 'node:util';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readProcess } from '../../lib/luna-runtime.mjs';
-import { sanitizeQuote } from '../../learning/common.mjs';
 import { CLAUSE_RULES, extractClauses } from '../lib/ledger.mjs';
 import { foldLedger } from '../lib/request-state.mjs';
 import { uiFile } from '../lib/profile.mjs';
@@ -68,6 +67,7 @@ printf '%s' "$FAKE_RESPONSE" > "$out"
     'pump();'
   ].join('\n'));
   fs.writeFileSync(path.join(bin, 'git'), `#!/bin/bash
+if [ "$1" = --no-optional-locks ]; then shift; fi
 repo=$2
 shift 2
 [ "$repo" = ${shellQuote(repo)} ] || exit 128
@@ -75,8 +75,10 @@ case "$1" in
   rev-parse)
     case "$2" in --show-toplevel) printf '%s' "$repo";; HEAD) printf 'task-base';; esac ;;
   ls-files)
-    eval "set -- $FAKE_UNTRACKED_ARGS"
-    if [ "$#" -gt 0 ]; then printf '%s\\0' "$@"; fi ;;
+    if [ "$2" != --stage ]; then
+      eval "set -- $FAKE_UNTRACKED_ARGS"
+      if [ "$#" -gt 0 ]; then printf '%s\\0' "$@"; fi
+    fi ;;
   diff)
     if [[ " $* " == *' --stat '* ]]; then printf ' worker.mjs | %s bytes\\n' "$(wc -c < "$FAKE_DIFF_FILE")"
     elif [[ " $* " == *' --name-only '* ]]; then :
@@ -402,13 +404,15 @@ async function crosscheckFixture(t) {
   const diff = Array.from({ length: 302 }, (_, index) => `+diff line ${index + 1}`).join('\n');
   fs.writeFileSync(f.env.FAKE_DIFF_FILE, diff);
   await f.command(['start']);
+  fs.writeFileSync(path.join(f.repo, 'worker.mjs'), diff);
+  f.toolResult('Edit', { file_path: 'worker.mjs' });
   await f.command(['add', 'Ledger and evidence', '--from', 'M1.c1,M1.c2']);
   await f.command(['evidence', 'L1', '--note', 'Reviewed']);
   await f.command(['done', 'L1']);
   return { f, original };
 }
 
-test('stop check 8 reads live owned jobs without a collector snapshot or a job lookup process', { timeout }, async (t) => {
+test('Stop reads live owned jobs without a collector snapshot or a job lookup process', { timeout }, async (t) => {
   const { f } = await crosscheckFixture(t);
   const check = path.join(f.root, 'check.sh');
   fs.writeFileSync(check, '#!/bin/sh\nprintf \'{"ok":true}\\n\'\n', { mode: 0o755 });
@@ -442,8 +446,8 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
     return originalSpawn.call(this, options);
   });
   const input = JSON.stringify({ session_id: f.env.CLAUDE_CODE_SESSION_ID, transcript_path: f.transcript, cwd: f.repo });
-  const blocked = await f.run(stop, [], {}, input);
-  assert.deepEqual(JSON.parse(blocked.stdout), { decision: 'block', reason: sanitizeQuote(`8. finish executor jobs: ${owned}`) });
+  const progress = await f.run(stop, [], {}, input);
+  assert.deepEqual(JSON.parse(progress.stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
 
   job('owned', f.env.CLAUDE_CODE_SESSION_ID, 'done');
   assert.equal((await f.run(stop, [], {}, input)).stdout, '');
@@ -451,7 +455,7 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
   assert.deepEqual(spawned.filter((file) => file !== 'git' && file !== check), []);
 
   const identity = new URL('../../lib/process-identity.mjs', import.meta.url);
-  await t.test('a live Windows wrapper in the home index blocks completion', {
+  await t.test('a live Windows wrapper in the home index allows a pause', {
     skip: !fs.existsSync(identity) && 'Windows process identity module is absent from this installation'
   }, () => {
     const homeIndex = path.join(f.env.HOME, '.claude', 'luna-run', 'active');
@@ -468,7 +472,7 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
         FAKE_UNTRACKED_ARGS: shellList(JSON.parse(f.env.FAKE_UNTRACKED)) },
       input, encoding: 'utf8', timeout
     });
-    assert.equal(stdout.trim(), JSON.stringify({ decision: 'block', reason: sanitizeQuote(`8. finish executor jobs: ${owned}`) }));
+    assert.deepEqual(JSON.parse(stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
     fs.rmSync(path.join(homeIndex, 'owned'));
   });
 
@@ -483,7 +487,7 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
     assert.equal(result.stdout, '');
   });
 
-  await t.test('a known running job survives an unreadable index that blocks completion', async () => {
+  await t.test('a known running job survives an unreadable index', async () => {
     const pointer = path.join(active, 'owned');
     fs.writeFileSync(pointer, `${owned}\n`);
     const status = `${owned}.status`;
@@ -493,98 +497,11 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
     fs.utimesSync(status, old, old);
     fs.writeFileSync(path.join(run, 'gem-active'), '');
     const result = await f.run(stop, [], {}, input);
-    assert.match(result.stdout, /"decision":"block","reason":"8\. cannot verify executor jobs:.*gem-active/);
+    assert.deepEqual(JSON.parse(result.stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
     f.append({ type: 'assistant', message: { content: 'The executor is still working.' } });
     const progress = await f.run(stop, [], {}, input);
     assert.deepEqual(JSON.parse(progress.stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
   });
-});
-
-test('stop check 10 audits completed reviews before complex writes and has its own calibration', { timeout }, async (t) => {
-  const { f } = await crosscheckFixture(t);
-  const configFile = path.join(f.home, 'orchestration.json');
-  const configFixture = new URL('./fixtures/orchestration.json', import.meta.url);
-  fs.copyFileSync(configFixture, configFile);
-  fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
-  f.toolResult('Write', { file_path: 'worker.mjs' });
-  f.env.FAKE_UNTRACKED = '["worker.mjs"]';
-  f.env.CONVEYOR_CHECK_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"ok\":true}'"]);
-  await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
-  await f.command(['crosscheck']);
-  f.append({ type: 'assistant', message: { content: await f.command(['checklist']) } });
-
-  const runs = path.join(f.home, 'sessions', 'ledger-test.jsonl');
-  const baseline = fs.readFileSync(runs, 'utf8');
-  const taskAt = Date.parse((await f.state()).task.at);
-  const record = (offset, fields) => JSON.stringify({
-    session: 'ledger-test', at: new Date(taskAt + offset).toISOString(), ...fields
-  }) + '\n';
-  const history = (...records) => fs.writeFileSync(runs, baseline + records.join(''));
-  const status = async (rc = 0) => JSON.parse(await f.command(['status', '--json'], {}, rc));
-  const work = { tier: 'complex', out: path.join(f.root, 'implementation.md'), mode: 'block' };
-  const review = { event: 'end', tier: 'approach', mode: 'read', out: path.join(f.root, 'review.md'), code: 0 };
-  const write = record(2, work);
-  history(write);
-  let result = await status(1);
-  assert.equal(result.check, 10);
-  assert.match(result.reason, /^10\. non-trivial change started without a completed approach review:/);
-
-  history(record(1, review), write);
-  assert.equal((await status()).ok, true);
-  history(record(1, { ...review, code: 5 }), write);
-  assert.equal((await status(1)).check, 10);
-  history(write, record(3, review));
-  assert.equal((await status(1)).check, 10);
-  history(record(2, { ...work, reviewSkip: 'rename only' }));
-  assert.equal((await status()).ok, true);
-  // A plan from the planner tier (Astra) needs a review by a different model (tier approach) after it.
-  const plan = record(0, { ...review, tier: 'planner', out: path.join(f.root, 'plan.md') });
-  history(plan, record(1, { ...review, tier: 'architect', out: path.join(f.root, 'self-review.md') }), write);
-  assert.match((await status(1)).reason, /^10\. the plan from tier planner \(Astra\) was not reviewed by a different model/);
-  history(plan, record(1, review), write);
-  assert.equal((await status()).ok, true);
-  // After a fallback the plan and the review can come from the same model; that is not an independent review.
-  const solPlan = record(0, { ...review, tier: 'planner', model: 'gpt-6.2-sol', out: path.join(f.root, 'plan.md') });
-  history(solPlan, record(1, { ...review, model: 'gpt-6.2-sol' }), write);
-  assert.equal((await status(1)).check, 10);
-
-  const failure = record(3, { ...work, event: 'end', code: 6, gate: { status: 'fail', rounds: 2 } });
-  const architect = record(4, { ...review, tier: 'architect', panel: 'architect', out: path.join(f.root, 'architect.md') });
-  const retry = record(5, { ...work, event: 'start', out: path.join(f.root, 'retry.md') });
-  history(record(1, review), write, failure, architect, retry);
-  assert.equal((await status()).ok, true);
-  history(record(1, review), write, failure, retry);
-  result = await status(1);
-  assert.equal(result.check, 10);
-  assert.match(result.reason, /^10\. work restarted after a gate failure without a completed architect review:/);
-
-  const config = JSON.parse(fs.readFileSync(configFixture, 'utf8'));
-  delete config.tiers.approach;
-  delete config.tiers.architect;
-  config.roles = Object.fromEntries(Object.entries(config.roles)
-    .filter(([, target]) => target !== 'tier:approach' && target !== 'tier:architect'));
-  fs.writeFileSync(configFile, JSON.stringify(config));
-  assert.equal((await status()).ok, true);
-  fs.copyFileSync(configFixture, configFile);
-
-  const old = new Date(Date.now() - 8 * 86400_000);
-  const age = (file) => {
-    fs.writeFileSync(file, old.toISOString() + '\n');
-    fs.utimesSync(file, old, old);
-  };
-  age(path.join(f.home, 'gate-calibration-start'));
-  const stopGate = async (mode) => {
-    const output = await f.run(stop, [], { CONVEYOR_GATE_MODE: mode }, JSON.stringify({
-      session_id: 'ledger-test', transcript_path: f.transcript, cwd: f.repo
-    }));
-    assert.equal(output.status, 0, output.stderr);
-    return JSON.parse(output.stdout);
-  };
-  const calibration = path.join(f.home, 'gate-calibration-start-10');
-  assert.ok(Date.parse(fs.readFileSync(calibration, 'utf8').trim()) >= taskAt);
-  assert.deepEqual(await stopGate(''), { systemMessage: `conveyor gate: ${result.reason}` });
-  age(calibration);
-  assert.deepEqual(await stopGate(''), { decision: 'block', reason: result.reason });
 });
 
 test('crosscheck uses a fake command, stores a state hash, and removes its temporary files', { timeout }, async (t) => {
@@ -602,7 +519,7 @@ test('crosscheck uses a fake command, stores a state hash, and removes its tempo
   assert.deepEqual(args.slice(0, 7), ['run', '--tier', 'scout', '-r', '-C', f.repo, '-f']);
   assert.equal(fs.existsSync(path.dirname(args[7])), false);
   assert.equal(JSON.parse(await f.command(['crosscheck'])).hash, first.hash);
-  fs.appendFileSync(f.env.FAKE_DIFF_FILE, '\n+Always detect changes beyond line 300');
+  fs.appendFileSync(path.join(f.repo, 'worker.mjs'), '\n+Always detect changes beyond line 300');
   assert.notEqual(JSON.parse(await f.command(['crosscheck'])).hash, first.hash);
   f.user('Please preserve all requirements verbatim.');
   const changed = JSON.parse(await f.command(['crosscheck']));
@@ -643,6 +560,7 @@ test('crosscheck defaults to the scout dispatcher and includes bounded untracked
   const env = { CONVEYOR_CROSSCHECK_CMD: '', FAKE_UNTRACKED: JSON.stringify(names) };
   await f.command(['start']);
   await f.command(['add', 'Ledger', '--from', 'M1']);
+  for (const name of names) f.toolResult('Write', { file_path: name });
   const first = JSON.parse(await f.command(['crosscheck'], env));
   const prompt = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
   assert.deepEqual(JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8')).slice(0, 6),
@@ -659,6 +577,7 @@ test('crosscheck stops a fake large diff after its bounded preview and still rec
   const f = await fixture(t);
   await f.command(['start']);
   await f.command(['add', 'Ledger', '--from', 'M1']);
+  f.toolResult('Edit', { file_path: 'worker.mjs' });
   const pidFile = path.join(f.root, 'large-diff.pid');
   const result = JSON.parse(await f.command(['crosscheck'], { FAKE_LARGE_PID: pidFile }));
   assert.equal(result.ok, true);

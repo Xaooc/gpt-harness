@@ -43,6 +43,8 @@ case "$kind" in
   check)
     ok=false
     if [ "$FAKE_CHECK_OK" = 1 ]; then ok=true; fi
+    while [ "$#" -gt 1 ] && [ "$1" != --files-from ]; do shift; done
+    if [ "$1" = --files-from ]; then log_call files "$(cat "$2")"; fi
     printf '{"ok":%s,"results":[],"hygiene":{}}' "$ok"
     exit "$FAKE_CHECK_RC" ;;
   overview) printf '{"jobs":%s}' "$FAKE_JOBS" ;;
@@ -60,18 +62,23 @@ esac
   // A shell fake avoids starting Node for every git query made by the real gate.
   fs.writeFileSync(path.join(bin, 'git'), `#!/bin/bash
 ${shellLog}
+if [ "$1" = --no-optional-locks ]; then shift; fi
 repo=$2
 shift 2
 log_call git "$@"
 [ "$FAKE_NONGIT" != 1 ] || exit 128
-[[ "$repo" = ${shellQuote(repo)} || "$repo" = ${shellQuote(path.join(root, 'second-repo'))} ]] || exit 128
+case "$repo" in
+  ${shellQuote(repo)}|${shellQuote(repo)}/*) top=${shellQuote(repo)} ;;
+  ${shellQuote(path.join(root, 'second-repo'))}) top="$repo" ;;
+  *) exit 128 ;;
+esac
 changed=$FAKE_CHANGED
 if [ -n "$FAKE_CHANGED_REPO" ] && [ "$FAKE_CHANGED_REPO" != "$repo" ]; then changed=0; fi
 nul_list() { eval "set -- $1"; if [ "$#" -gt 0 ]; then printf '%s\\0' "$@"; fi; }
 case "$1" in
   rev-parse)
-    case "$2" in --show-toplevel) printf '%s' "$repo";; HEAD) printf '%s' "$FAKE_HEAD";; esac ;;
-  ls-files) nul_list "$FAKE_UNTRACKED_ARGS" ;;
+    case "$2" in --show-toplevel) printf '%s' "$top";; HEAD) printf '%s' "$FAKE_HEAD";; esac ;;
+  ls-files) if [ "$1" != --stage ] && [ "$2" != --stage ]; then nul_list "$FAKE_UNTRACKED_ARGS"; fi ;;
   log)
     if [[ " $* " == *' --format=%H '* ]]; then
       [ "$FAKE_NO_NEW_COMMITS" = 1 ] || printf '%s' "$FAKE_HEAD"
@@ -82,16 +89,17 @@ case "$1" in
       elif [ "$changed" = 1 ]; then printf 'worker.mjs\\0'; fi
     elif [[ " $* " == *' --stat '* ]]; then printf ' worker.mjs | 1 +\\n'
     else printf '+export const result = true;\\n'; fi ;;
-  worktree) printf '%s' "$FAKE_WORKTREES" ;;
+  worktree)
+    if [ -z "$FAKE_WORKTREE_REPO" ] || [ "$FAKE_WORKTREE_REPO" = "$repo" ]; then printf '%s' "$FAKE_WORKTREES"; fi ;;
 esac
 exit 0
 `, { mode: 0o755 });
   let sequence = 0;
   const append = (entry) => fs.appendFileSync(transcript, JSON.stringify({ sessionId: session, ...entry }) + '\n');
-  const editResult = (edit, cwd = repo) => {
+  const editResult = (edit, cwd = repo, timestamp = fs.statSync(worker).mtimeMs, fields = {}) => {
     const id = `e${++sequence}`;
-    append({ type: 'assistant', cwd, message: { content: [{ type: 'tool_use', id, ...edit }] } });
-    append({ type: 'user', timestamp: new Date(fs.statSync(worker).mtimeMs).toISOString(),
+    append({ type: 'assistant', cwd, ...fields, message: { content: [{ type: 'tool_use', id, ...edit }] } });
+    append({ type: 'user', timestamp: new Date(timestamp).toISOString(), ...fields,
       message: { content: [{ type: 'tool_result', tool_use_id: id, content: 'Success' }] } });
   };
   const user = (text) => append({ type: 'user', uuid: `u${++sequence}`, origin: { kind: 'human' }, message: { content: text } });
@@ -128,13 +136,12 @@ exit 0
   assert.equal(captured.stdout, '');
   if (writeRun) write();
   if (changed) editResult({ name: 'Edit', input: { file_path: worker } });
-  const complete = async ({ semantic = true, final = true } = {}) => {
+  const complete = async ({ semantic = true } = {}) => {
     assert.match(await command(['start']), /requirements playback/);
     await command(['add', 'Fix the worker', '--from', 'M1.c1']);
     await command(['evidence', 'L1', '--artifact', proof]);
     await command(['done', 'L1']);
     if (semantic) await command(['crosscheck']);
-    if (final) assistant((await command(['checklist'])).trim());
   };
   return { root, repo, home, transcript, worker, proof, session, env, append, user, assistant, command, stop, write, complete,
     editResult,
@@ -158,7 +165,6 @@ test('no code changes means silent success, including read runs and prose-only w
   f.append({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Write', input: { file_path: 'README.md' } }] } });
   assert.equal(await f.stop(), null);
   assert.equal(f.calls('check').length, 0);
-  assert.equal(f.calls('overview').length, 0);
 });
 
 test('actual code changes without a ledger start block on reason 1, including transcript edits', { timeout }, async (t) => {
@@ -167,6 +173,7 @@ test('actual code changes without a ledger start block on reason 1, including tr
   const transcriptOnly = await fixture(t, { writeRun: false });
   transcriptOnly.env.FAKE_CHANGED = '1';
   for (const name of ['Write', 'Edit', 'MultiEdit']) {
+    fs.appendFileSync(transcriptOnly.worker, `// ${name}\n`);
     transcriptOnly.editResult({ name, input: { file_path: transcriptOnly.worker } });
     blocked(await transcriptOnly.stop(), 1, 'start the ledger');
   }
@@ -203,12 +210,9 @@ test('prompt capture records the earliest base and ledger start fills missing re
   await f.command(['start']);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { [f.repo]: 'task-base' });
   assert.equal(await f.stop(), null);
-  f.editResult({ name: 'Edit', input: { file_path: f.worker } });
-  blocked(await f.stop(), 2, 'M1.c1');
   fs.rmSync(file);
   await f.command(['start']);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { [f.repo]: 'later-head' });
-  blocked(await f.stop(), 2, 'M1.c1');
 });
 
 // Each edit form exercises the full ledger sequence and reports its own duration.
@@ -219,7 +223,7 @@ for (const [group, edits] of [
 ]) {
   for (const [index, edit] of edits.entries()) {
     const title = group === 'Bash' ? 'unattributed shell writes are silent before a non-Git editor write'
-      : 'non-Git editor writes enforce checks 1–4, 6, and 7 without turn checks';
+      : 'non-Git editor writes enforce checks 1, 3, 4, and 6 without turn checks';
     const name = `${title} (${index + 1})`;
     test(name, { timeout }, async (t) => {
       const f = await fixture(t, { gitRepo: false, writeRun: false });
@@ -230,8 +234,7 @@ for (const [group, edits] of [
       }
       blocked(await f.stop(), 1, 'non-git code edits: ledger checks only, turn checks unavailable');
       await f.command(['start']);
-      blocked(await f.stop(), 2, 'M1.c1');
-      await f.command(['add', 'Fix the worker', '--from', 'M1.c1']);
+          await f.command(['add', 'Fix the worker', '--from', 'M1.c1']);
       blocked(await f.stop(), 3, 'L1');
       await f.command(['evidence', 'L1', '--note', 'Reviewed']);
       await f.command(['done', 'L1']);
@@ -239,15 +242,13 @@ for (const [group, edits] of [
       await f.command(['evidence', 'L1', '--artifact', f.proof]);
       blocked(await f.stop(), 6, 'run ledger crosscheck');
       await f.command(['crosscheck']);
-      blocked(await f.stop(), 7, 'include the ledger checklist');
-      f.assistant((await f.command(['checklist'])).trim());
       assert.equal(await f.stop(), null);
       assert.equal(f.calls('check').length, 0);
     });
   }
 }
 
-test('owned running jobs allow a pause until the assistant includes a completion checklist', { timeout }, async (t) => {
+test('owned running jobs allow a pause independently of the assistant message', { timeout }, async (t) => {
   const f = await fixture(t);
   const jobs = ['running', 'queued', 'waiting-provider'].map((state) => ({ owner: f.session, state, out: `/tmp/${state}` }));
   jobs.push({ owner: 'someone-else', state: 'running', out: '/tmp/other' });
@@ -256,9 +257,9 @@ test('owned running jobs allow a pause until the assistant includes a completion
   f.assistant('Still working on L1.');
   assert.deepEqual(await f.stop(extra), { systemMessage: 'conveyor: work in progress, 3 jobs running' });
   f.assistant('- [x] Claimed complete');
-  blocked(await f.stop(extra), 1, 'start the ledger');
+  assert.deepEqual(await f.stop(extra), { systemMessage: 'conveyor: work in progress, 3 jobs running' });
   f.assistant('- L99 ✓ Claimed complete');
-  blocked(await f.stop(extra), 1, 'start the ledger');
+  assert.deepEqual(await f.stop(extra), { systemMessage: 'conveyor: work in progress, 3 jobs running' });
   assert.equal(f.calls('check').length, 0);
 });
 
@@ -311,21 +312,8 @@ test('unavailable scout crosschecks require a verified snapshot-specific waiver'
   blocked(await f.stop(), 6, 'cross-check unavailable');
   await f.command(['waive', 'crosscheck', '--quote', quote]);
   assert.equal(await f.stop(), null);
-  f.env.FAKE_HEAD = 'new-commit';
+  fs.appendFileSync(f.worker, '// new content\n');
   blocked(await f.stop(), 6, 'cross-check unavailable');
-});
-
-test('unlinked imperative clauses block on reason 2, recomputed from genuine transcript messages', { timeout }, async (t) => {
-  const f = await fixture(t);
-  await f.command(['start']);
-  const file = path.join(f.home, 'ledgers', `${f.session}.jsonl`);
-  const message = JSON.parse(await f.command(['show', '--json'])).messages[0];
-  fs.appendFileSync(file, JSON.stringify({ ...message, clauses: [] }) + '\n');
-  blocked(await f.stop(), 2, 'M1.c1');
-  await f.command(['link', 'M1.c1', 'none', '--reason', 'Handled as a question in the agreed scope']);
-  f.user('Always preserve fresh evidence.');
-  blocked(await f.stop(), 2, 'M2.c1');
-  assert.equal(f.calls('check').length, 0);
 });
 
 test('check 4 requires any current proof to qualify and uses actual artifact times', { timeout }, async (t) => {
@@ -344,13 +332,13 @@ test('check 4 requires any current proof to qualify and uses actual artifact tim
   const dispatch = path.join(f.root, 'dispatch.json');
   fs.writeFileSync(dispatch, '{"code":0}');
   await f.command(['evidence', 'L1', '--check', dispatch], {}, 1);
-  blocked(await f.stop(), 6, 'run ledger crosscheck');
+  assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 6\./);
   fs.writeFileSync(dispatch, '{"code":0,"gate":{"status":"pass"}}');
   await f.command(['evidence', 'L1', '--check', dispatch]);
-  blocked(await f.stop(), 6, 'run ledger crosscheck');
+  assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 6\./);
   const rerun = ['evidence', 'L1', '--cmd', 'test "$CONVEYOR_EVIDENCE_OK" = yes'];
   await f.command(rerun, { CONVEYOR_EVIDENCE_OK: 'no' }, 1);
-  blocked(await f.stop(), 6, 'run ledger crosscheck');
+  assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 6\./);
   fs.rmSync(f.proof);
   fs.rmSync(dispatch);
   blocked(await f.stop(), 4, 'refresh evidence');
@@ -358,46 +346,77 @@ test('check 4 requires any current proof to qualify and uses actual artifact tim
   blocked(await f.stop(), 6, 'run ledger crosscheck');
 });
 
-test('red turn checks block on reason 5 with the session repository and base', { timeout }, async (t) => {
+test('a v2 request checks owned changes in order 1, 3, 4, then 5', { timeout }, async (t) => {
   const f = await fixture(t);
-  await f.complete({ semantic: false });
-  blocked(await f.stop({ FAKE_CHECK_OK: '0', FAKE_CHECK_RC: '1' }), 5, 'fix red turn checks');
-  assert.deepEqual(f.calls('check')[0].args, ['run', '--dir', f.repo, '--level', 'turn', '--base', 'task-base', '--json']);
-  blocked(await f.stop({ FAKE_CHECK_OK: '1', FAKE_CHECK_RC: '2' }), 5, 'fix red turn checks');
-  assert.equal(f.calls('overview').length, 0);
+  const red = { FAKE_CHECK_OK: '1', FAKE_CHECK_RC: '2' };
+  blocked(await f.stop(red), 1, 'start the ledger');
+  await f.command(['start']);
+  await f.command(['add', 'Fix the worker', '--from', 'M1']);
+  blocked(await f.stop(red), 3, 'open items: L1');
+  await f.command(['done', 'L1']);
+  blocked(await f.stop(red), 4, 'refresh evidence');
+  assert.equal(f.calls('check').length, 0);
+  await f.command(['evidence', 'L1', '--artifact', f.proof]);
+  blocked(await f.stop(red), 5, 'fix red turn checks');
+  const args = f.calls('check')[0].args;
+  assert.deepEqual(args.slice(0, 8), ['run', '--dir', f.repo, '--level', 'turn', '--base', 'task-base', '--files-from']);
+  assert.equal(args[9], '--json');
+  assert.deepEqual(JSON.parse(f.calls('files')[0].args[0]), ['worker.mjs']);
+  assert.equal(fs.existsSync(path.dirname(args[8])), false);
+  const ledger = path.join(f.home, 'ledgers', `${f.session}.jsonl`);
+  const record = fs.readFileSync(ledger, 'utf8').trim().split('\n').map(JSON.parse).find(({ type }) => type === 'turn-check');
+  assert.equal(record.taskId, 'T1');
+  assert.equal(record.rc, 2);
+  assert.equal(record.ok, false);
+  assert.match(record.fingerprint, /^[a-f0-9]{64}$/);
+  assert.match((await f.stop(red)).systemMessage, /unchanged blocker, turn allowed — 5\./);
+  assert.equal(f.calls('check').length, 1);
 });
 
-test('a missing checklist in the last assistant message blocks on reason 7', { timeout }, async (t) => {
+test('a foreign edit in the same repo neither invalidates verification nor enters its checks', { timeout }, async (t) => {
   const f = await fixture(t);
-  await f.complete({ final: false });
-  f.assistant('All done.');
-  blocked(await f.stop(), 7, 'include the ledger checklist');
-  f.assistant('L10 was finished earlier.');
-  blocked(await f.stop(), 7, 'L1');
-  for (const mention of ['L1 was finished.', '- L1 done', '- L1 ✓suffix', 'Earlier: - L1 ✓ finished']) {
-    f.assistant(mention);
-    blocked(await f.stop(), 7, 'L1');
-  }
-  f.assistant((await f.command(['checklist'])).trim());
+  await f.complete();
   assert.equal(await f.stop(), null);
+  const foreign = path.join(f.repo, 'foreign.mjs');
+  fs.writeFileSync(foreign, 'foreign change\n');
+  const newer = Date.now() + 10_000;
+  fs.utimesSync(foreign, new Date(newer), new Date(newer));
+  f.editResult({ name: 'Edit', input: { file_path: foreign } }, f.repo, newer, { sessionId: 'other-session' });
+  f.env.FAKE_UNTRACKED = '["foreign.mjs"]';
+  f.env.FAKE_HEAD = 'another-session-commit';
+  assert.equal(await f.stop({ FAKE_CHECK_RC: '1' }), null);
+  assert.deepEqual(f.calls('files').map(({ args }) => JSON.parse(args[0])), [['worker.mjs']]);
 });
 
-test('running owned jobs, registered temporary paths, and expired owned worktrees block cleanup on reason 8', { timeout }, async (t) => {
+test('registered temporary paths and expired owned worktrees block cleanup on reason 8', { timeout }, async (t) => {
   const f = await fixture(t);
   await f.complete();
   const other = { owner: 'another-session', state: 'running', out: '/tmp/other' };
   const own = { owner: f.session, state: 'running', out: '/tmp/owned' };
-  blocked(await f.stop({ FAKE_JOBS: JSON.stringify([other, own]) }), 8, 'finish executor jobs: /tmp/owned');
+  assert.match((await f.stop({ FAKE_JOBS: JSON.stringify([other, own]) })).systemMessage, /work in progress, 1 jobs/);
   assert.equal(await f.stop({ FAKE_JOBS: JSON.stringify([other]) }), null);
   const scratch = path.join(f.root, 'scratch');
   fs.mkdirSync(scratch);
   await f.command(['tmp', 'register', scratch]);
   blocked(await f.stop(), 8, 'remove registered temporary paths');
   fs.rmSync(scratch, { recursive: true });
-  const expired = `worktree ${f.repo}-old\nHEAD abc\nlocked owner=${f.session} until=2000-01-01\n\n`;
+  const expired = `worktree ${f.repo}-old\nHEAD abc\nlocked owner=${f.session}; purpose=Test registration; until=2000-01-01\n\n`;
   blocked(await f.stop({ FAKE_WORKTREES: expired }), 8, 'clean up expired worktree');
-  const future = `worktree ${f.repo}-new\nHEAD abc\nlocked owner=${f.session} until=2999-01-01\n\n`;
+  const future = `worktree ${f.repo}-new\nHEAD abc\nlocked owner=${f.session}; purpose=Test registration; until=2999-01-01\n\n`;
   assert.equal(await f.stop({ FAKE_WORKTREES: future }), null);
+
+  const untouched = path.join(f.root, 'second-repo');
+  fs.mkdirSync(untouched);
+  const lock = `owner=${f.session}; purpose=An untouched worktree; until=2000-01-01`;
+  f.append({ type: 'assistant', message: { content: [{
+    type: 'tool_use', id: 'register-worktree', name: 'Bash', input: { command: 'node ~/.claude/scripts/disk/wt-new.mjs' }
+  }] } });
+  f.append({ type: 'user', message: { content: [{
+    type: 'tool_result', tool_use_id: 'register-worktree', content: `${untouched}\n${lock}\n`
+  }] } });
+  const registry = `worktree ${untouched}\nHEAD abc\nlocked ${lock}\n\n`;
+  blocked(await f.stop({ FAKE_WORKTREE_REPO: untouched, FAKE_WORKTREES: registry }), 8, 'clean up expired worktree');
+  assert.deepEqual(f.calls('files').map(({ args }) => JSON.parse(args[0])), [['worker.mjs']]);
 });
 
 test('verified gate waivers cover checks 5 and 8, and verified item waivers count as done', { timeout }, async (t) => {
@@ -405,9 +424,7 @@ test('verified gate waivers cover checks 5 and 8, and verified item waivers coun
   await f.complete();
   const quote = 'You may skip turn checks and cleanup for this task.';
   await f.command(['waive', 'gate', '--quote', quote], {}, 1);
-  const red = { FAKE_CHECK_OK: '0', FAKE_CHECK_RC: '1', FAKE_JOBS: JSON.stringify([
-    { owner: f.session, state: 'running', out: '/tmp/owned' }
-  ]) };
+  const red = { FAKE_CHECK_OK: '0', FAKE_CHECK_RC: '1' };
   blocked(await f.stop(red), 5, 'fix red turn checks');
   f.user(quote);
   await f.command(['waive', 'gate', '--quote', quote]);
@@ -418,27 +435,48 @@ test('verified gate waivers cover checks 5 and 8, and verified item waivers coun
   await f.command(['tmp', 'register', scratch]);
   assert.equal(await f.stop(red), null);
   assert.equal(f.calls('check').length, checks);
-  assert.equal(f.calls('overview').length, overviews);
+  assert.equal(f.calls('overview').length, overviews + 1);
   await f.command(['add', 'Explicit extra item', '--from', 'M1']);
   blocked(await f.stop(red), 3, 'open items: L2');
   await f.command(['waive', 'L2', '--quote', quote]);
   blocked(await f.stop(red), 6, 'run ledger crosscheck');
   await f.command(['crosscheck']);
-  blocked(await f.stop(red), 7, 'L2');
-  f.assistant((await f.command(['checklist'])).trim());
   assert.equal(await f.stop(red), null);
 });
 
-test('the stop loop guard allows after the same reason was given for three stops and logs the allowance', { timeout }, async (t) => {
+test('unchanged blockers allow the next Stop even when stop_hook_active is false', { timeout }, async (t) => {
   const f = await fixture(t);
+  const file = path.join(f.home, 'gate-state', `${f.session}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '{"reasons":["stale reason"]}');
   blocked(await f.stop(), 1, 'start the ledger');
-  blocked(await f.stop({}, { stop_hook_active: true }), 1, 'start the ledger');
-  blocked(await f.stop({}, { stop_hook_active: true }), 1, 'start the ledger');
-  const allowed = await f.stop({}, { stop_hook_active: true });
+  const first = JSON.parse(fs.readFileSync(file));
+  assert.deepEqual(Object.keys(first), ['version', 'requestKey', 'lastBlockedCheck', 'lastBlockedFingerprint']);
+  assert.equal(first.lastBlockedCheck, 1);
+  f.assistant('Still working.');
+  const allowed = await f.stop({}, { stop_hook_active: false });
   assert.deepEqual(Object.keys(allowed), ['systemMessage']);
-  assert.match(allowed.systemMessage, /^conveyor gate: .*\(allowed after 3 repeats\)$/);
-  const log = fs.readFileSync(path.join(f.root, 'claude/logs/conveyor-gate.log'), 'utf8');
-  assert.match(log, /allowed after 3 repeats/);
+  assert.match(allowed.systemMessage, /^conveyor gate: unchanged blocker, turn allowed — 1\./);
+  assert.deepEqual(await f.stop({}, { stop_hook_active: true }), allowed);
+  const running = { FAKE_JOBS: JSON.stringify([{ owner: f.session, state: 'running' }]) };
+  assert.match((await f.stop(running)).systemMessage, /work in progress/);
+  assert.deepEqual(await f.stop(), allowed);
+  fs.appendFileSync(f.worker, '// changed bytes\n');
+  blocked(await f.stop(), 1, 'start the ledger');
+  assert.notEqual(JSON.parse(fs.readFileSync(file)).lastBlockedFingerprint, first.lastBlockedFingerprint);
+  f.user('A different request.');
+  assert.equal(await f.stop(), null);
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('a session with only an orchestrator letter passes despite its own code change', { timeout }, async (t) => {
+  const f = await fixture(t, { changed: false });
+  fs.writeFileSync(f.transcript, '');
+  f.append({ type: 'user', origin: { kind: 'agent' }, message: { content: 'Please fix the worker.' } });
+  f.editResult({ name: 'Edit', input: { file_path: f.worker } });
+  assert.deepEqual(await f.stop(), {
+    systemMessage: 'conveyor: no owner prompt in this session; acceptance is held by the orchestrating session'
+  });
 });
 
 test('warn mode prints only systemMessage, defaults to calibration, and yields to explicit mode overrides', { timeout }, async (t) => {
@@ -462,7 +500,7 @@ test('warn mode prints only systemMessage, defaults to calibration, and yields t
   blocked(await f.stop({ CONVEYOR_GATE_MODE: '' }), 1, 'start the ledger');
   fs.writeFileSync(start, new Date(Date.now() + 86400_000).toISOString());
   fs.utimesSync(start, old, old);
-  blocked(await f.stop({ CONVEYOR_GATE_MODE: '' }), 1, 'start the ledger');
+  assert.match((await f.stop({ CONVEYOR_GATE_MODE: '' })).systemMessage, /unchanged blocker, turn allowed/);
   assert.deepEqual(Object.keys(await f.stop({ CONVEYOR_GATE_MODE: 'warn' })), ['systemMessage']);
   assert.equal(await f.stop({}, { transcript_path: path.join(f.root, 'missing.jsonl') }), null);
   assert.match(fs.readFileSync(path.join(f.root, 'claude/logs/conveyor-gate.log'), 'utf8'), /stop gate:.*ENOENT/);
@@ -471,11 +509,11 @@ test('warn mode prints only systemMessage, defaults to calibration, and yields t
 
 async function uiFixture(t) {
   const f = await fixture(t);
-  f.env.FAKE_STAGED = '["page.tsx"]';
   const page = path.join(f.repo, 'page.tsx');
   fs.writeFileSync(page, 'export const Page = () => <main />;\n');
   const old = new Date(Date.now() - 10_000);
   fs.utimesSync(page, old, old);
+  f.editResult({ name: 'Edit', input: { file_path: page } });
   await f.complete();
   return f;
 }
@@ -490,7 +528,7 @@ test('UI changes require image artifacts on reason 9, with warning mode and acti
     fs.writeFileSync(image, 'fake screenshot');
     await f.command(['evidence', 'L1', '--file', image]);
     await f.command(['crosscheck']);
-    blocked(await f.stop(), 9, 'ledger evidence <L> --artifact <screenshot>');
+    assert.match((await f.stop()).systemMessage, /ledger evidence <L> --artifact <screenshot>/);
     await f.command(['evidence', 'L1', '--artifact', image]);
     await f.command(['crosscheck']);
     assert.equal(await f.stop(), null);
@@ -502,7 +540,7 @@ test('stale image artifacts fail reason 9 even when another artifact satisfies i
     const image = path.join(f.root, 'desktop.webp');
     fs.writeFileSync(image, 'fake screenshot');
     await f.command(['evidence', 'L1', '--artifact', image]);
-    const old = new Date(Date.now() - 10_000);
+    const old = new Date(fs.statSync(f.worker).mtimeMs - 1000);
     fs.utimesSync(image, old, old);
     await f.command(['crosscheck']);
     blocked(await f.stop(), 9, 'user-facing change without a screenshot');
@@ -511,16 +549,12 @@ test('stale image artifacts fail reason 9 even when another artifact satisfies i
     assert.equal(await f.stop(), null);
   });
 
-test('image artifacts must be recorded and refreshed in the current turn', { timeout: 3000 }, async (t) => {
+test('a later conversation turn preserves a fresh image artifact for the same outcome', { timeout: 3000 }, async (t) => {
   const f = await uiFixture(t);
   const image = path.join(f.root, 'mobile.jpg');
   fs.writeFileSync(image, 'fake screenshot');
   await f.command(['evidence', 'L1', '--artifact', image]);
   f.user('Thanks.');
-  await f.command(['crosscheck']);
-  blocked(await f.stop(), 9, 'user-facing change without a screenshot');
-  fs.utimesSync(image, new Date(), new Date());
-  await f.command(['evidence', 'L1', '--artifact', image]);
   await f.command(['crosscheck']);
   assert.equal(await f.stop(), null);
 });
@@ -535,17 +569,43 @@ test('detected UI directories require screenshots, test and story changes do not
       const old = new Date(Date.now() - 10_000);
       fs.utimesSync(path.join(f.repo, file), old, old);
     }
-    f.env.FAKE_STAGED = '["frontend/view.test.tsx","frontend/view.stories.tsx"]';
+    for (const file of ['frontend/view.test.tsx', 'frontend/view.stories.tsx']) {
+      f.editResult({ name: 'Edit', input: { file_path: file } });
+    }
     await f.complete();
     assert.equal(await f.stop(), null);
-    f.env.FAKE_STAGED = '["frontend/view.js"]';
+    f.editResult({ name: 'Edit', input: { file_path: 'frontend/view.js' } });
     await f.command(['crosscheck']);
     blocked(await f.stop(), 9, 'user-facing change without a screenshot');
     const quote = 'You may skip screenshots for this task.';
     await f.command(['waive', 'gate', '--quote', quote], {}, 1);
-    blocked(await f.stop(), 9, 'user-facing change without a screenshot');
+    assert.match((await f.stop()).systemMessage, /unchanged blocker, turn allowed — 9\./);
     f.user(quote);
     await f.command(['waive', 'gate', '--quote', quote]);
     await f.command(['crosscheck']);
     assert.equal(await f.stop(), null);
   });
+
+test('an owner image covers only its linked UI outcome and revision', { timeout }, async (t) => {
+  const f = await fixture(t, { changed: false });
+  await f.command(['start']);
+  for (const file of ['a.tsx', 'b.tsx']) {
+    fs.writeFileSync(path.join(f.repo, file), 'export {};\n');
+    f.editResult({ name: 'Edit', input: { file_path: file } });
+    const id = (await f.command(['add', `Verify ${file}`, '--from', 'M1', '--paths', file])).trim();
+    await f.command(['evidence', id, '--cmd', 'printf verified']);
+  }
+  f.user([{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aW1hZ2U=' } }]);
+  await f.command(['evidence', 'L1', '--owner-message', 'M2']);
+  await f.command(['crosscheck']);
+  const missing = await f.stop();
+  blocked(missing, 9, 'without a screenshot: L2.');
+  assert.doesNotMatch(missing.reason, /L1/);
+  await f.command(['pending', 'L2', '--reason', 'Owner must verify the second UI outcome']);
+  await f.command(['crosscheck']);
+  assert.equal(await f.stop(), null);
+  await f.command(['amend', 'L1', '--from', 'M2', 'Verify the revised outcome A']);
+  await f.command(['evidence', 'L1', '--cmd', 'printf verified']);
+  await f.command(['crosscheck']);
+  blocked(await f.stop(), 9, 'without a screenshot: L1.');
+});

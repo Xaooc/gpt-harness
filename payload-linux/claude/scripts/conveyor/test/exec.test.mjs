@@ -1115,6 +1115,33 @@ test('a complex write requires a completed approach review or a recorded skip re
     records = await readLines(runs);
     assert.deepEqual(records.filter((record) => record.out === reviewOut).map(({ event, code }) => [event, code]), [['end', 0]]);
     assert.equal(records.at(-2).reviewSkip, undefined);
+
+    const at = Date.now();
+    const end = (offset, fields) => ({ event: 'end', session, at: new Date(at + offset).toISOString(), code: 0, ...fields });
+    const history = (...entries) => fs.writeFile(runs, entries.map((entry) => JSON.stringify(entry) + '\n').join(''));
+    const refuse = async (pattern) => {
+      const result = await env.run('complex', '-w');
+      assert.equal(result.status, 8, result.stderr);
+      assert.match(result.stderr, pattern);
+    };
+    const plan = end(1, { tier: 'planner', model: 'gpt-6.2-sol' });
+    const approach = end(2, { tier: 'approach', model: 'gpt-6.2-astra' });
+    const architect = end(3, { panel: 'architect' });
+    const failure = end(2, { tier: 'complex', code: 6, gate: { status: 'fail' } });
+    await history(end(0, { tier: 'approach', code: 5 }));
+    await refuse(/^approach review required/);
+    await history(plan, architect);
+    await refuse(/review it on tier approach/);
+    await history(plan, { ...approach, model: plan.model });
+    await refuse(/a different model/);
+    await history(plan, { ...approach, at: end(0, {}).at });
+    await refuse(/review it on tier approach/);
+    await history(plan, approach);
+    assert.equal((await env.run('complex', '-w')).status, 0);
+    await history(end(0, { tier: 'approach' }), failure, end(3, { tier: 'approach' }));
+    await refuse(/tier architect with the failure history/);
+    await history(end(0, { tier: 'approach' }), failure, architect);
+    assert.equal((await env.run('complex', '-w')).status, 0);
   } finally { await env.cleanup(); }
 });
 

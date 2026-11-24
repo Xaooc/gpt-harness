@@ -6,17 +6,25 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { entryText, isGenuineHumanEntry } from '../../learning/extract.mjs';
 import { readJsonl, sanitizeQuote } from '../../learning/common.mjs';
-import { loadConfig, withLock } from './orchestration.mjs';
+import { withLock } from './orchestration.mjs';
 import { repositorySurface, uiFile } from './profile.mjs';
 import { home, platform, processAlive, readProcessStat, shell } from './platform.mjs';
 import { clauseHints, foldLedger, latestMessages } from './request-state.mjs';
 import { collectTaskScope, inside, worktreeFor } from './task-scope.mjs';
+import { homePaths as diskHomePaths, localDate, parseLock, worktrees } from '../../disk/lib.mjs';
 
 export { foldLedger } from './request-state.mjs';
 
 const execute = promisify(execFile);
 const now = () => new Date().toISOString();
 const hash = (value) => createHash('sha256').update(value).digest('hex');
+const stopVersion = 2;
+const turnCheckVersion = 1;
+const fingerprint = (value) => hash(JSON.stringify(value));
+const sortedIdentities = (values) => values.sort((a, b) => {
+  const left = JSON.stringify(a), right = JSON.stringify(b);
+  return left < right ? -1 : left > right ? 1 : 0;
+});
 const left = '(?<![\\p{L}\\p{N}_])';
 const right = '(?![\\p{L}\\p{N}_])';
 
@@ -102,7 +110,6 @@ export function ledgerPaths(session) {
     home, ledger: path.join(home, 'ledgers', `${session}.jsonl`), runs: path.join(home, 'sessions', `${session}.jsonl`),
     context: path.join(home, 'sessions', `${session}.ledger.json`), bases: path.join(home, 'sessions', `${session}.base.json`),
     calibration: path.join(home, 'gate-calibration-start'),
-    approachCalibration: path.join(home, 'gate-calibration-start-10'),
     stops: path.join(home, 'gate-state', `${session}.json`)
   };
 }
@@ -597,17 +604,20 @@ async function repositoryRoot(directory) {
 
 export async function recordSessionBases(context) {
   const file = ledgerPaths(context.session).bases, bases = readJson(file, {});
+  const captured = {};
   const root = await repositoryRoot(context.cwd);
   const candidates = [...sessionRuns(context), ...(root ? [{ repo: root }] : [])];
   for (const candidate of candidates) {
     const directory = path.resolve(context.cwd, candidate.repo);
     const repo = directory === root ? root : await repositoryRoot(directory);
     if (!repo) continue;
-    if (bases[repo]) continue;
+    if (bases[repo] || captured[repo]) continue;
     const base = candidate.base || (await git(repo, ['rev-parse', 'HEAD'])).trim();
-    if (base) bases[repo] = base;
+    if (base) captured[repo] = base;
   }
-  writeJson(file, bases);
+  if (Object.keys(captured).length) {
+    await withLock(file, () => writeJson(file, { ...captured, ...readJson(file, {}) }));
+  }
 }
 
 async function changedNames(repo, base) {
@@ -649,78 +659,121 @@ export async function sessionRepos(context, rows = transcriptRows(context)) {
   return { applies: nonGit || repos.some((repo) => repo.changed), repos, nonGit, writes };
 }
 
-async function repoChanges(repos) {
-  const changes = new Map();
-  for (const { repo, base, files } of repos) {
-    const names = files || (await changedNames(repo, base)).files;
-    let newest = 0;
-    for (const file of names) {
-      const absolute = path.resolve(repo, file);
-      try { newest = Math.max(newest, fs.statSync(absolute).mtimeMs); }
-      catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-        // A removed file has no mtime; its directory records the removal.
-        let parent = path.dirname(absolute);
-        while (!fs.existsSync(parent) && path.dirname(parent) !== parent) parent = path.dirname(parent);
-        newest = Math.max(newest, fs.statSync(parent).mtimeMs);
-      }
-    }
-    changes.set(repo, newest);
-  }
-  return changes;
+async function ownedScope(context, state, rows = transcriptRows(context)) {
+  const boundary = state.task
+    ? state.messages.find((message) => message.id === state.task.messageId) || state.task
+    : state.primaryMessages.at(-1);
+  return collectTaskScope(context, boundary && { offset: boundary.offset, uuid: boundary.uuid,
+    at: boundary.at, id: state.task?.id }, rows);
 }
 
-async function evidenceProblem(state, scope) {
-  const allWrites = [...scope.repos.values(), scope.nonGit];
-  for (const item of state.items.filter((entry) => entry.status === 'done')) {
-    if (!item.evidence.length) return `${item.id}: evidence missing`;
-    const current = new Map(item.evidence.map((entry) => [`${entry.kind}:${entry.value}`, entry]));
-    const related = item.paths && new Set(item.paths);
-    let problem;
-    let supported = false;
-    for (const evidence of current.values()) {
-      if (evidence.kind === 'command') {
-        if (evidence.rc === 0) { supported = true; break; }
-        problem ??= 'command failed';
-        continue;
-      }
-      if (evidence.kind === 'owner-message') { supported = true; break; }
-      if (!['artifact', 'check'].includes(evidence.kind)) continue;
-      let jobDir;
-      if (evidence.kind === 'check') {
-        let dispatch;
-        try { dispatch = readJson(evidence.value); } catch { /* An unreadable report is red. */ }
-        if (evidence.ok === false || !checkPassed(dispatch)) {
-          problem ??= 'check evidence is red';
-          continue;
-        }
-        jobDir = dispatch.gate.last?.repo ?? dispatch.dir;
-      }
-      let stat;
-      try { stat = fs.statSync(evidence.value); } catch { /* An inaccessible artifact cannot qualify. */ }
-      if (!stat?.isFile()) {
-        problem ??= `file/artifact evidence missing: ${evidence.value}`;
-        continue;
-      }
-      const mtime = Number.isFinite(evidence.mtime) ? Math.min(stat.mtimeMs, evidence.mtime) : stat.mtimeMs;
-      const newerWrite = (writes) => {
-        for (const [file, at] of writes || []) if (at > mtime && (!related || related.has(file))) return true;
-        return false;
-      };
-      if (allWrites.some(newerWrite)) {
-        const repo = typeof jobDir === 'string' && path.isAbsolute(jobDir)
-          ? await worktreeFor(jobDir, jobDir) : await worktreeFor(evidence.value);
-        if (!repo || newerWrite(scope.repos.get(repo))) {
-          problem ??= `stale evidence in ${repo || evidence.value}`;
-          continue;
-        }
-      }
-      supported = true;
-      break;
+async function scopedRepos(context, scope) {
+  const file = ledgerPaths(context.session).bases;
+  const bases = readJson(file, {}), runs = sessionRuns(context);
+  const repos = [];
+  for (const [repo, paths] of scope.repos) {
+    let base = bases[repo];
+    if (!base) {
+      const captured = runs.find((run) => run.repo === repo && run.base)?.base
+        || (await git(repo, ['rev-parse', 'HEAD'])).trim();
+      base = await withLock(file, () => {
+        const current = readJson(file, {});
+        if (!current[repo]) writeJson(file, { ...current, [repo]: captured });
+        return current[repo] || captured;
+      });
     }
-    if (!supported) return `${item.id}: ${problem || 'runnable command, fresh artifact, or passing dispatch gate evidence required'}`;
+    repos.push({ repo, base, files: [...paths.keys()].map((file) => path.relative(repo, file)).sort() });
   }
-  return null;
+  return repos;
+}
+
+function latestEvidence(item) {
+  return [...new Map(item.evidence.map((entry) => [JSON.stringify([entry.kind, entry.value]), entry])).values()];
+}
+
+function proofRecorded(evidence) {
+  return (evidence.kind === 'command' && evidence.rc === 0) || evidence.kind === 'owner-message'
+    || (evidence.kind === 'artifact' && Number.isFinite(evidence.mtime))
+    || (evidence.kind === 'check' && evidence.ok === true);
+}
+
+function artifactTime(evidence) {
+  let stat;
+  try { stat = fs.statSync(evidence.value); } catch { /* An inaccessible artifact cannot qualify. */ }
+  if (!stat?.isFile()) return null;
+  return Number.isFinite(evidence.mtime) ? Math.min(stat.mtimeMs, evidence.mtime) : stat.mtimeMs;
+}
+
+const disposed = (item) => ['waived', 'pending-owner', 'superseded'].includes(item.status);
+const itemIdentity = (item) => [item.id, item.revision];
+
+async function outcomeProblems(state, scope) {
+  const open = [], lost = [];
+  for (const item of state.items) {
+    if (disposed(item) || item.resolution?.result === 'accepted') continue;
+    const failures = [];
+    let supported = false;
+    for (const evidence of latestEvidence(item)) {
+      const failure = await proofProblem(item, evidence, scope);
+      if (!failure) { supported = true; break; }
+      failures.push({ ...failure, evidence });
+    }
+    if (supported) continue;
+    const initiallyStale = new Set(failures.filter((failure) => failure.initiallyStale).map(({ evidence }) => evidence));
+    if (item.status === 'done' || item.evidence.some((entry) => proofRecorded(entry) && !initiallyStale.has(entry))
+      || item.previousEvidence.some(proofRecorded)) {
+      lost.push({ item, failures });
+    } else open.push(item);
+  }
+  return { open, lost };
+}
+
+async function proofProblem(item, evidence, scope) {
+  if (evidence.kind === 'command') return evidence.rc === 0 ? null : { type: 'command failed' };
+  if (evidence.kind === 'owner-message') return null;
+  if (!['artifact', 'check'].includes(evidence.kind)) return { type: 'supporting evidence only' };
+  let jobDir;
+  if (evidence.kind === 'check') {
+    let dispatch;
+    try { dispatch = readJson(evidence.value); } catch { /* An unreadable report is red. */ }
+    if (evidence.ok === false || !checkPassed(dispatch)) return { type: 'check evidence is red' };
+    jobDir = dispatch.gate.last?.repo ?? dispatch.dir;
+  }
+  const mtime = artifactTime(evidence);
+  if (mtime === null) return { type: 'file/artifact evidence missing', where: evidence.value };
+  const newer = (writes) => [...(writes || [])].filter(([file, at]) => at > mtime && (!item.paths || item.paths.includes(file)));
+  const allNewer = [...scope.repos.values(), scope.nonGit].flatMap(newer);
+  if (!allNewer.length) return null;
+  const repo = typeof jobDir === 'string' && path.isAbsolute(jobDir)
+    ? await worktreeFor(jobDir, jobDir) : await worktreeFor(evidence.value);
+  const related = repo ? newer(scope.repos.get(repo)) : allNewer;
+  return related.length ? { type: 'stale evidence in', where: repo || evidence.value, paths: related.map(([file]) => file),
+    initiallyStale: related.some(([, at]) => at > evidence.mtime && at <= Date.parse(evidence.at)) } : null;
+}
+
+async function pathVersions(files, root) {
+  const versions = [];
+  for (const file of [...new Set(files)].sort()) {
+    const version = await fileDigest(root ? path.join(root, file) : file);
+    versions.push([file, version?.mode ?? null, version?.digest ?? null]);
+  }
+  return versions;
+}
+
+async function lostProofInputs(lost) {
+  const inputs = [];
+  for (const { item, failures } of lost) {
+    const proofs = [];
+    for (const { type, evidence, paths } of failures) {
+      if (type === 'supporting evidence only') continue;
+      const { kind, value, rc } = evidence;
+      const artifacts = kind === 'artifact' ? await pathVersions([value]) : [];
+      proofs.push([kind, value, rc, type, artifacts, await pathVersions(paths || [])]);
+    }
+    const previous = item.previousEvidence.filter(proofRecorded).map(({ revision, kind, value }) => [revision, kind, value]);
+    inputs.push([itemIdentity(item), sortedIdentities(proofs), sortedIdentities(previous)]);
+  }
+  return sortedIdentities(inputs);
 }
 
 function preview(text, lines, bytes) {
@@ -778,15 +831,21 @@ async function fileDigest(file) {
   return { mode: stat.mode, digest: digest.digest('hex') };
 }
 
-export async function crosscheckSnapshot(context, state, repos) {
+export async function crosscheckSnapshot(context, state, scope) {
   state ??= await loadLedger(context);
-  repos ??= (await sessionRepos(context)).repos;
+  if (!state.legacy) scope ??= await ownedScope(context, state);
+  const repos = scope ? await scopedRepos(context, scope) : (await sessionRepos(context)).repos;
   const diffs = [];
   for (const entry of repos) {
     const { repo, base } = entry;
-    const changes = entry.files ? entry : await changedNames(repo, base);
-    const stat = await gitPreview(repo, ['diff', '--no-ext-diff', '--no-textconv', '--stat', base, '--']);
-    const diff = await gitPreview(repo, ['diff', '--no-ext-diff', '--no-textconv', base, '--']);
+    const pathspecs = scope ? entry.files.map((file) => `:(literal)${file.split(path.sep).join('/')}`) : [];
+    const args = ['diff', '--no-ext-diff', '--no-textconv'];
+    const stat = await gitPreview(repo, [...args, '--stat', base, '--', ...pathspecs]);
+    const diff = await gitPreview(repo, [...args, base, '--', ...pathspecs]);
+    const changes = scope ? { ...entry,
+      untracked: (await git(repo, ['ls-files', '--others', '--exclude-standard', '-z', '--', ...pathspecs]))
+        .split('\0').filter((file) => file && scope.repos.get(repo).has(path.resolve(repo, file))).sort()
+    } : entry;
     const files = [];
     for (const file of changes.files) files.push({ file, ...await fileDigest(path.join(repo, file)) });
     const untracked = [];
@@ -796,9 +855,13 @@ export async function crosscheckSnapshot(context, state, repos) {
         untracked.push({ file, content: await filePreview(absolute) });
       }
     }
-    // The index and streamed file digests invalidate evidence for changes beyond the displayed 300 lines.
-    const indexPath = (await git(repo, ['rev-parse', '--git-path', 'index'])).trim();
-    const index = indexPath ? await fileDigest(path.resolve(repo, indexPath)) : null;
+    // Keep staged versions outside the preview limit without including the rest of the index.
+    let index;
+    if (scope) index = await git(repo, ['ls-files', '--stage', '-z', '--', ...pathspecs]);
+    else {
+      const indexPath = (await git(repo, ['rev-parse', '--git-path', 'index'])).trim();
+      index = indexPath ? await fileDigest(path.resolve(repo, indexPath)) : null;
+    }
     diffs.push({ repo, base, stat, diff, head: changes.head, files, index,
       untrackedNames: changes.untracked.slice(0, 20), untracked });
   }
@@ -810,7 +873,7 @@ export async function crosscheckSnapshot(context, state, repos) {
       return { ...entry, mtime: actual };
     }) }));
   const nonGitFiles = [];
-  for (const file of codeWrites(transcriptRows(context), context.cwd)) {
+  for (const file of scope ? scope.nonGit.keys() : codeWrites(transcriptRows(context), context.cwd)) {
     if (!repos.some(({ repo }) => inside(repo, file))) nonGitFiles.push({ file, ...await fileDigest(file) });
   }
   const data = { messages, items, diffs, nonGitFiles };
@@ -1072,50 +1135,132 @@ async function ownedJobs(context) {
   }
 }
 
-async function cleanupProblem(context, state, repos, jobLookup) {
-  const { jobs: running, error } = jobLookup ?? await ownedJobs(context);
-  if (error !== undefined) return `cannot verify executor jobs: ${error}`;
-  if (running.length) return `finish executor jobs: ${running.map((job) => job.out || job.state).join(', ')}`;
-  const remaining = state.temps.filter((file) => fs.lstatSync(file, { throwIfNoEntry: false }));
-  if (remaining.length) return `remove registered temporary paths: ${remaining.join(', ')}`;
-  for (const { repo } of repos) {
-    const output = await git(repo, ['worktree', 'list', '--porcelain']);
-    for (const block of output.split(/\r?\n\r?\n/)) {
-      const reason = /^locked (.+)$/m.exec(block)?.[1];
-      if (!reason) continue;
-      const owner = /(?:^|\s)owner=([^\s]+)/.exec(reason)?.[1];
-      const until = /(?:^|\s)until=([^\s]+)/.exec(reason)?.[1];
-      if (owner === context.session && Date.parse(until) < Date.now()) {
-        return `clean up expired worktree: ${/^worktree (.+)$/m.exec(block)?.[1] || repo}`;
+function registeredWorktrees(rows, session) {
+  const calls = new Set(), paths = new Set();
+  for (const { entry } of rows) {
+    const content = entry.message?.content ?? entry.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (entry.type === 'assistant' && block.type === 'tool_use' && block.name === 'Bash' && block.id &&
+        /\bwt-new\.mjs\b/.test(block.input?.command)) calls.add(block.id);
+      if (entry.type !== 'user' || block.type !== 'tool_result' || !calls.delete(block.tool_use_id) || block.is_error) continue;
+      const output = block.toolUseResult?.stdout ?? entry.toolUseResult?.stdout ?? entryText({ content: block.content });
+      const lines = String(output).split(/\r?\n/);
+      for (let index = 1; index < lines.length; index++) {
+        const file = lines[index - 1];
+        if (path.isAbsolute(file) && parseLock(lines[index])?.owner === session) paths.add(file);
       }
     }
   }
-  return null;
+  return paths;
 }
 
-async function screenshotProblem(context, state, repos) {
-  const uiRepos = [];
-  for (const entry of repos) {
-    const { uiDirs } = await repositorySurface(entry.repo);
-    if (entry.files.some((file) => uiFile(path.relative(entry.repo, path.resolve(entry.repo, file)), uiDirs))) {
-      uiRepos.push(entry);
+async function cleanupProblem(context, state, scope, rows) {
+  const remaining = [...new Set(state.temps)].sort().filter((file) => {
+    try { return fs.lstatSync(file, { throwIfNoEntry: false }); }
+    catch { return true; } // The registration makes a lookup failure attributable to this session.
+  });
+  if (remaining.length) return { reason: `remove registered temporary paths: ${remaining.join(', ')}`, inputs: remaining };
+  const bases = readJson(ledgerPaths(context.session).bases, {});
+  let configured;
+  try { configured = readJson(diskHomePaths().config)?.repos; }
+  catch (error) { logGate(`${context.session}: cannot read disk audit configuration: ${error.message}`); }
+  const root = await repositoryRoot(context.cwd);
+  const roots = new Set([...scope.repos.keys(), ...Object.keys(bases), ...registeredWorktrees(rows, context.session),
+    ...(root ? [root] : []),
+    ...(Array.isArray(configured) ? configured.filter((repo) => typeof repo === 'string' && path.isAbsolute(repo)) : [])]);
+  const expired = new Map(), today = localDate();
+  for (const repo of [...roots].sort()) {
+    try {
+      for (const entry of worktrees(repo)) {
+        const lock = parseLock(entry.locked);
+        if (lock?.owner === context.session && lock.until < today) expired.set(entry.path, lock);
+      }
+    } catch (error) {
+      logGate(`${context.session}: cannot inspect worktrees in ${repo}: ${error.message}`);
     }
   }
-  if (!uiRepos.length) return false;
-  const changes = await repoChanges(uiRepos);
-  const turn = state.primaryMessages.at(-1);
-  const turnAt = Date.parse(turn?.at || state.task.at);
-  const recordedThisTurn = (evidence) => {
-    if (Date.parse(evidence.at) < turnAt) return false;
-    return !turn || !Number.isInteger(evidence.offset) || evidence.offset >= turn.offset;
-  };
-  const images = state.items.flatMap((item) => item.evidence).filter((evidence) => evidence.kind === 'artifact'
-    && /\.(?:png|jpe?g|webp)$/i.test(evidence.value) && recordedThisTurn(evidence));
-  // One fresh screenshot is the minimum evidence; the verify skill owns journey and viewport coverage.
-  return !images.some((evidence) => {
-    const stat = fs.statSync(evidence.value, { throwIfNoEntry: false });
-    return stat?.isFile() && stat.mtimeMs >= turnAt && [...changes.values()].every((mtime) => stat.mtimeMs >= mtime);
-  });
+  if (!expired.size) return null;
+  const files = [...expired.keys()].sort();
+  return { reason: `clean up expired worktrees: ${files.join(', ')}`,
+    inputs: files.map((file) => [file, expired.get(file).owner, expired.get(file).until]) };
+}
+
+function screenshotCovers(item, paths) {
+  if (disposed(item)) return true;
+  const newest = Math.max(...paths.values());
+  return latestEvidence(item).some((evidence) => evidence.kind === 'owner-message' ||
+    (evidence.kind === 'artifact' && /\.(?:png|jpe?g|webp)$/i.test(evidence.value) &&
+      (artifactTime(evidence) ?? -Infinity) >= newest));
+}
+
+async function screenshotProblems(context, state, scope) {
+  const items = state.items.filter((item) => item.status !== 'superseded');
+  const explicit = items.filter((item) => item.paths);
+  const unassigned = items.filter((item) => !item.paths);
+  const byItem = new Map(), missing = [];
+  for (const [repo, changes] of [...scope.repos, [context.cwd, scope.nonGit]]) {
+    if (!changes.size) continue;
+    const { uiDirs } = await repositorySurface(repo);
+    const remaining = new Map();
+    for (const [file, at] of changes) {
+      if (!uiFile(path.relative(repo, file), uiDirs)) continue;
+      const related = explicit.filter((item) => item.paths.includes(file));
+      if (!related.length) remaining.set(file, at);
+      for (const item of related) {
+        if (!byItem.has(item)) byItem.set(item, new Map());
+        byItem.get(item).set(file, at);
+      }
+    }
+    if (remaining.size && !unassigned.length) missing.push([repo, await pathVersions(remaining.keys())]);
+    for (const item of remaining.size ? unassigned : []) {
+      if (!byItem.has(item)) byItem.set(item, new Map());
+      for (const entry of remaining) byItem.get(item).set(...entry);
+    }
+  }
+  for (const [item, paths] of byItem) {
+    if (!screenshotCovers(item, paths)) missing.push([itemIdentity(item), await pathVersions(paths.keys())]);
+  }
+  return missing;
+}
+
+function turnFailures(report) {
+  return sortedIdentities([
+    ...(Array.isArray(report?.results) ? report.results : []).filter((entry) => entry && !['pass', 'skipped'].includes(entry.status))
+      .map(({ name, status, rc }) => ['check', name, status, rc]),
+    ...(Array.isArray(report?.hygiene?.grew) ? report.hygiene.grew : []).filter(Boolean)
+      .map(({ file, counter }) => ['hygiene', file, counter]),
+    ...(report?.tests?.ok === false ? [['test-budget']] : [])
+  ]);
+}
+
+export async function scopedTurnChecks(context, task, repos) {
+  const ledger = ledgerPaths(context.session).ledger;
+  const results = [];
+  for (const { repo, base, files } of repos) {
+    const inputs = [repo, base, await pathVersions(files, repo)];
+    const key = fingerprint([turnCheckVersion, inputs]);
+    results.push(await withLock(`${ledger}.${key}.turn-check`, async () => {
+      const cached = readJsonl(ledger).findLast((record) => record.type === 'turn-check' &&
+        record.taskId === task.id && record.fingerprint === key);
+      if (cached) return cached;
+      const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'conveyor-turn-check-'));
+      try {
+        const list = path.join(temporary, 'files.json');
+        fs.writeFileSync(list, JSON.stringify(files));
+        const command = process.env.CONVEYOR_CHECK_CMD || [process.execPath, path.join(claudeHome(), 'scripts/conveyor/check.mjs')];
+        const result = await runCommand(command, ['run', '--dir', repo, '--level', 'turn', '--base', base,
+          '--files-from', list, '--json'], repo);
+        let report;
+        try { report = JSON.parse(result.stdout); } catch { /* A missing or invalid report is red. */ }
+        const record = { type: 'turn-check', taskId: task.id, fingerprint: key, inputs,
+          rc: result.rc, ok: result.rc === 0 && report?.ok === true, failures: turnFailures(report) };
+        await ledgerTransaction(context, (records, put) => put(record));
+        return record;
+      } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+    }));
+  }
+  return results;
 }
 
 export function hasApproachReviewTiers(config) {
@@ -1172,106 +1317,88 @@ export function activeTaskId(session) {
   return readJsonl(ledgerPaths(session).ledger).findLast((record) => record.type === 'start')?.id ?? null;
 }
 
-function approachReviewProblem(context, task) {
-  const runs = approachReviewRuns(context.session, task);
-  for (const run of runs) {
-    // Write starts in the existing index have no event field and use the gate mode.
-    if ((run.event !== undefined && run.event !== 'start') || run.panel || run.tier !== 'complex'
-      || !['write', 'block', 'warn', 'off'].includes(run.mode) || validReviewSkip(run.reviewSkip)) continue;
-    const requirement = approachReviewRequirement(runs, Date.parse(run.at));
-    if (requirement === 'initial') {
-      return 'non-trivial change started without a completed approach review: run exec.mjs run --tier approach (medium) '
-        + 'or --tier architect (complex architecture) -r on the plan before implementing; record what you accepted';
-    }
-    if (requirement === 'independent') {
-      return 'the plan from tier planner (Astra) was not reviewed by a different model: run tier approach on it '
-        + 'before implementing';
-    }
-    if (requirement === 'retry') {
-      return 'work restarted after a gate failure without a completed architect review: '
-        + 'run an approach review on tier architect with the failure history before another attempt';
-    }
-  }
-  return null;
-}
-
 export async function gateStatus(context) {
   const rows = transcriptRows(context);
   const state = await loadLedger(context, rows);
-  if (state.legacy) return { applies: false, ok: true };
-  const boundary = state.task ? state.messages.find((message) => message.id === state.task.messageId) || state.task
-    : state.allMessages.at(-1);
-  const owned = await collectTaskScope(context, state.task ? { ...boundary, id: state.task.id } : boundary && {
-    offset: boundary.offset, uuid: boundary.uuid, at: boundary.at
-  }, rows);
-  const ownCode = [...owned.repos.values(), owned.nonGit].some((files) => [...files.keys()].some(codePath));
-  if (!(ownCode || (state.task && owned.repos.size))) return { applies: false, ok: true };
-  const nonGitOnly = !owned.repos.size;
-  const checklistLines = /^\s*[-*]\s*(L\d+)\s+(?:[✓✗](?=\s|$)|waived\b)/gm;
-  const lastAssistant = rows.findLast(({ entry }) => entry.type === 'assistant');
-  const final = lastAssistant ? entryText(lastAssistant.entry) : '';
-  const checked = new Set([...final.matchAll(checklistLines)].map((match) => match[1]));
-  const completionChecklist = checked.size > 0 || /^\s*(?:[-*]|\d+[.)])\s+\[[ xX]\](?=\s|$)/m.test(final);
-  const jobLookup = completionChecklist ? null : await ownedJobs(context);
-  if (jobLookup?.jobs.length) return { applies: true, ok: true,
-    systemMessage: `conveyor: work in progress, ${jobLookup.jobs.length} jobs running` };
-  const scope = nonGitOnly ? '; non-git code edits: ledger checks only, turn checks unavailable' : '';
-  const block = (check, reason) => ({ applies: true, ok: false, check,
-    reason: check === 9 ? `${check}. ${reason}${scope}` : sanitizeQuote(`${check}. ${reason}${scope}`, 1500) });
-  if (!state.task) return block(1, 'start the ledger and play back the requirements: ledger start');
-  const unlinked = state.primaryMessages.flatMap((message) => message.clauses).filter((clause) => !linked(state, clause.id));
-  if (unlinked.length) return block(2, `link imperative clauses in the ledger: ${unlinked.map((clause) => clause.id).join(', ')}`);
-  const open = state.items.filter((item) => item.status === 'open');
-  if (open.length) return block(3, `finish or obtain a user waiver for open items: ${open.map((item) => item.id).join(', ')}`);
-  const evidence = await evidenceProblem(state, owned);
-  if (evidence) return block(4, `refresh evidence: ${evidence}`);
-  const { repos, nonGit, writes } = await sessionRepos(context, rows);
-  const evidenceRepos = nonGit ? [...repos, { repo: context.cwd, base: null, files: writes }] : repos;
-  if (!state.gateWaived && !nonGit) {
-    for (const { repo, base } of repos) {
-      const command = process.env.CONVEYOR_CHECK_CMD || [process.execPath, path.join(claudeHome(), 'scripts/conveyor/check.mjs')];
-      const result = await runCommand(command, ['run', '--dir', repo, '--level', 'turn', '--base', base, '--json'], repo);
-      let check;
-      try { check = JSON.parse(result.stdout); } catch { /* A missing/invalid checker is red, never evidence of success. */ }
-      if (result.rc !== 0 || check?.ok !== true) return block(5, `fix red turn checks in ${repo}; run check --level turn --base ${base}`);
+  const requestKey = state.task?.id ?? state.primaryMessages.at(-1)?.id ?? null;
+  const ok = (applies, extra) => ({ applies, ok: true, requestKey, ...extra });
+  if (state.legacy) return ok(false);
+  // For orchestrator-only sessions, acceptance is held by the orchestrating session (owner 2026-11-24).
+  if (!state.task && !rows.some(({ entry }) => isGenuineHumanEntry(entry) && eligiblePrompt(entryText(entry)))) {
+    return ok(true, { systemMessage: 'conveyor: no owner prompt in this session; acceptance is held by the orchestrating session' });
+  }
+
+  const { jobs, error } = await ownedJobs(context);
+  if (error) logGate(`${context.session}: cannot verify executor jobs: ${error}`);
+  if (jobs.length) return ok(true, { wip: true, systemMessage: `conveyor: work in progress, ${jobs.length} jobs running` });
+
+  const scope = await ownedScope(context, state, rows);
+  const code = [...scope.repos.values(), scope.nonGit].flatMap((files) => [...files.keys()].filter(codePath));
+  const suffix = !scope.repos.size && code.length ? '; non-git code edits: ledger checks only, turn checks unavailable' : '';
+  const block = (check, reason, inputs) => ({ applies: true, ok: false, requestKey, check,
+    reason: check === 9 ? `${check}. ${reason}${suffix}` : sanitizeQuote(`${check}. ${reason}${suffix}`, 1500),
+    fingerprint: fingerprint([stopVersion, context.session, requestKey, check, inputs]) });
+
+  if (!state.task && code.length) {
+    return block(1, 'start the ledger and play back the requirements: ledger start', await pathVersions(code));
+  }
+  const applies = !!state.task && !state.delivered && (scope.repos.size > 0 || scope.nonGit.size > 0 || state.items.length > 0);
+  if (applies) {
+    const { open, lost } = await outcomeProblems(state, scope);
+    if (open.length) {
+      return block(3, `finish or obtain a user waiver for open items: ${open.map((item) => item.id).join(', ')}`,
+        sortedIdentities(open.map(itemIdentity)));
+    }
+    if (lost.length) {
+      const { item, failures } = lost[0];
+      const failure = failures.find(({ type }) => type !== 'supporting evidence only');
+      const detail = failure ? [failure.type, failure.where].filter(Boolean).join(' ')
+        : 'runnable command, fresh artifact, or passing dispatch gate evidence required';
+      return block(4, `refresh evidence: ${item.id}: ${detail}`, await lostProofInputs(lost));
+    }
+    if (!state.gateWaived) {
+      const checks = await scopedTurnChecks(context, state.task, await scopedRepos(context, scope));
+      const red = checks.filter((check) => !check.ok);
+      if (red.length) {
+        const [repo, base] = red[0].inputs;
+        return block(5, `fix red turn checks in ${repo}; run check --level turn --base ${base}`,
+          red.map(({ inputs, rc, failures }) => [inputs, rc, failures]));
+      }
+    }
+    const snapshot = await crosscheckSnapshot(context, state, scope);
+    const semantic = state.crosscheck;
+    const unanswered = (semantic?.findings || []).map(({ id }) => id).filter((id) => !linked(state, id)).sort();
+    const crosscheckWaived = state.waivers.some((waiver) => waiver.target === 'crosscheck'
+      && waiver.verified && waiver.hash === snapshot.hash);
+    const reviewInputs = [semantic?.ok, semantic?.hash === snapshot.hash, crosscheckWaived, unanswered,
+      state.primaryMessages.map(({ id, digest }) => [id, digest]),
+      snapshot.diffs.map(({ repo, base, files, index }) => [repo, base, files, index]), snapshot.nonGitFiles,
+      sortedIdentities(state.items.map(itemIdentity))];
+    if (semantic?.ok === null && !crosscheckWaived) {
+      return block(6, `cross-check unavailable: ${semantic.reason || 'no provider available'}; run it again or waive`, reviewInputs);
+    }
+    if (!semantic || semantic.hash !== snapshot.hash || (!semantic.ok && semantic.ok !== null && !semantic.findings?.length)
+      || unanswered.length) {
+      return block(6, 'run ledger crosscheck and link any missing or misread requirements', reviewInputs);
     }
   }
-  const snapshot = await crosscheckSnapshot(context, state, repos);
-  const semantic = state.crosscheck;
-  const crosscheckWaived = state.waivers.some((waiver) => waiver.target === 'crosscheck'
-    && waiver.verified && waiver.hash === snapshot.hash);
-  if (semantic?.ok === null && !crosscheckWaived) {
-    return block(6, `cross-check unavailable: ${semantic.reason || 'no provider available'}; run it again or waive`);
+  if (!state.gateWaived) {
+    const cleanup = await cleanupProblem(context, state, scope, rows);
+    if (cleanup) return block(8, cleanup.reason, cleanup.inputs);
+    if (applies) {
+      const missing = await screenshotProblems(context, state, scope);
+      if (missing.length) {
+        const targets = sanitizeQuote(missing.map(([target]) => Array.isArray(target) ? target[0] : target).join(', '), 1200);
+        return block(9, `user-facing change without a screenshot: ${targets}. `
+          + 'Use the project verify skill and record `ledger evidence <L> --artifact <screenshot>`.', sortedIdentities(missing));
+      }
+    }
   }
-  if (!semantic || semantic.hash !== snapshot.hash || (!semantic.ok && semantic.ok !== null && !semantic.findings?.length)
-    || semantic.findings?.some((finding) => !linked(state, finding.id))) {
-    return block(6, 'run ledger crosscheck and link any missing or misread requirements');
-  }
-  const absent = state.items.filter((item) => !checked.has(item.id));
-  if (absent.length) return block(7, `include the ledger checklist in the final message: ${absent.map((item) => item.id).join(', ')}`);
-  if (!state.gateWaived && !nonGit) {
-    const cleanup = await cleanupProblem(context, state, repos, jobLookup);
-    if (cleanup) return block(8, cleanup);
-  }
-  if (!state.gateWaived && await screenshotProblem(context, state, evidenceRepos)) {
-    return block(9, 'user-facing change without a screenshot: drive it with the project\'s verify skill '
-      + '(create .claude/skills/verify-<app> if missing) and record `ledger evidence <L> --artifact <screenshot>`');
-  }
-  if (!state.gateWaived && hasApproachReviewTiers(await loadConfig())) {
-    const mode = approachReviewMode(context.session);
-    const approach = approachReviewProblem(context, state.task);
-    if (approach) return { ...block(10, approach), mode };
-  }
-  return { applies: true, ok: true };
+  return ok(applies);
 }
 
 export function gateMode(session) {
   return calibrationMode(ledgerPaths(session).calibration);
-}
-
-function approachReviewMode(session) {
-  const mode = calibrationMode(ledgerPaths(session).approachCalibration);
-  return mode === 'warn' ? mode : gateMode(session);
 }
 
 function calibrationMode(file) {
@@ -1298,23 +1425,28 @@ export function logGate(message) {
   } catch { /* Logging must never block a hook. */ }
 }
 
-export function stopOutput(context, status, active) {
-  if (!status.applies) return null;
+export function stopOutput(context, status) {
   const file = ledgerPaths(context.session).stops;
-  if (status.ok) {
-    writeJson(file, { reasons: [] });
-    return status.systemMessage ? { systemMessage: status.systemMessage } : null;
-  }
-  const previous = readJson(file, { reasons: [] });
-  const repeated = active === true && previous.reasons.length === 3 && previous.reasons.every((reason) => reason === status.reason);
-  writeJson(file, { reasons: [...previous.reasons, status.reason].slice(-3) });
-  if (repeated) {
-    const systemMessage = `conveyor gate: ${status.reason} (allowed after 3 repeats)`;
-    logGate(`${context.session}: ${systemMessage}`);
-    return { systemMessage };
-  }
-  if ((status.mode ?? gateMode(context.session)) === 'warn') return { systemMessage: `conveyor gate: ${status.reason}` };
-  return { decision: 'block', reason: status.reason };
+  return withLock(file, () => {
+    const previous = readJson(file);
+    const sameRequest = previous?.version === stopVersion && previous.requestKey === status.requestKey;
+    if (status.ok) {
+      if (previous && (!status.wip || !sameRequest)) fs.rmSync(file, { force: true });
+      return status.systemMessage ? { systemMessage: status.systemMessage } : null;
+    }
+    if (gateMode(context.session) === 'warn') {
+      if (previous && !sameRequest) fs.rmSync(file, { force: true });
+      return { systemMessage: `conveyor gate: ${status.reason}` };
+    }
+    if (sameRequest && previous.lastBlockedFingerprint === status.fingerprint) {
+      const systemMessage = `conveyor gate: unchanged blocker, turn allowed — ${status.reason}`;
+      logGate(`${context.session}: ${systemMessage}`);
+      return { systemMessage };
+    }
+    writeJson(file, { version: stopVersion, requestKey: status.requestKey,
+      lastBlockedCheck: status.check, lastBlockedFingerprint: status.fingerprint });
+    return { decision: 'block', reason: status.reason };
+  });
 }
 
 export function registerTemporary(context, file) {
