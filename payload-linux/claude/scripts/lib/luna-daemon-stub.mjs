@@ -13,7 +13,8 @@ const audit = (value) => {
   if (process.argv[2]) appendFileSync(process.argv[2], `${JSON.stringify({ at: Date.now(), ...value })}\n`, 'utf8');
 };
 audit({ event: 'spawn', pid: process.pid, args: process.argv.slice(3),
-  managedPackageRoot: process.env.CODEX_MANAGED_PACKAGE_ROOT, managedByNpm: process.env.CODEX_MANAGED_BY_NPM });
+  managedPackageRoot: process.env.CODEX_MANAGED_PACKAGE_ROOT, managedByNpm: process.env.CODEX_MANAGED_BY_NPM,
+  codexHome: process.env.CODEX_HOME });
 
 const rateLimits = {
   limitId: 'codex', limitName: 'Codex', planType: 'plus', rateLimitReachedType: null,

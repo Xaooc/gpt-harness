@@ -5,13 +5,13 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { lockOwnerAlive, lockOwnerStart } from './platform.mjs';
+import { accountPaths, codexAccounts, loggedIn, selectAccount, stamp, validateAccounts } from './codex-accounts.mjs';
 
 const providers = ['codex', 'gemini', 'claude'];
 const reasons = ['quota', 'region', 'auth', 'start'];
 const defaultFile = new URL('../../../conveyor/orchestration.default.json', import.meta.url);
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const own = (value, key) => Object.hasOwn(value, key);
-const stamp = (value) => typeof value === 'number' ? value : Date.parse(value);
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function paths() {
@@ -36,10 +36,12 @@ export function wrapperPath(provider) {
   throw new Error(`No shell wrapper for ${provider}`);
 }
 
-function keys(value, required, label) {
+function keys(value, required, label, optional = []) {
   if (!object(value)) throw new Error(`${label} must be an object`);
   for (const key of Object.keys(value)) {
-    if (!required.includes(key)) throw new Error(`unknown ${label === 'config' ? 'top-level' : label} key: ${key}`);
+    if (!required.includes(key) && !optional.includes(key)) {
+      throw new Error(`unknown ${label === 'config' ? 'top-level' : label} key: ${key}`);
+    }
   }
   for (const key of required) {
     if (!own(value, key)) throw new Error(`${label}.${key} is required`);
@@ -91,7 +93,8 @@ function validateTiers(tiers, catalog, label, partial = false, knownTiers = tier
 
 export function validateConfig(config) {
   const required = ['version', 'tiers', 'panels', 'catalog', 'thresholds', 'unavailable_ttl_s', 'roles', 'presets'];
-  keys(config, required, 'config');
+  keys(config, required, 'config', ['codex_accounts']);
+  if (own(config, 'codex_accounts')) validateAccounts(config.codex_accounts);
   if (config.version !== 1) throw new Error('version must be 1');
   if (!object(config.catalog)) throw new Error('catalog must be an object');
   for (const provider of Object.keys(config.catalog)) {
@@ -309,31 +312,69 @@ async function readProviders() {
   return marks;
 }
 
-export async function markUnavailable(provider, reason, note, { config, now = Date.now() } = {}) {
+function codexMarks(provider = {}) {
+  const state = { ...provider, accounts: { ...provider.accounts } };
+  // Only pre-registry quota and auth marks implied main. Explicit provider marks can still coexist with account marks.
+  if (!own(provider, 'accounts') && ['quota', 'auth'].includes(provider.reason)) {
+    const { until, reason, note, at } = provider;
+    state.accounts.main = { until, reason, note, at };
+    for (const key of ['until', 'reason', 'note', 'at']) delete state[key];
+  }
+  if (typeof provider.switched === 'boolean') {
+    state.accounts.main = { switched: provider.switched, ...state.accounts.main };
+    delete state.switched;
+  }
+  return state;
+}
+
+export async function markUnavailable(provider, reason, note, { account, config, now = Date.now() } = {}) {
   if (!providers.includes(provider)) throw new Error(`unknown provider: ${provider}`);
   if (!reasons.includes(reason)) throw new Error(`unknown unavailable reason: ${reason}`);
   config ??= await loadConfig();
+  if (account !== undefined && (provider !== 'codex' || !['quota', 'auth'].includes(reason) ||
+      !codexAccounts(config).some(({ id }) => id === account))) {
+    throw new Error(`invalid unavailable mark for ${provider} account ${account}: ${reason}`);
+  }
   return withLock(paths().providers, async () => {
     const marks = await readProviders();
-    marks[provider] = {
-      ...marks[provider], until: new Date(now + config.unavailable_ttl_s[reason] * 1000).toISOString(),
+    if (provider === 'codex') marks.codex = codexMarks(marks.codex);
+    const mark = {
+      until: new Date(now + config.unavailable_ttl_s[reason] * 1000).toISOString(),
       reason, note, at: new Date(now).toISOString()
     };
+    if (account === undefined) marks[provider] = { ...marks[provider], ...mark };
+    else marks.codex.accounts[account] = {
+      switched: false, ...(own(marks.codex.accounts, account) ? marks.codex.accounts[account] : {}), ...mark
+    };
     await writeJsonAtomic(paths().providers, marks);
-    return marks[provider];
+    return account === undefined ? marks[provider] : marks.codex.accounts[account];
   });
 }
 
-async function codexUsage(now) {
-  const run = paths().run;
-  const candidates = await Promise.all([
-    optionalJson(path.join(run, 'codex-limits.json')),
-    optionalJson(path.join(run, 'daemon-net', 'codex-limits.json'))
-  ]);
-  const limits = candidates.filter(object).sort((a, b) => (stamp(b.at) || 0) - (stamp(a.at) || 0))[0];
+async function codexUsage(id, now, directories) {
+  const daemon = directories?.daemon;
+  const root = daemon ? (id === 'main' ? daemon : path.join(daemon, 'accounts', id)) : accountPaths(id).runRoot;
+  const roots = new Set([root]);
+  // Preserve the original LUNA_RUN_DIR lookup for main.
+  if (id === 'main') roots.add(directories?.run ?? paths().run);
+  const files = ['codex-limits.json', 'daemon-net/codex-limits.json', 'codex-limits.probe.json'];
+  const candidates = await Promise.all([...roots].flatMap((root) => files.map((file) => optionalJson(path.join(root, file)))));
+  const limits = candidates.filter((value) => object(value) && Number.isFinite(stamp(value.at)))
+    .sort((a, b) => stamp(b.at) - stamp(a.at))[0];
   if (!limits) return { known: false, ageS: null, stale: false, primary: null, secondary: null };
-  const ageS = Number.isFinite(stamp(limits.at)) ? Math.max(0, (now - stamp(limits.at)) / 1000) : null;
-  return { ...limits, ageS, stale: ageS !== null && ageS > 1800, known: ageS !== null && ageS <= 1800 };
+  const ageS = Math.max(0, (now - stamp(limits.at)) / 1000);
+  return { ...limits, ageS, stale: ageS > 1800, known: ageS <= 1800 };
+}
+
+export function codexLimitsSnapshot(state) {
+  const active = state.threshold.active;
+  const codexAccounts = state.threshold.accounts.map(({ id, label, loggedIn, exhausted, known, reason }) => {
+    const { until, reason: markReason } = state.providers.codex.accounts[id];
+    const { known: _known, stale: _stale, loggedIn: _loggedIn, ...limits } = state.usage.codexAccounts[id];
+    const mark = ['quota', 'auth'].includes(markReason) && stamp(until) > state.now ? { reason: markReason, until } : null;
+    return { id, label, active: id === active, loggedIn, exhausted, known, reason, mark, limits: limits.ageS === null ? null : limits };
+  });
+  return { codexAccounts, codexLimits: codexAccounts.find(({ id }) => id === (active ?? 'main'))?.limits ?? null };
 }
 
 async function collectorClaudeLimits(run, now) {
@@ -394,45 +435,30 @@ async function claudeUsage(now) {
   return { known: windows.length > 0, nearLimit: windows.some((limit) => limit.percentUsed >= 95), windows };
 }
 
-const used = (window) => Number.isFinite(window?.usedPercent) && window.usedPercent >= 0 ? window.usedPercent : null;
-
-function thresholdState(config, usage, previous) {
-  const { switch_percent: threshold, hysteresis_percent: hysteresis, windows } = config.thresholds.codex;
-  const switched = previous === true;
-  const readings = windows.map((name) => ({ name, window: usage[name], percent: used(usage[name]) }));
-  if (!usage.known || readings.every((reading) => reading.percent === null)) {
-    return { switched, skip: false, reason: `codex limits unknown${usage.stale ? ' (stale)' : ''}` };
-  }
-  const high = readings.find((reading) => reading.percent !== null && reading.percent >= threshold);
-  // A window the provider does not report (null) cannot hold the switch: recovery needs every
-  // reported window below the mark, and at least one window is reported (checked above).
-  const recovered = readings.every((reading) => reading.percent === null || reading.percent < threshold - hysteresis);
-  const skip = Boolean(high) || (switched && !recovered);
-  if (!skip) return { switched: false, skip: false, reason: 'available' };
-  const limiting = high || readings.find((reading) =>
-    reading.percent !== null && reading.percent >= threshold - hysteresis);
-  const mins = limiting?.window?.windowMins;
-  const label = mins ? `${mins % 60 === 0 ? `${mins / 60}h` : `${mins}m`} window`
-    : `${limiting?.name || 'unknown'} window`;
-  const reason = limiting
-    ? `codex ${limiting.percent}% ≥ ${high ? threshold : threshold - hysteresis}% ` +
-      `(${label}${high ? '' : '; hysteresis'})`
-    : `codex hysteresis: waiting for every configured window below ${threshold - hysteresis}%`;
-  return { switched: true, skip: true, reason };
-}
-
-export async function providerState(config, { now = Date.now(), persist = true } = {}) {
+export async function providerState(config, { now = Date.now(), persist = true, excludeCodexAccounts, codexDirectories } = {}) {
   config ??= await loadConfig();
-  const [codexRead, claudeRead] = await Promise.allSettled([codexUsage(now), claudeUsage(now)]);
-  const codex = codexRead.value ?? { known: false, ageS: null, stale: false, primary: null, secondary: null };
-  const claude = claudeRead.value ?? { known: false, nearLimit: false, windows: [] };
+  const accounts = codexAccounts(config);
+  const [readings, claude] = await Promise.all([
+    Promise.all(accounts.map(async ({ id }) => [id, { ...await codexUsage(id, now, codexDirectories), loggedIn: loggedIn(id) }])),
+    claudeUsage(now).catch(() => ({ known: false, nearLimit: false, windows: [] }))
+  ]);
+  const usage = Object.fromEntries(readings);
   const resolve = async () => {
     const marks = await readProviders();
-    const threshold = thresholdState(config, codex, marks.codex?.switched);
-    if (threshold.switched !== (marks.codex?.switched === true)) {
-      marks.codex = { ...marks.codex, switched: threshold.switched };
-      if (persist) await writeJsonAtomic(paths().providers, marks);
+    const previous = marks.codex;
+    const codex = codexMarks(previous);
+    const input = { accounts, usage, marks: codex.accounts, previousActive: codex.active, threshold: config.thresholds.codex, now };
+    const selected = selectAccount(input);
+    codex.active = selected.active;
+    for (const { id, switched } of selected.accounts) {
+      codex.accounts[id] = { ...(own(codex.accounts, id) ? codex.accounts[id] : {}), switched };
     }
+    marks.codex = codex;
+    if (persist && !isDeepStrictEqual(previous, codex)) await writeJsonAtomic(paths().providers, marks);
+    const eligible = excludeCodexAccounts?.size ? accounts.filter(({ id }) => !excludeCodexAccounts.has(id)) : accounts;
+    const { active, allExhausted, reason, accounts: statuses } = eligible.length === accounts.length
+      ? selected : selectAccount({ ...input, previousActive: codex.active, accounts: eligible });
+    const threshold = { switched: allExhausted, skip: allExhausted, reason, active, accounts: statuses };
     return { providers: marks, threshold };
   };
   const state = await (persist ? withLock(paths().providers, resolve) : resolve());
@@ -445,7 +471,9 @@ export async function providerState(config, { now = Date.now(), persist = true }
       wrappers[provider] = null;
     } catch (error) { wrappers[provider] = `${provider} wrapper unavailable: ${error.code || error.message}`; }
   }
-  return { ...state, usage: { codex, claude }, wrappers, now };
+  const codex = { ...usage.main };
+  delete codex.loggedIn;
+  return { ...state, usage: { codex, codexAccounts: usage, claude }, wrappers, now };
 }
 
 function resolveEntries(entries, state, now) {
@@ -463,7 +491,7 @@ function resolveEntries(entries, state, now) {
       available = false;
       reason = state.wrappers[entry.provider];
     } else if (entry.provider === 'codex') reason = state.threshold.reason;
-    return { ...entry, available, reason };
+    return { ...entry, available, reason, ...(entry.provider === 'codex' ? { active: state.threshold.active } : {}) };
   });
 }
 

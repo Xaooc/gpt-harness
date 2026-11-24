@@ -122,6 +122,34 @@ test('overview: every limit window, the active executor per tier, on every surfa
   }
 })
 
+test('limits: two Codex accounts with the active one marked; a reset says when and how long until, at any width', async ($, on) => {
+  const calls: Calls = []
+  const reset = new Date(START + ((2 * 24 + 3) * 60 + 5) * 60_000 + 30_000).toISOString()
+  const limits = (usedPercent: number) => ({
+    ...snapshot.codexLimits!, primary: { usedPercent, windowMins: 10080, resetsAt: reset }, secondary: null,
+  })
+  const account = { loggedIn: true, known: true, reason: null, mark: null }
+  engine(on, calls, { snapshot: {
+    ...snapshot,
+    orchestration: { ...snapshot.orchestration!, threshold: { ...snapshot.orchestration!.threshold, switch_percent: 60 } },
+    codexAccounts: [
+      { ...account, id: 'main', label: 'основной', active: false, exhausted: true, limits: limits(63) },
+      { ...account, id: 'second', label: 'второй', active: true, exhausted: false, limits: limits(12) },
+    ],
+  } })
+  await $.command.run({ command: 'luna', args: '' })
+  const wide = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await wide.find({ type: 'Text', text: /^основной$/ })).toBeTruthy()
+  expect(await wide.find({ type: 'Text', text: /≥ порога 60%/ })).toBeTruthy()
+  expect(await wide.find({ type: 'Text', text: /● сейчас/ })).toBeTruthy()
+  expect(await wide.find({ type: 'Text', text: /^через 2д 3ч 5м · \S/ })).toBeTruthy()
+  await wide.unmount()
+  // A docked pane is too narrow for one line: the reset moves under its row and keeps both parts.
+  const narrow = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 44 } })
+  expect(await narrow.find({ type: 'Text', text: /^↻ через 2д 3ч 5м · \S/ })).toBeTruthy()
+  await narrow.unmount()
+})
+
 test('settings: an effort pick sends set-entry with that effort; a preset applies by name', async ($, on) => {
   const calls: Calls = []
   engine(on, calls)

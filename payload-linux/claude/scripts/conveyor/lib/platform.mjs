@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { createReadStream, readFileSync, readdirSync, readlinkSync, statSync } from 'node:fs';
+import fs, { createReadStream, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -100,7 +100,7 @@ export function lockOwnerStart() {
 }
 
 function linuxArgv(pid) {
-  return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
+  return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
 }
 
 export function listProcesses({ argv = false } = {}) {
@@ -121,7 +121,7 @@ export function listProcesses({ argv = false } = {}) {
 
 export function readProcessCommand(pid) {
   if (platform !== 'linux' || !Number.isSafeInteger(pid) || pid <= 0) return null;
-  return { argv: linuxArgv(pid), exe: readlinkSync(`/proc/${pid}/exe`).replace(/ \(deleted\)$/, '') };
+  return { argv: linuxArgv(pid), exe: fs.readlinkSync(`/proc/${pid}/exe`).replace(/ \(deleted\)$/, '') };
 }
 
 export function linuxBootId() {

@@ -76,6 +76,19 @@ the Luna panel create `conveyor/orchestration.json`, which reinstalls never over
 GitHub) and per-machine settings (permissions, status line, MCP servers in `~/.codex/config.toml`, the proxy file)
 are set up on the machine itself.
 
+### Second Codex account
+
+On Linux, register a second executor account and sign in with its own Codex home.
+
+```bash
+node ~/.claude/scripts/codex-accounts.mjs add b --label "Second account"
+CODEX_HOME="$HOME/.codex-accounts/b" codex login --device-auth
+CODEX_HOME="$HOME/.codex-accounts/b" codex login status
+```
+
+Executors switch automatically at the usage threshold set in the Luna panel. The Codex review gate and Codex plugin
+stay on the main account. Windows support for a second account is pending.
+
 The Linux payload includes the whole conveyor: tier dispatcher with approach review, project checks with the test
 budget, the acceptance ledger and prompt/subagent/Stop gates, `interrogate`, harness hygiene, usage accounting, the
 vendored pstack and the Luna panel.

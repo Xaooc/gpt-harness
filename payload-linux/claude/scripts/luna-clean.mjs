@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { codexSessionRoots } from './conveyor/usage.mjs';
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -73,8 +74,8 @@ function configuration() {
   return {
     tmp: uniqueRoots(process.env.LUNA_CLEAN_TMP ? roots(process.env.LUNA_CLEAN_TMP) : tempRoots()),
     run: path.resolve(process.env.LUNA_CLEAN_RUN || path.join(claude, 'luna-run')),
-    sessions: path.resolve(process.env.LUNA_CLEAN_SESSIONS ||
-      path.join(process.env.CODEX_HOME || path.join(home, '.codex'), 'sessions')),
+    sessions: process.env.LUNA_CLEAN_SESSIONS ? [path.resolve(process.env.LUNA_CLEAN_SESSIONS)]
+      : codexSessionRoots(path.resolve(process.env.CONVEYOR_HOME || path.join(claude, 'conveyor'))),
     backups: uniqueRoots(process.env.LUNA_CLEAN_BAK_ROOTS ? roots(process.env.LUNA_CLEAN_BAK_ROOTS) : backupRoots)
   };
 }
@@ -279,7 +280,7 @@ function runCleaner(config, {
     }
     return changed;
   }
-  guarded(config.sessions, () => sessions(config.sessions));
+  for (const dir of config.sessions) guarded(dir, () => sessions(dir));
 
   for (const dir of config.backups) guarded(dir, () => {
     const groups = new Map();

@@ -16,29 +16,34 @@ set -u
 [ $# -ge 1 ] || { echo "usage: luna-stop.sh <out.md> [...]" >&2; exit 2; }
 field() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -1; }
 cancel_daemon_job() {
-  local out="$1" id port token discovery profile marker_profile
+  local out="$1" id port token base root discovery suffix profile marker_profile
   CANCELLED_DAEMON_JOB=""
   id=$(field id "$out.daemon")
   [[ "$id" =~ ^[a-f0-9]{32}$ ]] || return 1
   profile=$(field daemon_profile "$out.status"); profile="${profile:-default}"
   marker_profile=$(field daemon_profile "$out.daemon"); marker_profile="${marker_profile:-default}"
   [ "$profile" = "$marker_profile" ] || return 1
-  discovery="${LUNA_DAEMON_HOME:-$HOME/.claude/luna-run}"
-  case "$profile" in default) ;; net) discovery="$discovery/daemon-net" ;; *) return 1 ;; esac
-  discovery="$discovery/daemon.json"
-  read -r port token < <(node -e '
-    try {
-      const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-      if (!Number.isInteger(d.port) || d.port < 1 || d.port > 65535 || !/^[a-f0-9]{32}$/.test(d.token)) {
-        process.exit(1);
-      }
-      process.stdout.write(`${d.port} ${d.token}\n`);
-    } catch { process.exit(1); }
-  ' "$discovery" 2>/dev/null)
-  [ -n "$port" ] && [ -n "$token" ] || return 1
-  luna_daemon_curl "$token" --noproxy '*' -fs --max-time 5 -X POST \
-    "http://127.0.0.1:$port/jobs/$id/cancel" >/dev/null 2>&1 || return 1
-  CANCELLED_DAEMON_JOB=$id
+  base="${LUNA_DAEMON_HOME:-$HOME/.claude/luna-run}"
+  case "$profile" in default) suffix="" ;; net) suffix=/daemon-net ;; *) return 1 ;; esac
+  for root in "$base" "$base"/accounts/*; do
+    discovery="$root$suffix/daemon.json"
+    [ -r "$discovery" ] || continue
+    read -r port token < <(node -e '
+      try {
+        const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+        if (!Number.isInteger(d.port) || d.port < 1 || d.port > 65535 || !/^[a-f0-9]{32}$/.test(d.token)) {
+          process.exit(1);
+        }
+        process.stdout.write(`${d.port} ${d.token}\n`);
+      } catch { process.exit(1); }
+    ' "$discovery" 2>/dev/null) || continue
+    if luna_daemon_curl "$token" --noproxy '*' -fs --max-time 5 -X POST \
+        "http://127.0.0.1:$port/jobs/$id/cancel" >/dev/null 2>&1; then
+      CANCELLED_DAEMON_JOB=$id
+      return 0
+    fi
+  done
+  return 1
 }
 rc_all=0
 for out in "$@"; do
