@@ -2,7 +2,7 @@
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
-  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
+  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
 } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import path from 'node:path';
@@ -533,9 +533,13 @@ class Job {
     for (const directory of this.readDirs) args.push('--add-dir', directory);
     let prompt = rules + brief;
     if (Array.from(prompt).length > PROMPT_LIMIT && file) {
-      prompt = rules + `The full task brief is in the file ${file}. Read it completely first and follow it exactly.`;
-      args.push('--add-dir', path.dirname(file));
-      this.addDir = path.dirname(file);
+      // A copy in a folder of its own: the brief's real folder may be private (~/.claude, ~/.config) and must not open.
+      this.briefDir ??= mkdtempSync(path.join(tmpdir(), 'mlai-brief-'));
+      const copy = path.join(this.briefDir, path.basename(file));
+      writeFileSync(copy, brief, { mode: 0o600 });
+      prompt = rules + `The full task brief is in the file ${copy}. Read it completely first and follow it exactly.`;
+      args.push('--add-dir', this.briefDir);
+      this.addDir = this.briefDir;
     }
     if (Array.from(prompt).length > PROMPT_LIMIT) throw new Failure(`mlai: prompt exceeds ${PROMPT_LIMIT} characters`, 2);
     return { args, prompt };
@@ -724,6 +728,7 @@ class Job {
       try { if (this.ownsOutput) result = this.finalize(result); }
       finally {
         if (this.activeFile) { try { unlinkSync(this.activeFile); } catch {} }
+        if (this.briefDir) { try { rmSync(this.briefDir, { recursive: true, force: true }); } catch {} }
         // The session was kept only so a step-limited run could continue it.
         try { rmSync(path.join(this.mlaiHome, 'sessions', this.sessionId), { recursive: true, force: true }); } catch {}
         try { this.outputLock?.release(); } catch {}
