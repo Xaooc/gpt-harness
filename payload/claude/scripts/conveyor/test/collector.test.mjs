@@ -39,8 +39,10 @@ async function fixture(work, { realOverview = false, hangUsage = false, sessionF
   const lock = path.join(claude, 'luna-run', 'collector', 'collector.lock');
   const snapshot = path.join(directory, 'snapshot.json'), cli = path.join(scripts, 'luna-collector.mjs');
   const env = { ...process.env, HOME: root, USERPROFILE: root, LUNA_RUN_DIR: runDir,
-    CONVEYOR_HOME: path.join(claude, 'conveyor'), CLAUDE_HOME_DIR: claude, CODEX_HOME: path.join(root, '.codex') };
-  for (const name of ['CONVEYOR_PLATFORM', 'LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME', 'LUNA_COLLECTOR_LOCK_RETRY_MS']) delete env[name];
+    CONVEYOR_HOME: path.join(claude, 'conveyor'), CLAUDE_HOME_DIR: claude, CODEX_HOME: path.join(root, '.codex'),
+    LUNA_CODEX_BIN: '' };
+  for (const name of ['CONVEYOR_PLATFORM', 'LUNA_OVERVIEW_HOME', 'LUNA_DAEMON_HOME', 'LUNA_COLLECTOR_LOCK_RETRY_MS',
+    'LUNA_CODEX_MAIN_HOME', 'LUNA_DAEMON_APP_SERVER_CMD']) delete env[name];
   const command = async (action, options = {}) => {
     const { stdout } = await execute(process.execPath, [cli, action], { env, windowsHide: true, timeout, ...options });
     return stdout.trim() ? JSON.parse(stdout) : null;
@@ -64,14 +66,16 @@ async function fixture(work, { realOverview = false, hangUsage = false, sessionF
   };
   try {
     await Promise.all([sessions, directory, path.dirname(lock)].map(dir => fs.mkdir(dir, { recursive: true })));
-    const files = ['luna-collector.mjs', 'conveyor/lib/platform.mjs', 'conveyor/lib/sessions.mjs'];
+    const files = ['luna-collector.mjs', 'conveyor/lib/platform.mjs', 'conveyor/lib/sessions.mjs',
+      'conveyor/lib/codex-accounts.mjs', 'conveyor/lib/orchestration.mjs', 'lib/codex-limits-probe.mjs', 'lib/luna-runtime.mjs'];
+    if (process.platform === 'linux') files.push('account-lease.mjs');
     if (process.platform === 'win32') files.push('lib/process-identity.mjs');
+    await fs.mkdir(env.CONVEYOR_HOME, { recursive: true });
+    await fs.copyFile(new URL('../../../conveyor/orchestration.default.json', import.meta.url),
+      path.join(env.CONVEYOR_HOME, 'orchestration.default.json'));
     if (realOverview) {
       await Promise.all(['conveyor', 'lib', 'learning'].map(name => fs.cp(path.join(sources, name),
         path.join(scripts, name), { recursive: true })));
-      await fs.mkdir(path.join(claude, 'conveyor'), { recursive: true });
-      await fs.copyFile(new URL('../../../conveyor/orchestration.default.json', import.meta.url),
-        path.join(claude, 'conveyor', 'orchestration.default.json'));
       files.push('luna-overview.mjs');
     }
     for (const name of files) {
@@ -237,6 +241,53 @@ test('a quiet foreground collector stays resident and releases discovery and loc
     assert.deepEqual(await closed, [0, null]);
     assert.equal(await json(discovery), null);
     assert.equal(await json(lock), null);
+  });
+});
+
+test('a quiet account round probes both accounts and publishes the active limits', { timeout }, async () => {
+  await fixture(async ({ launch, snapshotWhen, env }) => {
+    env.LUNA_DAEMON_HOME = env.LUNA_RUN_DIR;
+    const audit = path.join(env.HOME, 'probe-audit');
+    env.LUNA_DAEMON_APP_SERVER_CMD = JSON.stringify([process.execPath, path.join(sources, 'lib/luna-daemon-stub.mjs'), audit]);
+    const config = await json(path.join(env.CONVEYOR_HOME, 'orchestration.default.json'));
+    config.codex_accounts = [{ id: 'main', label: 'Main' }, { id: 'second', label: 'Second' }];
+    await fs.writeFile(path.join(env.CONVEYOR_HOME, 'orchestration.json'), JSON.stringify(config));
+    const second = path.join(env.HOME, '.codex-accounts', 'second');
+    await fs.mkdir(second, { recursive: true });
+    await fs.writeFile(path.join(second, 'auth.json'), '');
+
+    launch();
+    const snapshot = await snapshotWhen((value) => value?.sections.codexAccounts?.status === 'ok');
+    assert.equal(snapshot.sections.jobs.status, 'idle');
+    assert.deepEqual(snapshot.codexAccounts.map(({ id }) => id), ['main', 'second']);
+    assert.deepEqual(snapshot.codexAccounts.map(({ active }) => active), [true, false]);
+    for (const account of snapshot.codexAccounts) {
+      const root = account.id === 'main' ? env.LUNA_RUN_DIR : path.join(env.LUNA_RUN_DIR, 'accounts', account.id);
+      const file = path.join(root, 'codex-limits.probe.json');
+      const limits = await json(file);
+      assert.deepEqual(Object.keys(limits), [
+        'v', 'at', 'source', 'planType', 'ordinaryUsageAllowed', 'reached', 'primary', 'secondary', 'byLimitId'
+      ]);
+      assert.deepEqual(Object.keys(limits.primary), ['usedPercent', 'windowMins', 'resetsAt']);
+      assert.deepEqual(Object.keys(limits.secondary), ['usedPercent', 'windowMins', 'resetsAt']);
+      assert.deepEqual(Object.keys(limits.byLimitId), ['codex', 'fast']);
+      for (const bucket of Object.values(limits.byLimitId)) {
+        assert.deepEqual(Object.keys(bucket), ['name', 'primary', 'secondary', 'reached']);
+      }
+      assert.equal(limits.source, 'probe');
+      assert.equal(limits.primary.usedPercent, 12);
+      assert.ok(account.loggedIn && account.known);
+      assert.deepEqual(account.limits, { ...limits, ageS: account.limits.ageS });
+      if (process.platform !== 'win32') assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    }
+    assert.deepEqual(snapshot.codexLimits, snapshot.codexAccounts.find(({ active }) => active).limits);
+    assert.equal(await json(path.join(env.CONVEYOR_HOME, 'providers.json')), null);
+    const calls = (await fs.readFile(audit, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    const servers = calls.filter(({ event }) => event === 'spawn');
+    assert.deepEqual(servers.map(({ codexHome }) => codexHome), [env.CODEX_HOME, second]);
+    assert.ok(servers.every(({ pid }) => !processAlive(pid)));
+    assert.deepEqual(calls.filter(({ method }) => method === 'account/rateLimits/read').map(({ params }) => params),
+      [{ excludeResetCreditDetails: true }, { excludeResetCreditDetails: true }]);
   });
 });
 

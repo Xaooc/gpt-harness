@@ -23,7 +23,8 @@ const SHUTDOWN_GRACE_MS = 3000;
 const QUIET_MS = 30 * SECOND;
 const MAX_SNAPSHOT = 3 * 1024 * 1024;
 const MAX_BEAT = 16 * 1024;
-const FAST_SECTIONS = ['daemon', 'jobs', 'codexLimits', 'orchestration'];
+const FAST_SECTIONS = ['daemon', 'jobs', 'orchestration'];
+const QUIET_SECTIONS = new Set(['sessions', 'codexAccounts', 'codexLimits']);
 const iso = (time = Date.now()) => new Date(time).toISOString();
 const message = (error) => String(error?.message ?? error).replace(/[\r\n]+/g, ' ').slice(0, 500);
 const object = (value) => value && typeof value === 'object' && !Array.isArray(value);
@@ -158,6 +159,31 @@ async function runUsage({ now }) {
   const { collectUsage, readUsageSummary } = await import('./conveyor/usage.mjs');
   if ((await collectUsage({ now })).locked) throw new Error('usage collection already running');
   return { ...await readUsageSummary({ now }), stale: false };
+}
+
+// The round reads the limits files at the pane's pace, but starts an app-server for an account at most once per
+// PROBE_EVERY_MS: a probe that keeps failing must not respawn Codex every few seconds.
+const PROBE_EVERY_MS = 5 * MINUTE;
+const probedAt = new Map();
+
+async function collectCodexAccounts(now, signal) {
+  const { codexLimitsSnapshot, loadConfig, providerState } = await import('./conveyor/lib/orchestration.mjs');
+  const { accountPaths } = await import('./conveyor/lib/codex-accounts.mjs');
+  const { probeLimits } = await import('./lib/codex-limits-probe.mjs');
+  const config = await loadConfig();
+  const initial = await providerState(config, { now, persist: false });
+  for (const { id, loggedIn } of initial.threshold.accounts) {
+    signal.throwIfAborted();
+    const { ageS } = initial.usage.codexAccounts[id];
+    if (!loggedIn || (ageS !== null && ageS <= 10 * MINUTE / SECOND)) continue;
+    // Windows has one account and an unverified app-server launch here: it only reads what its daemon wrote.
+    if (platform === 'win32' || now - (probedAt.get(id) ?? -Infinity) < PROBE_EVERY_MS) continue;
+    probedAt.set(id, now);
+    const { codexHome, runRoot } = accountPaths(id);
+    await probeLimits({ codexHome, out: path.join(runRoot, 'codex-limits.probe.json'), signal });
+  }
+  signal.throwIfAborted();
+  return codexLimitsSnapshot(await providerState(config, { persist: false }));
 }
 
 async function readProbeJson(file) {
@@ -295,14 +321,15 @@ async function serve(config, owner, result = {}) {
   const token = randomBytes(16).toString('hex');
   const defaults = {
     v: 1, ram: { freeMb: null, totalMb: null }, daemon: { running: false, appServer: null, healthy: false },
-    jobs: [], codexLimits: null, build: null, sessions: [], orchestration: null, switches: [], gemini: null, usage: null
+    jobs: [], codexLimits: null, codexAccounts: [], build: null, sessions: [], orchestration: null,
+    switches: [], gemini: null, usage: null
   };
   if (platform === 'win32') defaults.daemons = {};
   const values = { ...defaults, cli: null };
   const beats = new Map(), limits = new Map(), jobs = [], pending = new Set();
   const shutdown = new AbortController();
   const metadata = Object.fromEntries(
-    [...FAST_SECTIONS, 'ram', 'sessions', 'usage', 'cli', 'catalog', 'gemini'].map((name) => [name, section(0)]));
+    [...FAST_SECTIONS, ...QUIET_SECTIONS, 'ram', 'usage', 'cli', 'catalog', 'gemini'].map((name) => [name, section(0)]));
   metadata.gemini.reason = 'Gemini is not used';
   const saved = readJson(config.snapshot, MAX_SNAPSHOT);
   if (saved?.version === 2) {
@@ -368,7 +395,7 @@ async function serve(config, owner, result = {}) {
       for (const name of names) report(name, meta(name).okAt ? 'stale' : 'unavailable', Date.now(), message(error));
     };
     const controller = new AbortController();
-    const timeout = setTimeout(() => {
+    const timeout = deadline === null ? null : setTimeout(() => {
       const error = new Error(`deadline exceeded after ${deadline} ms`);
       controller.abort(error);
       fail(error);
@@ -388,6 +415,14 @@ async function serve(config, owner, result = {}) {
 
   const fast = () => fastMs;
   const probeDeadline = 4 * SECOND;
+  // Each app-server read has its own deadline, so a round can visit every account sequentially.
+  const codexAccountsJob = register({ names: ['codexAccounts', 'codexLimits'], interval: () => quiet ? PROBE_EVERY_MS : fastMs, deadline: null,
+    work: collectCodexAccounts,
+    merge(result, now) {
+      Object.assign(values, result);
+      report('codexAccounts', 'ok', now);
+      report('codexLimits', 'ok', now);
+    } });
   register({ names: ['ram'], interval: fast, deadline: SECOND,
     async work() {
       let available = freemem();
@@ -425,7 +460,7 @@ async function serve(config, owner, result = {}) {
       }
     } });
   let sessionCursors = {}, sessionIdentities;
-  const sessions = register({ names: ['sessions'], interval: () => quiet ? QUIET_MS : fastMs, deadline: probeDeadline,
+  register({ names: ['sessions'], interval: () => quiet ? QUIET_MS : fastMs, deadline: probeDeadline,
     async work(now) {
       const result = await readSessions({ now, claudeHome: config.claudeHome, cursors: sessionCursors,
         identities: sessionIdentities });
@@ -487,7 +522,7 @@ async function serve(config, owner, result = {}) {
 
   function publish(now) {
     const sections = Object.fromEntries(Object.entries(metadata).map(([name, state]) => [
-      name, quiet && name !== 'sessions' ? { ...state, status: 'idle', reason: null } : sectionView(state, now)
+      name, quiet && !QUIET_SECTIONS.has(name) ? { ...state, status: 'idle', reason: null } : sectionView(state, now)
     ]));
     const serialized = JSON.stringify(sections);
     if (!dirty && lastSections === serialized) return;
@@ -521,9 +556,12 @@ async function serve(config, owner, result = {}) {
       quiet = nextQuiet;
       fastMs = nextFast;
       dirty = true;
-      for (const job of jobs) job.dueAt = waking ? now : job.last + job.interval();
+      for (const job of jobs) {
+        if (job !== codexAccountsJob) job.dueAt = waking ? now : job.last + job.interval();
+      }
     }
-    for (const job of quiet ? [sessions] : jobs) {
+    for (const job of jobs) {
+      if (quiet && !job.names.every((name) => QUIET_SECTIONS.has(name))) continue;
       for (const name of job.names) {
         meta(name).staleAfterMs = name === 'cli' ? 6 * HOUR : name === 'catalog' ? HOUR : job.interval() + job.deadline;
       }

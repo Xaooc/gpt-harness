@@ -235,15 +235,23 @@ async function codexBusy() {
     if (platform !== 'linux') throw new Error('Codex update process inspection unavailable');
     const script = path.join(home(), '.claude', 'scripts', 'luna-daemon.mjs');
     if (await exists(script)) {
-      for (const profile of ['default', 'net']) {
-        const response = await runProbe(process.execPath, [script, '--status', '--profile', profile]);
+      // Every Codex account runs its own daemons under <base>/accounts/<id>; a job on any of them keeps Codex busy.
+      const base = process.env.LUNA_DAEMON_HOME || runDir();
+      const accounts = await fs.readdir(path.join(base, 'accounts'), { withFileTypes: true }).catch((error) => {
+        if (error.code === 'ENOENT') return [];
+        throw error;
+      });
+      const roots = [['', base], ...accounts.filter((entry) => entry.isDirectory())
+        .map(({ name }) => [`${name} `, path.join(base, 'accounts', name)])];
+      for (const [account, root] of roots) for (const profile of ['default', 'net']) {
+        const response = await runProbe(process.execPath, [script, '--status', '--profile', profile],
+          { env: { ...process.env, LUNA_DAEMON_HOME: root } });
         const parsed = daemonJobs(response.stdout);
         jobs += parsed.jobs.length;
-        if (parsed.jobs.length) reasons.push(`${profile} daemon has running or queued jobs`);
+        if (parsed.jobs.length) reasons.push(`${account}${profile} daemon has running or queued jobs`);
         if (parsed.health.ok && response.code !== 0) throw new Error('daemon status failed');
         if (!parsed.health.ok) {
-          const base = process.env.LUNA_DAEMON_HOME || runDir();
-          const info = await optionalJson(path.join(base, profile === 'net' ? 'daemon-net' : '', 'daemon.json'));
+          const info = await optionalJson(path.join(root, profile === 'net' ? 'daemon-net' : '', 'daemon.json'));
           if (info?.pid) {
             try { process.kill(info.pid, 0); throw new Error('live daemon status unavailable'); }
             catch (error) { if (error.code !== 'ESRCH') throw error; }

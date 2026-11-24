@@ -12,6 +12,21 @@ export type CodexLimits = {
   secondary: LimitWindow | null
 }
 
+/** One registered Codex account, in preference order. `active` is the account the next Codex job starts on. */
+export type CodexAccount = {
+  id: string
+  label: string
+  active: boolean
+  loggedIn: boolean
+  /** Past the threshold, held by hysteresis, or marked (quota/auth) until `mark.until`. */
+  exhausted: boolean
+  /** Fresh limits were read (≤ 30 min old). */
+  known: boolean
+  reason: string | null
+  mark: { reason: string; until: string } | null
+  limits: CodexLimits | null
+}
+
 export type DaemonJob = {
   id: string
   state: string
@@ -82,7 +97,12 @@ export type CatalogModel = { model: string; efforts: string[] }
 export type Orchestration = {
   chains: Record<string, ChainEntry[]>
   panels: Record<string, Seat[]>
-  threshold: { switch_percent: number; hysteresis_percent: number; windows: string[]; switched: boolean }
+  threshold: {
+    switch_percent: number; hysteresis_percent: number; windows: string[]
+    /** Every account is past the threshold: Codex jobs go to the next executor (Claude). */
+    switched: boolean
+    active?: string | null
+  }
   marks: Record<string, { until: string; reason: string }>
   presets: { name: string; label: string }[]
   catalog: Record<string, CatalogModel[]>
@@ -157,6 +177,8 @@ export type Snapshot = {
   }
   jobs: Job[]
   codexLimits: CodexLimits | null
+  /** Every registered account; absent from collectors older than the two-account release. */
+  codexAccounts?: CodexAccount[] | null
   build: { line: string; building: boolean; exeAt: string | null } | null
   sessions?: SessionBeat[]
   orchestration?: Orchestration | null
