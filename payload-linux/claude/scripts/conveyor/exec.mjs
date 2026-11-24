@@ -1044,6 +1044,11 @@ async function switchProvider(tier, from, to, reason, out) {
   process.stderr.write(`conveyor: ${tier}: ${from} → ${to} (${reason})\n`);
 }
 
+async function repositoryUnchanged(gate) {
+  if (!gate?.base) return false;
+  return (await gateChangedFiles(gate.repo, gate.base, gate.preExisting)).length === 0;
+}
+
 function failureReason(result, status, account, provider) {
   if (result.launchError) return { reason: 'start', note: result.launchError };
   if (provider === 'mlai') {
@@ -1259,7 +1264,14 @@ async function runCommand(args) {
         account = attempt.account = 'main';
         triedAccounts.add(account);
       }
-      const failure = failureReason(result, observed.values, account, entry.provider);
+      let failure = failureReason(result, observed.values, account, entry.provider);
+      // An mlai run that stopped short without changing anything leaves nothing to keep and nothing to apply twice: run
+      // it on the next chain entry instead of reporting it as done (2026-11-24: J6d stopped on an approval it could not
+      // get in headless mode, exit 0, and its work was silently lost).
+      const noWork = !failure && entry.provider === 'mlai' && result.code !== 0 && !result.signal &&
+        observed.values?.state !== 'done' && observed.values?.changed_files === '0' &&
+        (mode === 'read' || await repositoryUnchanged(gate));
+      if (noWork) failure = { reason: 'start', note: observed.values?.error || 'mlai stopped without changes', mark: false };
       Object.assign(attempt, {
         code: result.code, state: observed.values?.state ?? null, error: observed.values?.error ?? null,
         reached_running: observed.reachedRunning
@@ -1267,7 +1279,7 @@ async function runCommand(args) {
       dispatch.code = result.code;
       if (failure && failure.mark !== false) await markUnavailable(entry.provider, failure.reason, failure.note, { config, account: failure.account });
       const retryable = result.code === 3 || Boolean(failure && !result.launchError);
-      const started = observed.reachedRunning && (mode === 'write' || entry.provider === 'mlai');
+      const started = observed.reachedRunning && !noWork && (mode === 'write' || entry.provider === 'mlai');
       const canRetry = retryable && !started && !result.signal;
       let retryAccount = false;
       if (canRetry && (failure?.account || !panel)) {

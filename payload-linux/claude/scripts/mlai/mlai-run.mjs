@@ -541,7 +541,9 @@ class Job {
         const detail = oneLine(result?.subtype) || oneLine(result?.error);
         const note = `mlai: stopped early (exit 3: needs attention): ${detail}`;
         writeFileSync(this.outputFd, text + separator + heading + note + '\n');
-        return { state: 'incomplete', rc: 0, error: '' };
+        // Non-zero: the work is unfinished, so the dispatcher must not count it as done (it moves a run without changes
+        // to the next chain entry and returns this code otherwise).
+        return { state: 'incomplete', rc: 1, error: `mlai: stopped early (exit 3: ${detail || 'needs attention'})` };
       }
       case 6:
       case 7:

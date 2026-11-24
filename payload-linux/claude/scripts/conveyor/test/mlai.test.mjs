@@ -37,6 +37,16 @@ set -eu
 while getopts 'wrm:e:C:f:o:' opt; do
   case "$opt" in o) out=$OPTARG;; esac
 done
+flags="$(dirname "$out")"
+if [ -f "$flags/nowork" ]; then
+  printf 'provider=mlai\nstate=incomplete\nreached_running=1\nchanged_files=0\nerror=mlai: stopped early (exit 3: error_during_execution)\n' > "$out.status"
+  exit 1
+fi
+if [ -f "$flags/partial" ]; then
+  printf 'half\n' > partial.txt
+  printf 'provider=mlai\nstate=incomplete\nreached_running=1\nchanged_files=1\nerror=mlai: stopped early (exit 3: error_max_turns)\n' > "$out.status"
+  exit 1
+fi
 if [ -f "$(dirname "$out")/netfail" ]; then
   printf 'provider=mlai\nstate=unavailable\nunavailable_reason=start\nerror=mlai: connection interrupted (after 2 attempts)\n' > "$out.status"
   exit 3
@@ -44,10 +54,9 @@ fi
 printf '%s\n' "$MLAI_SLOT" > "$out"
 printf 'provider=mlai\nstate=done\nreached_running=1\n' > "$out.status"
 `, { mode: 0o755 });
-    const runJob = () => invoke(execMain, ['run', '--tier', 'complex', '-r', '-C', dir, '-f', brief, '-o', out], {
-      env, prefix: 'conveyor', captureChildren: true
-    });
-    await work({ home, slots: path.join(run, 'mlai', 'slots'), config, out, env, runJob });
+    const runJob = (mode = '-r') => invoke(execMain, ['run', '--tier', 'complex', mode, '-C', dir, '-f', brief, '-o', out,
+      ...(mode === '-w' ? ['--review-skip', 'test fixture'] : [])], { env, prefix: 'conveyor', captureChildren: true });
+    await work({ home, root, dir, slots: path.join(run, 'mlai', 'slots'), config, out, env, runJob });
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 }
 
@@ -81,7 +90,7 @@ test('two live mlai slots skip to Codex without marking mlai unavailable', async
 });
 
 test('mlai receives a free slot and releases it; a network failure before start falls through without a mark', async () => {
-  await withEnvironment(async ({ home, slots, out, runJob }) => {
+  await withEnvironment(async ({ home, dir, slots, out, runJob }) => {
     await fs.writeFile(path.join(path.dirname(out), 'netfail'), '');
     const failed = await runJob();
     assert.equal(failed.status, 0, failed.stderr);
@@ -89,6 +98,25 @@ test('mlai receives a free slot and releases it; a network failure before start 
     assert.equal(Object.hasOwn(await readJson(path.join(home, 'providers.json')).catch(() => ({})), 'mlai'), false);
     assert.deepEqual(await fs.readdir(slots), []);
     await fs.rm(path.join(path.dirname(out), 'netfail'));
+
+    // A write run that stopped without changing anything moves on; one that left changes stays and fails loudly.
+    for (const args of [['init', '-q'], ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base']]) {
+      const git = spawn('git', args, { cwd: dir });
+      assert.equal((await once(git, 'exit'))[0], 0);
+    }
+    await fs.writeFile(path.join(path.dirname(out), 'nowork'), '');
+    const idle = await runJob('-w');
+    assert.equal(idle.status, 0, idle.stderr);
+    assert.deepEqual((await readJson(`${out}.dispatch.json`)).attempts.map(({ provider }) => provider), ['mlai', 'codex']);
+    assert.equal(Object.hasOwn(await readJson(path.join(home, 'providers.json')).catch(() => ({})), 'mlai'), false);
+    await fs.rm(path.join(path.dirname(out), 'nowork'));
+    await fs.writeFile(path.join(path.dirname(out), 'partial'), '');
+    const partial = await runJob('-w');
+    assert.equal(partial.status, 1, partial.stderr);
+    assert.deepEqual((await readJson(`${out}.dispatch.json`)).attempts.map(({ provider }) => provider), ['mlai']);
+    await fs.rm(path.join(path.dirname(out), 'partial'));
+    await fs.rm(path.join(dir, 'partial.txt'));
+
     const result = await runJob();
     assert.equal(result.status, 0, result.stderr);
     const slot = (await fs.readFile(out, 'utf8')).trim();
