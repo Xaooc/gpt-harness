@@ -520,6 +520,7 @@ class Job {
     const error = clip(result?.error, 300) || `mlai exited ${code}`;
     switch (code) {
       case 0: {
+        if (this.options.write) text = contractHeadings(text);
         writeFileSync(this.outputFd, text);
         const missing = this.options.write
           ? HEADINGS.filter((heading) => !hasHeading(text, heading)) : [];
@@ -566,8 +567,11 @@ class Job {
       this.signal.throwIfAborted();
 
       const { code, result, text } = outcome;
+      // Transient network failures: a dropped stream, or the server not reached through the proxy (seen 2026-11-24,
+      // a 45 s timeout while the proxy answered normally a moment later).
+      const transient = /connection[ _-]?interrupted|Cannot reach the ML AI Code server/i;
       const interrupted = code === 1 && (result?.usage?.errorCode === 'connection_interrupted' ||
-        /connection[ _-]?interrupted/i.test(result?.error ?? '') || /connection[ _-]?interrupted/i.test(text));
+        transient.test(result?.error ?? '') || transient.test(text));
       if (!interrupted) return this.mapResult(outcome);
       if (retry >= retries) {
         return this.providerFailure(`mlai: connection interrupted (after ${this.values.attempts} attempts)`);
@@ -632,6 +636,12 @@ class Job {
     }
     return result.rc;
   }
+}
+
+// The CLI renders Markdown headings in its final text as plain "Changes:" lines; restore the contract headings.
+function contractHeadings(text) {
+  return text.replace(/^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?(Changes|Verification|Deviations|Not done)(?:\*\*)?:?(?:\*\*)?[ \t]*$/gm,
+    '## $1');
 }
 
 function hasHeading(text, heading) {
