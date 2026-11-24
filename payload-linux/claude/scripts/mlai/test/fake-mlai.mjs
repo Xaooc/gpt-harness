@@ -54,6 +54,10 @@ switch (process.env.FAKE_MLAI_SCENARIO) {
     send({ type: 'result', state: 'error', error: 'Not signed in. Run `mlai login`.', exitCode: 4 });
     process.exitCode = 4;
     break;
+  case 'daily':
+    send({ type: 'result', state: 'error', code: 'daily_run_limit', error: '[object Object]', exitCode: 1 });
+    process.exitCode = 1;
+    break;
   default:
     throw new Error(`Unknown fake scenario: ${process.env.FAKE_MLAI_SCENARIO}`);
 }

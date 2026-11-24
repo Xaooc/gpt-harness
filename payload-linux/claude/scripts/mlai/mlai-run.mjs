@@ -629,6 +629,8 @@ class Job {
   mapResult({ code, result, text, spawnError }) {
     if (spawnError) return this.providerFailure(`mlai: could not start CLI (${spawnError.code ?? 'spawn error'})`);
     const error = clip(cliError(result), 300) || `mlai exited ${code}`;
+    // An account has 100 task starts a day (reset 00:00 UTC, seen 2026-11-24); it comes as exit 1 before the start.
+    if (code !== 0 && /daily_run_limit|daily limit of \d+ task starts/i.test(error)) return this.providerFailure(error, 'quota');
     switch (code) {
       case 0: {
         if (this.options.write) text = contractHeadings(text);

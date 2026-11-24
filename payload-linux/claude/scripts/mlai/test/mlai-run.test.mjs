@@ -88,12 +88,18 @@ test('a started write attempt retries after a connection interruption', { timeou
   });
 });
 
-test('a sign-in failure before the agent starts is unavailable', { timeout: 300_000 }, async () => {
+test('a sign-in or daily-limit failure before the agent starts is unavailable', { timeout: 300_000 }, async () => {
   await fixture({ scenario: 'auth' }, ({ rc, stderr, status }) => {
     assert.equal(rc, 3, stderr);
     assert.equal(status.state, 'unavailable');
     assert.equal(status.unavailable_reason, 'auth');
     assert.notEqual(status.reached_running, '1');
+  });
+  // The daily start limit is the account's quota, and the CLI's unreadable error keeps its code.
+  await fixture({ scenario: 'daily' }, ({ rc, stderr, status }) => {
+    assert.equal(rc, 3, stderr);
+    assert.equal(status.unavailable_reason, 'quota');
+    assert.equal(status.error, 'mlai: daily_run_limit');
   });
 });
 
