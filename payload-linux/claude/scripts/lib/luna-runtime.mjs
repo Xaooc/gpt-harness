@@ -78,21 +78,7 @@ export function resolveCodex(env = process.env, home = env.HOME || homedir()) {
     }
     return path.resolve(env.LUNA_CODEX_BIN);
   }
-  const entries = (env.PATH || (process.platform === 'win32' ? env.Path : '') || '').split(path.delimiter).filter(Boolean);
-  if (process.platform === 'win32') {
-    const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
-    for (const entry of entries) {
-      const binary = path.join(entry, 'codex.exe');
-      if (executable(binary)) return binary;
-      if (!arch) continue;
-      const root = path.join(entry, 'node_modules', '@openai', 'codex');
-      const vendor = path.join('vendor', `${arch}-pc-windows-msvc`, 'bin', 'codex.exe');
-      const native = [path.join(root, 'node_modules', '@openai', `codex-win32-${process.arch}`, vendor),
-        path.join(root, vendor)].find(executable);
-      if (native) return native;
-    }
-    throw new Error('codex.exe not found');
-  }
+  const entries = (env.PATH || '').split(path.delimiter).filter(Boolean);
   const shim = entries.map((entry) => path.resolve(entry, 'codex')).find(executable);
   const roots = new Set();
   if (shim) {

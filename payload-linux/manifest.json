@@ -286,7 +286,7 @@
       "src": "claude/scripts/lib/luna-runtime.mjs",
       "dest": "scripts/lib/luna-runtime.mjs",
       "kind": "file",
-      "sha256": "ffd20a53f5b782e1548690ca36d88a138fafe400e4707801226a8f80dec25807"
+      "sha256": "869f9d3ab0ce26ce9e02c96f740de50ceccc60fe2907b4ed8a6c6216600ada8d"
     },
     {
       "src": "claude/scripts/lib/luna-runtime.sh",
@@ -3765,14 +3765,14 @@
       "src": "claude/scripts/conveyor/cli-update.mjs",
       "dest": "scripts/conveyor/cli-update.mjs",
       "kind": "file",
-      "sha256": "e6bf1381198ccafffeb94d784bf827d1a7bac58c5ca70f915d5da960efd6005f",
+      "sha256": "b729fbde261f4ba911db111d96ab5fac5ad3ea8e81f8e57ddff46e5c98b77be7",
       "executable": true
     },
     {
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "af6238b6cbffeea4eb4e43b1d98e46ddd908bdba102e7fcbb14bd217c12eb88c",
+      "sha256": "892e66a2913450d5d055e860d9c771e9c8f5ff13e26e4e76514f99b2fb847082",
       "executable": true
     },
     {

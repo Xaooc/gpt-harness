@@ -14,6 +14,7 @@ import {
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
 import { hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
+import { accountPaths } from './lib/codex-accounts.mjs';
 import { bash, platform, processAlive, readProcessStat, scanBinary } from './lib/platform.mjs';
 import { run as runSupervised, startMaintenanceWatchdog } from '../lib/supervised-run.mjs';
 
@@ -979,7 +980,7 @@ async function runCommand(args) {
     if (!seat) throw new Error(`unknown seat ${opts['--seat']} for panel ${panel}`);
     return { ...resolved, chain: [seat] };
   };
-  const triedAccounts = new Set(), excludedAccounts = new Set();
+  const triedAccounts = new Set(), excludedAccounts = new Set(), probedAccounts = new Set();
   const dispatch = {
     at: new Date().toISOString(), ...(panel ? { panel, seat: Number(opts['--seat']) } : { tier }),
     ...(role ? { role } : {}), brief, out, mode, dir,
@@ -1022,6 +1023,20 @@ async function runCommand(args) {
         return code = 5;
       }
       const entry = resolution.chain[index];
+      // With several accounts, one whose limits nobody has read yet (just registered, probes failing) is read once
+      // before a job starts on it: a depleted seat refuses the first turn only after the job is `running`, too late
+      // to move a write job to the other account.
+      if (entry.provider === 'codex' && entry.active && platform === 'linux' && state.threshold.accounts.length > 1 &&
+          !probedAccounts.has(entry.active) &&
+          state.threshold.accounts.find(({ id }) => id === entry.active)?.known === false) {
+        probedAccounts.add(entry.active);
+        const { probeLimits } = await import('../lib/codex-limits-probe.mjs');
+        const { codexHome, runRoot } = accountPaths(entry.active);
+        await probeLimits({ codexHome, out: path.join(runRoot, 'codex-limits.probe.json') }).catch(() => null);
+        state = await refresh();
+        resolution = await resolve(state);
+        continue;
+      }
       const skipped = resolution.chain.slice(cursor + 1, index);
       const reason = [failedReason, ...skipped.map((candidate) => candidate.reason)]
         .filter(Boolean).join('; ') || entry.reason;
