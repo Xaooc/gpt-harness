@@ -1,0 +1,646 @@
+#!/usr/bin/env node
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync,
+  lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync,
+  writeFileSync, writeSync
+} from 'node:fs';
+import { homedir, tmpdir, userInfo } from 'node:os';
+import path from 'node:path';
+import readline from 'node:readline';
+import { setTimeout as delay } from 'node:timers/promises';
+import { processRows, readProcess } from '../lib/luna-runtime.mjs';
+
+const HEADINGS = ['## Changes', '## Verification', '## Deviations', '## Not done'];
+const PROMPT_LIMIT = 28_000;
+const START_EVENTS = new Set(['inference_progress', 'tool', 'command', 'answer']);
+const USAGE = 'usage: mlai.sh [-w|-r] [-C dir] [-o out.md] [-e low|medium|high|xhigh|max] ' +
+  '[-m model] (-f prompt.md | "prompt text")';
+const oneLine = (text) => String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu, ' ').trim();
+const clip = (text, length) => Array.from(oneLine(text)).slice(0, length).join('');
+const fields = (text) => Object.fromEntries(text.split(/\r?\n/).filter((line) => line.includes('='))
+  .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+const readFields = (file) => { try { return fields(readFileSync(file, 'utf8')); } catch { return {}; } };
+const alive = (pid, started) => {
+  const row = readProcess(pid);
+  return row && row.state !== 'Z' && (!started || row.started === String(started));
+};
+
+class Failure extends Error {
+  constructor(message, rc = 1, state = 'failed', reason = '') {
+    super(oneLine(message));
+    Object.assign(this, { rc, state, reason });
+  }
+}
+
+function parseArgs(argv) {
+  const options = { dir: process.cwd(), out: '', file: '', effort: 'medium', model: 'pixis', write: false };
+  let index = 0;
+  for (; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--') { index += 1; break; }
+    if (!arg.startsWith('-') || arg === '-') break;
+    for (let offset = 1; offset < arg.length; offset += 1) {
+      const flag = arg[offset];
+      if (flag === 'w' || flag === 'r') { options.write = flag === 'w'; continue; }
+      const key = { C: 'dir', o: 'out', f: 'file', e: 'effort', m: 'model' }[flag];
+      if (!key) throw new Failure(`unknown option: ${arg}\n${USAGE}`, 2);
+      const value = arg.slice(offset + 1) || argv[++index];
+      if (!value) throw new Failure(`missing value for -${flag}\n${USAGE}`, 2);
+      options[key] = value;
+      break;
+    }
+  }
+  options.prompt = argv.slice(index).join(' ');
+  return options;
+}
+
+function integerEnv(name, fallback) {
+  const value = process.env[name] ?? String(fallback);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw new Failure(`${name} must be a non-negative integer`, 2);
+  }
+  return Number(value);
+}
+
+function refuseSymlink(file) {
+  try {
+    if (lstatSync(file).isSymbolicLink()) throw new Failure(`output symlink refused: ${file}`, 2);
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
+function atomicWrite(file, text) {
+  refuseSymlink(file);
+  const temporary = `${file}.tmp.${process.pid}.${randomBytes(8).toString('hex')}`;
+  let fd;
+  let created = false;
+  try {
+    fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    created = true;
+    writeFileSync(fd, text, 'utf8');
+    closeSync(fd);
+    fd = undefined;
+    refuseSymlink(file);
+    renameSync(temporary, file);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    if (created) { try { unlinkSync(temporary); } catch {} }
+  }
+}
+
+// Same mkdir/owner/token/rename protocol and stale-owner limits as the Gemini output lock.
+class OutputLock {
+  constructor(directory) {
+    this.directory = directory;
+    this.token = '';
+  }
+
+  remove(directory) {
+    for (const name of ['owner', 'owner.tmp']) {
+      try { unlinkSync(path.join(directory, name)); } catch {}
+    }
+    try { rmdirSync(directory); } catch {}
+  }
+
+  restore(directory) {
+    try {
+      if (existsSync(this.directory)) throw new Error('successor already owns lock');
+      renameSync(directory, this.directory);
+    } catch {}
+  }
+
+  reclaim() {
+    const ownerFile = path.join(this.directory, 'owner');
+    const owner = readFields(ownerFile);
+    let modified;
+    let stale = false;
+    if (existsSync(ownerFile)) {
+      const age = /^\d+$/.test(owner.since ?? '') ? Date.now() / 1000 - Number(owner.since) : 0;
+      stale = age > 600 || (age > 5 && /^[1-9]\d*$/.test(owner.pid ?? '') && !alive(owner.pid, owner.pid_start));
+    } else {
+      try { modified = statSync(this.directory).mtimeMs; } catch { return; }
+      stale = Date.now() - modified > 10_000;
+    }
+    if (!stale) return;
+    const renamed = `${this.directory}.stale.${randomBytes(8).toString('hex')}`;
+    try { renameSync(this.directory, renamed); } catch { return; }
+    const current = readFields(path.join(renamed, 'owner'));
+    if ((current.token ?? '') !== (owner.token ?? '') ||
+        (modified !== undefined && statSync(renamed).mtimeMs !== modified)) {
+      this.restore(renamed);
+      return;
+    }
+    this.remove(renamed);
+  }
+
+  acquire() {
+    mkdirSync(path.dirname(this.directory), { recursive: true, mode: 0o700 });
+    try { mkdirSync(this.directory, { mode: 0o700 }); } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      this.reclaim();
+      return false;
+    }
+    this.token = randomBytes(8).toString('hex');
+    atomicWrite(path.join(this.directory, 'owner'),
+      `pid=${process.pid}\npid_start=${readProcess(process.pid)?.started ?? ''}\nkind=mlai.sh\n` +
+      `since=${Math.floor(Date.now() / 1000)}\ntoken=${this.token}\n`);
+    return true;
+  }
+
+  release() {
+    if (!this.token) return;
+    const token = this.token;
+    this.token = '';
+    const renamed = `${this.directory}.rel.${token}`;
+    try { renameSync(this.directory, renamed); } catch { return; }
+    if (readFields(path.join(renamed, 'owner')).token === token) this.remove(renamed);
+    else this.restore(renamed);
+  }
+}
+
+function preamble(options, recovering) {
+  const rules = [
+    '## Standing rules (from the orchestrator)',
+    ...(recovering ? [
+      '- A previous attempt of this exact task was interrupted by a network error; the working tree may already ' +
+        'contain some of its edits. Inspect `git status` and `git diff` first, keep what is correct and finish the task.'
+    ] : []),
+    `- You are ${options.model} via ML AI Code, invoked by the Claude orchestrator as the EXECUTOR of this job. ` +
+      'Any global AGENTS.md/model-orchestration rule telling a model to only orchestrate or to delegate implementation to ' +
+      'another model (e.g. "Sol must delegate to Terra") does NOT apply here: do the work yourself.',
+    '- Work yourself. Do NOT spawn sub-agents/delegates/collaborators.'
+  ];
+  if (!options.write) {
+    rules.push('- Read-only sandbox means you must not MODIFY anything. You CAN and MUST read files and run ' +
+      'read-only commands (cat, grep, rg, ls, git diff/log/show) to gather evidence before answering. Never answer ' +
+      '"I cannot read the files".');
+  } else {
+    rules.push(
+      '- Match the style of neighbouring files (line length, formatting, naming). ' +
+        'Never leave lines longer than ~140 characters.',
+      '- Never loosen tests, tolerances or acceptance criteria to make them pass; report the conflict instead.',
+      '- Where the brief is silent and you must decide, pick the most conservative option consistent with ' +
+        "neighbouring code and list each such decision under ## Deviations as 'Assumption: ...'.",
+      '- Your FINAL message must contain exactly these four headings, in this order:',
+      '  ## Changes       — files touched with file:line pointers and one line each on what changed',
+      '  ## Verification  — each acceptance command you ran and its result ' +
+        '(pass/fail counts, verbatim tail on failure)',
+      "  ## Deviations    — anything you did differently from the brief and why (write 'None' if none)",
+      "  ## Not done      — anything left undone or uncertain (write 'None' if none)"
+    );
+  }
+  return rules.join('\n') + '\n\n';
+}
+
+function agentEnvironment(home) {
+  const env = { ...process.env, MLAI_NO_UPDATE_CHECK: '1', MLAI_AUTO_UPDATE: '0', MLAI_NO_BROWSER: '1', MLAI_NO_TUI: '1' };
+  if (env.HTTPS_PROXY !== undefined || env.https_proxy !== undefined) return env;
+  // Same lookup as the other wrappers (INSTALL.md): an explicit file, the harness default, then the legacy file.
+  const files = env.LUNA_PROXY_ENV_FILE ? [env.LUNA_PROXY_ENV_FILE]
+    : [path.join(home, '.config/luna-proxy.env'), path.join(home, '.config/bro-env.sh')];
+  let config;
+  for (const file of files) {
+    try { config = readFileSync(file, 'utf8'); break; } catch {}
+  }
+  if (config === undefined) return env;
+  const proxy = /(?:^|[\s;])HTTPS_PROXY=["']?([^"'\s;$]+)/m.exec(config)?.[1];
+  if (proxy) env.HTTPS_PROXY = env.HTTP_PROXY = proxy;
+  return env;
+}
+
+async function stopGroup(pgid) {
+  const groupAlive = () => processRows().some((row) => row.group === pgid && row.state !== 'Z');
+  const send = (signal) => {
+    try { process.kill(-pgid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  };
+  if (!groupAlive()) return;
+  send('SIGTERM');
+  const deadline = performance.now() + 3000;
+  while (groupAlive()) {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) {
+      send('SIGKILL');
+      return;
+    }
+    await delay(Math.min(100, remaining));
+  }
+}
+
+class Attempt {
+  constructor(job) {
+    this.job = job;
+    this.lastLine = performance.now();
+    this.credits = 0;
+    this.waitingForStream = true;
+    this.answer = '';
+  }
+
+  onLine(line) {
+    this.lastLine = performance.now();
+    let event;
+    try { event = JSON.parse(line); } catch {
+      if (this.job.nonJson++ < 5) this.job.log(`mlai: ${line}`);
+      return;
+    }
+    if (typeof event?.type !== 'string' || !event.type) return;
+
+    const { type, content } = event;
+    const { job } = this;
+    if (Number.isFinite(event.credits)) this.credits = event.credits;
+    if (Array.isArray(event.changedFiles)) job.values.changed_files = event.changedFiles.length;
+
+    let detail = content;
+    switch (type) {
+      case 'session':
+        if (typeof event.id === 'string') job.values.mlai_session = event.id;
+        detail = event.id;
+        break;
+      case 'tool': detail = [event.name, event.target].filter(Boolean).join(' '); break;
+      case 'command': detail = event.command; break;
+      case 'safety': detail = [event.decision, event.command ?? content].filter(Boolean).join(' '); break;
+      case 'output':
+        job.log(`output rc=${Number.isInteger(event.returncode) ? event.returncode : ''}`);
+        return;
+      case 'answer':
+        if (typeof content === 'string') this.answer = content;
+        break;
+      case 'completion':
+        detail = `changed_files=${job.values.changed_files}`;
+        break;
+      case 'finished': detail = event.state; break;
+      case 'result':
+        this.result = event;
+        detail = [event.subtype, event.error ?? event.state].filter(Boolean).join(' ');
+        break;
+    }
+
+    const note = clip(detail, 200);
+    if (type === 'stage' || type === 'tool' || type === 'command') job.values.last_note = note;
+    if (type !== 'inference_progress' || note) job.log(note ? `${type}: ${note}` : type);
+    if (job.values.state === 'starting' && (START_EVENTS.has(type) ||
+        (type === 'stage' && /^Starting the agent/.test(content)))) {
+      job.values.reached_running = 1;
+      job.status('running');
+    } else if (type === 'session') {
+      job.status();
+    }
+  }
+
+  async run([binary, ...args], prompt, env) {
+    const { job } = this;
+    const { signal } = job;
+    signal.throwIfAborted();
+    const child = spawn(binary, args, { cwd: job.options.dir, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const closed = new Promise((resolve) => child.once('close', resolve));
+    let onAbort;
+    const stopped = new Promise((resolve) => {
+      onAbort = resolve;
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    let spawnError;
+    child.once('error', (error) => { spawnError = error; });
+    child.stdin.on('error', (error) => {
+      // A CLI that exits before consuming the brief can still return a structured result.
+      if (error.code !== 'EPIPE' && error.code !== 'ERR_STREAM_DESTROYED') job.abort(error);
+    });
+    const stdout = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    const stderr = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
+    stdout.on('line', (line) => {
+      try { this.onLine(line); } catch (error) { job.abort(error); }
+    });
+    stderr.on('line', (line) => {
+      try { job.log(`mlai stderr: ${line}`); } catch (error) { job.abort(error); }
+    });
+    for (const reader of [stdout, stderr]) reader.on('error', (error) => job.abort(error));
+    try {
+      const pid = child.pid;
+      const started = readProcess(pid)?.started;
+      if (pid && process.env.MLAI_SLOT) {
+        atomicWrite(path.join(process.env.MLAI_SLOT, 'child.json'),
+          JSON.stringify({ pid, pid_start: started ?? '', pgid: pid }) + '\n');
+      }
+      job.values.pid = pid ?? '';
+      job.values.pid_start = started ?? '';
+      job.status('starting');
+      child.stdin.end(prompt, 'utf8');
+      const code = await Promise.race([closed, stopped]);
+      signal.throwIfAborted();
+      return { code: this.result?.exitCode ?? code ?? 1, result: this.result,
+        text: typeof this.result?.text === 'string' ? this.result.text : this.answer, spawnError };
+    } finally {
+      this.waitingForStream = false;
+      signal.removeEventListener('abort', onAbort);
+      try { if (child.pid) await stopGroup(child.pid); }
+      finally {
+        stdout.close();
+        stderr.close();
+        for (const stream of [child.stdin, child.stdout, child.stderr]) stream.destroy();
+        await Promise.race([closed, delay(1000, undefined, { ref: false })]);
+        child.unref();
+      }
+    }
+  }
+}
+
+class Job {
+  constructor(options) {
+    this.options = options;
+    this.home = homedir();
+    this.claudeHome = process.env.CLAUDE_HOME_DIR || path.join(this.home, '.claude');
+    this.mlaiHome = process.env.MLAI_HOME || path.join(this.home, '.mlai');
+    this.started = performance.now();
+    this.controller = new AbortController();
+    this.signal = this.controller.signal;
+    this.nonJson = 0;
+    this.values = {
+      state: 'starting', pid: '', wrapper_pid: process.pid, wrapper_start: readProcess(process.pid)?.started ?? '',
+      pid_start: '', owner: process.env.CLAUDE_CODE_SESSION_ID || `pid-${process.ppid}`,
+      started: new Date().toISOString(),
+      finished: '', rc: '', model: options.model, effort: options.effort,
+      sandbox: options.write ? 'workspace-write' : 'read-only', dir: path.resolve(options.dir),
+      engine: 'mlai', provider: 'mlai', error: '', last_note: '', unavailable_reason: '', elapsed_s: 0,
+      mlai_session: '', credits: 0, changed_files: 0, attempts: 0, reached_running: 0
+    };
+  }
+
+  abort(error) {
+    if (!this.signal.aborted) this.controller.abort(error instanceof Failure ? error : new Failure(error.message));
+  }
+
+  log(message) {
+    if (!this.ownsOutput) return;
+    appendFileSync(this.logFd, `${new Date().toISOString()} ${oneLine(message)}\n`);
+  }
+
+  status(state = this.values.state) {
+    if (state !== this.values.state || !this.statusWritten) this.log(`state=${state}`);
+    this.values.state = state;
+    this.values.elapsed_s = ((performance.now() - this.started) / 1000).toFixed(3);
+    atomicWrite(`${this.options.out}.status`, Object.entries(this.values)
+      .map(([key, value]) => `${key}=${oneLine(value)}\n`).join(''));
+    if (this.activeFile) {
+      atomicWrite(this.activeFile, JSON.stringify({
+        v: 1, id: path.basename(this.activeFile, '.json'), out: this.options.out,
+        owner: oneLine(this.values.owner), started: this.values.started,
+        pid: this.values.pid || null, wrapper_pid: process.pid
+      }) + '\n');
+    }
+    this.statusWritten = true;
+  }
+
+  prepareOutput() {
+    const options = this.options;
+    options.out = path.resolve(options.out || path.join(tmpdir(), `mlai-out.${randomBytes(8).toString('hex')}.md`));
+    const parent = path.dirname(options.out);
+    let existing = parent;
+    while (!existsSync(existing)) existing = path.dirname(existing);
+    if (realpathSync(existing) !== existing) throw new Failure(`output parent symlink refused: ${parent}`, 2);
+    mkdirSync(parent, { recursive: true });
+    if (realpathSync(parent) !== parent) throw new Failure(`output parent symlink refused: ${parent}`, 2);
+    for (const file of [options.out, `${options.out}.status`, `${options.out}.log`]) refuseSymlink(file);
+    const previous = readFields(`${options.out}.status`);
+    if ((previous.state === 'starting' || previous.state === 'running') &&
+        (alive(previous.wrapper_pid, previous.wrapper_start) || alive(previous.pid, previous.pid_start))) {
+      throw new Failure('output already in use', 1);
+    }
+    this.outputLock = new OutputLock(`${options.out}.mlai-lock`);
+    if (!this.outputLock.acquire() && !this.outputLock.acquire()) throw new Failure('output already in use', 1);
+    this.ownsOutput = true;
+    const flags = constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_APPEND | constants.O_NOFOLLOW;
+    this.outputFd = openSync(options.out, flags, 0o600);
+    this.logFd = openSync(`${options.out}.log`, flags, 0o600);
+    const active = path.join(process.env.LUNA_RUN_DIR || path.join(this.home, '.claude/luna-run'), 'mlai-active');
+    mkdirSync(active, { recursive: true, mode: 0o700 });
+    const id = createHash('sha1').update(options.out).digest('hex').slice(0, 16);
+    this.activeFile = path.join(active, `${id}.json`);
+    this.status();
+  }
+
+  validate() {
+    const options = this.options;
+    if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(options.effort)) {
+      throw new Failure(`unknown effort: ${options.effort}`, 2);
+    }
+    if (options.file && options.prompt) throw new Failure('use either -f or prompt text', 2);
+    let prompt = options.prompt;
+    if (options.file) {
+      options.file = path.resolve(options.file);
+      try { prompt = readFileSync(options.file, 'utf8'); }
+      catch { throw new Failure(`prompt file not readable: ${options.file}`, 2); }
+    }
+    if (!prompt.trim()) throw new Failure('prompt is missing or empty', 2);
+    try {
+      options.dir = realpathSync(options.dir);
+      if (!statSync(options.dir).isDirectory()) throw new Error('not a directory');
+    } catch { throw new Failure(`working directory does not exist: ${options.dir}`, 2); }
+    const homes = new Set([realpathSync(this.home)]);
+    try { homes.add(realpathSync(userInfo().homedir)); } catch {}
+    const privateDirs = [...homes].flatMap((home) => ['.claude', '.ssh', '.codex', '.config', '.mlai']
+      .map((name) => path.join(home, name))).map((directory) => {
+      try { return realpathSync(directory); } catch { return directory; }
+    });
+    if (options.dir === '/' || [...homes].some((home) => options.dir === home || home.startsWith(`${options.dir}/`)) ||
+        privateDirs.some((dir) => options.dir === dir || options.dir.startsWith(`${dir}/`))) {
+      throw new Failure(`unsafe project directory: ${options.dir}`, 2);
+    }
+    this.values.dir = options.dir;
+    return prompt;
+  }
+
+  record() {
+    if (process.env.LUNA_NO_REGISTRY === '1') return;
+    const registry = path.join(this.home, '.claude/scripts/learning/registry.mjs');
+    if (existsSync(registry)) {
+      spawnSync(process.execPath, [registry, 'record', this.options.out], { stdio: 'ignore', timeout: 2000 });
+    }
+  }
+
+  finalize(result) {
+    const { state, ...details } = result;
+    Object.assign(this.values, details, { finished: new Date().toISOString() });
+    try { this.status(state); }
+    catch (error) {
+      result = { state: 'failed', rc: 1, error: `finalize: ${oneLine(error.message)}` };
+      try {
+        const size = fstatSync(this.logFd).size;
+        const tail = Buffer.alloc(Math.min(size, 64 * 1024));
+        const length = readSync(this.logFd, tail, 0, tail.length, Math.max(0, size - tail.length));
+        ftruncateSync(this.logFd, 0);
+        writeSync(this.logFd, tail.subarray(0, length));
+      } catch {}
+      try {
+        atomicWrite(`${this.options.out}.status`, `state=failed\nrc=1\nerror=${oneLine(result.error)}\n`);
+      } catch {}
+    }
+    try { this.record(); } catch {}
+    return result;
+  }
+
+  precheck() {
+    const binary = path.resolve(process.env.MLAI_BIN || path.join(this.claudeHome, 'tools/mlai/node_modules/.bin/mlai'));
+    try {
+      accessSync(binary, constants.X_OK);
+      if (!statSync(binary).isFile()) throw new Error();
+    } catch { throw new Failure('mlai: CLI missing or not executable', 3, 'unavailable', 'start'); }
+
+    let expires;
+    try { expires = JSON.parse(readFileSync(path.join(this.mlaiHome, 'auth.json'), 'utf8'))?.expires; }
+    catch { throw new Failure('mlai: not signed in', 3, 'unavailable', 'auth'); }
+    if (!Number.isFinite(expires)) throw new Failure('mlai: not signed in', 3, 'unavailable', 'auth');
+    if (expires <= Date.now()) throw new Failure('mlai: sign-in expired', 3, 'unavailable', 'auth');
+    return binary;
+  }
+
+  invocation(brief) {
+    const { write, model, effort, file } = this.options;
+    const rules = preamble(this.options, write && this.values.reached_running === 1);
+    const args = ['-p', '--mode', write ? 'auto' : 'plan', '-m', model];
+    if (model === 'pixis-opus') args.push('--effort', effort === 'xhigh' ? 'max' : effort);
+    args.push('--output-format', 'stream-json', '--no-session-persistence');
+    let prompt = rules + brief;
+    if (Array.from(prompt).length > PROMPT_LIMIT && file) {
+      prompt = rules + `The full task brief is in the file ${file}. Read it completely first and follow it exactly.`;
+      args.push('--add-dir', path.dirname(file));
+    }
+    if (Array.from(prompt).length > PROMPT_LIMIT) throw new Failure(`mlai: prompt exceeds ${PROMPT_LIMIT} characters`, 2);
+    return { args, prompt };
+  }
+
+  providerFailure(error, reason = 'start') {
+    const started = this.values.reached_running === 1;
+    return {
+      state: started ? 'failed' : 'unavailable', rc: started ? 1 : 3, error,
+      unavailable_reason: started && reason === 'start' ? '' : reason
+    };
+  }
+
+  mapResult({ code, result, text, spawnError }) {
+    if (spawnError) return this.providerFailure(`mlai: could not start CLI (${spawnError.code ?? 'spawn error'})`);
+    const error = clip(result?.error, 300) || `mlai exited ${code}`;
+    switch (code) {
+      case 0: {
+        writeFileSync(this.outputFd, text);
+        const missing = this.options.write
+          ? HEADINGS.filter((heading) => !hasHeading(text, heading)) : [];
+        if (missing.length) this.log(`result is missing contract headings: ${missing.join('|')}`);
+        return { state: missing.length ? 'incomplete' : 'done', rc: 0, error: '' };
+      }
+      case 3: {
+        const heading = hasHeading(text, '## Not done') ? '' : '## Not done\n\n';
+        const separator = text ? (text.endsWith('\n') ? '\n' : '\n\n') : '';
+        const detail = oneLine(result?.subtype) || oneLine(result?.error);
+        const note = `mlai: stopped early (exit 3: needs attention): ${detail}`;
+        writeFileSync(this.outputFd, text + separator + heading + note + '\n');
+        return { state: 'incomplete', rc: 0, error: '' };
+      }
+      case 6:
+      case 7:
+        writeFileSync(this.outputFd, text);
+        return { state: 'incomplete', rc: 1, error: code === 6
+          ? 'mlai: the agent reported the task impossible' : "mlai: needs the owner's decision (changes kept)" };
+      case 2: return { state: 'failed', rc: 2, error };
+      case 4: return this.providerFailure(error, 'auth');
+      case 5: return this.providerFailure(error, 'quota');
+      case 130: return { state: 'stopped', rc: 130, error: 'stopped' };
+      default: return this.providerFailure(error);
+    }
+  }
+
+  async execute(brief, retries, retryDelay) {
+    let invocation = this.invocation(brief);
+    const binary = this.precheck();
+    const env = agentEnvironment(this.home);
+    for (let retry = 0; ; retry += 1) {
+      this.signal.throwIfAborted();
+      const { args, prompt } = invocation;
+      const attempt = new Attempt(this);
+      this.attempt = attempt;
+      this.values.attempts += 1;
+      let outcome;
+      try { outcome = await attempt.run([binary, ...args], prompt, env); }
+      finally {
+        this.values.credits += attempt.credits;
+        this.attempt = undefined;
+      }
+      this.signal.throwIfAborted();
+
+      const { code, result, text } = outcome;
+      const interrupted = code === 1 && (result?.usage?.errorCode === 'connection_interrupted' ||
+        /connection[ _-]?interrupted/i.test(result?.error ?? '') || /connection[ _-]?interrupted/i.test(text));
+      if (!interrupted) return this.mapResult(outcome);
+      if (retry >= retries) {
+        return this.providerFailure(`mlai: connection interrupted (after ${this.values.attempts} attempts)`);
+      }
+      this.log(`mlai: connection interrupted, retrying (attempt ${this.values.attempts + 1})`);
+      this.status();
+      await delay(retryDelay * (retry + 1), undefined, { signal: this.signal });
+      invocation = this.invocation(brief);
+    }
+  }
+
+  async run() {
+    let result;
+    const interrupt = () => this.abort(new Failure('stopped', 130, 'stopped'));
+    process.on('SIGTERM', interrupt);
+    process.on('SIGINT', interrupt);
+    let heartbeat;
+    let watchdog;
+    try {
+      this.prepareOutput();
+      heartbeat = setInterval(() => {
+        try { this.status(); } catch (error) { this.abort(error); }
+      }, 15_000);
+      const brief = this.validate();
+      const idle = integerEnv('LUNA_IDLE_MAX_S', 900);
+      const total = integerEnv('LUNA_TIMEOUT_S', 28800);
+      const retries = integerEnv('MLAI_RETRIES', 2);
+      const retryDelay = integerEnv('MLAI_RETRY_DELAY_MS', 5000);
+      const launched = performance.now();
+      watchdog = setInterval(() => {
+        const now = performance.now();
+        if (idle && this.attempt?.waitingForStream && now - this.attempt.lastLine >= idle * 1000) {
+          this.abort(new Failure(`no mlai stream lines for ${idle}s`, 124, 'stalled'));
+        } else if (total && now - launched >= total * 1000) {
+          this.abort(new Failure(`exceeded total timeout ${total}s`, 124, 'stalled'));
+        }
+      }, 100);
+      result = await this.execute(brief, retries, retryDelay);
+    } catch (error) {
+      const failure = this.signal.aborted ? this.signal.reason : error;
+      result = { state: failure.state ?? 'failed', rc: failure.rc ?? 1, error: oneLine(failure.message),
+        unavailable_reason: failure.reason ?? '' };
+    } finally {
+      clearInterval(heartbeat);
+      clearInterval(watchdog);
+      try { if (this.ownsOutput) result = this.finalize(result); }
+      finally {
+        if (this.activeFile) { try { unlinkSync(this.activeFile); } catch {} }
+        try { this.outputLock?.release(); } catch {}
+        for (const fd of [this.outputFd, this.logFd]) {
+          if (fd !== undefined) { try { closeSync(fd); } catch {} }
+        }
+        process.off('SIGTERM', interrupt);
+        process.off('SIGINT', interrupt);
+      }
+    }
+    if (result.error) process.stderr.write(`mlai.sh: ${oneLine(result.error)}\n`);
+    if (this.ownsOutput) {
+      for await (const chunk of createReadStream(this.options.out, { flags: constants.O_RDONLY | constants.O_NOFOLLOW })) {
+        if (!process.stdout.write(chunk)) await new Promise((resolve) => process.stdout.once('drain', resolve));
+      }
+    }
+    return result.rc;
+  }
+}
+
+function hasHeading(text, heading) {
+  return text.split(/\r?\n/).some((line) => line.trimEnd() === heading);
+}
+
+try {
+  process.exitCode = await new Job(parseArgs(process.argv.slice(2))).run();
+} catch (error) {
+  process.stderr.write(`mlai.sh: ${error.message}\n`);
+  process.exitCode = error.rc ?? 2;
+}
