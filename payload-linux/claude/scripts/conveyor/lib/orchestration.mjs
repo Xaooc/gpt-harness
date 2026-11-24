@@ -345,7 +345,10 @@ export async function markUnavailable(provider, reason, note, { account, config,
   if (!reasons.includes(reason)) throw new Error(`unknown unavailable reason: ${reason}`);
   config ??= await loadConfig();
   const accountIds = (name) => (name === 'codex' ? codexAccounts(config) : mlaiAccounts(config));
-  if (account !== undefined && (!['codex', 'mlai'].includes(provider) || !['quota', 'auth'].includes(reason) ||
+  // An mlai account can also carry a start mark: its own route failed (2026-11-24: Vercel's bot checkpoint answered 403
+  // to the Dutch exit of account b), while the other accounts keep mlai in the chain.
+  const accountReasons = provider === 'mlai' ? ['quota', 'auth', 'start'] : ['quota', 'auth'];
+  if (account !== undefined && (!['codex', 'mlai'].includes(provider) || !accountReasons.includes(reason) ||
       !accountIds(provider).some(({ id }) => id === account))) {
     throw new Error(`invalid unavailable mark for ${provider} account ${account}: ${reason}`);
   }

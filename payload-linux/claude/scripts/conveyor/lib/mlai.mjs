@@ -177,7 +177,7 @@ async function claimSlot({ slots, limit }, out, mode) {
 }
 
 function markActive(mark, now) {
-  if (!mark || (mark.reason !== 'auth' && mark.reason !== 'quota')) return false;
+  if (!mark || !['auth', 'quota', 'start'].includes(mark.reason)) return false;
   const until = Date.parse(mark.until);
   return !Number.isFinite(until) || now < until;
 }

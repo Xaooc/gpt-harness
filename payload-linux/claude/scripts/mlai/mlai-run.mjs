@@ -15,7 +15,17 @@ const PROMPT_LIMIT = 28_000;
 const START_EVENTS = new Set(['inference_progress', 'tool', 'command', 'answer']);
 const USAGE = 'usage: mlai.sh [-w|-r] [-C dir] [-o out.md] [-e low|medium|high|xhigh|max] ' +
   '[-m model] (-f prompt.md | "prompt text")';
-const oneLine = (text) => String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu, ' ').trim();
+// The CLI's result.error can be an object ({code, message}); String() would log it as "[object Object]".
+const errorText = (value) => value && typeof value === 'object'
+  ? [value.code, value.message].filter(Boolean).join(': ') || JSON.stringify(value) : value;
+// The CLI can report an error as the literal text "[object Object]" next to a code (http_error): keep the code then.
+const cliError = (result) => {
+  const text = oneLine(result?.error);
+  const code = oneLine(result?.code);
+  if (!text || text === '[object Object]') return code ? `mlai: ${code}` : '';
+  return code && !text.includes(code) ? `${code}: ${text}` : text;
+};
+const oneLine = (text) => String(errorText(text) ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu, ' ').trim();
 const clip = (text, length) => Array.from(oneLine(text)).slice(0, length).join('');
 const fields = (text) => Object.fromEntries(text.split(/\r?\n/).filter((line) => line.includes('='))
   .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
@@ -282,7 +292,7 @@ class Attempt {
       case 'finished': detail = event.state; break;
       case 'result':
         this.result = event;
-        detail = [event.subtype, event.error ?? event.state].filter(Boolean).join(' ');
+        detail = [event.subtype, cliError(event) || event.state].filter(Boolean).join(' ');
         break;
     }
 
@@ -618,7 +628,7 @@ class Job {
 
   mapResult({ code, result, text, spawnError }) {
     if (spawnError) return this.providerFailure(`mlai: could not start CLI (${spawnError.code ?? 'spawn error'})`);
-    const error = clip(result?.error, 300) || `mlai exited ${code}`;
+    const error = clip(cliError(result), 300) || `mlai exited ${code}`;
     switch (code) {
       case 0: {
         if (this.options.write) text = contractHeadings(text);
@@ -681,7 +691,7 @@ class Job {
       // a 45 s timeout while the proxy answered normally a moment later).
       const transient = /connection[ _-]?interrupted|Cannot reach the ML AI Code server/i;
       const interrupted = code === 1 && (result?.usage?.errorCode === 'connection_interrupted' ||
-        transient.test(result?.error ?? '') || transient.test(text) || (!result && transient.test(stderr)));
+        transient.test(oneLine(result?.error)) || transient.test(text) || (!result && transient.test(stderr)));
       // The step limit ends one turn, not the task: resume the same session, a few times at most.
       if (code === 3 && result?.subtype === 'error_max_turns' && this.values.continues < continues) {
         this.values.continues += 1;

@@ -1062,8 +1062,10 @@ function failureReason(result, status, account, provider) {
     // its slots filled first, and the next job may reach the server or run in a project folder (2026-11-24).
     if (reason === 'start' && mlaiJobError.test(status?.error || '')) return { reason, note: status.error, mark: false };
     if (['auth', 'quota'].includes(reason)) return { account: owner, reason, note: status.error || reason };
-    if (reason === 'start') return { reason, note: status.error || reason };
-    return result.code === 3 ? { reason: 'start', note: status?.error || 'wrapper exited 3' } : null;
+    // Any other failure before the start belongs to that account (its sign-in home or its own route): mark only it, so
+    // the job tries the next mlai account and the others stay in the chain.
+    if (reason === 'start') return { account: owner, reason, note: status.error || reason };
+    return result.code === 3 ? { account: owner, reason: 'start', note: status?.error || 'wrapper exited 3' } : null;
   }
   if (account && result.code !== 0) {
     const explicit = status?.unavailable_reason;
