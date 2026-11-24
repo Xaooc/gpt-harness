@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   codexLimitsSnapshot, loadConfigWithSource, paths as orchestrationPaths, providerState, resolveChain, resolvePanel
 } from './conveyor/lib/orchestration.mjs';
-import { codexAccounts, validAccountId } from './conveyor/lib/codex-accounts.mjs';
+import { codexAccounts, stamp, validAccountId } from './conveyor/lib/codex-accounts.mjs';
 import { summarizeUsage, usagePaths } from './conveyor/usage.mjs';
 import { quotaPaths } from './conveyor/gemini-quota.mjs';
 
@@ -67,6 +67,7 @@ function empty(now = Date.now()) {
     orchestration: { source: null, chains: {}, panels: {}, threshold: null, marks: {}, presets: [], catalog: {}, configError: null },
     switches: [], gemini: { available: false, reason: 'orchestration unavailable', tokensToday: 0, jobsToday: 0, mcp: null,
       quota: { available: false, buckets: [], at: null } },
+    mlai: null,
     usage: { ...summarizeUsage(null, now), stale: true }
   };
 }
@@ -212,8 +213,8 @@ async function activeJobs(run, now, boot = Date.now() - uptime() * 1000, signal)
   return jobs.sort(newest).slice(0, 40);
 }
 
-async function geminiActiveJobs(config, now, wrapperStart, signal) {
-  const directory = path.join(config.run, 'gem-active');
+async function providerActiveJobs(config, provider, now, wrapperStart, signal) {
+  const directory = path.join(config.run, provider === 'gemini' ? 'gem-active' : 'mlai-active');
   let names;
   try { names = (await fs.readdir(directory)).filter((name) => name.endsWith('.json')).slice(0, ACTIVE_LIMIT); }
   catch { return { jobs: [], statuses: new Map() }; }
@@ -228,7 +229,7 @@ async function geminiActiveJobs(config, now, wrapperStart, signal) {
       if (text === null) continue;
       const values = statusValues(text);
       if (!(await wrapperStart(pointer.wrapper_pid, values.wrapper_start))) continue;
-      if (values.provider !== 'gemini') continue;
+      if (values.provider !== provider) continue;
       statuses.set(pointer.out, values);
       if (terminal.has(values.state)) continue;
       const stat = await fs.stat(`${pointer.out}.log`).catch(() => null);
@@ -236,22 +237,24 @@ async function geminiActiveJobs(config, now, wrapperStart, signal) {
       const queued = values.state === 'queued' || string(values.state).startsWith('waiting-');
       const note = cleanText(values.last_note || '', 200);
       jobs.push({
-        out: pointer.out, state: values.state || '', model: values.acp_model || '', effort: values.effort || '',
+        out: pointer.out, state: values.state || '', model: (provider === 'gemini' ? values.acp_model : values.model) || '',
+        effort: values.effort || '',
         sandbox: values.sandbox || '', engine: values.engine || '', ageS: seconds(values.started || pointer.started, now),
         dir: values.dir || '', error: values.error || '', queuePos: null, owner: values.owner || string(pointer.owner),
         idleS, activity: { kind: queued ? 'queued' : values.state === 'starting' ? 'starting' : note ? 'writing' : 'unknown',
-          text: note, sinceS: idleS }, provider: 'gemini'
+          text: note, sinceS: idleS }, provider
       });
     }
   }));
   return { jobs: jobs.sort(newest).slice(0, 40), statuses };
 }
 
-async function geminiUsage(config, now, active, signal) {
+async function dailyUsage(config, now, active, signal) {
   const midnight = new Date(now);
   midnight.setHours(0, 0, 0, 0);
-  const statuses = new Map((await active).statuses);
-  const records = jsonLines(await readTail(config.registry, 64 * 1024 * 1024));
+  const statuses = new Map((await allReads(active)).flatMap(({ statuses }) => [...statuses]));
+  // Today's records sit at the end; this runs on every fast collector cycle, so read only the recent tail.
+  const records = jsonLines(await readTail(config.registry, 2 * 1024 * 1024));
   const outputs = [...new Set(records.filter((record) => config.localPath(record.out) &&
     !(Date.parse(record.finished) < midnight.getTime())).map((record) => record.out))];
   let cursor = 0;
@@ -263,15 +266,19 @@ async function geminiUsage(config, now, active, signal) {
       if (text !== null) statuses.set(out, statusValues(text));
     }
   }));
-  let tokensToday = 0, jobsToday = 0;
+  const gemini = { tokensToday: 0, jobsToday: 0 }, mlai = { creditsToday: 0, jobsToday: 0 };
   for (const values of statuses.values()) {
     const finished = Date.parse(values.finished);
-    if (values.provider !== 'gemini' || !terminal.has(values.state) ||
-        !Number.isFinite(finished) || finished < midnight.getTime() || finished > now) continue;
-    jobsToday++;
-    tokensToday += Math.max(0, number(Number(values.usage_total)) ?? 0);
+    if (!terminal.has(values.state) || !Number.isFinite(finished) || finished < midnight.getTime() || finished > now) continue;
+    if (values.provider === 'gemini') {
+      gemini.jobsToday++;
+      gemini.tokensToday += Math.max(0, number(Number(values.usage_total)) ?? 0);
+    } else if (values.provider === 'mlai') {
+      mlai.jobsToday++;
+      mlai.creditsToday += number(Number(values.credits)) ?? 0;
+    }
   }
-  return { tokensToday, jobsToday };
+  return { gemini, mlai };
 }
 
 async function geminiMcp(config) {
@@ -305,6 +312,20 @@ async function orchestrationStatus(snapshot, now, includeGemini, codexDirectorie
     presets: Object.entries(config.presets).map(([name, preset]) => ({ name, label: preset.label })),
     catalog: config.catalog, configError: null
   };
+  if (state.mlai) {
+    const model = config.catalog.mlai?.[0];
+    const probe = model && { tiers: { mlai: [{ provider: 'mlai', model: model.model, effort: model.efforts[0] }] } };
+    const entry = probe ? (await resolveChain('mlai', { config: probe, state, now })).chain[0] : null;
+    const mark = state.providers.mlai;
+    const until = new Date(stamp(mark?.until));
+    const { installed, signedIn, expiresAt, reason, slots } = state.mlai;
+    snapshot.mlai = {
+      installed, signedIn, expiresAt, reason,
+      slots: { ...slots, holders: slots.holders.map(({ index, out, at }) => ({ index, out: string(out), at: string(at) })) },
+      available: entry?.available ?? false, availability: entry?.reason ?? 'no mlai models in catalog',
+      mark: until.getTime() > now ? { reason: string(mark.reason), until: string(mark.until) || until.toISOString() } : null
+    };
+  }
   if (!includeGemini) return state;
   // Resolve an availability probe even when no configured tier or panel currently uses Gemini.
   const model = config.catalog.gemini[0];
@@ -542,12 +563,14 @@ async function collectSections(snapshot, probes, previous, signal) {
       for (const field of fields) {
         if (Object.hasOwn(previous || {}, field)) snapshot[field] = previous[field];
       }
-      const prior = previous?.sections?.[name];
       const reason = cleanText(String(error?.message || error), 500);
-      (snapshot.sections ??= {})[name] = {
-        attemptAt: snapshot.at, okAt: prior?.okAt || null, staleAfterMs: prior?.staleAfterMs ?? DEADLINE_MS,
-        status: 'stale', reason
-      };
+      for (const section of name === 'orchestration' ? fields : [name]) {
+        const prior = previous?.sections?.[section];
+        (snapshot.sections ??= {})[section] = {
+          attemptAt: snapshot.at, okAt: prior?.okAt || null, staleAfterMs: prior?.staleAfterMs ?? DEADLINE_MS,
+          status: 'stale', reason
+        };
+      }
       if (name === 'orchestration' && !previous?.orchestration) {
         snapshot.orchestration = { ...snapshot.orchestration, configError: reason };
       }
@@ -568,29 +591,32 @@ async function codexLimits(config, now) {
   return { codexLimits: limits ? { ...limits, ageS: seconds(limits.at, now) } : null };
 }
 
-function sharedProbes(config, snapshot, now, geminiActive, includeGemini, standalone) {
+function sharedProbes(config, snapshot, now, geminiActive, mlaiActive, includeGemini, standalone) {
   // Orchestration and Gemini share availability data. Keep the subprobes parallel and commit the Gemini fields together.
-  const routing = { orchestration: { ...snapshot.orchestration }, gemini: { ...snapshot.gemini } };
+  const routing = { orchestration: { ...snapshot.orchestration }, gemini: { ...snapshot.gemini }, mlai: null };
   const orchestration = orchestrationStatus(routing, now, includeGemini, standalone ? config : undefined);
   const availability = orchestration.then(() => routing.gemini, (error) => ({
     ...routing.gemini, reason: cleanText(String(error.message), 500)
   }));
+  let providerUsage;
+  const usage = (signal) => providerUsage ??= dailyUsage(config, now,
+    [mlaiActive(signal), ...(includeGemini ? [geminiActive(signal)] : [])], signal);
   return [
     ...(standalone ? [['codexLimits', ['codexLimits', 'codexAccounts'], async () => {
       const state = await orchestration.catch(() => null);
       return state ? codexLimitsSnapshot(state) : codexLimits(config, now);
     }]] : []),
-    ['orchestration', ['orchestration'], async () => {
-      await orchestration;
-      return { orchestration: routing.orchestration };
+    ['orchestration', ['orchestration', 'mlai'], async (signal) => {
+      const [, totals] = await allReads([orchestration, usage(signal)]);
+      return { orchestration: routing.orchestration, mlai: routing.mlai && { ...routing.mlai, ...totals.mlai } };
     }],
     ['switches', ['switches'], async () => ({ switches: await switches() })],
     ...(includeGemini ? [['gemini', ['gemini'], async (signal) => {
-      const [status, usage, mcp, quota] = await allReads([
-        availability, geminiUsage(config, now, geminiActive(signal), signal),
+      const [status, totals, mcp, quota] = await allReads([
+        availability, usage(signal),
         geminiMcp(config), geminiQuotaStatus(now, config)
       ]);
-      return { gemini: { ...status, ...usage, mcp, quota } };
+      return { gemini: { ...status, ...totals.gemini, mcp, quota } };
     }]] : []),
     ...(standalone ? [['usage', ['usage'], async () => ({ usage: await usageStatus(now, config) })]] : [])
   ];
@@ -609,8 +635,9 @@ async function collectOverview(config, now, includeGemini = true, { signal, prev
     const wrapper = readProcess(pid);
     return wrapper && wrapper.state !== 'Z' && (!expected || expected === wrapper.started);
   };
-  let activeGemini;
-  const geminiActive = (signal) => activeGemini ??= geminiActiveJobs(config, now, wrapperStart, signal);
+  let activeGemini, activeMlai;
+  const geminiActive = (signal) => activeGemini ??= providerActiveJobs(config, 'gemini', now, wrapperStart, signal);
+  const mlaiActive = (signal) => activeMlai ??= providerActiveJobs(config, 'mlai', now, wrapperStart, signal);
   await collectSections(snapshot, [
     ...(signal ? [] : [['ram', ['ram'], () => ({
       ram: { freeMb: Math.round((config.platform === 'linux' ? availableMemory() : freemem()) / 1048576),
@@ -622,10 +649,11 @@ async function collectOverview(config, now, includeGemini = true, { signal, prev
       return result;
     }],
     ['jobs', ['jobs'], async (signal) => {
-      const [jobs, active] = await allReads([activeJobs(config.run, now, undefined, signal), geminiActive(signal)]);
-      return { jobs: [...jobs, ...active.jobs].sort(newest).slice(0, 40) };
+      const [jobs, gemini, mlai] = await allReads([activeJobs(config.run, now, undefined, signal),
+        geminiActive(signal), mlaiActive(signal)]);
+      return { jobs: [...jobs, ...gemini.jobs, ...mlai.jobs].sort(newest).slice(0, 40) };
     }],
-    ...sharedProbes(config, snapshot, now, geminiActive, includeGemini, !signal)
+    ...sharedProbes(config, snapshot, now, geminiActive, mlaiActive, includeGemini, !signal)
   ], previous, signal);
   markDaemonJobs(snapshot, previous, jobsFailures);
   return snapshot;
@@ -668,6 +696,7 @@ async function selfTest() {
     config.geminiStatus = path.join(directory, 'gateway-status.json');
     const fixture = new URL('./conveyor/test/fixtures/orchestration.json', import.meta.url);
     const orchestration = JSON.parse(await fs.readFile(fixture, 'utf8'));
+    const defaults = JSON.parse(await fs.readFile(new URL('../conveyor/orchestration.default.json', import.meta.url), 'utf8'));
     await fs.mkdir(orchestrationPaths().home);
     const usageCache = { v: 1, at: new Date(now).toISOString(), days: {}, topJobs: [] };
     await fs.writeFile(usagePaths().cache, JSON.stringify(usageCache));
@@ -709,7 +738,7 @@ async function selfTest() {
     check('JSON shape', () => {
       assert.deepEqual(Object.keys(snapshot), [
         'v', 'at', 'ram', 'daemon', 'jobs', 'codexLimits', 'codexAccounts', 'build', 'sessions', 'orchestration', 'switches',
-        'gemini', 'usage'
+        'gemini', 'mlai', 'usage'
       ]);
       assert.equal(snapshot.v, 1);
       assert.equal(snapshot.at, new Date(now).toISOString());
@@ -758,7 +787,7 @@ async function selfTest() {
       assert.equal(snapshot.orchestration.chains.complex[1].selected, false);
       assert.deepEqual(snapshot.orchestration.panels.design.map((entry) => entry.seat), [0, 1, 2]);
       assert.deepEqual(snapshot.orchestration.threshold, { ...orchestration.thresholds.codex, switched: false });
-      assert.deepEqual(snapshot.orchestration.catalog, orchestration.catalog);
+      assert.deepEqual(snapshot.orchestration.catalog, { ...orchestration.catalog, mlai: defaults.catalog.mlai });
       assert.equal(snapshot.orchestration.presets[0].label, orchestration.presets['max-quality'].label);
       assert.equal(snapshot.gemini.available, true);
       assert.equal(snapshot.gemini.mcp, null);
@@ -831,6 +860,7 @@ async function selfTest() {
       assert.deepEqual(noOrchestration.codexLimits, withGemini.codexLimits);
       assert.deepEqual(noOrchestration.switches, withGemini.switches);
       assert.equal(noOrchestration.gemini.tokensToday, 209);
+      assert.deepEqual(noOrchestration.mlai, withGemini.mlai);
     });
     await fs.writeFile(orchestrationPaths().config, '{broken');
     await fs.writeFile(config.geminiStatus, '{broken');
@@ -841,6 +871,20 @@ async function selfTest() {
       assert.equal(corruptOrchestration.jobs.length, 4);
     });
     await fs.writeFile(orchestrationPaths().config, JSON.stringify(orchestration));
+    const mlaiOut = path.join(directory, 'mlai-job'), mlaiDir = path.join(directory, 'mlai-active');
+    await fs.mkdir(mlaiDir);
+    await fs.writeFile(path.join(mlaiDir, `${gemPointer.id}.json`), JSON.stringify({ ...gemPointer, out: mlaiOut }));
+    await fs.writeFile(`${mlaiOut}.status`, [
+      'provider=mlai', 'state=running', 'model=pixis-opus', `wrapper_start=${readProcess(process.pid).started}`
+    ].join('\n'));
+    const withoutGemini = await collectOverview(config, now, false);
+    check('mlai-active job is listed with the wrapper model when Gemini collection is disabled', () => {
+      const job = withoutGemini.jobs.find((entry) => entry.out === mlaiOut);
+      assert.equal(job?.provider, 'mlai');
+      assert.equal(job.state, 'running');
+      assert.equal(job.model, 'pixis-opus');
+    });
+    await fs.rm(mlaiDir, { recursive: true });
     check('Linux absolute paths including spaces', () => {
       for (const value of ['/tmp/job', `${directory}/some path/job`]) assert.equal(localPath(value), true);
       for (const value of ['//server/share/job', 'job', '']) assert.equal(localPath(value), false);

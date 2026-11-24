@@ -116,8 +116,8 @@ function tokens(n: number): string {
  *  Gemini Flash, Sonnet. Unknown ids are shown as they are. */
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
 
-/** ML AI Code ids as a person says them: Pixis Sol, Sonnet 5.5, GLM 5.3; a non-Pixis model gets "· ML" so the
- *  Astra on ML AI never reads as Codex's Astra. */
+/** ML AI Code ids as a person says them: Pixis Sol, ML Sonnet 5.5, ML GLM 5.3; a non-Pixis model gets an "ML" prefix
+ *  so the Astra on ML AI never reads as Codex's Astra. */
 function mlaiName(m: string): string {
   const pixis = /^pixis(?:-(\w+))?$/i.exec(m)
   if (pixis) return pixis[1] ? `Pixis ${cap(pixis[1])}` : 'Pixis'
@@ -128,7 +128,7 @@ function mlaiName(m: string): string {
   const other = /^([a-z]+)-([\d.]+)$/i.exec(m)
   const base = gpt ? `${cap(gpt[2] ?? '')} ${gpt[1]}` : claude ? `${cap(claude[1] ?? '')} ${claude[2]}`
     : other ? `${(other[1] ?? '').length <= 3 ? (other[1] ?? '').toUpperCase() : cap(other[1] ?? '')} ${other[2]}` : m
-  return `${base} · ML`
+  return `ML ${base}`
 }
 
 const PROVIDER_RU: Record<string, string> = { mlai: 'ML AI', codex: 'Codex', claude: 'Claude', gemini: 'Gemini' }
@@ -764,7 +764,8 @@ export const register: Register = on => {
     const TierLine = ({ tier, chain }: { tier: string; chain: ChainEntry[] }) => {
       const open = v.editTier === tier
       const active = chain.find(c => c.selected)
-      const rest = chain.filter(c => c !== active)
+      // Fallbacks are the entries after the one that runs; skipped entries before it are named in the warning line.
+      const rest = active ? chain.slice(chain.indexOf(active) + 1) : chain
       const skipped = chain.filter(c => !c.available)
       return (
         <Box flexDirection="column" key={`tier-${tier}`}>

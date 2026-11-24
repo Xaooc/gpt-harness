@@ -23,7 +23,7 @@ const SHUTDOWN_GRACE_MS = 3000;
 const QUIET_MS = 30 * SECOND;
 const MAX_SNAPSHOT = 3 * 1024 * 1024;
 const MAX_BEAT = 16 * 1024;
-const FAST_SECTIONS = ['daemon', 'jobs', 'orchestration'];
+const FAST_SECTIONS = ['daemon', 'jobs', 'orchestration', 'mlai'];
 const QUIET_SECTIONS = new Set(['sessions', 'codexAccounts', 'codexLimits']);
 const iso = (time = Date.now()) => new Date(time).toISOString();
 const message = (error) => String(error?.message ?? error).replace(/[\r\n]+/g, ' ').slice(0, 500);
@@ -322,7 +322,7 @@ async function serve(config, owner, result = {}) {
   const defaults = {
     v: 1, ram: { freeMb: null, totalMb: null }, daemon: { running: false, appServer: null, healthy: false },
     jobs: [], codexLimits: null, codexAccounts: [], build: null, sessions: [], orchestration: null,
-    switches: [], gemini: null, usage: null
+    switches: [], gemini: null, mlai: null, usage: null
   };
   if (platform === 'win32') defaults.daemons = {};
   const values = { ...defaults, cli: null };

@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type {
-  ChainEntry, ClaudeLimit, CliStatus, CodexAccount, CodexLimits, Collapsed, Job, LimitWindow, PanelData, SessionBeat,
-  Snapshot, View,
+  ChainEntry, ClaudeLimit, CliStatus, CodexAccount, CodexLimits, Collapsed, Job, LimitWindow, MlaiState, PanelData,
+  SessionBeat, Snapshot, View,
 } from '../types'
 
 // The Luna pane, conveyor edition: limits of every provider, the executor chains with the active one marked, every
@@ -102,6 +102,10 @@ function gb(mb: number): string {
   return `${(mb / 1024).toFixed(1)} ГБ`
 }
 
+function credits(n: number): string {
+  return n >= 10 ? `${Math.round(n)}` : n >= 1 ? n.toFixed(1) : n.toFixed(2)
+}
+
 function tokens(n: number): string {
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)} млн`
   if (n >= 1e3) return `${Math.round(n / 1e3)} тыс`
@@ -110,8 +114,28 @@ function tokens(n: number): string {
 
 /** A model as a person names it, version kept so a new release never looks like the old one: Sol 6.1, Luna 6,
  *  Gemini Flash, Sonnet. Unknown ids are shown as they are. */
+const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
+
+/** ML AI Code ids as a person says them: Pixis Sol, ML Sonnet 5.5, ML GLM 5.3; a non-Pixis model gets an "ML" prefix
+ *  so the Astra on ML AI never reads as Codex's Astra. */
+function mlaiName(m: string): string {
+  const pixis = /^pixis(?:-(\w+))?$/i.exec(m)
+  if (pixis) return pixis[1] ? `Pixis ${cap(pixis[1])}` : 'Pixis'
+  const own = /^(?:ml-ai|mlai)-(\w+)$/i.exec(m)
+  if (own) return `ML ${cap(own[1] ?? '')}`
+  const gpt = /^gpt-([\d.]+)-(\w+)$/i.exec(m)
+  const claude = /^claude-(\w+)-([\d.]+)$/i.exec(m)
+  const other = /^([a-z]+)-([\d.]+)$/i.exec(m)
+  const base = gpt ? `${cap(gpt[2] ?? '')} ${gpt[1]}` : claude ? `${cap(claude[1] ?? '')} ${claude[2]}`
+    : other ? `${(other[1] ?? '').length <= 3 ? (other[1] ?? '').toUpperCase() : cap(other[1] ?? '')} ${other[2]}` : m
+  return `ML ${base}`
+}
+
+const PROVIDER_RU: Record<string, string> = { mlai: 'ML AI', codex: 'Codex', claude: 'Claude', gemini: 'Gemini' }
+
 function modelName(provider: string | undefined, model: string): string {
   const m = model || ''
+  if (provider === 'mlai') return mlaiName(m)
   const gpt = /^gpt-([\d.]+)-(sol|luna|terra|astra)$/i.exec(m)
   if (gpt) {
     const fam = gpt[2] ?? ''
@@ -127,9 +151,29 @@ function modelName(provider: string | undefined, model: string): string {
   return m || '—'
 }
 
-function providerOf(j: Job): 'codex' | 'gemini' {
+function providerOf(j: Job): 'mlai' | 'codex' | 'gemini' {
+  if (j.provider === 'mlai') return 'mlai'
   return j.provider === 'gemini' || /^gemini/i.test(j.model) ? 'gemini' : 'codex'
 }
+
+/** How the ML AI Code sign-in stands: it lasts 7 days, so the pane warns two days ahead. */
+function mlaiSignIn(m: MlaiState | null | undefined, now: number):
+  { text: string; level: 'ok' | 'soon' | 'warning' | 'error'; leftS: number | null } | null {
+  if (!m) return null
+  if (!m.installed) return { text: 'не установлен', level: 'warning', leftS: null }
+  if (!m.signedIn) {
+    return m.reason === 'sign-in expired'
+      ? { text: 'вход истёк', level: 'error', leftS: 0 }
+      : { text: 'нет входа', level: 'warning', leftS: null }
+  }
+  const t = m.expiresAt ? Date.parse(m.expiresAt) : NaN
+  if (!Number.isFinite(t)) return { text: 'вход есть', level: 'ok', leftS: null }
+  const leftS = (t - now) / 1000
+  if (leftS <= 0) return { text: 'вход истёк', level: 'error', leftS: 0 }
+  return { text: `вход до ${wallClock(t, now)}`, level: leftS < 48 * 3600 ? 'soon' : 'ok', leftS }
+}
+
+const MLAI_LOGIN = 'MLAI_NO_BROWSER=1 ~/.claude/tools/mlai/node_modules/.bin/mlai login'
 
 function jobName(out: string): string {
   const parts = out.split(/[\\/]/).filter(Boolean)
@@ -155,6 +199,11 @@ function windowName(kind: string, mins: number | null | undefined): string {
 /** Why a chain entry is skipped, in Russian, from the dispatcher's English reason. */
 function reasonRu(reason: string): string {
   const r = reason || ''
+  const busy = /sessions busy \((\d+)\/(\d+)\)/.exec(r)
+  if (busy) return `заняты все сессии (${busy[1]}/${busy[2]})`
+  if (/sign-in expired/i.test(r)) return 'вход истёк'
+  if (/not signed in/i.test(r)) return 'нет входа'
+  if (/not installed/i.test(r)) return 'не установлен'
   const pct = /(\d+)% ≥ (\d+)%/.exec(r)
   if (pct) return `${pct[1]}% ≥ порога ${pct[2]}%`
   if (/quota/i.test(r)) return `квота${/until (\S+)/i.test(r) ? ` до ${clock(/until (\S+)/i.exec(r)?.[1])}` : ''}`
@@ -255,6 +304,15 @@ function attentionItems(d: PanelData): Alert[] {
       out.push({ level: 'warning', text: 'Все аккаунты Codex на пороге: задачи идут на Claude' })
     }
   } else if (s.codexLimits?.reached) out.push({ level: 'error', text: 'Лимит Codex исчерпан' })
+  // ML AI Code matters only while some chain or panel uses it.
+  const usesMlai = [...Object.values(o?.chains ?? {}), ...Object.values(o?.panels ?? {})].some(c => c.some(x => x.provider === 'mlai'))
+  const sign = usesMlai ? mlaiSignIn(s.mlai, d.polledAt || Date.now()) : null
+  if (sign && sign.level !== 'ok') {
+    const text = sign.level === 'soon' ? `ML AI: вход истекает через ${timeLeft(sign.leftS ?? 0)}, войдите заново`
+      : sign.text === 'не установлен' ? 'ML AI не установлен: задачи идут на Codex'
+      : `ML AI: ${sign.text}, задачи идут на Codex`
+    out.push({ level: sign.level === 'error' ? 'error' : 'warning', text })
+  }
   if (d.error) out.push({ level: 'warning', text: `Данные не обновляются: ${d.error.slice(0, 80)}` })
   return out.sort((a, b) => (a.level === 'error' ? 0 : 1) - (b.level === 'error' ? 0 : 1))
 }
@@ -706,7 +764,8 @@ export const register: Register = on => {
     const TierLine = ({ tier, chain }: { tier: string; chain: ChainEntry[] }) => {
       const open = v.editTier === tier
       const active = chain.find(c => c.selected)
-      const rest = chain.filter(c => c !== active)
+      // Fallbacks are the entries after the one that runs; skipped entries before it are named in the warning line.
+      const rest = active ? chain.slice(chain.indexOf(active) + 1) : chain
       const skipped = chain.filter(c => !c.available)
       return (
         <Box flexDirection="column" key={`tier-${tier}`}>
@@ -808,6 +867,7 @@ export const register: Register = on => {
     const jobs = (snap.jobs ?? []).filter(j => providerOf(j) !== 'gemini')
     const accounts = codexAccountsOf(snap)
     const codex = snap.codexLimits ?? accounts[0]?.limits ?? null
+    const mlai = snap.mlai ?? null
     const room = Math.max(4, (e.viewport?.rows ?? 40) - 30)
 
     // ---- Overview ----
@@ -878,6 +938,39 @@ export const register: Register = on => {
       return a.active ? { text: '● сейчас', color: 'success' } : { text: 'в запасе', color: 'subtle' }
     }
 
+    // ML AI Code has no usage windows: what limits it is two sessions at a time and a 7-day sign-in. One row in the
+    // same columns as the limit rows (name · what · count · bar · state), a hint under it only when action is needed.
+    const MlaiLines = ({ m }: { m: MlaiState }) => {
+      const sign = mlaiSignIn(m, now)
+      const limit = m.slots?.limit ?? 2
+      const used = Math.min(m.slots?.used ?? 0, limit)
+      const full = used >= limit
+      const mark = m.mark && Date.parse(m.mark.until) > now ? m.mark : null
+      const markText = mark ? `${mark.reason === 'auth' ? 'ошибка входа' : mark.reason === 'quota' ? 'лимит тарифа' : 'сбой запуска'} до ${clock(mark.until)}` : ''
+      const stateColor = mark || sign?.level === 'error' ? 'error' : sign && sign.level !== 'ok' ? 'warning' : 'subtle'
+      return (
+        <Box flexDirection="column">
+          <Box flexDirection="row" alignItems="center" gap={1}>
+            <Box width={7} flexShrink={0}><Text size="footnote" weight="medium">ML AI</Text></Box>
+            <Box width={7} flexShrink={0}><Text size="caption" color="subtle">сессии</Text></Box>
+            <Box width={5} flexShrink={0} justifyContent="flex-end">
+              <Text size="footnote" weight="medium" color={full ? 'warning' : 'success'} tabular>{`${used}/${limit}`}</Text>
+            </Box>
+            <Box flexShrink={0}><Bar pct={limit ? (used / limit) * 100 : 0} color={full ? 'warning' : 'success'} /></Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text size="caption" color={stateColor} wrap="truncate-end">{markText || sign?.text || ''}</Text>
+            </Box>
+          </Box>
+          {full ? (
+            <Box paddingLeft={8}><Text size="caption" color="subtle" wrap="truncate-end">обе заняты: новые задачи идут дальше по цепочке</Text></Box>
+          ) : null}
+          {m.installed && sign && sign.level !== 'ok' ? (
+            <Box paddingLeft={8}><Text size="caption" color="subtle" wrap="wrap">войти: {MLAI_LOGIN}</Text></Box>
+          ) : null}
+        </Box>
+      )
+    }
+
     const Limits = () => {
       const claude = d.claude.filter(l => l.kind !== 'spend_limit' || l.percentUsed > 0)
         .sort((a, b) => (a.kind === 'five_hour' ? -1 : b.kind === 'five_hour' ? 1 : 0))
@@ -906,11 +999,13 @@ export const register: Register = on => {
               </Box>
             )
           }) : <CodexWindows limits={codex} showName />}
+          {mlai ? <Box flexDirection="column"><Rule /><MlaiLines m={mlai} /></Box> : null}
           {today ? (
             <Box paddingTop={0}>
               <Button key="today-usage" plain onPress={() => void setView({ tab: 'usage' })}>
                 <Text size="caption" color="subtle" wrap="truncate-end">
-                  сегодня  Claude {tokens(tok(today.claude))} · Codex {tokens(tok(today.codex))} ток.  ›
+                  сегодня  Claude {tokens(tok(today.claude))} · Codex {tokens(tok(today.codex))} ток.
+                  {mlai?.jobsToday ? ` · ML AI ${credits(mlai.creditsToday)} кр.` : ''}  ›
                 </Text>
               </Button>
             </Box>
@@ -983,7 +1078,7 @@ export const register: Register = on => {
           ) : null}
           {recent && last ? (
             <Text size="caption" color="subtle" wrap="wrap">
-              {clock(last.at)} {TIER_RU[last.tier] ?? last.tier}: {last.from} → {last.to}{last.reason ? ` (${reasonRu(last.reason)})` : ''}
+              {clock(last.at)} {TIER_RU[last.tier] ?? last.tier}: {PROVIDER_RU[last.from] ?? last.from} → {PROVIDER_RU[last.to] ?? last.to}{last.reason ? ` (${reasonRu(last.reason)})` : ''}
             </Text>
           ) : null}
         </Card>
@@ -1004,7 +1099,7 @@ export const register: Register = on => {
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
             <Text size="footnote" wrap="truncate-end" dimColor={!isRunning}>
               <Text color={quiet ?? (isRunning ? 'success' : 'warning')}>{isRunning ? '▶' : '◷'} </Text>
-              <Text color="subtle">Codex </Text>
+              <Text color="subtle">{PROVIDER_RU[providerOf(j)] ?? 'Codex'} </Text>
               <Text weight="medium">{modelName(j.provider, j.model)}</Text>
               <Text color="subtle"> {j.effort} </Text>{jobName(j.out)}
             </Text>
@@ -1042,9 +1137,12 @@ export const register: Register = on => {
       const beats = snap.sessions ?? []
       const counts = {
         codex: jobs.filter(j => providerOf(j) === 'codex' && j.state === 'running').length,
+        mlai: jobs.filter(j => providerOf(j) === 'mlai' && j.state === 'running').length,
         claude: beats.reduce((n, b) => n + (b.agents?.length ?? 0) + background(b).length, 0),
       }
       const filter = v.filter === 'gemini' ? 'all' : v.filter
+      // An executor filter shows that executor's jobs only: no Claude plans or agents.
+      const executorOnly = filter === 'codex' || filter === 'mlai'
       const showJob = (j: Job) => filter === 'all' || filter === providerOf(j)
       const showAgents = filter === 'all' || filter === 'claude'
       const visible = jobs.filter(showJob)
@@ -1054,7 +1152,7 @@ export const register: Register = on => {
       const busyNow = (g: (typeof all)[number]) => !!g.beat && g.beat.state !== 'idle'
       const planOpen = (b?: SessionBeat) => !!b?.plan && b.plan.total > 0 && b.plan.done < b.plan.total
       const withWork = all.filter(g => g.jobs.length || (showAgents && ((g.beat?.agents?.length ?? 0) > 0 || background(g.beat).length > 0))
-        || (filter !== 'codex' && planOpen(g.beat)) || busyNow(g) || g.id === d.sessionId)
+        || (!executorOnly && planOpen(g.beat)) || busyNow(g) || g.id === d.sessionId)
         .sort((a, b) => (a.id === d.sessionId ? -1 : b.id === d.sessionId ? 1 : 0) || (b.jobs.length - a.jobs.length))
       const idle = all.filter(g => !withWork.includes(g) && g.beat && now - g.beat.updatedAt <= 15 * 60_000)
       const orphans = visible.filter(j => !j.owner)
@@ -1063,6 +1161,9 @@ export const register: Register = on => {
           <Head text="Задачи" right={
             <Box flexDirection="row" gap={0}>
               <Chip id="f-all" label="все" active={v.filter === 'all'} onPress={() => void setView({ filter: 'all' })} />
+              {mlai || counts.mlai ? (
+                <Chip id="f-mlai" label={`ML AI ${counts.mlai}`} active={v.filter === 'mlai'} onPress={() => void setView({ filter: 'mlai' })} />
+              ) : null}
               <Chip id="f-codex" label={`Codex ${counts.codex}`} active={v.filter === 'codex'} onPress={() => void setView({ filter: 'codex' })} />
               <Chip id="f-claude" label={`Claude ${counts.claude}`} active={v.filter === 'claude'} onPress={() => void setView({ filter: 'claude' })} />
             </Box>
@@ -1078,7 +1179,7 @@ export const register: Register = on => {
             const stateColor = b?.state === 'thinking' ? 'claude' : b?.state === 'idle' ? 'warning' : 'subtle'
             const id = `s-${g.id}`
             const open = !folded[id]
-            const plan = filter !== 'codex' && b?.plan && b.plan.total > 0 ? b.plan : null
+            const plan = !executorOnly && b?.plan && b.plan.total > 0 ? b.plan : null
             // Executor launches already have their own Codex row; the shell that waits for them adds nothing.
             const bg = showAgents ? background(b).filter(x => x.kind !== 'executor' || g.jobs.length === 0) : []
             const work = g.jobs.length + (showAgents ? b?.agents?.length ?? 0 : 0) + bg.length
@@ -1307,6 +1408,15 @@ export const register: Register = on => {
                 </Text>
               ) : null}
             </Box>
+            {mlai ? (
+              <Box flexDirection="column" paddingTop={1}>
+                <Text size="footnote" weight="medium">ML AI Code</Text>
+                <MlaiLines m={mlai} />
+                <Text size="caption" color="subtle" wrap="wrap">
+                  {`Стоит в цепочке там, куда его поставили (обычно первым). Одновременно идут не больше ${mlai.slots?.limit ?? 2} сессий: когда все заняты, задача сразу идёт к следующему в цепочке, без ожидания. Вход действует 7 дней. Начатая задача на другого исполнителя не переносится.`}
+                </Text>
+              </Box>
+            ) : null}
             <Box paddingTop={1}><PresetRow /></Box>
             <Box paddingTop={1}>
               <Input key="preset-name" placeholder="сохранить как пресет…" value={v.presetName}
@@ -1345,12 +1455,12 @@ export const register: Register = on => {
           <Fold id="set-catalog" title="Каталог моделей" byDefault={false}>
             {Object.entries(o.catalog ?? {}).filter(([p]) => p !== 'gemini').map(([p, models]) => (
               <Box flexDirection="row" gap={1} key={`cat-${p}`}>
-                <Box width={7} flexShrink={0}><Text size="footnote" color="subtle">{p}</Text></Box>
+                <Box width={7} flexShrink={0}><Text size="footnote" color="subtle">{PROVIDER_RU[p] ?? p}</Text></Box>
                 <Box flexGrow={1} flexShrink={1}><Text size="footnote" wrap="wrap">{models.map(m => modelName(p, m.model)).join(' · ')}</Text></Box>
               </Box>
             ))}
             <Box flexDirection="row" alignItems="center" gap={1} paddingTop={1}>
-              <Select key="draft-provider" value={v.draftProvider} options={['codex', 'claude'].map(p => ({ value: p, label: p }))}
+              <Select key="draft-provider" value={v.draftProvider} options={['mlai', 'codex', 'claude'].map(p => ({ value: p, label: PROVIDER_RU[p] ?? p }))}
                 onSelect={value => void setView({ draftProvider: value })} />
               <Box flexGrow={1} minWidth={14}>
                 <Input key="draft-model" placeholder="id новой модели" value={v.draftModel}
@@ -1369,7 +1479,7 @@ export const register: Register = on => {
                 onInput={value => void setView({ draftEfforts: value.replace(/\s+/g, '') })} submitLabel="ок"
                 onSubmit={value => void setView({ draftEfforts: value.replace(/\s+/g, '') })} />
             </Box>
-            <Link id="catalog-refresh" label="найти новые модели Codex и Claude"
+            <Link id="catalog-refresh" label="найти новые модели ML AI, Codex и Claude"
               onPress={() => void refreshCatalog($)} />
           </Fold>
         </Box>
