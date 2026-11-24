@@ -3894,7 +3894,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "c227ff9b202336beedf429ddf7347cc7519399e269a6902a238f4d721a25299c",
+      "sha256": "96f52f24c851efe3179714ebbe1c2a99aa496ca33fa2fddef6766e5d21370643",
       "executable": true
     },
     {

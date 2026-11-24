@@ -444,7 +444,9 @@ class Job {
     });
     if (options.dir === '/' || [...homes].some((home) => options.dir === home || home.startsWith(`${options.dir}/`)) ||
         privateDirs.some((dir) => options.dir === dir || options.dir.startsWith(`${dir}/`))) {
-      throw new Failure(`unsafe project directory: ${options.dir}`, 2);
+      // Exit 3 so the dispatcher runs this job on the next chain entry (Codex) instead of failing it: sessions without
+      // a project folder work under ~/.config, which mlai's own sandbox must not get.
+      throw new Failure(`mlai: refuses this project directory: ${options.dir}`, 3, 'unavailable', 'start');
     }
     this.values.dir = options.dir;
     return prompt;
