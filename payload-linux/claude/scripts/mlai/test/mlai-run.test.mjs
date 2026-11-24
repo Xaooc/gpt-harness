@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -42,7 +42,7 @@ async function fixture({ scenario, worktree = false }, verify) {
       env: {
         ...process.env, HOME: home, MLAI_HOME: mlaiHome, MLAI_BIN: fake, MLAI_SLOT: slot,
         LUNA_RUN_DIR: run, LUNA_NO_REGISTRY: '1', MLAI_RETRIES: '2', MLAI_RETRY_DELAY_MS: '10',
-        LUNA_IDLE_MAX_S: '30', LUNA_TIMEOUT_S: '30', MLAI_READ_ROOTS: path.join(root, 'projects'), FAKE_MLAI_SCENARIO: scenario, FAKE_MLAI_STATE_DIR: state
+        LUNA_IDLE_MAX_S: '30', LUNA_TIMEOUT_S: '30', MLAI_READ_ROOTS: worktree ? root : path.join(root, 'projects'), FAKE_MLAI_SCENARIO: scenario, FAKE_MLAI_STATE_DIR: state
       },
       stdio: ['ignore', 'pipe', 'pipe'], timeout: 300_000
     });
@@ -55,7 +55,7 @@ async function fixture({ scenario, worktree = false }, verify) {
     });
     const status = Object.fromEntries(readFileSync(`${out}.status`, 'utf8').trimEnd().split('\n')
       .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
-    verify({ rc, stdout, stderr, status, output: readFileSync(out, 'utf8'), slot, state, mlaiHome });
+    verify({ rc, stdout, stderr, status, output: readFileSync(out, 'utf8'), slot, state, mlaiHome, root, dir });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -104,8 +104,14 @@ test('a sign-in or daily-limit failure before the agent starts is unavailable', 
 });
 
 test('a run stopped by the step limit continues the same session and then removes it', { timeout: 300_000 }, async () => {
-  await fixture({ scenario: 'steps', worktree: true }, ({ rc, stderr, status, output, state, mlaiHome }) => {
+  await fixture({ scenario: 'steps', worktree: true }, ({ rc, stderr, status, output, state, mlaiHome, root, dir }) => {
     assert.equal(readFileSync(path.join(state, 'checkpoints-1.txt'), 'utf8'), '0', 'checkpoints off in a worktree');
+    // A read root that holds the job folder would be mounted read-only over it: only its other subfolders are passed.
+    const reads = JSON.parse(readFileSync(path.join(state, 'args-1.json'), 'utf8'))
+      .filter((arg, i, all) => all[i - 1] === '--add-dir');
+    assert.ok(reads.includes(realpathSync(path.join(root, 'main'))), 'the sibling main repo is readable');
+    assert.ok(!reads.some((target) => realpathSync(dir).startsWith(`${target}/`) || target === realpathSync(dir)),
+      `no read root holds the job folder: ${reads.join(' ')}`);
     assert.equal(rc, 0, stderr);
     assert.equal(status.state, 'done');
     assert.equal(status.attempts, '2');

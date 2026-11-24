@@ -2,7 +2,7 @@
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
-  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
+  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
 } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import path from 'node:path';
@@ -589,8 +589,21 @@ class Job {
     }
     const dirs = [...found].filter((target) => target !== '/' && target !== dir && !target.startsWith(`${dir}/`) &&
       target !== home && this.readable(target)).sort();
-    // Keep the outermost of nested folders, at most 12.
-    const kept = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`))).slice(0, 12);
+    // Keep the outermost of nested folders.
+    const outer = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`)));
+    // The CLI mounts each --add-dir read-only over everything inside it, the job folder included (2026-11-24: with
+    // ~/dev readable every write in a ~/dev worktree failed with "Read-only file system"). A folder that holds the job
+    // folder is replaced by its other subfolders, level by level down to the job folder; shallow ones first, at most 64.
+    const split = (target) => {
+      if (!dir.startsWith(`${target}/`)) return [target];
+      const next = path.join(target, dir.slice(target.length + 1).split('/')[0]);
+      let entries = [];
+      try { entries = readdirSync(target, { withFileTypes: true }); } catch {}
+      return entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(target, entry.name)).sort()
+        .flatMap((child) => child === dir ? [] : child === next ? split(child) : this.readable(child) ? [child] : []);
+    };
+    const depth = (target) => target.split('/').length;
+    const kept = outer.flatMap(split).sort((a, b) => depth(a) - depth(b) || a.localeCompare(b)).slice(0, 64);
     if (kept.length) this.log(`read access: ${kept.join(' ')}`);
     return kept;
   }
