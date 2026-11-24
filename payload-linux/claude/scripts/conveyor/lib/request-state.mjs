@@ -23,6 +23,7 @@ function applyOutcomeRecord(item, record) {
   if (record.type === 'amend') {
     item.amendments.push(record);
     item.text = record.text;
+    if (record.paths !== undefined) item.paths = record.paths;
     item.sources = [...new Set([...(item.sources || []), record.source])];
     item.revision++;
     item.previousEvidence.push(...item.evidence);

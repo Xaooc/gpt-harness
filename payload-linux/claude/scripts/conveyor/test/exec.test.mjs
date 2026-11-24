@@ -56,6 +56,9 @@ case "$1" in
     exit 0 ;;
   diff) names=$working ;;
   log) names=$committed ;;
+  cat-file)
+    if [ "$3" = 'fixture-base:source.js' ]; then printf 'before\n'; exit 0; fi
+    printf 'fatal: path does not exist in fixture base\n' >&2; exit 128 ;;
   ls-files) if [[ " $* " == *' --cached '* ]]; then names=$files; else names=$untracked; fi ;;
   *) printf 'unexpected fake git arguments: %s\\n' "$*" >&2; exit 1 ;;
 esac
@@ -371,6 +374,44 @@ test('a write wrapper that runs, edits a file and hits quota is never retried', 
     assert.equal((await readJson(paths().providers)).codex.reason, 'quota');
     await assert.rejects(fs.stat(paths().switches), { code: 'ENOENT' });
     assert.doesNotMatch(run.stdout, /claude-subagent/);
+  } finally { await env.cleanup(); }
+});
+
+test('a failed gate-off write still records edits to already-dirty files', { timeout }, async () => {
+  const realPath = process.env.PATH;
+  const env = await environment();
+  try {
+    await env.setup();
+    const git = (...args) => execFileSync('git', ['-C', env.dir, ...args], {
+      env: { ...process.env, PATH: realPath }, stdio: 'ignore'
+    });
+    git('init', '-q');
+    git('config', 'user.name', 'Conveyor Test');
+    git('config', 'user.email', 'conveyor@example.test');
+    const file = path.join(env.dir, 'dirty.txt');
+    await fs.writeFile(file, 'committed\n');
+    git('add', 'dirty.txt');
+    git('commit', '-qm', 'base');
+    await fs.writeFile(file, 'already dirty\n');
+    await fs.writeFile(path.join(env.dir, 'foreign.txt'), 'leave unchanged\n');
+    appendRecord('gate-session', { type: 'start', version: 2, id: 'T1' });
+    const wrapper = path.join(env.root, 'failure.sh');
+    await fs.writeFile(wrapper, '#!/bin/bash\nprintf "executor edit\\n" > dirty.txt\nexit 17\n');
+    const run = await env.run('complex', '-w', { PATH: realPath, CONVEYOR_LUNA_SH: wrapper },
+      ['--review-skip', 'test fixture', '--no-gate', '--waive', 'W-1']);
+    assert.equal(run.status, 17, run.stderr);
+    const [start, end] = await readLines(ledgerPaths('gate-session').runs);
+    assert.equal(start.mode, 'off');
+    assert.equal(end.code, 17);
+    assert.equal(Object.hasOwn(end, 'repo'), false);
+    assert.equal(end.acceptance.task, 'T1');
+    assert.equal(end.acceptance.session, 'gate-session');
+    assert.ok(end.acceptance.runId);
+    assert.equal(end.acceptance.truncated, false);
+    const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
+    assert.deepEqual(end.acceptance.changed, [{
+      path: file, before: hash('already dirty\n'), after: hash('executor edit\n'), at: end.acceptance.changed[0]?.at
+    }]);
   } finally { await env.cleanup(); }
 });
 
@@ -1099,7 +1140,7 @@ test('a green write gate appends checks and records the owner, excluding pre-exi
     assert.equal(dispatch.gate.rounds, 0);
     const records = await readLines(path.join(paths().home, 'sessions', 'gate-session.jsonl'));
     assert.equal(records.length, 2);
-    const [owner, completion] = records;
+    const [owner, { acceptance, ...completion }] = records;
     assert.deepEqual(owner, {
       at: owner.at, session: 'gate-session', repo: env.dir, base: 'fixture-base', out: env.out, tier: 'complex', mode: 'block'
     });
@@ -1109,6 +1150,7 @@ test('a green write gate appends checks and records the owner, excluding pre-exi
       provider: 'codex', model: 'gpt-6.1-sol', code: 0, gate: { status: 'pass', rounds: 0 }
     });
     assert.ok(Number.isFinite(Date.parse(completion.at)));
+    assert.deepEqual(acceptance.changed.map((change) => path.basename(change.path)).sort(), ['committed.js', 'new.txt', 'source.js']);
   } finally { await env.cleanup(); }
 });
 
@@ -1139,6 +1181,12 @@ test('a red gate repairs on the same provider and preserves the brief and failur
     assert.match(output, /Round 0: fail[\s\S]*Round 1: pass[\s\S]*## Gate: pass/);
     assert.equal((await readLines(gate.checks)).length, 4);
     assert.equal((await readJson(`${env.out}.dispatch.json`)).gate.rounds, 1);
+    const [, end] = await readLines(ledgerPaths('gate-session').runs);
+    const [initial, repair] = end.acceptance.changed.filter(({ path: file }) => file === path.join(env.dir, 'source.js'));
+    assert.equal(initial.before, createHash('sha256').update('before\n').digest('hex'));
+    assert.equal(initial.after, createHash('sha256').update('change 1\n').digest('hex'));
+    assert.equal(repair.before, initial.after);
+    assert.equal(repair.after, createHash('sha256').update('change 2\n').digest('hex'));
   } finally { await env.cleanup(); }
 });
 

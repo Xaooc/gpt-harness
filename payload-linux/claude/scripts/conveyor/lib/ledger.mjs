@@ -10,6 +10,7 @@ import { loadConfig, withLock } from './orchestration.mjs';
 import { repositorySurface, uiFile } from './profile.mjs';
 import { home, platform, processAlive, readProcessStat, shell } from './platform.mjs';
 import { clauseHints, foldLedger, latestMessages } from './request-state.mjs';
+import { collectTaskScope, inside, worktreeFor } from './task-scope.mjs';
 
 export { foldLedger } from './request-state.mjs';
 
@@ -373,24 +374,31 @@ export function linkSource(context, clause, target, reason) {
   });
 }
 
-export function addItem(context, text, sources) {
+function outcomePaths(context, files) {
+  return [...new Set(files.map((file) => path.resolve(context.cwd, file)))].sort();
+}
+
+export function addItem(context, text, sources, files) {
   return withSyncedLedger(context, (state, records, put) => {
     requireTask(state);
     if (!text?.trim() || !sources.length) throw new Error('add requires text and --from sources');
     for (const source of sources) if (!knownSource(state, source)) throw new Error(`unknown source: ${source}`);
     const id = nextId(records, 'L');
-    put({ type: 'item', taskId: state.task.id, id, text, sources, status: 'open' });
+    put({ type: 'item', taskId: state.task.id, id, text, sources, status: 'open',
+      ...(files && { paths: outcomePaths(context, files) }) });
     return id;
   });
 }
 
-export function amendItem(context, id, source, text) {
+export function amendItem(context, id, source, text, files) {
   return withSyncedLedger(context, (state, records, put, rows) => {
     const item = findItem(state, id);
     ownerMessage(state, rows, source);
     if (!text?.trim()) throw new Error('amend requires corrected outcome text');
-    if (text.trim() !== item.text.trim()) {
-      put({ type: 'amend', taskId: state.task.id, item: id, revision: item.revision, source, text: text.trim() });
+    const paths = files && outcomePaths(context, files);
+    if (text.trim() !== item.text.trim() || (paths && JSON.stringify(paths) !== JSON.stringify(item.paths))) {
+      put({ type: 'amend', taskId: state.task.id, item: id, revision: item.revision, source, text: text.trim(),
+        ...(paths && { paths }) });
     }
   });
 }
@@ -472,6 +480,7 @@ export async function addEvidence(context, id, kind, value, expectedRc = 0) {
   const result = await runCommand(value, [], context.cwd);
   record.rc = result.rc;
   record.expectedRc = expectedRc;
+  record.cwd = context.cwd;
   record.at = now();
   record.output = sanitizeQuote(result.stdout || result.stderr, 800);
   await withSyncedLedger(context, (current, records, put) => {
@@ -515,21 +524,25 @@ export function checklist(state, { showRevision = false } = {}) {
   }).join('\n');
 }
 
-// Non-git transcript edits use these extensions; git repositories use their actual changes.
+// Non-Git changes and provisional requests apply only to code paths.
 export const CODE_EXTENSIONS = new Set([
   '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.sh', '.bash', '.zsh', '.fish', '.rs', '.go', '.java',
   '.c', '.h', '.cc', '.cpp', '.hpp', '.cs', '.rb', '.php', '.swift', '.kt', '.kts', '.scala', '.lua', '.pl', '.r',
   '.sql', '.css', '.scss', '.less', '.sass', '.html', '.htm', '.vue', '.svelte', '.astro', '.json', '.jsonc',
   '.yaml', '.yml', '.toml', '.xml', '.ini', '.cfg', '.conf', '.gradle', '.proto', '.tf', '.hcl', '.ex', '.exs',
-  '.erl', '.hrl', '.clj', '.cljs', '.edn', '.ps1', '.psm1', '.bat', '.cmd', '.dockerfile', '.make'
+  '.erl', '.hrl', '.clj', '.cljs', '.edn', '.ps1', '.psm1', '.bat', '.cmd', '.dockerfile', '.make', '.ipynb'
 ]);
+
+function codePath(file) {
+  return CODE_EXTENSIONS.has(path.extname(file).toLowerCase())
+    || /^(Dockerfile|Makefile|CMakeLists\.txt|Gemfile)$/i.test(path.basename(file));
+}
 
 function codeWrites(rows, cwd) {
   const files = new Set();
   const add = (file) => {
     if (typeof file !== 'string') return;
-    if (CODE_EXTENSIONS.has(path.extname(file).toLowerCase())
-      || /^(Dockerfile|Makefile|CMakeLists\.txt|Gemfile)$/i.test(path.basename(file))) files.add(path.resolve(cwd, file));
+    if (codePath(file)) files.add(path.resolve(cwd, file));
   };
   for (const { entry } of rows) {
     if (entry.type !== 'assistant' || !Array.isArray(entry.message?.content)) continue;
@@ -568,11 +581,6 @@ function checkPassed(check) {
 function checkEvidencePassed(file) {
   try { return checkPassed(readJson(file)); }
   catch { return false; }
-}
-
-function inside(repo, file) {
-  const relative = path.relative(repo, file);
-  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function sessionRuns(context) {
@@ -662,35 +670,55 @@ async function repoChanges(repos) {
   return changes;
 }
 
-async function evidenceProblem(state, repos) {
-  const changes = await repoChanges(repos);
+async function evidenceProblem(state, scope) {
+  const allWrites = [...scope.repos.values(), scope.nonGit];
   for (const item of state.items.filter((entry) => entry.status === 'done')) {
     if (!item.evidence.length) return `${item.id}: evidence missing`;
-    const newest = new Map(), expected = new Set();
-    let supported = false;
-    // A successful rerun supersedes an earlier failed attempt of the same command/check.
     const current = new Map(item.evidence.map((entry) => [`${entry.kind}:${entry.value}`, entry]));
+    const related = item.paths && new Set(item.paths);
+    let problem;
+    let supported = false;
     for (const evidence of current.values()) {
       if (evidence.kind === 'command') {
-        if (evidence.rc !== 0) return `${item.id}: command failed`;
-        supported = true;
+        if (evidence.rc === 0) { supported = true; break; }
+        problem ??= 'command failed';
+        continue;
       }
+      if (evidence.kind === 'owner-message') { supported = true; break; }
+      if (!['artifact', 'check'].includes(evidence.kind)) continue;
+      let jobDir;
       if (evidence.kind === 'check') {
-        if (!checkEvidencePassed(evidence.value)) return `${item.id}: check evidence is red`;
-        supported = true;
+        let dispatch;
+        try { dispatch = readJson(evidence.value); } catch { /* An unreadable report is red. */ }
+        if (evidence.ok === false || !checkPassed(dispatch)) {
+          problem ??= 'check evidence is red';
+          continue;
+        }
+        jobDir = dispatch.gate.last?.repo ?? dispatch.dir;
       }
-      if (!['file', 'artifact'].includes(evidence.kind)) continue;
-      const owners = repos.filter(({ repo }) => inside(repo, evidence.value));
-      const relevant = owners.length ? owners : repos;
-      for (const { repo } of relevant) expected.add(repo);
-      const stat = fs.statSync(evidence.value, { throwIfNoEntry: false });
-      if (!stat?.isFile()) return `${item.id}: file/artifact evidence missing: ${evidence.value}`;
-      if (evidence.kind === 'artifact') supported = true;
-      for (const { repo } of relevant) newest.set(repo, Math.max(newest.get(repo) || 0, stat.mtimeMs));
+      let stat;
+      try { stat = fs.statSync(evidence.value); } catch { /* An inaccessible artifact cannot qualify. */ }
+      if (!stat?.isFile()) {
+        problem ??= `file/artifact evidence missing: ${evidence.value}`;
+        continue;
+      }
+      const mtime = Number.isFinite(evidence.mtime) ? Math.min(stat.mtimeMs, evidence.mtime) : stat.mtimeMs;
+      const newerWrite = (writes) => {
+        for (const [file, at] of writes || []) if (at > mtime && (!related || related.has(file))) return true;
+        return false;
+      };
+      if (allWrites.some(newerWrite)) {
+        const repo = typeof jobDir === 'string' && path.isAbsolute(jobDir)
+          ? await worktreeFor(jobDir, jobDir) : await worktreeFor(evidence.value);
+        if (!repo || newerWrite(scope.repos.get(repo))) {
+          problem ??= `stale evidence in ${repo || evidence.value}`;
+          continue;
+        }
+      }
+      supported = true;
+      break;
     }
-    for (const repo of expected) if (!newest.has(repo)) return `${item.id}: file/artifact evidence missing in ${repo}`;
-    for (const [repo, mtime] of newest) if (mtime < changes.get(repo)) return `${item.id}: stale evidence in ${repo}`;
-    if (!supported) return `${item.id}: runnable command, fresh artifact, or passing dispatch gate evidence required`;
+    if (!supported) return `${item.id}: ${problem || 'runnable command, fresh artifact, or passing dispatch gate evidence required'}`;
   }
   return null;
 }
@@ -1139,6 +1167,11 @@ export function taskApproachReviewRequirement(session) {
   return task ? approachReviewRequirement(approachReviewRuns(session, task)) : null;
 }
 
+export function activeTaskId(session) {
+  if (!validSession(session)) return null;
+  return readJsonl(ledgerPaths(session).ledger).findLast((record) => record.type === 'start')?.id ?? null;
+}
+
 function approachReviewProblem(context, task) {
   const runs = approachReviewRuns(context.session, task);
   for (const run of runs) {
@@ -1164,9 +1197,16 @@ function approachReviewProblem(context, task) {
 
 export async function gateStatus(context) {
   const rows = transcriptRows(context);
-  const { applies, repos, nonGit, writes } = await sessionRepos(context, rows);
-  if (!applies) return { applies: false, ok: true };
   const state = await loadLedger(context, rows);
+  if (state.legacy) return { applies: false, ok: true };
+  const boundary = state.task ? state.messages.find((message) => message.id === state.task.messageId) || state.task
+    : state.allMessages.at(-1);
+  const owned = await collectTaskScope(context, state.task ? { ...boundary, id: state.task.id } : boundary && {
+    offset: boundary.offset, uuid: boundary.uuid, at: boundary.at
+  }, rows);
+  const ownCode = [...owned.repos.values(), owned.nonGit].some((files) => [...files.keys()].some(codePath));
+  if (!(ownCode || (state.task && owned.repos.size))) return { applies: false, ok: true };
+  const nonGitOnly = !owned.repos.size;
   const checklistLines = /^\s*[-*]\s*(L\d+)\s+(?:[✓✗](?=\s|$)|waived\b)/gm;
   const lastAssistant = rows.findLast(({ entry }) => entry.type === 'assistant');
   const final = lastAssistant ? entryText(lastAssistant.entry) : '';
@@ -1175,7 +1215,7 @@ export async function gateStatus(context) {
   const jobLookup = completionChecklist ? null : await ownedJobs(context);
   if (jobLookup?.jobs.length) return { applies: true, ok: true,
     systemMessage: `conveyor: work in progress, ${jobLookup.jobs.length} jobs running` };
-  const scope = nonGit ? '; non-git code edits: ledger checks only, turn checks unavailable' : '';
+  const scope = nonGitOnly ? '; non-git code edits: ledger checks only, turn checks unavailable' : '';
   const block = (check, reason) => ({ applies: true, ok: false, check,
     reason: check === 9 ? `${check}. ${reason}${scope}` : sanitizeQuote(`${check}. ${reason}${scope}`, 1500) });
   if (!state.task) return block(1, 'start the ledger and play back the requirements: ledger start');
@@ -1183,9 +1223,10 @@ export async function gateStatus(context) {
   if (unlinked.length) return block(2, `link imperative clauses in the ledger: ${unlinked.map((clause) => clause.id).join(', ')}`);
   const open = state.items.filter((item) => item.status === 'open');
   if (open.length) return block(3, `finish or obtain a user waiver for open items: ${open.map((item) => item.id).join(', ')}`);
-  const evidenceRepos = nonGit ? [...repos, { repo: context.cwd, base: null, files: writes }] : repos;
-  const evidence = await evidenceProblem(state, evidenceRepos);
+  const evidence = await evidenceProblem(state, owned);
   if (evidence) return block(4, `refresh evidence: ${evidence}`);
+  const { repos, nonGit, writes } = await sessionRepos(context, rows);
+  const evidenceRepos = nonGit ? [...repos, { repo: context.cwd, base: null, files: writes }] : repos;
   if (!state.gateWaived && !nonGit) {
     for (const { repo, base } of repos) {
       const command = process.env.CONVEYOR_CHECK_CMD || [process.execPath, path.join(claudeHome(), 'scripts/conveyor/check.mjs')];

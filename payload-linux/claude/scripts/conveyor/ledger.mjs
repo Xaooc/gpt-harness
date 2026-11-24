@@ -28,7 +28,7 @@ export async function main(args = process.argv.slice(2)) {
   const [command, ...values] = positional;
   const context = sessionContext(flags['--session'] || process.env.CLAUDE_CODE_SESSION_ID);
   const allowed = {
-    start: ['--note'], add: ['--from'], amend: ['--from'], pending: ['--reason', '--resolve', '--result'],
+    start: ['--note'], add: ['--from', '--paths'], amend: ['--from', '--paths'], pending: ['--reason', '--resolve', '--result'],
     link: ['--reason'], evidence: ['--cmd', '--rc', '--file', '--artifact', '--check', '--note', '--owner-message'],
     done: [], waive: ['--quote'], crosscheck: [], checklist: [], show: ['--json'], status: ['--json'], tmp: []
   };
@@ -39,6 +39,8 @@ export async function main(args = process.argv.slice(2)) {
     if (flag !== '--session' && !allowed[command].includes(flag)) throw new Error(`unknown option: ${flag}`);
   }
   const arity = (count) => { if (values.length !== count) throw new Error(`${command} requires ${count} arguments`); };
+  const files = flags['--paths']?.split(',').map((file) => file.trim()).filter(Boolean);
+  if (files && !files.length) throw new Error('--paths requires at least one file');
   if (command === 'start') {
     arity(0);
     const state = await startTask(context, flags['--note']);
@@ -47,11 +49,11 @@ export async function main(args = process.argv.slice(2)) {
     }).join('\n') + '\nLink every clause, then include ledger checklist in the final message.');
   } else if (command === 'add') {
     arity(1);
-    print(await addItem(context, values[0], (flags['--from'] || '').split(/[\s,]+/).filter(Boolean)));
+    print(await addItem(context, values[0], (flags['--from'] || '').split(/[\s,]+/).filter(Boolean), files));
   } else if (command === 'amend') {
     arity(2);
     if (!flags['--from']) throw new Error('amend requires --from');
-    await amendItem(context, values[0], flags['--from'], values[1]);
+    await amendItem(context, values[0], flags['--from'], values[1], files);
   } else if (command === 'pending') {
     arity(1);
     const reason = flags['--reason'], source = flags['--resolve'], result = flags['--result'];

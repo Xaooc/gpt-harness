@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { main as ledgerMain } from '../../scripts/conveyor/ledger.mjs';
-import { invoke, invokeHook, shellList, shellLog } from '../../scripts/conveyor/test/process-fixture.mjs';
+import { invoke, invokeHook, shellList, shellLog, shellQuote } from '../../scripts/conveyor/test/process-fixture.mjs';
 
 const gate = fileURLToPath(new URL('../conveyor-stop-gate.mjs', import.meta.url));
 const capture = fileURLToPath(new URL('../conveyor-prompt-capture.mjs', import.meta.url));
@@ -64,6 +64,7 @@ repo=$2
 shift 2
 log_call git "$@"
 [ "$FAKE_NONGIT" != 1 ] || exit 128
+[[ "$repo" = ${shellQuote(repo)} || "$repo" = ${shellQuote(path.join(root, 'second-repo'))} ]] || exit 128
 changed=$FAKE_CHANGED
 if [ -n "$FAKE_CHANGED_REPO" ] && [ "$FAKE_CHANGED_REPO" != "$repo" ]; then changed=0; fi
 nul_list() { eval "set -- $1"; if [ "$#" -gt 0 ]; then printf '%s\\0' "$@"; fi; }
@@ -87,6 +88,12 @@ exit 0
 `, { mode: 0o755 });
   let sequence = 0;
   const append = (entry) => fs.appendFileSync(transcript, JSON.stringify({ sessionId: session, ...entry }) + '\n');
+  const editResult = (edit, cwd = repo) => {
+    const id = `e${++sequence}`;
+    append({ type: 'assistant', cwd, message: { content: [{ type: 'tool_use', id, ...edit }] } });
+    append({ type: 'user', timestamp: new Date(fs.statSync(worker).mtimeMs).toISOString(),
+      message: { content: [{ type: 'tool_result', tool_use_id: id, content: 'Success' }] } });
+  };
   const user = (text) => append({ type: 'user', uuid: `u${++sequence}`, origin: { kind: 'human' }, message: { content: text } });
   const assistant = (text) => append({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
   const run = async (program, args, extra = {}, input) => {
@@ -120,6 +127,7 @@ exit 0
   assert.equal(captured.status, 0, captured.stderr);
   assert.equal(captured.stdout, '');
   if (writeRun) write();
+  if (changed) editResult({ name: 'Edit', input: { file_path: worker } });
   const complete = async ({ semantic = true, final = true } = {}) => {
     assert.match(await command(['start']), /requirements playback/);
     await command(['add', 'Fix the worker', '--from', 'M1.c1']);
@@ -129,6 +137,7 @@ exit 0
     if (final) assistant((await command(['checklist'])).trim());
   };
   return { root, repo, home, transcript, worker, proof, session, env, append, user, assistant, command, stop, write, complete,
+    editResult,
     calls: (kind) => fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse)
       .filter((entry) => entry.kind === kind) : [] };
 }
@@ -158,15 +167,14 @@ test('actual code changes without a ledger start block on reason 1, including tr
   const transcriptOnly = await fixture(t, { writeRun: false });
   transcriptOnly.env.FAKE_CHANGED = '1';
   for (const name of ['Write', 'Edit', 'MultiEdit']) {
-    transcriptOnly.append({ type: 'assistant', message: { content: [{ type: 'tool_use', name,
-      input: { file_path: transcriptOnly.worker } }] } });
+    transcriptOnly.editResult({ name, input: { file_path: transcriptOnly.worker } });
     blocked(await transcriptOnly.stop(), 1, 'start the ledger');
   }
   assert.equal(f.calls('check').length, 0);
-  assert.ok(transcriptOnly.calls('git').some((call) => call.args.includes('--name-only')));
+  assert.ok(transcriptOnly.calls('git').some((call) => call.args.includes('--show-toplevel')));
 });
 
-test('write runs and tool calls alone are silent; tracked, staged, untracked, and committed changes apply', { timeout }, async (t) => {
+test('unattributed tracked, staged, untracked, and committed changes are silent', { timeout }, async (t) => {
   const f = await fixture(t, { changed: false });
   f.append({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Write',
     input: { file_path: f.worker } }] } });
@@ -174,15 +182,16 @@ test('write runs and tool calls alone are silent; tracked, staged, untracked, an
   for (const extra of [
     { FAKE_CHANGED: '1' }, { FAKE_STAGED: '["worker.mjs"]' }, { FAKE_UNTRACKED: '["worker.mjs"]' },
     { FAKE_HEAD: 'committed-after-base', FAKE_COMMITTED: '["worker.mjs"]' }
-  ]) blocked(await f.stop(extra), 1, 'start the ledger');
-  // Even a later commit with no remaining working-tree diff still applies.
-  blocked(await f.stop({ FAKE_HEAD: 'committed-after-base' }), 1, 'start the ledger');
+  ]) assert.equal(await f.stop(extra), null);
+  assert.equal(await f.stop({ FAKE_HEAD: 'committed-after-base' }), null);
   assert.equal(await f.stop({ FAKE_HEAD: 'earlier-commit', FAKE_NO_NEW_COMMITS: '1' }), null);
   assert.equal(await f.stop(), null, 'reverted edits and ignored files produce no git changes');
   const second = path.join(f.root, 'second-repo');
   fs.mkdirSync(second);
   fs.writeFileSync(path.join(second, 'worker.mjs'), 'changed\n');
   f.write('write', { repo: second });
+  assert.equal(await f.stop({ FAKE_CHANGED: '1', FAKE_CHANGED_REPO: second }), null);
+  f.editResult({ name: 'Edit', input: { file_path: 'worker.mjs' } }, second);
   blocked(await f.stop({ FAKE_CHANGED: '1', FAKE_CHANGED_REPO: second }), 1, 'start the ledger');
 });
 
@@ -193,11 +202,13 @@ test('prompt capture records the earliest base and ledger start fills missing re
   f.env.FAKE_HEAD = 'later-head';
   await f.command(['start']);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { [f.repo]: 'task-base' });
+  assert.equal(await f.stop(), null);
+  f.editResult({ name: 'Edit', input: { file_path: f.worker } });
   blocked(await f.stop(), 2, 'M1.c1');
   fs.rmSync(file);
   await f.command(['start']);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { [f.repo]: 'later-head' });
-  assert.equal(await f.stop(), null);
+  blocked(await f.stop(), 2, 'M1.c1');
 });
 
 // Each edit form exercises the full ledger sequence and reports its own duration.
@@ -207,10 +218,16 @@ for (const [group, edits] of [
     .map((command) => ({ name: 'Bash', input: { command } }))]
 ]) {
   for (const [index, edit] of edits.entries()) {
-    const name = `non-git code edits enforce ledger checks 1–4, 6, and 7 without turn checks (${group} ${index + 1})`;
+    const title = group === 'Bash' ? 'unattributed shell writes are silent before a non-Git editor write'
+      : 'non-Git editor writes enforce checks 1–4, 6, and 7 without turn checks';
+    const name = `${title} (${index + 1})`;
     test(name, { timeout }, async (t) => {
-      const f = await fixture(t, { gitRepo: false });
-      f.append({ type: 'assistant', message: { content: [{ type: 'tool_use', ...edit }] } });
+      const f = await fixture(t, { gitRepo: false, writeRun: false });
+      f.editResult(edit);
+      if (group === 'Bash') {
+        assert.equal(await f.stop(), null);
+        f.editResult({ name: 'Edit', input: { file_path: f.worker } });
+      }
       blocked(await f.stop(), 1, 'non-git code edits: ledger checks only, turn checks unavailable');
       await f.command(['start']);
       blocked(await f.stop(), 2, 'M1.c1');
@@ -311,7 +328,7 @@ test('unlinked imperative clauses block on reason 2, recomputed from genuine tra
   assert.equal(f.calls('check').length, 0);
 });
 
-test('stale evidence blocks on reason 4 using current file mtimes instead of recorded claims', { timeout }, async (t) => {
+test('check 4 requires any current proof to qualify and uses actual artifact times', { timeout }, async (t) => {
   const f = await fixture(t);
   await f.complete({ semantic: false });
   const old = new Date(Date.now() - 60_000);
@@ -327,13 +344,16 @@ test('stale evidence blocks on reason 4 using current file mtimes instead of rec
   const dispatch = path.join(f.root, 'dispatch.json');
   fs.writeFileSync(dispatch, '{"code":0}');
   await f.command(['evidence', 'L1', '--check', dispatch], {}, 1);
-  blocked(await f.stop(), 4, 'check evidence is red');
+  blocked(await f.stop(), 6, 'run ledger crosscheck');
   fs.writeFileSync(dispatch, '{"code":0,"gate":{"status":"pass"}}');
   await f.command(['evidence', 'L1', '--check', dispatch]);
   blocked(await f.stop(), 6, 'run ledger crosscheck');
   const rerun = ['evidence', 'L1', '--cmd', 'test "$CONVEYOR_EVIDENCE_OK" = yes'];
   await f.command(rerun, { CONVEYOR_EVIDENCE_OK: 'no' }, 1);
-  blocked(await f.stop(), 4, 'command failed');
+  blocked(await f.stop(), 6, 'run ledger crosscheck');
+  fs.rmSync(f.proof);
+  fs.rmSync(dispatch);
+  blocked(await f.stop(), 4, 'refresh evidence');
   await f.command(rerun, { CONVEYOR_EVIDENCE_OK: 'yes' });
   blocked(await f.stop(), 6, 'run ledger crosscheck');
 });

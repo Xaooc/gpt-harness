@@ -10,11 +10,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import {
   loadConfig, saveConfig, updateConfig, providerState, resolveChain, resolvePanel, markUnavailable,
-  recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths
+  recordSwitch, renderRoles, wrapperPath, writeJsonAtomic, paths, withLock
 } from './lib/orchestration.mjs';
 import { testFile, trimSnapshot, trimViolations } from './lib/hygiene.mjs';
-import { hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
+import { activeTaskId, hasApproachReviewTiers, ledgerHome, taskApproachReviewRequirement, validReviewSkip } from './lib/ledger.mjs';
 import { bash, platform, processAlive, readProcessStat, scanBinary } from './lib/platform.mjs';
+import { inside } from './lib/task-scope.mjs';
 import { run as runSupervised, startMaintenanceWatchdog } from '../lib/supervised-run.mjs';
 
 // Matches luna.sh's retryable_model_error deny pattern, including usage, auth and invalid-model failures.
@@ -144,6 +145,109 @@ async function workingFiles(repo) {
   const tracked = await git(repo, ['diff', '--name-only', '--no-renames', '-z', 'HEAD', '--']);
   const untracked = await git(repo, ['ls-files', '--others', '--exclude-standard', '-z']);
   return [...new Set(`${tracked}${untracked}`.split('\0').filter(Boolean))];
+}
+
+const acceptanceFileLimit = 5000;
+const acceptanceByteLimit = 20 * 1024 * 1024;
+const contentHash = (content) => createHash('sha256').update(content).digest('hex');
+
+async function worktreeHash(file, repo) {
+  try {
+    const stat = await fs.lstat(file);
+    if (stat.size > acceptanceByteLimit || (!stat.isFile() && !stat.isSymbolicLink())) return undefined;
+    if (!inside(repo, await fs.realpath(path.dirname(file)))) return undefined;
+    if (stat.isSymbolicLink()) return contentHash(await fs.readlink(file, { encoding: 'buffer' }));
+    const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile() || opened.size > acceptanceByteLimit) return undefined;
+      const hash = createHash('sha256');
+      let bytes = 0;
+      for await (const chunk of handle.createReadStream({ autoClose: false, end: acceptanceByteLimit })) {
+        bytes += chunk.length;
+        if (bytes > acceptanceByteLimit) return undefined;
+        hash.update(chunk);
+      }
+      return hash.digest('hex');
+    } finally { await handle.close(); }
+  } catch (error) {
+    return ['ENOENT', 'ENOTDIR'].includes(error.code) ? null : undefined;
+  }
+}
+
+async function committedHash(repo, head, file) {
+  if (!head) return null;
+  try {
+    const { stdout } = await execute('git', ['-C', repo, 'cat-file', 'blob', `${head}:${file}`], {
+      ...gitOptions, encoding: 'buffer', maxBuffer: acceptanceByteLimit
+    });
+    return contentHash(stdout);
+  } catch (error) {
+    return error.code === 128 && /but not in|does not exist in/.test(String(error.stderr)) ? null : undefined;
+  }
+}
+
+async function acceptanceCandidates(repo, range, dir, previous = []) {
+  const relative = path.relative(repo, dir).split(path.sep).join('/');
+  const scope = [relative ? `:(literal)${relative}` : '.'];
+  const tracked = ['--name-only', '--no-renames', '-z'];
+  const unstaged = await git(repo, ['diff', ...tracked, '--', ...scope]);
+  const staged = await git(repo, ['diff', '--cached', ...tracked, '--', ...scope]);
+  const untracked = await git(repo, ['ls-files', '-o', '--exclude-standard', '-z', '--', ...scope]);
+  const committed = range ? await git(repo, ['log', '--format=', ...tracked, '-m', range, '--', ...scope]) : '';
+  const names = (unstaged + staged + untracked + committed).split('\0');
+  return new Set([...previous, ...names.filter((file) => file && inside(dir, path.resolve(repo, file)))]);
+}
+
+async function recordWriteAttempt(acceptance, gate, dir, operation) {
+  if (!acceptance || !gate.root) return operation();
+  const repo = gate.root;
+  let jobDir;
+  try { jobDir = await fs.realpath(dir); }
+  catch { acceptance.truncated = true; return operation(); }
+  const before = new Map();
+  const range = gate.base ? `${gate.base}..HEAD` : null;
+  let head, haveBefore = false;
+  try {
+    head = (await git(repo, ['rev-parse', '--verify', 'HEAD'])).trim();
+  } catch (error) {
+    if (error.code !== 128) acceptance.truncated = true;
+    else head = null;
+  }
+  try {
+    const files = await acceptanceCandidates(repo, range || head, jobDir);
+    acceptance.truncated ||= files.size > acceptanceFileLimit;
+    for (const file of [...files].slice(0, acceptanceFileLimit)) {
+      before.set(file, await worktreeHash(path.resolve(repo, file), repo));
+    }
+    haveBefore = files.size <= acceptanceFileLimit;
+  } catch { acceptance.truncated = true; }
+  try {
+    return await operation();
+  } finally {
+    const at = new Date().toISOString();
+    try {
+      const afterHead = range ? null : (await git(repo, ['rev-parse', '--verify', 'HEAD']).catch(() => '')).trim();
+      const files = await acceptanceCandidates(repo, range || afterHead, jobDir, before.keys());
+      acceptance.truncated ||= files.size > acceptanceFileLimit;
+      for (const file of [...files].slice(0, acceptanceFileLimit)) {
+        // An unlisted file started clean and can be recovered from the launch commit.
+        const prior = before.has(file) ? before.get(file) : haveBefore && head !== undefined
+          ? await committedHash(repo, head, file) : undefined;
+        const absolute = path.resolve(repo, file);
+        const after = await worktreeHash(absolute, repo);
+        if (prior === undefined || after === undefined) acceptance.truncated = true;
+        else if (prior !== after) {
+          if (!acceptance.changed.has(absolute) && acceptance.changed.size < acceptanceFileLimit) {
+            acceptance.changed.set(absolute, []);
+          }
+          const changes = acceptance.changed.get(absolute);
+          if (changes) changes.push({ path: absolute, before: prior, after, at });
+          else acceptance.truncated = true;
+        }
+      }
+    } catch { acceptance.truncated = true; }
+  }
 }
 
 export async function gateChangedFiles(repo, base, preExisting = []) {
@@ -284,6 +388,7 @@ export function modifiedTests(before, after, includeAdded = false) {
 
 async function prepareGate(dir, brief, out, tier, panel, skip, reviewSkip) {
   const gate = { ...await gateRepository(dir), mode: 'off', preExisting: [] };
+  gate.root = gate.base ? gate.repo : (await git(dir, ['rev-parse', '--show-toplevel']).catch(() => '')).trim();
   try { gate.mode = panel || skip ? 'off' : await gateMode(gate.repo); }
   catch (error) { gate.mode = 'block'; gate.configError = error.message; }
   if (gate.base && gate.mode !== 'off') gate.preExisting = await workingFiles(gate.repo);
@@ -301,14 +406,14 @@ async function prepareGate(dir, brief, out, tier, panel, skip, reviewSkip) {
 async function appendRunRecord(record) {
   try {
     const file = gateSessionFile(record.session);
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.appendFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    // Large acceptance rows can span several writes, even with O_APPEND.
+    await withLock(file, () => fs.appendFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 }));
   } catch (error) {
     process.stderr.write(`conveyor: could not append run index: ${error.message}\n`);
   }
 }
 
-async function finishGate(gate, dispatch, entry, dir, out) {
+async function finishGate(gate, dispatch, entry, dir, out, acceptance) {
   if (!gate || gate.mode === 'off') return 0;
   const append = (text) => fs.appendFile(out, `${text}\n`);
   const report = async (text) => {
@@ -355,8 +460,8 @@ async function finishGate(gate, dispatch, entry, dir, out) {
       const brief = `${out}.gate-${rounds}.brief.md`, fixOut = `${out}.gate-${rounds}.out.md`;
       await fs.writeFile(brief, gate.brief + '\n\n## The work above is done but failed the project\'s checks\n\n' +
         `${gateDetails(last, true)}\n${budgetOnly ? '' : `\n${gateInstruction}\n`}`);
-      const result = await launch(entry, ['-w', '-m', entry.model, '-e', entry.effort,
-        '-C', dir, '-f', brief, '-o', fixOut], dir);
+      const result = await recordWriteAttempt(acceptance, gate, dir, () => launch(entry,
+        ['-w', '-m', entry.model, '-e', entry.effort, '-C', dir, '-f', brief, '-o', fixOut], dir));
       const after = await protectedFiles(gate.repo);
       const tests = modifiedTests(before, after, budgetOnly);
       const forbiddenTests = budgetOnly ? tests.filter((file) => !files.includes(file)) : tests;
@@ -970,7 +1075,7 @@ async function runCommand(args) {
   if (opts['--waive']) dispatch.waive = opts['--waive'];
   if (opts['--no-gate']) dispatch.noGate = true;
   const saveDispatch = () => writeJsonAtomic(`${out}.dispatch.json`, dispatch);
-  let lock, code = 1, reviewRefused = false;
+  let lock, acceptance, code = 1, reviewRefused = false;
   try {
     lock = mode === 'write' ? await acquireWriteLock(dir, out, brief) : null;
     if (lock && !lock.release) {
@@ -1026,8 +1131,15 @@ async function runCommand(args) {
       const tracker = trackStatus(`${out}.status`);
       let result, observed;
       try {
-        result = await launch(entry, [mode === 'write' ? '-w' : '-r', '-m', entry.model, '-e', entry.effort,
+        const launchAttempt = () => launch(entry, [mode === 'write' ? '-w' : '-r', '-m', entry.model, '-e', entry.effort,
           '-C', dir, '-f', brief, '-o', out], dir);
+        if (gate) {
+          acceptance ??= {
+            session: session || 'unknown', task: activeTaskId(session), runId: randomUUID(),
+            startedAt: new Date().toISOString(), repo: gate.root || null, changed: new Map(), truncated: false
+          };
+          result = await recordWriteAttempt(acceptance, gate, dir, launchAttempt);
+        } else result = await launchAttempt();
       } finally { observed = tracker.finish(); }
       const failure = failureReason(result, observed.values);
       Object.assign(attempt, {
@@ -1040,7 +1152,7 @@ async function runCommand(args) {
       if (panel || !retryable || (mode === 'write' && observed.reachedRunning) || result.signal) {
         attempt.retry = false;
         if (result.code === 0 && ['done', 'incomplete'].includes(observed.values?.state)) {
-          dispatch.code = await finishGate(gate, dispatch, entry, dir, out);
+          dispatch.code = await finishGate(gate, dispatch, entry, dir, out, acceptance);
         }
         await saveDispatch();
         return code = dispatch.code;
@@ -1060,7 +1172,8 @@ async function runCommand(args) {
       if (!reviewRefused) await appendRunRecord({
         event: 'end', at: new Date().toISOString(), session: session || 'unknown', out, tier, ...(panel ? { panel } : {}), mode,
         provider: dispatch.provider ?? null, model: dispatch.model ?? null, code,
-        gate: dispatch.gate ? { status: dispatch.gate.status, rounds: dispatch.gate.rounds ?? null } : null
+        gate: dispatch.gate ? { status: dispatch.gate.status, rounds: dispatch.gate.rounds ?? null } : null,
+        ...(acceptance && { acceptance: { ...acceptance, changed: [...acceptance.changed.values()].flat() } })
       });
     } finally { lock?.release?.(); }
   }

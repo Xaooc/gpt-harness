@@ -11,8 +11,9 @@ import { sanitizeQuote } from '../../learning/common.mjs';
 import { CLAUSE_RULES, extractClauses } from '../lib/ledger.mjs';
 import { foldLedger } from '../lib/request-state.mjs';
 import { uiFile } from '../lib/profile.mjs';
+import { collectTaskScope } from '../lib/task-scope.mjs';
 import { main as ledgerMain } from '../ledger.mjs';
-import { invoke, invokeHook, shellList, shellLog } from './process-fixture.mjs';
+import { invoke, invokeHook, shellList, shellLog, shellQuote } from './process-fixture.mjs';
 
 const cli = fileURLToPath(new URL('../ledger.mjs', import.meta.url));
 const capture = fileURLToPath(new URL('../../../hooks/conveyor-prompt-capture.mjs', import.meta.url));
@@ -69,6 +70,7 @@ printf '%s' "$FAKE_RESPONSE" > "$out"
   fs.writeFileSync(path.join(bin, 'git'), `#!/bin/bash
 repo=$2
 shift 2
+[ "$repo" = ${shellQuote(repo)} ] || exit 128
 case "$1" in
   rev-parse)
     case "$2" in --show-toplevel) printf '%s' "$repo";; HEAD) printf 'task-base';; esac ;;
@@ -111,7 +113,15 @@ esac
     return result.stdout;
   }
   assert.equal(await prompt(text), '');
-  return { root, repo, home, transcript, env, append, user, command, prompt, run,
+  const toolResult = (name, input, result = {}) => {
+    const { cwd = repo, timestamp = new Date().toISOString(), toolUseResult, ...block } = result;
+    const id = `tool-${++sequence}`;
+    append({ type: 'assistant', cwd, message: { content: [{ type: 'tool_use', name, id, input }] } });
+    append({ type: 'user', timestamp, toolUseResult, message: {
+      content: [{ type: 'tool_result', tool_use_id: id, content: 'Success', ...block }]
+    } });
+  };
+  return { root, repo, home, transcript, env, append, user, command, prompt, run, toolResult,
     state: async () => JSON.parse(await command(['show', '--json'])),
     records: () => fs.readFileSync(path.join(home, 'ledgers/ledger-test.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
 }
@@ -404,6 +414,7 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
   fs.writeFileSync(check, '#!/bin/sh\nprintf \'{"ok":true}\\n\'\n', { mode: 0o755 });
   f.env.CONVEYOR_CHECK_CMD = JSON.stringify([check]);
   fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
+  f.toolResult('Write', { file_path: 'worker.mjs' });
   f.env.FAKE_UNTRACKED = '["worker.mjs"]';
   await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
   await f.command(['crosscheck']);
@@ -495,6 +506,7 @@ test('stop check 10 audits completed reviews before complex writes and has its o
   const configFixture = new URL('./fixtures/orchestration.json', import.meta.url);
   fs.copyFileSync(configFixture, configFile);
   fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
+  f.toolResult('Write', { file_path: 'worker.mjs' });
   f.env.FAKE_UNTRACKED = '["worker.mjs"]';
   f.env.CONVEYOR_CHECK_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"ok\":true}'"]);
   await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
@@ -667,3 +679,111 @@ test('UI file detection covers UI extensions and detected directories while excl
       assert.equal(uiFile(file, ['frontend', 'templates']), false, file);
     }
   });
+
+async function taskScope(f, task, extra = {}) {
+  let scope;
+  const result = await invoke(async () => {
+    scope = await collectTaskScope({ session: 'ledger-test', transcript: f.transcript, cwd: f.repo }, task);
+    return 0;
+  }, [], { env: { ...f.env, ...extra }, cwd: f.repo });
+  assert.equal(result.status, 0, result.stderr);
+  return scope;
+}
+
+test('task scope uses successful editor results and excludes denied, unmatched and identical edits', { timeout }, async (t) => {
+  const f = await fixture(t);
+  f.toolResult('Edit', { file_path: 'earlier.mjs' });
+  f.user('Please fix the current request.');
+  await f.command(['start']);
+  const { task } = await f.state();
+  const timestamp = '2026-08-01T00:00:00.000Z';
+  f.toolResult('Edit', { file_path: 'input.mjs' }, { timestamp,
+    toolUseResult: { filePath: 'actual.mjs', structuredPatch: [{ lines: ['-old', '+new'] }] } });
+  f.toolResult('Edit', { file_path: 'denied.mjs' }, { is_error: true, content: 'The user rejected this tool use.' });
+  f.toolResult('Write', { file_path: 'unchanged.mjs', content: 'same' },
+    { toolUseResult: { originalFile: 'same', structuredPatch: [] } });
+  f.append({ type: 'assistant', cwd: f.repo, message: {
+    content: [{ type: 'tool_use', id: 'unmatched', name: 'Edit', input: { file_path: 'unmatched.mjs' } }]
+  } });
+  const executorPath = path.join(f.repo, 'executor.mjs');
+  const row = { event: 'end', mode: 'write', session: 'ledger-test', at: timestamp, code: 17,
+    acceptance: { session: 'ledger-test', repo: f.repo, task: task.id, runId: 'run',
+      changed: [{ path: executorPath, before: null, after: 'hash' }] } };
+  const earlier = { ...row, acceptance: { ...row.acceptance, task: 'T0',
+    changed: [{ path: path.join(f.repo, 'earlier-run.mjs'), before: null, after: 'hash' }] } };
+  fs.appendFileSync(path.join(f.home, 'sessions', 'ledger-test.jsonl'), JSON.stringify(row) + '\n' + JSON.stringify(earlier) + '\n');
+  const scope = await taskScope(f, task);
+  assert.deepEqual([...scope.repos], [[f.repo, new Map([
+    [path.join(f.repo, 'actual.mjs'), Date.parse(timestamp)], [executorPath, Date.parse(timestamp)]
+  ])]]);
+  assert.equal(scope.nonGit.size, 0);
+});
+
+async function freshnessFixture(t, external = false) {
+  const f = await fixture(t, 'Please fix the worker.');
+  const proof = path.join(external ? f.root : f.repo, 'proof.log');
+  const older = new Date(Date.now() - 10_000);
+  fs.writeFileSync(proof, 'verification\n');
+  fs.utimesSync(proof, older, older);
+  f.env.CONVEYOR_CHECK_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"ok\":true}'"]);
+  await f.command(['start']);
+  await f.command(['add', 'Fix the worker', '--from', 'M1.c1']);
+  f.toolResult('Edit', { file_path: 'owned.mjs' }, { timestamp: new Date(older.getTime() - 1000).toISOString() });
+  await f.command(['evidence', 'L1', '--artifact', proof]);
+  await f.command(['done', 'L1']);
+  const check = async () => JSON.parse(await f.command(['status', '--json'], {}, 1)).check;
+  return { f, check, proof };
+}
+
+test('only a later owned edit in the artifact worktree makes proof stale', { timeout }, async (t) => {
+  const { f, check, proof } = await freshnessFixture(t);
+  fs.writeFileSync(path.join(f.repo, 'foreign.mjs'), 'foreign bytes\n');
+  assert.ok(fs.statSync(path.join(f.repo, 'foreign.mjs')).mtimeMs > fs.statSync(proof).mtimeMs);
+  f.env.FAKE_UNTRACKED = '["foreign.mjs"]';
+  assert.equal(await check(), 6);
+  f.toolResult('Edit', { file_path: 'owned.mjs' });
+  assert.equal(await check(), 4);
+  await f.command(['evidence', 'L1', '--cmd', 'test "$LEDGER_PROOF" = yes'], { LEDGER_PROOF: 'yes' });
+  await f.command(['evidence', 'L1', '--cmd', 'exit 1'], {}, 1);
+  assert.equal(await check(), 6);
+  await f.command(['evidence', 'L1', '--cmd', 'test "$LEDGER_PROOF" = yes'], { LEDGER_PROOF: 'no' }, 1);
+  assert.equal(await check(), 4);
+});
+
+test('only commits confirmed by paired Bash results enter this request scope', { timeout }, async (t) => {
+  const realPath = process.env.PATH;
+  const f = await fixture(t);
+  await f.command(['start']);
+  const { task } = await f.state();
+  const git = (...args) => execFileSync('git', ['-C', f.repo, ...args], { encoding: 'utf8' });
+  git('init', '-q');
+  git('config', 'user.name', 'Ledger Test');
+  git('config', 'user.email', 'ledger@example.test');
+  fs.writeFileSync(path.join(f.repo, 'own.mjs'), 'own\n');
+  git('add', 'own.mjs');
+  const output = git('commit', '-m', 'owned');
+  f.toolResult('Bash', { command: `git -C ${shellQuote(f.repo)} commit -m owned` }, { cwd: f.root, content: output });
+  fs.writeFileSync(path.join(f.repo, 'foreign.mjs'), 'foreign\n');
+  git('add', 'foreign.mjs');
+  const foreign = git('commit', '-m', 'foreign');
+  f.toolResult('Bash', { command: 'git log -1' }, { content: foreign });
+  const scope = await taskScope(f, task, { PATH: realPath });
+  assert.deepEqual([...scope.repos.get(f.repo).keys()], [path.join(f.repo, 'own.mjs')]);
+});
+
+test('an external artifact compares only with owned writes, including non-Git edits', { timeout }, async (t) => {
+  const { f, check } = await freshnessFixture(t, true);
+  fs.writeFileSync(path.join(f.repo, 'foreign.mjs'), 'foreign bytes\n');
+  fs.writeFileSync(path.join(f.root, 'foreign.mjs'), 'foreign bytes\n');
+  f.env.FAKE_UNTRACKED = '["foreign.mjs"]';
+  assert.equal(await check(), 6);
+  f.toolResult('Edit', { file_path: 'owned-outside.mjs' }, { cwd: f.root });
+  assert.equal(await check(), 4);
+  await f.command(['amend', 'L1', 'Fix the worker', '--from', 'M1', '--paths', 'owned.mjs']);
+  const state = await f.state();
+  assert.equal(state.items[0].revision, 2);
+  assert.deepEqual(state.items[0].paths, [path.join(f.repo, 'owned.mjs')]);
+  await f.command(['evidence', 'L1', '--artifact', path.join(f.root, 'proof.log')]);
+  await f.command(['done', 'L1']);
+  assert.equal(await check(), 6);
+});
