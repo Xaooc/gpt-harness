@@ -234,6 +234,7 @@ class Attempt {
     this.credits = 0;
     this.waitingForStream = true;
     this.answer = '';
+    this.stderr = '';
   }
 
   onLine(line) {
@@ -310,6 +311,7 @@ class Attempt {
       try { this.onLine(line); } catch (error) { job.abort(error); }
     });
     stderr.on('line', (line) => {
+      this.stderr = (this.stderr + line + '\n').slice(-4096);
       try { job.log(`mlai stderr: ${line}`); } catch (error) { job.abort(error); }
     });
     for (const reader of [stdout, stderr]) reader.on('error', (error) => job.abort(error));
@@ -326,7 +328,7 @@ class Attempt {
       child.stdin.end(prompt, 'utf8');
       const code = await Promise.race([closed, stopped]);
       signal.throwIfAborted();
-      return { code: this.result?.exitCode ?? code ?? 1, result: this.result,
+      return { code: this.result?.exitCode ?? code ?? 1, result: this.result, stderr: this.stderr,
         text: typeof this.result?.text === 'string' ? this.result.text : this.answer, spawnError };
     } finally {
       this.waitingForStream = false;
@@ -566,12 +568,12 @@ class Job {
       }
       this.signal.throwIfAborted();
 
-      const { code, result, text } = outcome;
+      const { code, result, text, stderr } = outcome;
       // Transient network failures: a dropped stream, or the server not reached through the proxy (seen 2026-11-24,
       // a 45 s timeout while the proxy answered normally a moment later).
       const transient = /connection[ _-]?interrupted|Cannot reach the ML AI Code server/i;
       const interrupted = code === 1 && (result?.usage?.errorCode === 'connection_interrupted' ||
-        transient.test(result?.error ?? '') || transient.test(text));
+        transient.test(result?.error ?? '') || transient.test(text) || (!result && transient.test(stderr)));
       if (!interrupted) return this.mapResult(outcome);
       if (retry >= retries) {
         return this.providerFailure(`mlai: connection interrupted (after ${this.values.attempts} attempts)`);
@@ -586,8 +588,8 @@ class Job {
   async run() {
     let result;
     const interrupt = () => this.abort(new Failure('stopped', 130, 'stopped'));
-    process.on('SIGTERM', interrupt);
-    process.on('SIGINT', interrupt);
+    // SIGHUP too: the dispatcher forwards it, and an unhandled one would orphan the CLI's own process group.
+    for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, interrupt);
     let heartbeat;
     let watchdog;
     try {
@@ -624,8 +626,7 @@ class Job {
         for (const fd of [this.outputFd, this.logFd]) {
           if (fd !== undefined) { try { closeSync(fd); } catch {} }
         }
-        process.off('SIGTERM', interrupt);
-        process.off('SIGINT', interrupt);
+        for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.off(signal, interrupt);
       }
     }
     if (result.error) process.stderr.write(`mlai.sh: ${oneLine(result.error)}\n`);

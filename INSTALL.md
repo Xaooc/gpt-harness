@@ -104,6 +104,10 @@ At most 2 mlai sessions run at once (`CONVEYOR_MLAI_SLOTS` overrides it); a job 
 chain entry. Without the CLI or a valid sign-in the dispatcher skips mlai, and the Luna panel shows why. The account's
 `mlai_sk_` API key is for the HTTP API only; the CLI does not use it.
 
+An existing `~/.claude/conveyor/orchestration.json` gains the mlai model catalog on its next load but keeps its own
+chains: put mlai first in the Luna panel, or with `node ~/.claude/scripts/conveyor/exec.mjs config add-entry --tier
+<tier> --at 0 --provider mlai --model <id> --effort <effort>` (journaled; `config undo` reverts it).
+
 The Linux payload includes the whole conveyor: tier dispatcher with approach review, project checks with the test
 budget, the acceptance ledger and prompt/subagent/Stop gates, `interrogate`, harness hygiene, usage accounting, the
 vendored pstack and the Luna panel.
