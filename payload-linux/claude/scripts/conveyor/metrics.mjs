@@ -71,7 +71,7 @@ export function collectMetrics({ start, end, home = process.env.CLAUDE_HOME_DIR 
           if (row.type === 'waive') result.waivers++;
         }
         const at = timestamp(row.at);
-        if (['done', 'checklist', 'crosscheck'].includes(row.type) && at <= end
+        if (['done', 'checklist', 'crosscheck', 'delivered'].includes(row.type) && at <= end
           && (!completions.has(session) || at < completions.get(session))) completions.set(session, at);
       }
     }
@@ -134,8 +134,11 @@ export function collectMetrics({ start, end, home = process.env.CLAUDE_HOME_DIR 
       let at;
       try { at = state?.at ?? fs.statSync(file).mtimeMs; }
       catch { continue; }
-      if (!within(at) || !Array.isArray(state?.reasons)) continue;
-      const reasons = new Set(state.reasons.map((reason) => /^([1-8])\./.exec(String(reason))?.[1]).filter(Boolean));
+      if (!within(at)) continue;
+      // v1 kept the last three reason strings; v2 keeps only the last blocking check id.
+      const reasons = Array.isArray(state?.reasons)
+        ? new Set(state.reasons.map((reason) => /^([1-9])\./.exec(String(reason))?.[1]).filter(Boolean))
+        : new Set(Number.isInteger(state?.lastBlockedCheck) ? [String(state.lastBlockedCheck)] : []);
       if (reasons.size) result.stopGate.sessions++;
       for (const reason of reasons) result.stopGate.reasons[reason] = (result.stopGate.reasons[reason] || 0) + 1;
     }

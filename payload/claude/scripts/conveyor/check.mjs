@@ -98,7 +98,13 @@ async function run(repo, opts, profile) {
   const base = opts['--base'] ?? 'HEAD';
   const revision = (await git(repo, ['rev-parse', '--verify', '--end-of-options', `${base}^{commit}`])).trim();
   let names;
-  if (opts['--files'] !== undefined) names = opts['--files'].split(',').filter(Boolean);
+  if (opts['--files-from'] !== undefined) {
+    if (opts['--files'] !== undefined) throw new Error('choose either --files or --files-from');
+    names = JSON.parse(await fs.readFile(opts['--files-from'], 'utf8'));
+    if (!Array.isArray(names) || names.some((name) => typeof name !== 'string')) {
+      throw new Error('--files-from requires a JSON array of repository-relative paths');
+    }
+  } else if (opts['--files'] !== undefined) names = opts['--files'].split(',').filter(Boolean);
   else {
     const diff = await git(repo, ['diff', '--name-only', '--no-renames', '-z', revision, '--']);
     const untracked = await git(repo, ['ls-files', '--others', '--exclude-standard', '-z']);
@@ -210,7 +216,9 @@ export async function main(args = process.argv.slice(2)) {
     throw new Error('usage: check.mjs run | hygiene | trust | init --dir <repo> [--json]');
   }
   const allowed = { '--dir': true, '--json': false };
-  if (action === 'run') Object.assign(allowed, { '--level': true, '--files': true, '--base': true, '--test-budget': true });
+  if (action === 'run') {
+    Object.assign(allowed, { '--level': true, '--files': true, '--files-from': true, '--base': true, '--test-budget': true });
+  }
   else if (action === 'hygiene') allowed['--write-baseline'] = false;
   else if (action === 'init') allowed['--write'] = false;
   const opts = options(rest, allowed);

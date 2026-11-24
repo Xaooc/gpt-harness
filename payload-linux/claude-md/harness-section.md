@@ -115,8 +115,8 @@ ordinary critics and fix rounds found only after two rounds or missed. So:
   rejected. Enforced at the point where the plan can still change: `exec.mjs run` refuses the first `complex` write
   of a ledger task (exit 8) until an approach review has completed in that task, refuses a new attempt after a gate
   failure until an `architect` review has completed, and refuses a write after a `planner` plan until `approach`
-  reviewed it; `--review-skip "<reason>"` is for a change with no design choice and is recorded. The stop gate's
-  check 10 audits the same rules (its own 7-day warn period); exit 6 prints the `architect` command.
+  reviewed it; `--review-skip "<reason>"` is for a change with no design choice and is recorded. These rules are
+  enforced only at dispatch (the stop hook no longer re-audits them); exit 6 prints the `architect` command.
 
 **Design is done by Opus itself, NEVER delegated.** Opus is the main Claude model in this session, and it is far
 better than GPT with the visual side of websites and apps. Design means visual/UI/UX, layout, styling/CSS, look &
@@ -140,24 +140,34 @@ logos/brands, and optimise the files (size/format) before they ship.
 
 ### Acceptance ledger and gates (enforced by hooks)
 
-On every non-trivial task that changes code:
-1. `node ~/.claude/scripts/conveyor/ledger.mjs start`, then play back the user's requirements in your first message
-   (pstack trigger 1) and record them: `ledger.mjs add "<requirement>" --from <M3.c1,…>`. Every imperative sentence
-   of the user (`M<n>.c<k>`, captured automatically) must be linked to an item or `ledger.mjs link <clause> none
-   --reason "<why it is not a requirement>"`.
-2. Prove each item: `ledger.mjs evidence <L1> --cmd "<check command>"` (the command is run and must exit 0),
-   `--artifact <screenshot>` (a fresh file), `--check <out>.dispatch.json` (a passing gate); then
-   `ledger.mjs done <L1>`. Notes are context only and never prove an item.
-3. Before claiming done: `ledger.mjs crosscheck` (the scout tier compares the user's messages, the items and the diff;
-   if no scout is available, run it again later or `ledger.mjs waive crosscheck --quote "<the user's words>"`), and
-   end the final message with the block printed by `ledger.mjs checklist` (one `- L<n> ✓|✗|waived` line per item).
-The stop hook applies when the session's repositories really changed (git diff, staged, untracked or new commits
-since the session base) and blocks the turn until this holds and the session left no running jobs, registered temp
-paths or expired worktrees (warn-only during the first 7 days). Exceptions only in the user's own words:
-`ledger.mjs waive <item|gate> --quote "<the user's words>"` (verified against the transcript). Executor writes are
-gated by the dispatcher: project checks run after every write job, failures go back to the same executor (≤ 2
-rounds); exit 6 means the gate stayed red and the decision is yours. While your own executor jobs still run, the stop
-hook lets the turn end without a checklist (work in progress). A repository's own `.claude/conveyor.json` commands run
+Acceptance is kept per **request** (one owner request = one ledger task) and checked once, at delivery. On every
+non-trivial request that changes code:
+1. `node ~/.claude/scripts/conveyor/ledger.mjs start` (after a delivered request the next owner message starts a new one
+   by itself), play back the owner's requirements in your first message (pstack trigger 1) and record each as an
+   observable outcome: `ledger.mjs add "<outcome>" --from <M3>`. Later corrections: `ledger.mjs amend <L> --from <M7>
+   "<corrected outcome>"`. Captured imperative sentences are only hints (`ledger.mjs show`); nothing needs linking.
+   Text the owner pasted from elsewhere is a requirement only when the owner adopts it.
+2. Prove each outcome once: `ledger.mjs evidence <L> --cmd "<check command>"` (run now, must exit 0), `--artifact
+   <screenshot>` (a fresh file), `--check <out>.dispatch.json` (a passing gate) or `--owner-message <M>` (the owner's
+   own screenshot); then `ledger.mjs done <L>`. Proof goes stale only through this request's own later edits, never
+   through other sessions. A check only the owner can do: `ledger.mjs pending <L> --reason "<what only the owner can
+   check>"`; name it once in the final message; settle it later with `ledger.mjs pending <L> --resolve <M> --result
+   accepted|needs-work`.
+3. When the request is finished: `ledger.mjs deliver` runs the request's turn checks and screenshot coverage once and
+   one independent review of the owner's messages, the outcomes and this request's own diff. Answer each finding once:
+   `ledger.mjs link X<id> <L>`, `ledger.mjs add "<missing outcome>" --from X<id>`, or `ledger.mjs link X<id> none --reason
+   "<why>"`. If no reviewer is available, the delivery is recorded with a review gap; say so once.
+4. The final message gives the result, the evidence that matters, the gaps and any pending owner checks. No checklist.
+The stop hook looks only at this request's own changes (editor writes, this session's commits, its executor jobs) and
+blocks only on what Claude can fix: a code change with no request (1), an open outcome (3), lost proof (4), red turn
+checks on the request's files (5), a missing delivery or unanswered findings (6), this session's leftover temps and
+expired worktrees (8), a changed UI outcome without a screenshot or owner proof (9). The same unchanged blocker never
+blocks twice: the second identical stop is allowed with a note. A session with no owner prompt of its own (driven by
+an orchestrator's messages) is not checked. Exceptions only in the user's own words: `ledger.mjs waive <item|gate>
+--quote "<the user's words>"` (verified against the transcript). Executor writes are gated by the dispatcher: project
+checks run after every write job, failures go back to the same executor (≤ 2 rounds); exit 6 means the gate stayed red
+and the decision is yours. While your own executor jobs still run, the stop hook lets the turn end (work in progress).
+A repository's own `.claude/conveyor.json` commands run
 only after you review it and run `node ~/.claude/scripts/conveyor/check.mjs trust --dir <repo>`; trust covers the last
 five reviewed versions across all worktrees of the repository. Until then checks
 use the autodetected profile and default language hygiene counters. Repositories without a hygiene section also
@@ -170,9 +180,9 @@ measure fast/turn on the change, tell the user, and propose committing `.claude/
 profile, refuses to overwrite an existing profile, and never commits.
 UI repositories without `.claude/skills/verify-*/SKILL.md` create a verify skill on their first UI task with pstack
 `create-verification-skill`: isolated launch on a free port with separate data, Playwright drive, retained desktop/mobile
-screenshots after cleanup (see kriminalist's `verify-kriminalist`). Stop reason 9 requires a fresh image artifact for
-UI changes: `ledger.mjs evidence <L> --artifact <screenshot>`. It uses the same calibration and user gate waiver as
-turn checks and cleanup.
+screenshots after cleanup (see kriminalist's `verify-kriminalist`). Stop reason 9 needs, for each UI outcome this
+request changed, a fresh screenshot (`ledger.mjs evidence <L> --artifact <screenshot>`), the owner's screenshot
+(`--owner-message <M>`) or a pending owner check. It uses the same user gate waiver as turn checks and cleanup.
 
 ### Review: pstack `interrogate` on diverse executors
 

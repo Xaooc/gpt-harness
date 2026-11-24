@@ -85,7 +85,7 @@ any problem that fails the gate to `architect`. For complex architecture `planne
 plan from the facts; `approach` (a different model) then reviews it. `exec.mjs` refuses the first complex write of a
 task until the review has completed (exit 8; `--review-skip "<reason>"` for a change with no design choice). Brief and rules: the "Approach review" section of `~/.claude/CLAUDE.md`.
 It complements `interrogate` (which reviews the diff after implementation) and never covers visual or product design.
-The stop gate's check 10 enforces it.
+`exec.mjs` enforces it at dispatch.
 
 Panels hold the seats the owner set in the Luna panel (the session-start digest lists them); never add or swap a
 provider yourself. Agreement across seats is high-signal; a seat whose provider is unavailable is skipped and
@@ -112,12 +112,14 @@ the same scope: the runner removes its worktrees. The runner collects evidence; 
 
 ## Harness gates that pstack meets
 
-- **First message** (poteto-mode trigger 1) is also the acceptance-ledger playback: list the user's requirements
-  in your own words before work starts, and record them: `node ~/.claude/scripts/conveyor/ledger.mjs start`, then
-  `ledger.mjs add … --from <clause ids>`; every captured imperative clause is linked or marked `none` with a reason.
-- **Final reply** of a code-changing task ends with the `ledger.mjs checklist` block, after `ledger.mjs crosscheck`.
-- **Prove It Works** is enforced: on a turn that changed code, the stop gate checks the acceptance ledger, the
-  evidence and the final checklist. Do not claim done without evidence; the gate will block it.
+- **First message** (poteto-mode trigger 1) is also the acceptance playback: list the owner's requirements in your
+  own words before work starts and record each as an outcome: `node ~/.claude/scripts/conveyor/ledger.mjs start`
+  (automatic after a delivered request), then `ledger.mjs add "<outcome>" --from <M…>`; corrections with
+  `ledger.mjs amend`. Captured clauses are hints only (`ledger.mjs show`).
+- **Final reply** of a code-changing request comes after `ledger.mjs deliver` (one review of the request) and gives
+  the result, the evidence that matters, the gaps and pending owner checks (`ledger.mjs pending`). No checklist.
+- **Prove It Works** is enforced: the stop gate checks this request's own outcomes, their proof and the delivery,
+  never other sessions' changes, and never blocks twice on an unchanged blocker.
 - **Encode Lessons in Structure** has a queue: read it with `node ~/.claude/scripts/conveyor/checks.mjs list`;
   build checks with `<pstack>/skills/correct/SKILL.md` only after the user agrees, then close each with
   `node ~/.claude/scripts/conveyor/checks.mjs done <id> --repo <dir> --proof "<command>" --commit <sha>`.

@@ -1,16 +1,18 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ChildProcess, execFileSync } from 'node:child_process';
+import { ChildProcess, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readProcess } from '../../lib/luna-runtime.mjs';
-import { sanitizeQuote } from '../../learning/common.mjs';
-import { CLAUSE_RULES, extractClauses, foldLedger } from '../lib/ledger.mjs';
+import { CLAUSE_RULES, extractClauses } from '../lib/ledger.mjs';
+import { foldLedger } from '../lib/request-state.mjs';
 import { uiFile } from '../lib/profile.mjs';
+import { collectTaskScope } from '../lib/task-scope.mjs';
 import { main as ledgerMain } from '../ledger.mjs';
-import { invoke, invokeHook, shellList, shellLog } from './process-fixture.mjs';
+import { invoke, invokeHook, shellList, shellLog, shellQuote } from './process-fixture.mjs';
 
 const cli = fileURLToPath(new URL('../ledger.mjs', import.meta.url));
 const capture = fileURLToPath(new URL('../../../hooks/conveyor-prompt-capture.mjs', import.meta.url));
@@ -32,13 +34,18 @@ async function fixture(t, text = 'Please add a safe ledger. Ensure cleanup.') {
     CLAUDE_CODE_SESSION_ID: 'ledger-test', CLAUDE_CODE_TRANSCRIPT_PATH: transcript, CONVEYOR_GATE_MODE: 'block',
     PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_DIFF_FILE: path.join(root, 'diff.txt'),
     FAKE_PROMPT_COPY: path.join(root, 'prompt-copy.txt'), FAKE_ARGS: path.join(root, 'args.json'),
-    FAKE_RESPONSE: '{"missing":[],"misread":[]}', FAKE_RC: '0'
+    FAKE_REVIEW_CALLS: path.join(root, 'review-calls'), FAKE_RESPONSE: '{"missing":[],"misread":[]}', FAKE_RC: '0'
   };
   delete env.CONVEYOR_OVERVIEW_CMD;
   const fake = path.join(root, 'crosscheck.sh');
   fs.writeFileSync(fake, `#!/bin/bash
 ${shellLog}
+printf 'review\n' >> "$FAKE_REVIEW_CALLS"
 json_args "$@" > "$FAKE_ARGS"
+if [ -n "$FAKE_RELEASE" ]; then
+  touch "$FAKE_RELEASE.started"
+  while [ ! -f "$FAKE_RELEASE" ]; do sleep 0.02; done
+fi
 while [ "$#" -gt 0 ]; do
   case "$1" in -f) cp -- "$2" "$FAKE_PROMPT_COPY";; -o) out=$2;; esac
   shift
@@ -47,6 +54,9 @@ if [ "$FAKE_RC" != 0 ]; then printf 'Gemini unavailable' >&2; exit "$FAKE_RC"; f
 printf '%s' "$FAKE_RESPONSE" > "$out"
 `, { mode: 0o755 });
   env.CONVEYOR_CROSSCHECK_CMD = JSON.stringify([fake]);
+  const check = path.join(root, 'check.sh');
+  fs.writeFileSync(check, '#!/bin/sh\nprintf \'{"ok":true}\\n\'\n', { mode: 0o755 });
+  env.CONVEYOR_CHECK_CMD = JSON.stringify([check]);
   fs.writeFileSync(env.FAKE_DIFF_FILE, '');
   // Retain the streaming Node producer only for the large-output cancellation scenario.
   const largeGit = path.join(root, 'large-git.cjs');
@@ -65,14 +75,23 @@ printf '%s' "$FAKE_RESPONSE" > "$out"
     'pump();'
   ].join('\n'));
   fs.writeFileSync(path.join(bin, 'git'), `#!/bin/bash
+if [ "$1" = --no-optional-locks ]; then shift; fi
 repo=$2
 shift 2
+[ "$repo" = ${shellQuote(repo)} ] || exit 128
 case "$1" in
   rev-parse)
     case "$2" in --show-toplevel) printf '%s' "$repo";; HEAD) printf 'task-base';; esac ;;
+  ls-tree)
+    if [ -n "$FAKE_TREE_READY" ]; then touch "$FAKE_TREE_READY.started"; fi
+    if [[ " $* " == *worker.mjs* ]]; then
+      printf '100644 blob 1234567890123456789012345678901234567890\\tworker.mjs\\0'
+    fi ;;
   ls-files)
-    eval "set -- $FAKE_UNTRACKED_ARGS"
-    if [ "$#" -gt 0 ]; then printf '%s\\0' "$@"; fi ;;
+    if [ "$2" != --stage ]; then
+      eval "set -- $FAKE_UNTRACKED_ARGS"
+      if [ "$#" -gt 0 ]; then printf '%s\\0' "$@"; fi
+    fi ;;
   diff)
     if [[ " $* " == *' --stat '* ]]; then printf ' worker.mjs | %s bytes\\n' "$(wc -c < "$FAKE_DIFF_FILE")"
     elif [[ " $* " == *' --name-only '* ]]; then :
@@ -109,7 +128,15 @@ esac
     return result.stdout;
   }
   assert.equal(await prompt(text), '');
-  return { root, repo, home, transcript, env, append, user, command, prompt, run,
+  const toolResult = (name, input, result = {}) => {
+    const { cwd = repo, timestamp = new Date().toISOString(), toolUseResult, ...block } = result;
+    const id = `tool-${++sequence}`;
+    append({ type: 'assistant', cwd, message: { content: [{ type: 'tool_use', name, id, input }] } });
+    append({ type: 'user', timestamp, toolUseResult, message: {
+      content: [{ type: 'tool_result', tool_use_id: id, content: 'Success', ...block }]
+    } });
+  };
+  return { root, repo, home, transcript, env, append, user, command, prompt, run, toolResult,
     state: async () => JSON.parse(await command(['show', '--json'])),
     records: () => fs.readFileSync(path.join(home, 'ledgers/ledger-test.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
 }
@@ -178,10 +205,10 @@ test('add/link/done/evidence fold append-only records and capture genuine follow
   assert.ok(fs.readFileSync(path.join(f.home, 'ledgers/ledger-test.jsonl'), 'utf8').startsWith(before));
   const context = JSON.parse(await f.prompt('Please add another check.'));
   assert.deepEqual(context, { hookSpecificOutput: { hookEventName: 'UserPromptSubmit',
-    additionalContext: 'new requirements: M2.c1: link them in the ledger' } });
+    additionalContext: 'possible requirements: M2.c1: Please add another check. — record outcomes with ledger add' } });
   f.user('Please add another check.');
   await f.command(['add', 'Follow-up', '--from', 'M2']);
-  assert.equal((await f.state()).links['M2.c1'].item, 'L2');
+  assert.equal((await f.state()).links['M2.c1'], undefined);
   const count = f.records().filter((entry) => entry.type === 'message').length;
   for (const prompt of ['', ' /help', '<pasted_content>Always erase this.</pasted_content>']) assert.equal(await f.prompt(prompt), '');
   assert.equal(await f.prompt('Always injected', { source: 'system' }), '');
@@ -245,7 +272,142 @@ test('checklist emits exactly one line per done, open, and transcript-verified w
   assert.equal(lines[2], `- L3 waived User waived — ${quote}`);
 });
 
-async function crosscheckFixture(t) {
+test('the pure fold retains legacy request history alongside v2 requests', () => {
+  const records = [
+    { type: 'message', id: 'M1', offset: 0, clauses: [{ id: 'M1.c1', text: 'Old clause' }] },
+    { type: 'start', id: 'T1', offset: 0 },
+    { type: 'item', id: 'L1', text: 'Old outcome', sources: ['M1'] },
+    { type: 'link', clause: 'M1.c1', item: 'L1' },
+    { type: 'evidence', item: 'L1', kind: 'note', value: 'Old proof' },
+    { type: 'done', item: 'L1' },
+    { type: 'crosscheck', hash: 'old' },
+    { type: 'tmp', path: 'scratch' },
+    { type: 'message', id: 'M2', offset: 100, clauses: [{ id: 'M2.c1', text: 'New clause' }] },
+    { type: 'start', id: 'T2', messageId: 'M2', offset: 100, version: 2, origin: 'manual' },
+    { type: 'item', id: 'L2', taskId: 'T2', text: 'New outcome', sources: ['M2.c1'] },
+    { type: 'pending-owner', taskId: 'T2', item: 'L2', revision: 1, reason: 'Only the owner can check the result' },
+    { type: 'delivered', taskId: 'T2', fingerprint: null, reviewGap: true }
+  ];
+  assert.equal(foldLedger(records.slice(0, 8)).legacy, true);
+  const state = foldLedger(records);
+  assert.equal(state.legacy, false);
+  assert.equal(state.ready, true);
+  assert.equal(state.delivered, true);
+  assert.equal(state.delivery.reviewGap, true);
+  assert.deepEqual(state.messages.map(({ id }) => id), ['M2']);
+  assert.deepEqual(state.items.map(({ id }) => id), ['L2']);
+  assert.deepEqual(state.hints, []);
+  assert.deepEqual(state.temps, ['scratch']);
+  const [legacy] = state.archived;
+  assert.equal(legacy.legacy, true);
+  assert.equal(legacy.links['M1.c1'].item, 'L1');
+  assert.equal(legacy.crosscheck.hash, 'old');
+  assert.equal(legacy.items[0].status, 'done');
+  assert.equal(legacy.items[0].evidence[0].value, 'Old proof');
+});
+
+test('concurrent CLI adds allocate distinct outcome IDs', { timeout }, async (t) => {
+  const f = await fixture(t);
+  await f.command(['start']);
+  const launch = promisify(execFile);
+  const results = await Promise.all(Array.from({ length: 8 }, (_, index) => launch(process.execPath,
+    [cli, 'add', 'Outcome ' + index, '--from', 'M1'], { cwd: f.repo, env: f.env, timeout })));
+  const ids = Array.from({ length: 8 }, (_, index) => 'L' + (index + 1));
+  assert.deepEqual(results.map(({ stdout }) => stdout.trim()).sort(), ids);
+  assert.deepEqual((await f.state()).items.map(({ id }) => id), ids);
+});
+
+test('amend and pending resolution track outcome revisions, earlier requests, and unlinked hints', { timeout }, async (t) => {
+  const f = await fixture(t);
+  await f.command(['start']);
+  await f.command(['add', 'Verify desktop', '--from', 'M1']);
+  await f.command(['add', 'Verify mobile', '--from', 'M1.c2']);
+  await f.command(['evidence', 'L1', '--note', 'Initial observation']);
+  await f.command(['done', 'L1']);
+  f.user('Please verify the tablet layout as well.');
+  await f.command(['amend', 'L1', '--from', 'M2', 'Verify desktop and tablet']);
+  let state = await f.state();
+  assert.equal(state.items[0].revision, 2);
+  assert.equal(state.items[0].status, 'open');
+  assert.deepEqual(state.items[0].evidence, []);
+  assert.equal(state.items[0].previousEvidence[0].value, 'Initial observation');
+  assert.deepEqual(state.hints.map(({ id }) => id), ['M1.c1', 'M2.c1']);
+  await f.command(['evidence', 'L1', '--owner-message', 'M2'], {}, 1);
+  f.user([{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } }], { origin: { kind: 'hook' } });
+  await f.command(['evidence', 'L1', '--owner-message', 'M3'], {}, 1);
+  f.user([{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA==' } }]);
+  await f.command(['evidence', 'L1', '--owner-message', 'M3']);
+  assert.equal((await f.state()).items[0].evidence[0].revision, 2);
+  await f.command(['pending', 'L1', '--reason', 'Only the owner can verify the tablet']);
+  await f.command(['pending', 'L2', '--reason', 'Only the owner can verify mobile']);
+  state = await f.state();
+  assert.equal(state.ready, true);
+  assert.equal(state.delivered, false);
+  assert.equal(state.pending[0].revision, 2);
+  assert.match(await f.command(['show']), /L1 \(revision 2, pending-owner\).*Only the owner can verify the tablet/);
+  f.user('The desktop and tablet layouts pass. Please fix the mobile layout.');
+  await f.command(['start']);
+  await f.command(['pending', 'L1', '--resolve', 'M4', '--result', 'accepted']);
+  assert.equal((await f.command(['pending', 'L2', '--resolve', 'M4', '--result', 'needs-work'])).trim(), 'L3');
+  state = await f.state();
+  assert.deepEqual(state.archived[0].items.map(({ status }) => status), ['done', 'superseded']);
+  assert.equal(state.archived[0].items[0].resolution.source, 'M4');
+  assert.deepEqual(state.items.map(({ id, sources, previousItem }) => ({ id, sources, previousItem })),
+    [{ id: 'L3', sources: ['M4'], previousItem: 'L2' }]);
+  assert.deepEqual(state.hints.map(({ id }) => id), ['M4.c1']);
+  assert.equal((await f.command(['add', 'A separate follow-up', '--from', 'M4'])).trim(), 'L4');
+});
+
+test('prompt capture starts the next request after delivery and manual start reuses it', { timeout }, async (t) => {
+  const f = await fixture(t);
+  await f.command(['start']);
+  const file = path.join(f.home, 'ledgers/ledger-test.jsonl');
+  fs.appendFileSync(file, JSON.stringify({ type: 'delivered', taskId: 'T1', fingerprint: null, reviewGap: false }) + '\n');
+  assert.equal(await f.prompt('Please add an injected outcome.', { source: 'system' }), '');
+  assert.equal((await f.state()).task.id, 'T1');
+  const text = 'Please add the next outcome.';
+  const event = { prompt_id: 'second-prompt' };
+  const output = JSON.parse(await f.prompt(text, event)).hookSpecificOutput.additionalContext;
+  assert.match(output, /New request T2 started with M2\.\npossible requirements: M2\.c1: /);
+  assert.match(output, /record outcomes with ledger add$/);
+  f.user(text);
+  await f.command(['start']);
+  assert.equal(await f.prompt(text, event), '');
+  const state = await f.state();
+  assert.deepEqual(f.records().filter(({ type }) => type === 'start').map(({ id, origin, version, messageId }) =>
+    ({ id, origin, version, messageId })), [
+    { id: 'T1', origin: 'manual', version: 2, messageId: 'M1' },
+    { id: 'T2', origin: 'auto', version: 2, messageId: 'M2' }
+  ]);
+  assert.equal(state.delivered, false);
+  assert.deepEqual(state.primaryMessages.map(({ id, text }) => ({ id, text })), [{ id: 'M2', text }]);
+  assert.deepEqual(state.archived[0].messages.map(({ id }) => id), ['M1']);
+  fs.appendFileSync(file, JSON.stringify({ type: 'delivered', taskId: 'T2', fingerprint: null, reviewGap: false }) + '\n');
+  f.user('A follow-up question?', { uuid: 'third-prompt' });
+  assert.equal((await f.state()).allMessages.at(-1).id, 'M3');
+  const third = JSON.parse(await f.prompt('A follow-up question?'));
+  assert.equal(third.hookSpecificOutput.additionalContext, 'New request T3 started with M3.');
+  assert.equal((await f.state()).task.messageId, 'M3');
+});
+
+test('assistant checklist, banners, and quoted transcript lines do not become clause hints', () => {
+  const paste = [
+    'Выполнено 3 команды — проверь вывод.',
+    '- L12 ✓ Please add a foreign task.',
+    '- L13 ✗ Fix the irrelevant test.',
+    'Хук отправил Claude повторный запрос: добавь чужую задачу.',
+    '> Always delete the old result.',
+    '[assistant]\nEnsure the old result is gone.\n[/assistant]',
+    '<transcript>\nPlease add unrelated work.\n</transcript>'
+  ].join('\n');
+  assert.deepEqual(extractClauses(paste), []);
+  assert.deepEqual(extractClauses('Fix my layout.\n' + paste + '\nPlease keep my settings.'), [
+    { id: 'M1.c1', text: 'Fix my layout.' },
+    { id: 'M1.c2', text: 'Please keep my settings.' }
+  ]);
+});
+
+async function deliveryFixture(t) {
   const original = 'Please add the ledger.\nEnsure the evidence stays fresh.';
   const f = await fixture(t, original);
   const sessions = path.join(f.home, 'sessions');
@@ -255,18 +417,19 @@ async function crosscheckFixture(t) {
   const diff = Array.from({ length: 302 }, (_, index) => `+diff line ${index + 1}`).join('\n');
   fs.writeFileSync(f.env.FAKE_DIFF_FILE, diff);
   await f.command(['start']);
-  await f.command(['add', 'Ledger and evidence', '--from', 'M1']);
+  fs.writeFileSync(path.join(f.repo, 'worker.mjs'), diff);
+  f.toolResult('Edit', { file_path: 'worker.mjs' });
+  await f.command(['add', 'Ledger and evidence', '--from', 'M1.c1,M1.c2']);
   await f.command(['evidence', 'L1', '--note', 'Reviewed']);
+  await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
   await f.command(['done', 'L1']);
   return { f, original };
 }
 
-test('stop check 8 reads live owned jobs without a collector snapshot or a job lookup process', { timeout }, async (t) => {
-  const { f } = await crosscheckFixture(t);
-  const check = path.join(f.root, 'check.sh');
-  fs.writeFileSync(check, '#!/bin/sh\nprintf \'{"ok":true}\\n\'\n', { mode: 0o755 });
-  f.env.CONVEYOR_CHECK_CMD = JSON.stringify([check]);
+test('Stop reads live owned jobs without a collector snapshot or a job lookup process', { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
   fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
+  f.toolResult('Write', { file_path: 'worker.mjs' });
   f.env.FAKE_UNTRACKED = '["worker.mjs"]';
   await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
   await f.command(['crosscheck']);
@@ -294,16 +457,16 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
     return originalSpawn.call(this, options);
   });
   const input = JSON.stringify({ session_id: f.env.CLAUDE_CODE_SESSION_ID, transcript_path: f.transcript, cwd: f.repo });
-  const blocked = await f.run(stop, [], {}, input);
-  assert.deepEqual(JSON.parse(blocked.stdout), { decision: 'block', reason: sanitizeQuote(`8. finish executor jobs: ${owned}`) });
+  const progress = await f.run(stop, [], {}, input);
+  assert.deepEqual(JSON.parse(progress.stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
 
   job('owned', f.env.CLAUDE_CODE_SESSION_ID, 'done');
   assert.equal((await f.run(stop, [], {}, input)).stdout, '');
-  assert.ok(spawned.includes(check));
-  assert.deepEqual(spawned.filter((file) => file !== 'git' && file !== check), []);
+  assert.equal(f.records().filter(({ type }) => type === 'turn-check').length, 1);
+  assert.deepEqual(spawned.filter((file) => file !== 'git'), []);
 
   const identity = new URL('../../lib/process-identity.mjs', import.meta.url);
-  await t.test('a live Windows wrapper in the home index blocks completion', {
+  await t.test('a live Windows wrapper in the home index allows a pause', {
     skip: !fs.existsSync(identity) && 'Windows process identity module is absent from this installation'
   }, () => {
     const homeIndex = path.join(f.env.HOME, '.claude', 'luna-run', 'active');
@@ -320,7 +483,7 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
         FAKE_UNTRACKED_ARGS: shellList(JSON.parse(f.env.FAKE_UNTRACKED)) },
       input, encoding: 'utf8', timeout
     });
-    assert.equal(stdout.trim(), JSON.stringify({ decision: 'block', reason: sanitizeQuote(`8. finish executor jobs: ${owned}`) }));
+    assert.deepEqual(JSON.parse(stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
     fs.rmSync(path.join(homeIndex, 'owned'));
   });
 
@@ -335,7 +498,7 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
     assert.equal(result.stdout, '');
   });
 
-  await t.test('a known running job survives an unreadable index that blocks completion', async () => {
+  await t.test('a known running job survives an unreadable index', async () => {
     const pointer = path.join(active, 'owned');
     fs.writeFileSync(pointer, `${owned}\n`);
     const status = `${owned}.status`;
@@ -345,141 +508,32 @@ test('stop check 8 reads live owned jobs without a collector snapshot or a job l
     fs.utimesSync(status, old, old);
     fs.writeFileSync(path.join(run, 'gem-active'), '');
     const result = await f.run(stop, [], {}, input);
-    assert.match(result.stdout, /"decision":"block","reason":"8\. cannot verify executor jobs:.*gem-active/);
+    assert.deepEqual(JSON.parse(result.stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
     f.append({ type: 'assistant', message: { content: 'The executor is still working.' } });
     const progress = await f.run(stop, [], {}, input);
     assert.deepEqual(JSON.parse(progress.stdout), { systemMessage: 'conveyor: work in progress, 1 jobs running' });
   });
 });
 
-test('stop check 10 audits completed reviews before complex writes and has its own calibration', { timeout }, async (t) => {
-  const { f } = await crosscheckFixture(t);
-  const configFile = path.join(f.home, 'orchestration.json');
-  const configFixture = new URL('./fixtures/orchestration.json', import.meta.url);
-  fs.copyFileSync(configFixture, configFile);
-  fs.writeFileSync(path.join(f.repo, 'worker.mjs'), 'export const worker = true;\n');
-  f.env.FAKE_UNTRACKED = '["worker.mjs"]';
-  f.env.CONVEYOR_CHECK_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"ok\":true}'"]);
-  await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
-  await f.command(['crosscheck']);
-  f.append({ type: 'assistant', message: { content: await f.command(['checklist']) } });
+function reviewCalls(f) {
+  return fs.readFileSync(f.env.FAKE_REVIEW_CALLS, 'utf8').trim().split('\n').length;
+}
 
-  const runs = path.join(f.home, 'sessions', 'ledger-test.jsonl');
-  const baseline = fs.readFileSync(runs, 'utf8');
-  const taskAt = Date.parse((await f.state()).task.at);
-  const record = (offset, fields) => JSON.stringify({
-    session: 'ledger-test', at: new Date(taskAt + offset).toISOString(), ...fields
-  }) + '\n';
-  const history = (...records) => fs.writeFileSync(runs, baseline + records.join(''));
-  const status = async (rc = 0) => JSON.parse(await f.command(['status', '--json'], {}, rc));
-  const work = { tier: 'complex', out: path.join(f.root, 'implementation.md'), mode: 'block' };
-  const review = { event: 'end', tier: 'approach', mode: 'read', out: path.join(f.root, 'review.md'), code: 0 };
-  const write = record(2, work);
-  history(write);
-  let result = await status(1);
-  assert.equal(result.check, 10);
-  assert.match(result.reason, /^10\. non-trivial change started without a completed approach review:/);
-
-  history(record(1, review), write);
-  assert.equal((await status()).ok, true);
-  history(record(1, { ...review, code: 5 }), write);
-  assert.equal((await status(1)).check, 10);
-  history(write, record(3, review));
-  assert.equal((await status(1)).check, 10);
-  history(record(2, { ...work, reviewSkip: 'rename only' }));
-  assert.equal((await status()).ok, true);
-  // A plan from the planner tier (Astra) needs a review by a different model (tier approach) after it.
-  const plan = record(0, { ...review, tier: 'planner', out: path.join(f.root, 'plan.md') });
-  history(plan, record(1, { ...review, tier: 'architect', out: path.join(f.root, 'self-review.md') }), write);
-  assert.match((await status(1)).reason, /^10\. the plan from tier planner \(Astra\) was not reviewed by a different model/);
-  history(plan, record(1, review), write);
-  assert.equal((await status()).ok, true);
-  // After a fallback the plan and the review can come from the same model; that is not an independent review.
-  const solPlan = record(0, { ...review, tier: 'planner', model: 'gpt-6.2-sol', out: path.join(f.root, 'plan.md') });
-  history(solPlan, record(1, { ...review, model: 'gpt-6.2-sol' }), write);
-  assert.equal((await status(1)).check, 10);
-
-  const failure = record(3, { ...work, event: 'end', code: 6, gate: { status: 'fail', rounds: 2 } });
-  const architect = record(4, { ...review, tier: 'architect', panel: 'architect', out: path.join(f.root, 'architect.md') });
-  const retry = record(5, { ...work, event: 'start', out: path.join(f.root, 'retry.md') });
-  history(record(1, review), write, failure, architect, retry);
-  assert.equal((await status()).ok, true);
-  history(record(1, review), write, failure, retry);
-  result = await status(1);
-  assert.equal(result.check, 10);
-  assert.match(result.reason, /^10\. work restarted after a gate failure without a completed architect review:/);
-
-  const config = JSON.parse(fs.readFileSync(configFixture, 'utf8'));
-  delete config.tiers.approach;
-  delete config.tiers.architect;
-  config.roles = Object.fromEntries(Object.entries(config.roles)
-    .filter(([, target]) => target !== 'tier:approach' && target !== 'tier:architect'));
-  fs.writeFileSync(configFile, JSON.stringify(config));
-  assert.equal((await status()).ok, true);
-  fs.copyFileSync(configFixture, configFile);
-
-  const old = new Date(Date.now() - 8 * 86400_000);
-  const age = (file) => {
-    fs.writeFileSync(file, old.toISOString() + '\n');
-    fs.utimesSync(file, old, old);
-  };
-  age(path.join(f.home, 'gate-calibration-start'));
-  const stopGate = async (mode) => {
-    const output = await f.run(stop, [], { CONVEYOR_GATE_MODE: mode }, JSON.stringify({
-      session_id: 'ledger-test', transcript_path: f.transcript, cwd: f.repo
-    }));
-    assert.equal(output.status, 0, output.stderr);
-    return JSON.parse(output.stdout);
-  };
-  const calibration = path.join(f.home, 'gate-calibration-start-10');
-  assert.ok(Date.parse(fs.readFileSync(calibration, 'utf8').trim()) >= taskAt);
-  assert.deepEqual(await stopGate(''), { systemMessage: `conveyor gate: ${result.reason}` });
-  age(calibration);
-  assert.deepEqual(await stopGate(''), { decision: 'block', reason: result.reason });
-});
-
-test('crosscheck uses a fake command, stores a state hash, and removes its temporary files', { timeout }, async (t) => {
-  const { f, original } = await crosscheckFixture(t);
-  const first = JSON.parse(await f.command(['crosscheck']));
-  assert.equal(first.ok, true);
-  assert.match(first.hash, /^[0-9a-f]{64}$/);
-  assert.equal((await f.state()).crosscheck.hash, first.hash);
-  const prompt = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
-  assert.ok(prompt.includes(original));
-  assert.match(prompt, /Ledger and evidence[\s\S]*Reviewed[\s\S]*task-base/);
-  assert.ok(prompt.includes('+diff line 300'));
-  assert.ok(!prompt.includes('+diff line 301'));
-  const args = JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8'));
-  assert.deepEqual(args.slice(0, 7), ['run', '--tier', 'scout', '-r', '-C', f.repo, '-f']);
-  assert.equal(fs.existsSync(path.dirname(args[7])), false);
-  assert.equal(JSON.parse(await f.command(['crosscheck'])).hash, first.hash);
-  fs.appendFileSync(f.env.FAKE_DIFF_FILE, '\n+Always detect changes beyond line 300');
-  assert.notEqual(JSON.parse(await f.command(['crosscheck'])).hash, first.hash);
-  f.user('Please preserve all requirements verbatim.');
-  const changed = JSON.parse(await f.command(['crosscheck']));
-  assert.notEqual(changed.hash, first.hash);
-});
-
-test('crosscheck records findings and unavailable results and removes temporary files', { timeout }, async (t) => {
-  const { f } = await crosscheckFixture(t);
-  const found = JSON.parse(await f.command(['crosscheck'], { FAKE_RESPONSE: '{"missing":["cleanup"],"misread":["scope"]}' }, 1));
-  assert.equal(found.ok, false);
-  assert.deepEqual(found.findings.map((finding) => finding.kind), ['missing', 'misread']);
-  await f.command(['link', found.findings[0].id, 'L1']);
-  await f.command(['link', found.findings[1].id, 'none', '--reason', 'Already included in the explicit scope']);
-  const unavailable = JSON.parse(await f.command(['crosscheck'], { FAKE_RC: '3' }));
-  assert.equal(unavailable.ok, null);
-  assert.match(unavailable.reason, /unavailable/);
-  assert.equal(fs.existsSync(path.dirname(JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8'))[7])), false);
-  for (const code of ['4', '5']) {
-    const missing = JSON.parse(await f.command(['crosscheck'], { FAKE_RC: code }));
-    assert.equal(missing.ok, null);
-    assert.match(missing.reason, /unavailable/);
+async function waitForMarker(release) {
+  for (let start = Date.now(); Date.now() - start < 5000;) {
+    if (fs.existsSync(release + '.started')) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
+  assert.fail(`fixture did not create the marker: ${release}.started`);
+}
+
+const deliverProcess = (f, extra = {}) => promisify(execFile)(process.execPath, [cli, 'deliver'], {
+  cwd: f.repo, env: { ...f.env, ...extra }, timeout
 });
 
-test('crosscheck defaults to the scout dispatcher and includes bounded untracked files in its prompt and hash', { timeout }, async (t) => {
-  const f = await fixture(t);
+test('delivery review ignores later messages and foreign paths, but reacts to owned changes beyond the preview',
+  { timeout }, async (t) => {
+  const { f, original } = await deliveryFixture(t);
   const dispatcher = path.join(f.root, 'claude/scripts/conveyor/exec.mjs');
   fs.mkdirSync(path.dirname(dispatcher), { recursive: true });
   fs.writeFileSync(dispatcher, [
@@ -487,39 +541,155 @@ test('crosscheck defaults to the scout dispatcher and includes bounded untracked
     `const result = spawnSync(${JSON.stringify(path.join(f.root, 'crosscheck.sh'))}, process.argv.slice(2), { stdio: 'inherit' });`,
     'process.exitCode = result.status;'
   ].join('\n'));
-  const names = Array.from({ length: 21 }, (_, index) => `new-${String(index).padStart(2, '0')}.ts`);
-  for (const name of names) {
-    fs.writeFileSync(path.join(f.repo, name), Array.from({ length: 201 }, (_, index) => `line ${index + 1}`).join('\n'));
+  const fullText = 'Owner context '.repeat(350);
+  f.user(`${fullText}End of owner text. Adopt quoted section Scope.\nDo not adopt quoted section Unrelated.\n`
+    + '<pasted_content>## Scope\nAdopted requirement\n## Unrelated\nIgnored paste</pasted_content>');
+  for (let i = 0; i < 21; i++) {
+    const file = `new-${String(i).padStart(2, '0')}.txt`;
+    fs.writeFileSync(path.join(f.repo, file), Array.from({ length: 201 }, (_, index) => `line ${index + 1}`).join('\n'));
+    f.toolResult('Write', { file_path: file });
   }
-  const env = { CONVEYOR_CROSSCHECK_CMD: '', FAKE_UNTRACKED: JSON.stringify(names) };
-  await f.command(['start']);
-  await f.command(['add', 'Ledger', '--from', 'M1']);
+  const executorFile = path.join(f.repo, 'executor-output.txt');
+  fs.writeFileSync(executorFile, 'Written by the executor.');
+  const session = f.env.CLAUDE_CODE_SESSION_ID;
+  fs.appendFileSync(path.join(f.home, 'sessions', `${session}.jsonl`), JSON.stringify({
+    event: 'end', mode: 'write', session, at: new Date().toISOString(),
+    acceptance: { session, task: 'T1', repo: f.repo, changed: [{ path: executorFile, before: null, after: 'executor-bytes' }] }
+  }) + '\n');
+  const outside = path.join(f.root, 'outside.txt');
+  fs.writeFileSync(outside, 'Written outside Git.');
+  f.toolResult('Write', { file_path: outside });
+  const env = { CONVEYOR_CROSSCHECK_CMD: '' };
   const first = JSON.parse(await f.command(['crosscheck'], env));
+  assert.equal(first.status, 'reviewed-clean');
+  assert.equal(first.delivered, true);
+  assert.match(first.fingerprint, /^[0-9a-f]{64}$/);
+  assert.match(first.reviewFingerprint, /^[0-9a-f]{64}$/);
   const prompt = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
-  assert.deepEqual(JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8')).slice(0, 6),
-    ['run', '--tier', 'scout', '-r', '-C', f.repo]);
-  assert.ok(!prompt.includes('new-20.ts'), 'untracked names and contents are limited to twenty files');
-  assert.equal((prompt.match(/\[untracked /g) || []).length, 20);
-  assert.ok(prompt.includes('line 200'));
-  assert.ok(!prompt.includes('line 201'));
-  fs.appendFileSync(path.join(f.repo, names[0]), '\nchanged untracked content');
-  assert.notEqual(JSON.parse(await f.command(['crosscheck'], env)).hash, first.hash);
-});
-
-test('crosscheck stops a fake large diff after its bounded preview and still records a result', { timeout }, async (t) => {
-  const f = await fixture(t);
-  await f.command(['start']);
-  await f.command(['add', 'Ledger', '--from', 'M1']);
+  assert.ok(prompt.includes(JSON.stringify(original).slice(1, -1)));
+  assert.match(prompt, /End of owner text.*Adopt quoted section Scope/);
+  assert.match(prompt, /"adoptedQuotations"[\s\S]*Adopted requirement/);
+  assert.doesNotMatch(prompt, /Ignored paste/);
+  assert.match(prompt, /Ledger and evidence[\s\S]*Reviewed[\s\S]*task-base/);
+  const { git: [gitPreview], nonGit } = JSON.parse(prompt.slice(prompt.indexOf('\n{') + 1));
+  assert.ok(gitPreview.additions.some(({ content }) => content === 'Written by the executor.'));
+  assert.deepEqual(nonGit.map(({ file, content }) => [file, content]), [[outside, 'Written outside Git.']]);
+  assert.match(gitPreview.diff, /\+diff line 300/);
+  assert.doesNotMatch(gitPreview.diff, /\+diff line 301/);
+  assert.equal(gitPreview.additions.length, 20);
+  assert.equal(gitPreview.additions.some(({ file }) => file === 'new-20.txt'), false);
+  assert.match(gitPreview.additions.find(({ file }) => file === 'new-00.txt').content, /line 200$/);
+  const args = JSON.parse(fs.readFileSync(f.env.FAKE_ARGS, 'utf8'));
+  assert.deepEqual(args.slice(0, 7), ['run', '--tier', 'scout', '-r', '-C', f.repo, '-f']);
+  assert.equal(fs.existsSync(path.dirname(args[7])), false);
+  f.user('Please preserve all requirements verbatim.');
+  fs.writeFileSync(path.join(f.repo, 'foreign.txt'), 'other session content');
+  f.append({ sessionId: 'foreign-session', type: 'assistant', cwd: f.repo,
+    message: { content: [{ type: 'tool_use', id: 'foreign', name: 'Write', input: { file_path: 'foreign.txt' } }] } });
+  await f.command(['evidence', 'L1', '--cmd', 'printf passed']);
+  assert.equal(JSON.parse(await f.command(['deliver'])).fingerprint, first.fingerprint);
+  assert.equal(reviewCalls(f), 1);
+  fs.appendFileSync(path.join(f.repo, 'new-20.txt'), '\nChanged beyond the preview');
+  f.toolResult('Edit', { file_path: 'new-20.txt' });
+  const changed = JSON.parse(await f.command(['deliver']));
+  assert.notEqual(changed.fingerprint, first.fingerprint);
+  assert.equal(reviewCalls(f), 2);
   const pidFile = path.join(f.root, 'large-diff.pid');
-  const result = JSON.parse(await f.command(['crosscheck'], { FAKE_LARGE_PID: pidFile }));
-  assert.equal(result.ok, true);
-  const prompt = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
-  assert.equal((prompt.match(/^\+large diff line/gm) || []).length, 300);
-  assert.ok(Buffer.byteLength(prompt) < 256 * 1024);
+  fs.chmodSync(path.join(f.repo, 'worker.mjs'), 0o755);
+  const modeChange = JSON.parse(await f.command(['deliver'], { FAKE_LARGE_PID: pidFile }));
+  assert.notEqual(modeChange.fingerprint, changed.fingerprint);
+  assert.equal(modeChange.delivered, true);
+  const large = fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8');
+  assert.equal((large.match(/\+large diff line/g) || []).length, 300);
+  assert.ok(Buffer.byteLength(large) < 256 * 1024);
   assert.equal(fs.existsSync(pidFile + '.finished'), false);
   assert.throws(() => process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 0), { code: 'ESRCH' });
 });
 
+test('two simultaneous deliveries dispatch one independent review and record one delivery', { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
+  const release = path.join(f.root, 'release'), ready = path.join(f.root, 'second-inputs');
+  const calls = [deliverProcess(f, { FAKE_RELEASE: release })];
+  try {
+    await waitForMarker(release);
+    calls.push(deliverProcess(f, { FAKE_RELEASE: release, FAKE_TREE_READY: ready }));
+    await waitForMarker(ready);
+    fs.writeFileSync(release, '');
+    const results = await Promise.all(calls);
+    assert.deepEqual(results.map(({ stdout }) => JSON.parse(stdout).status), ['reviewed-clean', 'reviewed-clean']);
+    assert.equal(reviewCalls(f), 1);
+    for (const kind of ['turn-check', 'screenshot-check', 'delivered']) {
+      assert.equal(f.records().filter(({ type }) => type === kind).length, 1);
+    }
+  } finally { fs.closeSync(fs.openSync(release, 'a')); await Promise.allSettled(calls); }
+});
+
+test('finding links and dismissals reuse the review, while adding an outcome reviews again with prior answers',
+  { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
+  const FAKE_RESPONSE = JSON.stringify({ missing: [{ text: 'cleanup', source: 'M1.c1' }, 'docs'],
+    misread: [{ text: 'scope', source: 'M1.c2' }] });
+  const found = JSON.parse(await f.command(['deliver'], { FAKE_RESPONSE }, 1));
+  assert.equal(found.status, 'reviewed-with-findings');
+  assert.deepEqual(found.findings.map(({ id }) => id), ['X1', 'X2', 'X3']);
+  await f.command(['link', 'X1', 'L1']);
+  await f.command(['link', 'X3', 'none', '--reason', 'Already included in the explicit scope']);
+  assert.deepEqual(JSON.parse(await f.command(['deliver'], {}, 1)).unanswered, ['X2']);
+  assert.equal(reviewCalls(f), 1);
+  await f.command(['add', 'Document the ledger', '--from', 'X2']);
+  await f.command(['deliver'], {}, 1);
+  assert.equal(reviewCalls(f), 1);
+  await f.command(['evidence', 'L2', '--cmd', 'printf verified']);
+  await f.command(['done', 'L2']);
+  const second = JSON.parse(await f.command(['deliver'], { FAKE_RESPONSE }));
+  assert.deepEqual(second.findings.map(({ id }) => id), ['X1', 'X2', 'X3']);
+  assert.deepEqual(second.unanswered, []);
+  assert.equal(reviewCalls(f), 2);
+  assert.match(fs.readFileSync(f.env.FAKE_PROMPT_COPY, 'utf8'), /priorFindings[\s\S]*Already included in the explicit scope/);
+  await f.command(['link', 'X1', 'L2'], {}, 1);
+  assert.equal(JSON.parse(await f.command(['deliver'])).delivered, true);
+  assert.equal(reviewCalls(f), 2);
+});
+
+test('unavailable reviews deliver with a review gap and allow automatic request rollover', { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
+  const failed = JSON.parse(await f.command(['deliver'], { FAKE_RESPONSE: 'not json' }, 1));
+  assert.equal(failed.status, 'error');
+  assert.equal(failed.delivered, false);
+  const quote = 'You may waive the unavailable delivery review for this request.';
+  f.user(quote);
+  const output = await f.command(['deliver'], { FAKE_RC: '3' });
+  assert.match(output, /"status": "unavailable"/);
+  assert.match(output, /Delivery review gap:/);
+  await f.command(['waive', 'crosscheck', '--quote', quote]);
+  assert.equal(f.records().findLast(({ type }) => type === 'delivered').reviewGap, true);
+  assert.equal(reviewCalls(f), 2);
+  assert.match(await f.prompt('Please follow up on delivery.'), /T2/);
+  assert.equal((await f.state()).task.id, 'T2');
+});
+
+test('an in-flight review of stale work stays history and cannot close the updated delivery', { timeout }, async (t) => {
+  const { f } = await deliveryFixture(t);
+  const release = path.join(f.root, 'release');
+  const first = deliverProcess(f, { FAKE_RELEASE: release, FAKE_RESPONSE: '{"missing":["outdated finding"],"misread":[]}' })
+    .then(() => assert.fail('stale delivery should exit nonzero'), (error) => error);
+  try {
+    await waitForMarker(release);
+    fs.appendFileSync(path.join(f.repo, 'worker.mjs'), '\nUpdated while the review runs');
+    f.toolResult('Edit', { file_path: 'worker.mjs' });
+    const second = JSON.parse(await f.command(['deliver']));
+    fs.writeFileSync(release, '');
+    const result = JSON.parse((await first).stdout);
+    assert.equal(result.stale, true);
+    assert.equal(result.delivered, false);
+    assert.notEqual(result.fingerprint, second.fingerprint);
+    const state = await f.state();
+    assert.equal(state.reviews.length, 2);
+    assert.deepEqual(state.deliveries.map(({ fingerprint }) => fingerprint), [second.fingerprint]);
+    assert.equal(JSON.parse(await f.command(['deliver'])).delivered, true);
+    assert.equal(reviewCalls(f), 2);
+  } finally { fs.closeSync(fs.openSync(release, 'a')); await first; }
+});
 
 test('UI file detection covers UI extensions and detected directories while excluding tests and stories',
   { timeout: 3000 }, () => {
@@ -530,3 +700,162 @@ test('UI file detection covers UI extensions and detected directories while excl
       assert.equal(uiFile(file, ['frontend', 'templates']), false, file);
     }
   });
+
+async function taskScope(f, task, extra = {}) {
+  let scope;
+  const result = await invoke(async () => {
+    scope = await collectTaskScope({ session: 'ledger-test', transcript: f.transcript, cwd: f.repo }, task);
+    return 0;
+  }, [], { env: { ...f.env, ...extra }, cwd: f.repo });
+  assert.equal(result.status, 0, result.stderr);
+  return scope;
+}
+
+test('task scope uses successful editor results and excludes denied, unmatched and identical edits', { timeout }, async (t) => {
+  const f = await fixture(t);
+  f.toolResult('Edit', { file_path: 'earlier.mjs' });
+  f.user('Please fix the current request.');
+  await f.command(['start']);
+  const { task } = await f.state();
+  const timestamp = '2026-08-01T00:00:00.000Z';
+  f.toolResult('Edit', { file_path: 'input.mjs' }, { timestamp,
+    toolUseResult: { filePath: 'actual.mjs', structuredPatch: [{ lines: ['-old', '+new'] }] } });
+  f.toolResult('Edit', { file_path: 'denied.mjs' }, { is_error: true, content: 'The user rejected this tool use.' });
+  f.toolResult('Write', { file_path: 'unchanged.mjs', content: 'same' },
+    { toolUseResult: { originalFile: 'same', structuredPatch: [] } });
+  f.append({ type: 'assistant', cwd: f.repo, message: {
+    content: [{ type: 'tool_use', id: 'unmatched', name: 'Edit', input: { file_path: 'unmatched.mjs' } }]
+  } });
+  const executorPath = path.join(f.repo, 'executor.mjs');
+  const row = { event: 'end', mode: 'write', session: 'ledger-test', at: timestamp, code: 17,
+    acceptance: { session: 'ledger-test', repo: f.repo, task: task.id, runId: 'run',
+      changed: [{ path: executorPath, before: null, after: 'hash' }] } };
+  const earlier = { ...row, acceptance: { ...row.acceptance, task: 'T0',
+    changed: [{ path: path.join(f.repo, 'earlier-run.mjs'), before: null, after: 'hash' }] } };
+  fs.appendFileSync(path.join(f.home, 'sessions', 'ledger-test.jsonl'), JSON.stringify(row) + '\n' + JSON.stringify(earlier) + '\n');
+  const scope = await taskScope(f, task);
+  assert.deepEqual([...scope.repos], [[f.repo, new Map([
+    [path.join(f.repo, 'actual.mjs'), Date.parse(timestamp)], [executorPath, Date.parse(timestamp)]
+  ])]]);
+  assert.equal(scope.nonGit.size, 0);
+});
+
+async function freshnessFixture(t, external = false) {
+  const f = await fixture(t, 'Please fix the worker.');
+  const proof = path.join(external ? f.root : f.repo, 'proof.log');
+  const older = new Date(Date.now() - 10_000);
+  fs.writeFileSync(proof, 'verification\n');
+  fs.utimesSync(proof, older, older);
+  f.env.CONVEYOR_CHECK_CMD = JSON.stringify(['/bin/sh', '-c', "printf '%s' '{\"ok\":true}'"]);
+  await f.command(['start']);
+  await f.command(['add', 'Fix the worker', '--from', 'M1.c1']);
+  f.toolResult('Edit', { file_path: 'owned.mjs' }, { timestamp: new Date(older.getTime() - 1000).toISOString() });
+  await f.command(['evidence', 'L1', '--artifact', proof]);
+  await f.command(['done', 'L1']);
+  const check = async () => JSON.parse(await f.command(['status', '--json'], {}, 1)).check;
+  return { f, check, proof };
+}
+
+test('only a later owned edit in the artifact worktree makes proof stale', { timeout }, async (t) => {
+  const { f, check, proof } = await freshnessFixture(t);
+  fs.writeFileSync(path.join(f.repo, 'foreign.mjs'), 'foreign bytes\n');
+  assert.ok(fs.statSync(path.join(f.repo, 'foreign.mjs')).mtimeMs > fs.statSync(proof).mtimeMs);
+  f.env.FAKE_UNTRACKED = '["foreign.mjs"]';
+  assert.equal(await check(), 6);
+  f.toolResult('Edit', { file_path: 'owned.mjs' });
+  assert.equal(await check(), 4);
+  await f.command(['evidence', 'L1', '--cmd', 'test "$LEDGER_PROOF" = yes'], { LEDGER_PROOF: 'yes' });
+  await f.command(['evidence', 'L1', '--cmd', 'exit 1'], {}, 1);
+  assert.equal(await check(), 6);
+  await f.command(['evidence', 'L1', '--cmd', 'test "$LEDGER_PROOF" = yes'], { LEDGER_PROOF: 'no' }, 1);
+  assert.equal(await check(), 4);
+});
+
+test('only commits confirmed by paired Bash results enter this request scope', { timeout }, async (t) => {
+  const realPath = process.env.PATH;
+  const f = await fixture(t);
+  await f.command(['start']);
+  const { task } = await f.state();
+  const git = (...args) => execFileSync('git', ['-C', f.repo, ...args], { encoding: 'utf8' });
+  git('init', '-q');
+  git('config', 'user.name', 'Ledger Test');
+  git('config', 'user.email', 'ledger@example.test');
+  fs.writeFileSync(path.join(f.repo, 'own.mjs'), 'own\n');
+  git('add', 'own.mjs');
+  const output = git('commit', '-m', 'owned');
+  f.toolResult('Bash', { command: `git -C ${shellQuote(f.repo)} commit -m owned` }, { cwd: f.root, content: output });
+  fs.writeFileSync(path.join(f.repo, 'foreign.mjs'), 'foreign\n');
+  git('add', 'foreign.mjs');
+  const foreign = git('commit', '-m', 'foreign');
+  f.toolResult('Bash', { command: 'git log -1' }, { content: foreign });
+  const scope = await taskScope(f, task, { PATH: realPath });
+  assert.deepEqual([...scope.repos.get(f.repo).keys()], [path.join(f.repo, 'own.mjs')]);
+});
+
+test('an external artifact compares only with owned writes, including non-Git edits', { timeout }, async (t) => {
+  const { f, check } = await freshnessFixture(t, true);
+  fs.writeFileSync(path.join(f.repo, 'foreign.mjs'), 'foreign bytes\n');
+  fs.writeFileSync(path.join(f.root, 'foreign.mjs'), 'foreign bytes\n');
+  f.env.FAKE_UNTRACKED = '["foreign.mjs"]';
+  assert.equal(await check(), 6);
+  f.toolResult('Edit', { file_path: 'owned-outside.mjs' }, { cwd: f.root });
+  assert.equal(await check(), 4);
+  await f.command(['amend', 'L1', 'Fix the worker', '--from', 'M1', '--paths', 'owned.mjs']);
+  const state = await f.state();
+  assert.equal(state.items[0].revision, 2);
+  assert.deepEqual(state.items[0].paths, [path.join(f.repo, 'owned.mjs')]);
+  await f.command(['evidence', 'L1', '--artifact', path.join(f.root, 'proof.log')]);
+  await f.command(['done', 'L1']);
+  assert.equal(await check(), 6);
+});
+
+function replayFixture(t, records, stops, transcript = []) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'conveyor-replay-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const ledger = path.join(root, 'ledger.jsonl'), log = path.join(root, 'transcript.jsonl');
+  const before = '2026-11-20T12:00:00.000Z', at = '2026-11-20T12:01:00.000Z';
+  const hook = 'node "/example/hooks/conveyor-stop-gate.mjs"';
+  const write = (file, rows) => fs.writeFileSync(file, rows.map((row) => JSON.stringify(row) + '\n').join(''));
+  write(ledger, records.map((record) => ({ at: before, ...record })));
+  const rows = transcript.slice();
+  for (const [index, reason] of stops.entries()) {
+    const toolUseID = `stop-${index + 1}`;
+    const summary = { type: 'system', subtype: 'stop_hook_summary', toolUseID, hookInfos: [{ command: hook }] };
+    const attachment = { type: 'attachment', attachment: { type: 'hook_blocking_error', hookEvent: 'Stop', toolUseID,
+      blockingError: { command: hook, blockingError: reason } } };
+    rows.push(summary, attachment, ...(index === 0 ? [structuredClone(attachment)] : []));
+  }
+  write(log, rows.map((row) => ({ sessionId: 'replay-fixture', timestamp: at, ...row })));
+  const replay = fileURLToPath(new URL('../../../../../tools/replay-acceptance.mjs', import.meta.url));
+  return execFileSync(process.execPath, [replay, '--ledger', ledger, '--transcript', log], { encoding: 'utf8', timeout });
+}
+
+test('acceptance replay counts a Stop summary and duplicate conveyor attachments once', { timeout }, (t) => {
+  const report = replayFixture(t, [], ['1. start the ledger']);
+  assert.match(report, /Recovered 1 Stop checkpoints across 1 sessions, including 1 conveyor summaries/);
+  assert.match(report, /\| replay-fixture \| 1 \| 1 \| 0 \/ 0 \|/);
+});
+
+test('acceptance replay reports an old-proven artifact reopened by an attributed write', { timeout }, (t) => {
+  const artifact = '/example/proof.html';
+  const report = replayFixture(t, [
+    { type: 'start', id: 'T1', offset: 0 },
+    { type: 'item', id: 'L1', paths: [artifact], text: 'Produce proof' },
+    { type: 'evidence', item: 'L1', kind: 'artifact', value: artifact, mtime: Date.parse('2026-11-20T12:00:00.000Z') },
+    { type: 'done', item: 'L1' }
+  ], ['6. run ledger crosscheck'], [
+    { type: 'assistant', cwd: '/example', message: { content: [
+      { type: 'tool_use', id: 'write-proof', name: 'Write', input: { file_path: artifact, content: 'updated' } }
+    ] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'write-proof', content: 'Success' }] } }
+  ]);
+  assert.match(report, /\| T1\/L1 \| 2026-11-20T12:01:00\.000Z \(stop-1\) \| artifact \| artifact registration predates/);
+});
+
+test('acceptance replay allows the second and third unchanged blocks', { timeout }, (t) => {
+  const report = replayFixture(t, [
+    { type: 'start', id: 'T1', offset: 0 },
+    { type: 'item', id: 'L1', text: 'Finish the outcome' }
+  ], Array(3).fill('3. finish or obtain a user waiver for open items: L1'));
+  assert.match(report, /\| replay-fixture \| 3 \| 3 \| 0 \/ 0 \| 0 \/ 0 \/ 0 \| 1 \| 0 \| 2 \| 0 \/ 2 \| 0 \|/);
+});

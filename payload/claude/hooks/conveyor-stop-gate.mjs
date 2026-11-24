@@ -11,7 +11,7 @@ try {
   const { rememberContext, gateStatus, gateMode, stopOutput } = await import('../scripts/conveyor/lib/ledger.mjs');
   const context = rememberContext(event);
   gateMode(context.session);
-  const output = stopOutput(context, await gateStatus(context), event.stop_hook_active);
+  const output = await stopOutput(context, await gateStatus(context));
   if (output) process.stdout.write(JSON.stringify(output) + '\n');
 } catch (error) {
   try {
