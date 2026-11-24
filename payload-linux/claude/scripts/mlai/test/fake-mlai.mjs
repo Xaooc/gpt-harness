@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+
+const state = process.env.FAKE_MLAI_STATE_DIR;
+const counter = path.join(state, 'attempts');
+const attempt = (existsSync(counter) ? Number(readFileSync(counter, 'utf8')) : 0) + 1;
+writeFileSync(counter, String(attempt));
+
+let prompt = '';
+process.stdin.setEncoding('utf8');
+for await (const chunk of process.stdin) prompt += chunk;
+writeFileSync(path.join(state, `prompt-${attempt}.md`), prompt);
+
+const send = (event) => process.stdout.write(JSON.stringify(event) + '\n');
+send({ type: 'stage', content: 'Loading project context' });
+
+switch (process.env.FAKE_MLAI_SCENARIO) {
+  case 'retry': {
+    send({ type: 'session', id: `fake-session-${attempt}` });
+    send({ type: 'stage', content: 'Starting the agent' });
+    send({ type: 'tool', name: 'read_file', target: 'greeting.txt' });
+    if (attempt === 1) {
+      send({ type: 'result', exitCode: 1, error: 'Transient network error',
+        usage: { errorCode: 'connection_interrupted' }, credits: 0.125, changedFiles: [] });
+      process.exitCode = 1;
+    } else {
+      const text = '## Changes\nUpdated greeting.txt.\n\n## Verification\nChecks passed.\n\n' +
+        '## Deviations\nNone\n\n## Not done\nNone\n';
+      send({ type: 'answer', content: text });
+      send({ type: 'result', exitCode: 0, text, credits: 0.25, changedFiles: ['greeting.txt'] });
+    }
+    break;
+  }
+  case 'auth':
+    send({ type: 'result', state: 'error', error: 'Not signed in. Run `mlai login`.', exitCode: 4 });
+    process.exitCode = 4;
+    break;
+  default:
+    throw new Error(`Unknown fake scenario: ${process.env.FAKE_MLAI_SCENARIO}`);
+}
