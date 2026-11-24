@@ -3772,7 +3772,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "e917819d6af0f83139af9bb18ec867dbb66b950b8189d299a592bf682c9819c3",
+      "sha256": "9178a9db103183ad4a2f4e16e4c7e81552f42957afff5dcb65be61b2cd44fefd",
       "executable": true
     },
     {
@@ -5285,7 +5285,7 @@
       "src": "claude/scripts/mlai/mlai-run.mjs",
       "dest": "scripts/mlai/mlai-run.mjs",
       "kind": "file",
-      "sha256": "ed1e1c3bc8e005f6bc6de56a0c17e5d3e1366cbf282b4aab40b5f7db64962195",
+      "sha256": "5c0205e4a2a2a51ab32fe4a770bffb315abb93bb911b6f153f92ec141d51c6c8",
       "executable": true
     }
   ],
