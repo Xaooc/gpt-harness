@@ -1059,6 +1059,12 @@ export async function gateStatus(context) {
   const scope = nonGit ? '; non-git code edits: ledger checks only, turn checks unavailable' : '';
   const block = (check, reason) => ({ applies: true, ok: false, check,
     reason: check === 9 ? `${check}. ${reason}${scope}` : sanitizeQuote(`${check}. ${reason}${scope}`, 1500) });
+  // A session driven only by another session (orchestrator letters, no genuine owner prompt) has no
+  // requirements of its own to play back: acceptance is held by the orchestrating session (owner 2026-11-24).
+  if (!state.task && !rows.some(({ entry }) => isGenuineHumanEntry(entry) && eligiblePrompt(entryText(entry)))) {
+    return { applies: true, ok: true,
+      systemMessage: 'conveyor: no owner prompt in this session; acceptance is held by the orchestrating session' };
+  }
   if (!state.task) return block(1, 'start the ledger and play back the requirements: ledger start');
   const unlinked = state.primaryMessages.flatMap((message) => message.clauses).filter((clause) => !linked(state, clause.id));
   if (unlinked.length) return block(2, `link imperative clauses in the ledger: ${unlinked.map((clause) => clause.id).join(', ')}`);

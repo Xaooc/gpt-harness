@@ -3806,7 +3806,7 @@
       "src": "claude/scripts/conveyor/lib/ledger.mjs",
       "dest": "scripts/conveyor/lib/ledger.mjs",
       "kind": "file",
-      "sha256": "2d08aa69f8c7b2343f18801ea23786e72580a5a1777ce7228166eb043fc66dbe"
+      "sha256": "24799c9e05a2aa14576de4a834be27a754311039fbda53311e6943c3b2d9b17c"
     },
     {
       "src": "claude/scripts/conveyor/lib/orchestration.mjs",
