@@ -9,6 +9,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processRows, readProcess } from '../lib/luna-runtime.mjs';
+import { GateBridge } from './gate-bridge.mjs';
 
 const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname);
 
@@ -803,6 +804,14 @@ class Job {
     const binary = this.precheck();
     const env = agentEnvironment(this.home);
     Object.assign(env, this.engineChecks());
+    // The agent's `pytest` takes its slots in the host's machine-wide pool through a folder the sandbox can write.
+    if (!this.bridge) {
+      const gate = process.env.MLAI_PYTEST_GATE ?? path.join(SCRIPT_DIR, '..', 'pytest_gate.py');
+      const dir = path.join(this.home, '.cache', 'mlai-gate-bridge', this.sessionId);
+      try { this.bridge = new GateBridge({ dir, gate, log: (line) => this.log(line) }).start(); }
+      catch (error) { this.log(`gate bridge unavailable: ${error.message}`); }
+    }
+    if (this.bridge) env.PYTEST_GATE_BRIDGE = this.bridge.dir;
     // The engine's step checkpoints write refs and objects into the repository's git directory. A worktree keeps it in
     // the main repo, outside the folder the CLI's sandbox lets the agent write, so every checkpoint failed
     // (checkpoint_error: Read-only file system; the engine goes on). Off there; on where .git sits in the job folder.
@@ -893,6 +902,7 @@ class Job {
       finally {
         if (this.activeFile) { try { unlinkSync(this.activeFile); } catch {} }
         if (this.briefDir) { try { rmSync(this.briefDir, { recursive: true, force: true }); } catch {} }
+        try { await this.bridge?.stop(); } catch {}
         // The session was kept only so a step-limited run could continue it.
         try { rmSync(path.join(this.mlaiHome, 'sessions', this.sessionId), { recursive: true, force: true }); } catch {}
         try { this.outputLock?.release(); } catch {}

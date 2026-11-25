@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -68,6 +69,15 @@ switch (process.env.FAKE_MLAI_SCENARIO) {
     const answer = '## Changes\n- x\n\n## Verification\n- y\n\n## Deviations\nNone\n\n## Not done\nNone';
     send({ type: 'answer', content: answer });
     send({ type: 'result', exitCode: 0, text: answer.replace(/^## (Deviations|Not done)\n/gm, '') });
+    break;
+  }
+  case 'gate': {
+    // The agent runs plain `pytest`: PATH leads to bin/pytest, which asks the host's gate through the bridge.
+    const run = spawnSync('pytest', ['tests/x.py::t'], { stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
+    writeFileSync(path.join(state, 'shim-exit.txt'), `${run.status} ${run.stderr ?? ''}`);
+    const text = '## Changes\n- x\n\n## Verification\n- ran\n\n## Deviations\nNone\n\n## Not done\nNone';
+    send({ type: 'answer', content: text });
+    send({ type: 'result', exitCode: 0, text });
     break;
   }
   case 'daily':
