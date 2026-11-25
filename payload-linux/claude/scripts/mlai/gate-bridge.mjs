@@ -5,9 +5,10 @@
 // slots with gate-hold.mjs as its "pytest", and the run starts once granted. A gate that refuses (disk, error) answers
 // with a deny file instead.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readProcess } from '../lib/luna-runtime.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 export const HOLDER = path.join(HERE, 'gate-hold.mjs');
@@ -19,6 +20,9 @@ export class GateBridge {
 
   start() {
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    const self = readProcess(process.pid);
+    writeFileSync(path.join(this.dir, 'owner'), `${process.pid} ${self?.started ?? ''}\n`);
+    sweep(path.dirname(this.dir), this.dir);
     this.timer = setInterval(() => this.poll(), 1000);
     return this;
   }
@@ -64,5 +68,25 @@ export class GateBridge {
     for (const child of this.children.values()) { try { process.kill(-child.pid, 'SIGTERM'); } catch {} }
     for (let wait = 0; this.children.size && wait < 50; wait += 1) await delay(100);
     try { rmSync(this.dir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+/** Bridge folders of wrappers that died without their cleanup (a SIGKILL, 2026-11-25): their owner process is gone, or
+ *  a folder without an owner is older than a day. Holders of such runs end on their own when the run's processes do. */
+export function sweep(parent, keep) {
+  let names = [];
+  try { names = readdirSync(parent); } catch { return; }
+  for (const name of names) {
+    const dir = path.join(parent, name);
+    if (dir === keep) continue;
+    let stale;
+    try {
+      const [pid, started] = readFileSync(path.join(dir, 'owner'), 'utf8').trim().split(' ');
+      const row = readProcess(pid);
+      stale = !row || row.state === 'Z' || (started && row.started !== started);
+    } catch {
+      try { stale = Date.now() - statSync(dir).mtimeMs > 86_400_000; } catch { stale = false; }
+    }
+    if (stale) { try { rmSync(dir, { recursive: true, force: true }); } catch {} }
   }
 }

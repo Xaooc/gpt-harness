@@ -216,3 +216,21 @@ test('the host holder keeps the slots while any process of the run lives and fre
     sleeper.kill('SIGKILL');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('a bridge folder left by a killed wrapper is swept; a live one stays', { timeout: 30_000 }, async () => {
+  const { GateBridge } = await import('../gate-bridge.mjs');
+  const parent = mkdtempSync(path.join(tmpdir(), 'mlai-bridges-'));
+  try {
+    const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    await new Promise((resolve) => dead.once('exit', resolve));
+    for (const [name, owner] of [['dead', `${dead.pid} 1`], ['live', `${process.pid}`]]) {
+      mkdirSync(path.join(parent, name));
+      writeFileSync(path.join(parent, name, 'owner'), `${owner}\n`);
+    }
+    const bridge = new GateBridge({ dir: path.join(parent, 'mine'), gate: '/nonexistent', log: () => {} }).start();
+    assert.ok(!existsSync(path.join(parent, 'dead')), 'the dead wrapper\'s folder is gone');
+    assert.ok(existsSync(path.join(parent, 'live')), 'a live wrapper\'s folder stays');
+    await bridge.stop();
+    assert.ok(!existsSync(path.join(parent, 'mine')), 'a bridge removes its own folder');
+  } finally { rmSync(parent, { recursive: true, force: true }); }
+});

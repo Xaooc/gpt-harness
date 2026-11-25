@@ -5306,7 +5306,7 @@
       "src": "claude/scripts/mlai/gate-bridge.mjs",
       "dest": "scripts/mlai/gate-bridge.mjs",
       "kind": "file",
-      "sha256": "7e60cd4e40a22e829ff518cb4d3ee3d428f60e84e6e68fd88ff908a732b0e7ec"
+      "sha256": "34e66ada6820ea0ade284bab690b0d3a7f2150ef70fa382433f3eb3cdef68757"
     },
     {
       "src": "claude/scripts/mlai/gate-hold.mjs",
