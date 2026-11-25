@@ -9,6 +9,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processRows, readProcess } from '../lib/luna-runtime.mjs';
+import { GateBridge } from './gate-bridge.mjs';
 
 const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname);
 
@@ -361,7 +362,7 @@ class Attempt {
       const code = await Promise.race([closed, stopped]);
       signal.throwIfAborted();
       return { code: this.result?.exitCode ?? code ?? 1, result: this.result, stderr: this.stderr,
-        text: typeof this.result?.text === 'string' ? this.result.text : this.answer, spawnError };
+        text: typeof this.result?.text === 'string' ? this.result.text : this.answer, answer: this.answer, spawnError };
     } finally {
       this.waitingForStream = false;
       signal.removeEventListener('abort', onAbort);
@@ -728,7 +729,7 @@ class Job {
     };
   }
 
-  mapResult({ code, result, text, spawnError }) {
+  mapResult({ code, result, text, answer, spawnError }) {
     // A read-only answer has no run of its own to verify, yet the engine starts it with a "> **Not verified.**" banner
     // whenever its checks found nothing to confirm; a reader that expects JSON (the delivery review) then fails to parse
     // it (2026-11-25). The banner goes to the log, the answer stays as the agent wrote it.
@@ -745,11 +746,21 @@ class Job {
     if (code !== 0 && /daily_run_limit|daily limit of \d+ task starts/i.test(error)) return this.providerFailure(error, 'quota');
     switch (code) {
       case 0: {
+        const raw = text;
         if (this.options.write) text = contractHeadings(text);
         writeFileSync(this.outputFd, text);
         const missing = this.options.write
           ? HEADINGS.filter((heading) => !hasHeading(text, heading)) : [];
-        if (missing.length) this.log(`result is missing contract headings: ${missing.join('|')}`);
+        if (missing.length) {
+          this.log(`result is missing contract headings: ${missing.join('|')}`);
+          // One run in three lost "Deviations"/"Not done" (2026-11-25) and the CLI's own texts were gone: keep them whole
+          // next to the output, so the next loss shows where the headings went.
+          const evidence = `${this.options.out}.headings.json`;
+          try {
+            writeFileSync(evidence, JSON.stringify({ missing, answer: answer ?? null, result: raw ?? null, saved: text }, null, 2));
+            this.log(`CLI texts kept for the missing headings: ${evidence}`);
+          } catch (error) { this.log(`could not keep the CLI texts: ${error.message}`); }
+        }
         return { state: missing.length ? 'incomplete' : 'done', rc: 0, error: '' };
       }
       case 3: {
@@ -793,6 +804,21 @@ class Job {
     const binary = this.precheck();
     const env = agentEnvironment(this.home);
     Object.assign(env, this.engineChecks());
+    // The agent's `pytest` takes its slots in the host's machine-wide pool through a folder the sandbox can write.
+    if (!this.bridge) {
+      const gate = process.env.MLAI_PYTEST_GATE ?? path.join(SCRIPT_DIR, '..', 'pytest_gate.py');
+      const dir = path.join(this.home, '.cache', 'mlai-gate-bridge', this.sessionId);
+      try { this.bridge = new GateBridge({ dir, gate, log: (line) => this.log(line) }).start(); }
+      catch (error) { this.log(`gate bridge unavailable: ${error.message}`); }
+    }
+    if (this.bridge) {
+      env.PYTEST_GATE_BRIDGE = this.bridge.dir;
+      // Any pytest the sandbox starts (`python -m pytest`, `.venv/bin/pytest`, `uv run pytest`) loads pyplugin/mlai_gate
+      // and asks the same bridge; the agent did not keep to plain `pytest` (2026-11-25).
+      const plugins = path.join(SCRIPT_DIR, 'pyplugin');
+      env.PYTHONPATH = [plugins, env.PYTHONPATH].filter(Boolean).join(':');
+      env.PYTEST_PLUGINS = [env.PYTEST_PLUGINS, 'mlai_gate'].filter(Boolean).join(',');
+    }
     // The engine's step checkpoints write refs and objects into the repository's git directory. A worktree keeps it in
     // the main repo, outside the folder the CLI's sandbox lets the agent write, so every checkpoint failed
     // (checkpoint_error: Read-only file system; the engine goes on). Off there; on where .git sits in the job folder.
@@ -883,6 +909,7 @@ class Job {
       finally {
         if (this.activeFile) { try { unlinkSync(this.activeFile); } catch {} }
         if (this.briefDir) { try { rmSync(this.briefDir, { recursive: true, force: true }); } catch {} }
+        try { await this.bridge?.stop(); } catch {}
         // The session was kept only so a step-limited run could continue it.
         try { rmSync(path.join(this.mlaiHome, 'sessions', this.sessionId), { recursive: true, force: true }); } catch {}
         try { this.outputLock?.release(); } catch {}

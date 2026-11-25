@@ -9,4 +9,30 @@ if [ -n "${MLAI_PYTEST_SHIM:-}" ]; then
   exec pytest "$@"
 fi
 export MLAI_PYTEST_SHIM=1
-exec python3 "$HOME/.claude/scripts/pytest_gate.py" -n "${MLAI_PYTEST_WORKERS:-0}" -- "$@"
+gate="$HOME/.claude/scripts/pytest_gate.py"
+workers="${MLAI_PYTEST_WORKERS:-0}"
+bridge="${PYTEST_GATE_BRIDGE:-}"
+if [ -z "$bridge" ] || [ ! -d "$bridge" ]; then
+  exec python3 "$gate" -n "$workers" -- "$@"
+fi
+# The gate in here sees a private /tmp, so the host takes the machine-wide slots first (mlai/gate-bridge.mjs): ask,
+# wait for the grant, run, and say done. The run's basetemp carries the request id, so the host keeps the slots while
+# any process of the run lives.
+id="$$-$(date +%s%N)"
+pgid=$(awk '{ sub(/^.*\) /, ""); print $3 }' "/proc/$$/stat")
+{ printf '%s\n%s\n%s\n' "$$" "$pgid" "$workers"; for arg in "$@"; do printf '%s\n' "$arg"; done; } > "$bridge/.req-$id"
+mv "$bridge/.req-$id" "$bridge/req-$id"
+echo "[pytest] waiting for the machine's test gate" >&2
+while [ ! -e "$bridge/grant-$id" ]; do
+  if [ -e "$bridge/deny-$id" ]; then
+    echo "[pytest] the machine's test gate refused this run: $(cat "$bridge/deny-$id")" >&2
+    exit 75
+  fi
+  sleep 1
+done
+# Granted here: the pytest plugin (pyplugin/mlai_gate.py) must not ask again for this run.
+MLAI_GATE_GRANTED=1 python3 "$gate" -n "$workers" -- --basetemp="$bridge/run-$id" "$@"
+code=$?
+printf '%s\n' "$code" > "$bridge/done-$id"
+case "$code" in 0|5) rm -rf "$bridge/run-$id" ;; *) echo "[pytest] failing tests' dirs kept in $bridge/run-$id" >&2 ;; esac
+exit "$code"

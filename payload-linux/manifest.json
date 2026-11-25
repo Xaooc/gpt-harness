@@ -5285,7 +5285,7 @@
       "src": "claude/scripts/mlai/mlai-run.mjs",
       "dest": "scripts/mlai/mlai-run.mjs",
       "kind": "file",
-      "sha256": "e20621d2fb0c7cc0a02a65ae9d47d52a1a1e21e083c06b16a6a461cde4d1e0a6",
+      "sha256": "78d7b4bb69401acd749c59eb937bda2a8fea3fab7e82a6f6b949342ad9992514",
       "executable": true
     },
     {
@@ -5299,8 +5299,27 @@
       "src": "claude/scripts/mlai/bin/pytest",
       "dest": "scripts/mlai/bin/pytest",
       "kind": "file",
-      "sha256": "72da98d31496c7d156091e5b2283752420b45df721af17b618c5040968421ac6",
+      "sha256": "bd01e1c87b47f15e9399e547a711afd04df98e45c738edb5e3f72307b90c0304",
       "executable": true
+    },
+    {
+      "src": "claude/scripts/mlai/gate-bridge.mjs",
+      "dest": "scripts/mlai/gate-bridge.mjs",
+      "kind": "file",
+      "sha256": "34e66ada6820ea0ade284bab690b0d3a7f2150ef70fa382433f3eb3cdef68757"
+    },
+    {
+      "src": "claude/scripts/mlai/gate-hold.mjs",
+      "dest": "scripts/mlai/gate-hold.mjs",
+      "kind": "file",
+      "sha256": "6d21570195b16584bef3c616a6516448b819d0dd87e863f427c2eb86fedf1b91",
+      "executable": true
+    },
+    {
+      "src": "claude/scripts/mlai/pyplugin/mlai_gate.py",
+      "dest": "scripts/mlai/pyplugin/mlai_gate.py",
+      "kind": "file",
+      "sha256": "3275d9e843101ab601434ea0299a58a3dd088092c365b4a4542ad0acfefa1ad0"
     }
   ],
   "settings": "settings/hooks.json",
