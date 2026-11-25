@@ -34,7 +34,7 @@ async function fixture(t, text = 'Please add a safe ledger. Ensure cleanup.') {
     CLAUDE_CODE_SESSION_ID: 'ledger-test', CLAUDE_CODE_TRANSCRIPT_PATH: transcript, CONVEYOR_GATE_MODE: 'block',
     PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_DIFF_FILE: path.join(root, 'diff.txt'),
     FAKE_PROMPT_COPY: path.join(root, 'prompt-copy.txt'), FAKE_ARGS: path.join(root, 'args.json'),
-    FAKE_REVIEW_CALLS: path.join(root, 'review-calls'), FAKE_RESPONSE: '{"missing":[],"misread":[]}', FAKE_RC: '0'
+    FAKE_REVIEW_CALLS: path.join(root, 'review-calls'), FAKE_RESPONSE: 'Review:\n```json\n{"missing":[],"misread":[]}\n```\nNo findings.', FAKE_RC: '0'
   };
   delete env.CONVEYOR_OVERVIEW_CMD;
   const fake = path.join(root, 'crosscheck.sh');

@@ -37,7 +37,11 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   stopped early without changing any file goes to the next chain entry; one that stopped early (CLI exit 3) with changes
   is continued by the next chain entry on the same tree, lock and gate, with a brief that carries mlai's changed files and
   report (`dispatch.continuation`). mlai answers its own approvals (`--yes`, owner 2026-11-25); secrets (`~/.claude`,
-  `~/.codex`, `~/.config`, `~/.mlai*`, secret-looking files at project tops) are closed by deny rules. A run that used all its steps
+  `~/.codex`, `~/.config`, `~/.mlai*`, secret-looking files at project tops) are closed by deny rules; `~/.claude/scripts`
+  stays readable for `pytest_gate.py`. The engine's baseline test runs are off; a read-only job also skips the engine's
+  final checks (its report, if those checks fail anyway, comes back `done` with a note); a write job keeps them, runs tests
+  through `pytest_gate.py` with the project interpreter (`PYTEST_GATE_LAUNCHER`), and a write stopped by them
+  (`error_checks_failed`) is continued like an exit 3. A run that used all its steps
   for one turn (`error_max_turns`) is continued in the same session automatically, up to 3 times (`MLAI_CONTINUES`).
   mlai jobs may read, without an approval, their project trees (`~/dev`, `~/rpg`, `~/work`, `MLAI_READ_ROOTS`) and the
   paths a brief names; private folders (`~/.claude` except skills/scripts, `~/.codex`, `~/.config`, `~/.ssh`) stay closed.

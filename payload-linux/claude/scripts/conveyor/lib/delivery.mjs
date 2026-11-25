@@ -200,8 +200,20 @@ export async function buildDeliverySnapshot(context, state, inputs) {
   return { ...data, invalidationFingerprint: fingerprint, reviewFingerprint: digest(prompt), prompt };
 }
 
+/** The review's JSON, also when the reviewer wraps it in a fence or adds a line around it (mlai did both, 2026-11-25). */
+function reviewJson(text) {
+  const trimmed = text.trim();
+  try { return JSON.parse(trimmed); } catch {}
+  const fenced = /```(?:json)?\s*\n?([\s\S]*?)\n?```/i.exec(trimmed)?.[1];
+  if (fenced !== undefined) {
+    try { return JSON.parse(fenced); } catch {}
+  }
+  const start = trimmed.indexOf('{'), end = trimmed.lastIndexOf('}');
+  return JSON.parse(start >= 0 && end > start ? trimmed.slice(start, end + 1) : trimmed);
+}
+
 function parseFindings(text) {
-  const result = JSON.parse(text.trim().replace(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i, '$1'));
+  const result = reviewJson(text);
   return ['missing', 'misread'].flatMap((kind) => {
     if (!Array.isArray(result?.[kind])) throw new Error('review must return missing/misread arrays');
     return result[kind].map((finding) => {
