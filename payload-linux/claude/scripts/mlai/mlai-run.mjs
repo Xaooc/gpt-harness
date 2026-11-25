@@ -2,7 +2,7 @@
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
-  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
+  accessSync, appendFileSync, closeSync, constants, createReadStream, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync
 } from 'node:fs';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import path from 'node:path';
@@ -540,7 +540,7 @@ class Job {
     // session is removed when the wrapper ends.
     args.push('--max-steps', String(this.maxSteps), '--session-id', this.sessionId, '--output-format', 'stream-json');
     this.readDirs ??= this.readAccess(brief);
-    for (const directory of this.readDirs) args.push('--add-dir', directory);
+    args.push(...this.readArgs());
     let prompt = rules + brief;
     if (Array.from(prompt).length > PROMPT_LIMIT && file) {
       // A copy in a folder of its own: the brief's real folder may be private (~/.claude, ~/.config) and must not open.
@@ -590,22 +590,21 @@ class Job {
     const dirs = [...found].filter((target) => target !== '/' && target !== dir && !target.startsWith(`${dir}/`) &&
       target !== home && this.readable(target)).sort();
     // Keep the outermost of nested folders.
-    const outer = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`)));
-    // The CLI mounts each --add-dir read-only over everything inside it, the job folder included (2026-11-24: with
-    // ~/dev readable every write in a ~/dev worktree failed with "Read-only file system"). A folder that holds the job
-    // folder is replaced by its other subfolders, level by level down to the job folder; shallow ones first, at most 64.
-    const split = (target) => {
-      if (!dir.startsWith(`${target}/`)) return [target];
-      const next = path.join(target, dir.slice(target.length + 1).split('/')[0]);
-      let entries = [];
-      try { entries = readdirSync(target, { withFileTypes: true }); } catch {}
-      return entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(target, entry.name)).sort()
-        .flatMap((child) => child === dir ? [] : child === next ? split(child) : this.readable(child) ? [child] : []);
-    };
-    const depth = (target) => target.split('/').length;
-    const kept = outer.flatMap(split).sort((a, b) => depth(a) - depth(b) || a.localeCompare(b)).slice(0, 64);
+    const kept = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`)));
     if (kept.length) this.log(`read access: ${kept.join(' ')}`);
     return kept;
+  }
+
+  /** Read access as CLI flags. `--add-dir` is mounted read-only over everything inside it, the job folder included
+   *  (2026-11-24: with ~/dev added every write in a ~/dev worktree failed with "Read-only file system"), so a folder that
+   *  holds the job folder gets only a Read rule: it lifts the approval and mounts nothing; the sandbox already reads /.
+   *  An absolute path in a rule starts with // (verified 2026-11-25; one leading / is read relative and never matched). */
+  readArgs() {
+    const dir = this.options.dir;
+    return (this.readDirs ?? []).filter((target) => !/[()]/.test(target)).flatMap((target) => [
+      '--allowedTools', `Read(/${target})`, '--allowedTools', `Read(/${target}/**)`,
+      ...(dir.startsWith(`${target}/`) ? [] : ['--add-dir', target])
+    ]);
   }
 
   gitOutside() {
@@ -624,7 +623,7 @@ class Job {
     if (model === 'pixis-opus') args.push('--effort', effort === 'xhigh' ? 'max' : effort);
     args.push('--max-steps', String(this.maxSteps), '--output-format', 'stream-json');
     if (this.addDir) args.push('--add-dir', this.addDir);
-    for (const directory of this.readDirs ?? []) args.push('--add-dir', directory);
+    args.push(...this.readArgs());
     const prompt = 'continue: you stopped at the step limit. Pick up exactly where you left off and finish the whole task.' +
       (write ? ' End with the four headings ## Changes, ## Verification, ## Deviations, ## Not done covering the whole ' +
         'task, not only this part.' : '');
