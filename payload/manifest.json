@@ -4077,7 +4077,7 @@
       "src": "claude/scripts/conveyor/test/ledger.test.mjs",
       "dest": "scripts/conveyor/test/ledger.test.mjs",
       "kind": "file",
-      "sha256": "58c19398647408cd45c4379161db401d4ceef1336c837621807d8d188d89fff3"
+      "sha256": "11374151f7cce0a7b4cd8ac335865af09d0107bb446dd7079686f8bba2fe8e0d"
     },
     {
       "src": "claude/scripts/conveyor/test/metrics.test.mjs",
@@ -5356,7 +5356,7 @@
       "src": "claude/scripts/conveyor/lib/delivery.mjs",
       "dest": "scripts/conveyor/lib/delivery.mjs",
       "kind": "file",
-      "sha256": "b59fa83c3dc482d25950b88ae67c247a43a0026e2ffc174274cfd0f6364128bd"
+      "sha256": "7e0cebc00e2e7c57c08ac4863fb5553187e5f928bd02c85454d79dbda540f87e"
     },
     {
       "src": "claude/scripts/conveyor/lib/request-state.mjs",

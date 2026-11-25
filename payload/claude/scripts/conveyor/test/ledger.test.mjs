@@ -671,7 +671,7 @@ test('unavailable reviews deliver with a review gap and allow automatic request 
 test('an in-flight review of stale work stays history and cannot close the updated delivery', { timeout }, async (t) => {
   const { f } = await deliveryFixture(t);
   const release = path.join(f.root, 'release');
-  const first = deliverProcess(f, { FAKE_RELEASE: release, FAKE_RESPONSE: '{"missing":["outdated finding"],"misread":[]}' })
+  const first = deliverProcess(f, { FAKE_RELEASE: release, FAKE_RESPONSE: 'Review:\n```json\n{"missing":["outdated finding"],"misread":[]}\n```\nNote: fenced, with text around.' })
     .then(() => assert.fail('stale delivery should exit nonzero'), (error) => error);
   try {
     await waitForMarker(release);
