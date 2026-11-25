@@ -33,8 +33,11 @@ bash ~/.claude/scripts/luna-status.sh <result.md> [...]           # state of a j
   (tell the user). A write job that already started is never re-run on another provider. ML AI Code (`mlai`) runs
   at most 2 sessions at once; a job that finds both busy goes to the next chain entry at once, without a mark.
   `mlai` retries its own `connection_interrupted` failures; its exit 7 ("needs the owner's decision") comes back as a
-  non-zero code without gate fix rounds: read the answer and decide. An mlai run that stopped early without changing any
-  file goes to the next chain entry; one that stopped early with changes returns non-zero, never 0. A run that used all its steps
+  non-zero code without gate fix rounds: read the answer and decide, and so does exit 6 ("impossible"). An mlai run that
+  stopped early without changing any file goes to the next chain entry; one that stopped early (CLI exit 3) with changes
+  is continued by the next chain entry on the same tree, lock and gate, with a brief that carries mlai's changed files and
+  report (`dispatch.continuation`). mlai answers its own approvals (`--yes`, owner 2026-11-25); secrets (`~/.claude`,
+  `~/.codex`, `~/.config`, `~/.mlai*`, secret-looking files at project tops) are closed by deny rules. A run that used all its steps
   for one turn (`error_max_turns`) is continued in the same session automatically, up to 3 times (`MLAI_CONTINUES`).
   mlai jobs may read, without an approval, their project trees (`~/dev`, `~/rpg`, `~/work`, `MLAI_READ_ROOTS`) and the
   paths a brief names; private folders (`~/.claude` except skills/scripts, `~/.codex`, `~/.config`, `~/.ssh`) stay closed.

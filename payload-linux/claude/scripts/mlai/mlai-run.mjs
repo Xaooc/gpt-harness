@@ -11,6 +11,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { processRows, readProcess } from '../lib/luna-runtime.mjs';
 
 const HEADINGS = ['## Changes', '## Verification', '## Deviations', '## Not done'];
+// Never readable by the agent (see secretArgs): sign-ins, keys and tokens of the harness, its providers and the shell.
+const SECRET_HOME_PATHS = ['.claude', '.claude.json', '.codex', '.config', '.mlai', '.mlai-accounts', '.gemini',
+  '.local/share/keyrings', '.password-store', '.bash_history', '.zsh_history', '.python_history', '.node_repl_history'];
+const SECRET_NAME = /secret|credential|password|admin_access|^\.env(\..+)?$/i;
 const PROMPT_LIMIT = 28_000;
 const START_EVENTS = new Set(['inference_progress', 'tool', 'command', 'answer']);
 const USAGE = 'usage: mlai.sh [-w|-r] [-C dir] [-o out.md] [-e low|medium|high|xhigh|max] ' +
@@ -384,7 +388,7 @@ class Job {
       finished: '', rc: '', model: options.model, effort: options.effort,
       sandbox: options.write ? 'workspace-write' : 'read-only', dir: path.resolve(options.dir),
       engine: 'mlai', provider: 'mlai', account: process.env.MLAI_ACCOUNT || 'main', error: '', last_note: '',
-      unavailable_reason: '', elapsed_s: 0,
+      unavailable_reason: '', cli_exit: '', elapsed_s: 0,
       mlai_session: '', credits: 0, changed_files: 0, attempts: 0, continues: 0, reached_running: 0
     };
   }
@@ -540,14 +544,14 @@ class Job {
     // session is removed when the wrapper ends.
     args.push('--max-steps', String(this.maxSteps), '--session-id', this.sessionId, '--output-format', 'stream-json');
     this.readDirs ??= this.readAccess(brief);
-    args.push(...this.readArgs());
-    let prompt = rules + this.readNote() + brief;
+    args.push('--yes', ...this.readArgs(), ...this.secretArgs());
+    let prompt = rules + brief;
     if (Array.from(prompt).length > PROMPT_LIMIT && file) {
       // A copy in a folder of its own: the brief's real folder may be private (~/.claude, ~/.config) and must not open.
       this.briefDir ??= mkdtempSync(path.join(tmpdir(), 'mlai-brief-'));
       const copy = path.join(this.briefDir, path.basename(file));
       writeFileSync(copy, brief, { mode: 0o600 });
-      prompt = rules + this.readNote() + `The full task brief is in the file ${copy}. Read it completely first and follow it exactly.`;
+      prompt = rules + `The full task brief is in the file ${copy}. Read it completely first and follow it exactly.`;
       args.push('--add-dir', this.briefDir);
       this.addDir = this.briefDir;
     }
@@ -557,8 +561,7 @@ class Job {
 
   /** Folders outside the job directory the agent may read without an approval nobody can give in a headless run (it
    *  stops the run as `limited`, seen on J7b and J8): the project trees the job lives in and the existing absolute paths
-   *  the brief names, never the private home folders. `--yes` would also open ~/.claude and ~/.codex, which the CLI's
-   *  sandbox does not hide. */
+   *  the brief names, never the private home folders. */
   readAccess(brief) {
     const dir = this.options.dir;
     const home = realpathSync(this.home);
@@ -621,15 +624,44 @@ class Job {
     ];
   }
 
-  /** Folders that hold the job folder are readable only with the file tools: tell the agent, or it tries `ls ..`. */
-  readNote() {
+  /** Places the agent must never read, as deny rules. Every run answers its own approvals (--yes, owner's decision
+   *  2026-11-25: 92 approval stops in one day, 7 jobs lost), and the CLI's sandbox reads all of / except a few key
+   *  folders, so secrets stay closed by deny rules: the engine applies a Read deny to the file tools and to the paths it
+   *  finds in shell commands (verified 2026-11-25 on a canary under ~/.config: `cat` and read_file both refused). A
+   *  denied folder that holds the job folder is denied as its other entries, level by level down to the job folder. */
+  secretArgs() {
     const dir = this.options.dir;
-    const holders = (this.readDirs ?? []).filter((target) => dir.startsWith(`${target}/`));
-    if (!holders.length) return '';
-    const parent = path.dirname(dir);
-    return `Reading outside the working folder: ${parent} and the folders above it (inside ${holders.join(', ')}) open ` +
-      'only to your file tools (read_file, list_files, Glob, search_text); shell commands there (ls, cat, find) need an ' +
-      'approval nobody can give and stop the run. Use the file tools for them.\n\n';
+    const home = realpathSync(this.home);
+    const targets = new Set(SECRET_HOME_PATHS.map((name) => path.join(home, name)));
+    for (const extra of (process.env.MLAI_DENY_PATHS ?? '').split(':').filter(Boolean)) {
+      targets.add(extra.replace(/^~(?=\/|$)/, home));
+    }
+    // Secret-looking files at the top of the project trees and of the job's main repository (~/rpg/ADMIN_ACCESS.txt).
+    const tops = [...(this.readDirs ?? [])];
+    try {
+      const common = execFileSync('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim();
+      if (common) tops.push(path.dirname(common));
+    } catch {}
+    for (const top of tops) {
+      let entries = [];
+      try { entries = readdirSync(top, { withFileTypes: true }); } catch {}
+      for (const entry of entries) {
+        if (!entry.isDirectory() && SECRET_NAME.test(entry.name)) targets.add(path.join(top, entry.name));
+      }
+    }
+    const around = (target) => {
+      if (target === dir) return [];
+      if (!dir.startsWith(`${target}/`)) return [target];
+      const next = path.join(target, dir.slice(target.length + 1).split('/')[0]);
+      let entries = [];
+      try { entries = readdirSync(target); } catch {}
+      return entries.map((name) => path.join(target, name)).sort()
+        .flatMap((child) => child === dir ? [] : child === next ? around(child) : [child]);
+    };
+    const denied = [...targets].filter((target) => existsSync(target) && !/[()]/.test(target)).flatMap(around).slice(0, 200);
+    if (denied.length) this.log(`denied: ${denied.length} secret paths`);
+    return denied.flatMap((target) => ['--disallowedTools', `Read(/${target})`, '--disallowedTools', `Read(/${target}/**)`]);
   }
 
   gitOutside() {
@@ -648,7 +680,7 @@ class Job {
     if (model === 'pixis-opus') args.push('--effort', effort === 'xhigh' ? 'max' : effort);
     args.push('--max-steps', String(this.maxSteps), '--output-format', 'stream-json');
     if (this.addDir) args.push('--add-dir', this.addDir);
-    args.push(...this.readArgs());
+    args.push('--yes', ...this.readArgs(), ...this.secretArgs());
     const prompt = 'continue: you stopped at the step limit. Pick up exactly where you left off and finish the whole task.' +
       (write ? ' End with the four headings ## Changes, ## Verification, ## Deviations, ## Not done covering the whole ' +
         'task, not only this part.' : '');
@@ -664,6 +696,8 @@ class Job {
   }
 
   mapResult({ code, result, text, spawnError }) {
+    // The dispatcher continues an unfinished write run only after exit 3; 6 and 7 are the agent's answers.
+    this.values.cli_exit = spawnError ? '' : String(code ?? '');
     if (spawnError) return this.providerFailure(`mlai: could not start CLI (${spawnError.code ?? 'spawn error'})`);
     const error = clip(cliError(result), 300) || `mlai exited ${code}`;
     // An account has 100 task starts a day (reset 00:00 UTC, seen 2026-11-24); it comes as exit 1 before the start.

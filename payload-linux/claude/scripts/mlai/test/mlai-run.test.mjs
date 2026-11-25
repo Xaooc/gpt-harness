@@ -33,6 +33,8 @@ async function fixture({ scenario, worktree = false }, verify) {
     } else execFileSync('git', ['init', '--quiet', dir], { env: { ...process.env, HOME: home }, timeout: 300_000 });
     mkdirSync(path.join(root, 'shared'), { recursive: true });
     mkdirSync(path.join(root, 'projects'), { recursive: true });
+    mkdirSync(path.join(home, '.codex'), { recursive: true });
+    writeFileSync(path.join(root, 'projects', 'ADMIN_ACCESS.txt'), 'x\n');
     writeFileSync(path.join(root, 'shared', 'notes.txt'), 'context\n');
     writeFileSync(brief, `Update greeting.txt and summarize the changes. Context: ${path.join(root, 'shared', 'notes.txt')}.\n`);
     writeFileSync(path.join(mlaiHome, 'auth.json'), JSON.stringify({
@@ -55,7 +57,7 @@ async function fixture({ scenario, worktree = false }, verify) {
     });
     const status = Object.fromEntries(readFileSync(`${out}.status`, 'utf8').trimEnd().split('\n')
       .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
-    verify({ rc, stdout, stderr, status, output: readFileSync(out, 'utf8'), slot, state, mlaiHome, root, dir });
+    verify({ rc, stdout, stderr, status, output: readFileSync(out, 'utf8'), slot, state, mlaiHome, root, dir, home });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -71,6 +73,8 @@ test('a started write attempt retries after a connection interruption', { timeou
     const args = JSON.parse(readFileSync(path.join(state, 'args-1.json'), 'utf8'));
     assert.ok(args.some((arg, i) => args[i - 1] === '--add-dir' && arg.endsWith('/shared')), 'brief path is readable');
     assert.ok(args.some((arg, i) => args[i - 1] === '--add-dir' && arg.endsWith('/projects')), 'project root is readable');
+    assert.ok(args.some((arg, i) => args[i - 1] === '--disallowedTools' && arg.endsWith('/projects/ADMIN_ACCESS.txt)')),
+      'secret-looking files at the top of a project tree are denied');
     assert.equal(readFileSync(path.join(state, 'checkpoints-1.txt'), 'utf8'), 'unset', 'checkpoints stay on in a plain repo');
     assert.equal(status.credits, '0.375');
     assert.equal(status.changed_files, '1');
@@ -104,14 +108,19 @@ test('a sign-in or daily-limit failure before the agent starts is unavailable', 
 });
 
 test('a run stopped by the step limit continues the same session and then removes it', { timeout: 300_000 }, async () => {
-  await fixture({ scenario: 'steps', worktree: true }, ({ rc, stderr, status, output, state, mlaiHome, root, dir }) => {
+  await fixture({ scenario: 'steps', worktree: true }, ({ rc, stderr, status, output, state, mlaiHome, root, dir, home }) => {
     assert.equal(readFileSync(path.join(state, 'checkpoints-1.txt'), 'utf8'), '0', 'checkpoints off in a worktree');
     // A read root that holds the job folder would be mounted read-only over it as --add-dir: it gets a Read rule instead.
     const args = JSON.parse(readFileSync(path.join(state, 'args-1.json'), 'utf8'));
     const reads = args.filter((arg, i) => args[i - 1] === '--add-dir');
     assert.ok(args.includes(`Read(/${realpathSync(root)}/**)`), `the root holding the job folder has a Read rule: ${args.join(' ')}`);
     assert.ok(reads.includes(realpathSync(path.join(root, 'main'))), 'shell commands can read the sibling main repo');
-    assert.match(readFileSync(path.join(state, 'prompt-1.md'), 'utf8'), /open only to your file tools/);
+    // Approvals are answered (--yes); secrets stay closed by deny rules, the job folder never.
+    assert.ok(args.includes('--yes'), 'approvals are answered');
+    const denies = args.filter((arg, i) => args[i - 1] === '--disallowedTools');
+    assert.ok(denies.includes(`Read(/${realpathSync(home)}/.codex/**)`), `provider sign-ins are denied: ${denies.join(' ')}`);
+    assert.ok(!denies.some((rule) => realpathSync(dir).startsWith(rule.slice(6, -1).replace(/\/\*\*$/, '') + '/')),
+      'no deny rule covers the job folder');
     assert.ok(!reads.some((target) => realpathSync(dir).startsWith(`${target}/`) || target === realpathSync(dir)),
       `no --add-dir holds the job folder: ${reads.join(' ')}`);
     assert.equal(rc, 0, stderr);

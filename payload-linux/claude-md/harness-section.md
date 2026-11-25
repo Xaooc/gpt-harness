@@ -75,7 +75,8 @@ blocks `gem.sh` and `mlai.sh`; a diagnostic may prefix `CONVEYOR_DIRECT_PROVIDER
   edits them in the **Luna panel** (model and effort per task kind, presets). Do not hand-edit it.
 - Codex is skipped automatically at **80 %** usage (configurable in the panel; hysteresis), a provider that hit a
   quota/region/auth error is skipped for its TTL, and a write job that already started is never re-run on
-  another provider. Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`; exit 5: no provider
+  another provider (one exception: an mlai write run that stopped unfinished with changes is continued by the next
+  chain entry on the same tree). Exit 4 means "spawn a Claude subagent" with the model in `<out>.dispatch.json`; exit 5: no provider
   available; exit 6: the project's checks stayed red after the fix rounds; exit 7: another write job already runs in
   that repository, so start the slice in its own worktree (`wt-new.mjs`) or wait for it.
 - Never `gpt-6-astra` on Codex. `gpt-6.2-astra` is allowed there (owner 2026-11-18) and serves the `architect` tier.
