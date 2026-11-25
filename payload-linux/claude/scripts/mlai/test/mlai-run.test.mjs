@@ -110,6 +110,8 @@ test('a run stopped by the step limit continues the same session and then remove
     const args = JSON.parse(readFileSync(path.join(state, 'args-1.json'), 'utf8'));
     const reads = args.filter((arg, i) => args[i - 1] === '--add-dir');
     assert.ok(args.includes(`Read(/${realpathSync(root)}/**)`), `the root holding the job folder has a Read rule: ${args.join(' ')}`);
+    assert.ok(reads.includes(realpathSync(path.join(root, 'main'))), 'shell commands can read the sibling main repo');
+    assert.match(readFileSync(path.join(state, 'prompt-1.md'), 'utf8'), /open only to your file tools/);
     assert.ok(!reads.some((target) => realpathSync(dir).startsWith(`${target}/`) || target === realpathSync(dir)),
       `no --add-dir holds the job folder: ${reads.join(' ')}`);
     assert.equal(rc, 0, stderr);
