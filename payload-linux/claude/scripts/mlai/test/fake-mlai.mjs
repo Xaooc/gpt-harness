@@ -14,7 +14,7 @@ writeFileSync(path.join(state, `prompt-${attempt}.md`), prompt);
 writeFileSync(path.join(state, `args-${attempt}.json`), JSON.stringify(process.argv.slice(2)));
 writeFileSync(path.join(state, `checkpoints-${attempt}.txt`), process.env.MINI_STEP_CHECKPOINTS ?? 'unset');
 writeFileSync(path.join(state, `env-${attempt}.json`), JSON.stringify(Object.fromEntries(['MINI_MLAI_FINAL_GATES',
-  'MINI_VERIFY_BASELINE', 'MINI_CHECKER', 'PYTEST_GATE_LAUNCHER'].map((key) => [key, process.env[key] ?? null]))));
+  'MINI_VERIFY_BASELINE', 'MINI_CHECKER', 'PYTEST_GATE_LAUNCHER', 'PATH'].map((key) => [key, process.env[key] ?? null]))));
 
 const send = (event) => process.stdout.write(JSON.stringify(event) + '\n');
 send({ type: 'stage', content: 'Loading project context' });

@@ -5285,7 +5285,7 @@
       "src": "claude/scripts/mlai/mlai-run.mjs",
       "dest": "scripts/mlai/mlai-run.mjs",
       "kind": "file",
-      "sha256": "071254b76438d120e9cabdd1400cafce96fffdbddce5ccf6b436d1f321bdeaa2",
+      "sha256": "6225fd04141229612cbe4ef58cb342fad9fbd2bb0583a5614cb7dec40229bce0",
       "executable": true
     },
     {
@@ -5293,6 +5293,13 @@
       "dest": "scripts/mlai-accounts.mjs",
       "kind": "file",
       "sha256": "8cf617e5af8cb18313ff9d2b88a94ec1b68774df3b689859456b4b31f9ddc2e1",
+      "executable": true
+    },
+    {
+      "src": "claude/scripts/mlai/bin/pytest",
+      "dest": "scripts/mlai/bin/pytest",
+      "kind": "file",
+      "sha256": "72da98d31496c7d156091e5b2283752420b45df721af17b618c5040968421ac6",
       "executable": true
     }
   ],

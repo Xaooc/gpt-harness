@@ -10,6 +10,8 @@ import readline from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { processRows, readProcess } from '../lib/luna-runtime.mjs';
 
+const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname);
+
 const HEADINGS = ['## Changes', '## Verification', '## Deviations', '## Not done'];
 // Never readable by the agent (see secretArgs): sign-ins, keys and tokens of the harness, its providers and the shell.
 const SECRET_HOME_PATHS = ['.claude', '.claude.json', '.codex', '.config', '.mlai', '.mlai-accounts', '.gemini',
@@ -194,9 +196,9 @@ function preamble(options, recovering) {
       '- Match the style of neighbouring files (line length, formatting, naming). ' +
         'Never leave lines longer than ~140 characters.',
       '- Never loosen tests, tolerances or acceptance criteria to make them pass; report the conflict instead.',
-      '- Run tests only through the machine\'s gate: `python3 ~/.claude/scripts/pytest_gate.py -n 0 -- <test ids>` ' +
-        '(it already uses the project interpreter), and only the tests the brief names plus those of the files you ' +
-        'changed. Never `uv run`, `uv sync` or a bare `pytest`: they build environments in the working tree.',
+      '- Run tests with the plain `pytest <test ids>` command: in this run it goes through the machine\'s test gate with ' +
+        'the project interpreter. Only the tests the brief names plus those of the files you changed. Never `uv run`, ' +
+        '`uv sync`, `python -m pytest` or a path to another pytest: they bypass the gate or build environments here.',
       '- Where the brief is silent and you must decide, pick the most conservative option consistent with ' +
         "neighbouring code and list each such decision under ## Deviations as 'Assumption: ...'.",
       '- Your FINAL message must contain exactly these four headings, in this order:',
@@ -675,7 +677,8 @@ class Job {
    *  vs run tests), the checker agent and acceptance tests: the reader verifies a report. A write job keeps the final
    *  gate, whose finds are real work (V6-171), and runs tests through pytest_gate with the project's interpreter. */
   engineChecks() {
-    const env = { MINI_VERIFY_BASELINE: '0' };
+    // bin/pytest routes the agent's `pytest` through pytest_gate.py; the engine recognises only that word as a test run.
+    const env = { MINI_VERIFY_BASELINE: '0', PATH: `${path.join(SCRIPT_DIR, 'bin')}:${process.env.PATH ?? ''}` };
     if (!this.options.write) Object.assign(env, { MINI_MLAI_FINAL_GATES: '0', MINI_CHECKER: '0', MINI_ACCEPTANCE: '0' });
     const python = this.projectPython();
     if (python && !process.env.PYTEST_GATE_LAUNCHER) env.PYTEST_GATE_LAUNCHER = JSON.stringify([python, '-m', 'pytest']);

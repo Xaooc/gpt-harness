@@ -1,0 +1,12 @@
+#!/bin/sh
+# `pytest` inside ML AI Code jobs: every run goes through the machine's test gate (pytest_gate.py: worker cap, free RAM
+# and disk checks, its own temp dir), with the project interpreter from PYTEST_GATE_LAUNCHER. The engine recognises a
+# test run only by the word `pytest`, so the agent types plain `pytest <ids>` and this file does the rest.
+if [ -n "${MLAI_PYTEST_SHIM:-}" ]; then
+  # Called again from inside the gate: hand over to the real pytest further down PATH.
+  here=$(dirname "$0")
+  PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$here" | paste -sd: -)
+  exec pytest "$@"
+fi
+export MLAI_PYTEST_SHIM=1
+exec python3 "$HOME/.claude/scripts/pytest_gate.py" -n "${MLAI_PYTEST_WORKERS:-0}" -- "$@"

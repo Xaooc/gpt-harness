@@ -117,6 +117,8 @@ test('a sign-in or daily-limit failure before the agent starts is unavailable', 
     assert.match(status.error, /final checks did not pass/);
     const env = JSON.parse(readFileSync(path.join(state, 'env-1.json'), 'utf8'));
     assert.deepEqual([env.MINI_MLAI_FINAL_GATES, env.MINI_VERIFY_BASELINE], [null, '0']);
+    // The agent's `pytest` is the gate shim, first on PATH.
+    assert.match(env.PATH, /\/scripts\/mlai\/bin:/);
   });
   // The daily start limit is the account's quota, and the CLI's unreadable error keeps its code.
   await fixture({ scenario: 'daily' }, ({ rc, stderr, status }) => {
