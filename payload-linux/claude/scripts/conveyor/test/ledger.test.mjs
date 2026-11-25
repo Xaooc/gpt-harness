@@ -34,7 +34,7 @@ async function fixture(t, text = 'Please add a safe ledger. Ensure cleanup.') {
     CLAUDE_CODE_SESSION_ID: 'ledger-test', CLAUDE_CODE_TRANSCRIPT_PATH: transcript, CONVEYOR_GATE_MODE: 'block',
     PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_DIFF_FILE: path.join(root, 'diff.txt'),
     FAKE_PROMPT_COPY: path.join(root, 'prompt-copy.txt'), FAKE_ARGS: path.join(root, 'args.json'),
-    FAKE_REVIEW_CALLS: path.join(root, 'review-calls'), FAKE_RESPONSE: '{"missing":[],"misread":[]}', FAKE_RC: '0'
+    FAKE_REVIEW_CALLS: path.join(root, 'review-calls'), FAKE_RESPONSE: 'Review:\n```json\n{"missing":[],"misread":[]}\n```\nNo findings.', FAKE_RC: '0'
   };
   delete env.CONVEYOR_OVERVIEW_CMD;
   const fake = path.join(root, 'crosscheck.sh');
@@ -671,7 +671,7 @@ test('unavailable reviews deliver with a review gap and allow automatic request 
 test('an in-flight review of stale work stays history and cannot close the updated delivery', { timeout }, async (t) => {
   const { f } = await deliveryFixture(t);
   const release = path.join(f.root, 'release');
-  const first = deliverProcess(f, { FAKE_RELEASE: release, FAKE_RESPONSE: 'Review:\n```json\n{"missing":["outdated finding"],"misread":[]}\n```\nNote: fenced, with text around.' })
+  const first = deliverProcess(f, { FAKE_RELEASE: release, FAKE_RESPONSE: '{"missing":["outdated finding"],"misread":[]}' })
     .then(() => assert.fail('stale delivery should exit nonzero'), (error) => error);
   try {
     await waitForMarker(release);

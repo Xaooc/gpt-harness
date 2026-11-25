@@ -4077,7 +4077,7 @@
       "src": "claude/scripts/conveyor/test/ledger.test.mjs",
       "dest": "scripts/conveyor/test/ledger.test.mjs",
       "kind": "file",
-      "sha256": "11374151f7cce0a7b4cd8ac335865af09d0107bb446dd7079686f8bba2fe8e0d"
+      "sha256": "7542bd9d7672ccbdc2cab8f1c6fbc2d4d27272f0a146a335aa76bc1906fd16b2"
     },
     {
       "src": "claude/scripts/conveyor/test/metrics.test.mjs",
