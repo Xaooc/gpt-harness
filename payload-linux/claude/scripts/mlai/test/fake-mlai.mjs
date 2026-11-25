@@ -32,7 +32,9 @@ switch (process.env.FAKE_MLAI_SCENARIO) {
       const text = '## Changes\nUpdated greeting.txt.\n\n## Verification\nChecks passed.\n\n' +
         '## Deviations\nNone\n\n## Not done\nNone\n';
       send({ type: 'answer', content: text });
-      send({ type: 'result', exitCode: 0, text, credits: 0.25, changedFiles: ['greeting.txt'] });
+      // The CLI's result text drops heading-only lines the answer still has.
+      const dropped = text.replace(/^## (Deviations|Not done)\n/gm, '');
+      send({ type: 'result', exitCode: 0, text: dropped, credits: 0.25, changedFiles: ['greeting.txt'] });
     }
     break;
   }
