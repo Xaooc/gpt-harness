@@ -17,6 +17,7 @@ const HEADINGS = ['## Changes', '## Verification', '## Deviations', '## Not done
 const SECRET_HOME_PATHS = ['.claude', '.claude.json', '.codex', '.config', '.mlai', '.mlai-accounts', '.gemini',
   '.local/share/keyrings', '.password-store', '.bash_history', '.zsh_history', '.python_history', '.node_repl_history'];
 const SECRET_READABLE = ['.claude/scripts'];
+const UNVERIFIED_BANNER = /^> \*\*Not verified\.\*\*[^\n]*\n+/;
 const SECRET_NAME = /secret|credential|password|admin_access|^\.env(\..+)?$/i;
 const PROMPT_LIMIT = 28_000;
 const START_EVENTS = new Set(['inference_progress', 'tool', 'command', 'answer']);
@@ -728,6 +729,13 @@ class Job {
   }
 
   mapResult({ code, result, text, spawnError }) {
+    // A read-only answer has no run of its own to verify, yet the engine starts it with a "> **Not verified.**" banner
+    // whenever its checks found nothing to confirm; a reader that expects JSON (the delivery review) then fails to parse
+    // it (2026-11-25). The banner goes to the log, the answer stays as the agent wrote it.
+    if (!this.options.write && typeof text === 'string' && UNVERIFIED_BANNER.test(text)) {
+      this.log(`engine banner dropped: ${clip(text.match(UNVERIFIED_BANNER)[0], 300)}`);
+      text = text.replace(UNVERIFIED_BANNER, '');
+    }
     // The dispatcher continues an unfinished write run only after exit 3; 6 and 7 are the agent's answers.
     this.values.cli_exit = spawnError ? '' : String(code ?? '');
     this.values.cli_subtype = oneLine(result?.subtype);

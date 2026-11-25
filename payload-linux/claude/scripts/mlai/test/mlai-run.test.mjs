@@ -107,7 +107,7 @@ test('a sign-in or daily-limit failure before the agent starts is unavailable', 
     assert.equal(rc, 0, stderr);
     assert.equal(status.state, 'done');
     assert.equal(status.cli_subtype, 'error_checks_failed');
-    assert.match(output, /rpg_master\/x\.py:3[\s\S]*final checks did not confirm/);
+    assert.match(output, /^The flow is in rpg_master\/x\.py:3[\s\S]*final checks did not confirm/, 'engine banner dropped');
     const env = JSON.parse(readFileSync(path.join(state, 'env-1.json'), 'utf8'));
     assert.deepEqual([env.MINI_MLAI_FINAL_GATES, env.MINI_VERIFY_BASELINE, env.MINI_CHECKER], ['0', '0', '0']);
   });

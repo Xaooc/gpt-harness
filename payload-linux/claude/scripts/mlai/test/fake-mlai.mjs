@@ -57,7 +57,8 @@ switch (process.env.FAKE_MLAI_SCENARIO) {
     process.exitCode = 4;
     break;
   case 'checks': {
-    const text = 'The flow is in rpg_master/x.py:3.';
+    const text = '> **Not verified.** The final checks did not confirm this work. Any claims are unconfirmed.\n\n' +
+      'The flow is in rpg_master/x.py:3.';
     send({ type: 'answer', content: text });
     send({ type: 'result', exitCode: 7, subtype: 'error_checks_failed', text, error: 'Some final checks did not pass' });
     process.exitCode = 7;
