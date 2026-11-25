@@ -5285,7 +5285,7 @@
       "src": "claude/scripts/mlai/mlai-run.mjs",
       "dest": "scripts/mlai/mlai-run.mjs",
       "kind": "file",
-      "sha256": "4c98dcb668952bbd8bbca198d34ac1bc85b35eace0e85e33724e7e45d96d65b4",
+      "sha256": "6225fd04141229612cbe4ef58cb342fad9fbd2bb0583a5614cb7dec40229bce0",
       "executable": true
     },
     {

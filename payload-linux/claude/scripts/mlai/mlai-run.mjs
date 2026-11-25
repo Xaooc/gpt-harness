@@ -360,7 +360,7 @@ class Attempt {
       const code = await Promise.race([closed, stopped]);
       signal.throwIfAborted();
       return { code: this.result?.exitCode ?? code ?? 1, result: this.result, stderr: this.stderr,
-        text: finalText(this.result?.text, this.answer), spawnError };
+        text: typeof this.result?.text === 'string' ? this.result.text : this.answer, spawnError };
     } finally {
       this.waitingForStream = false;
       signal.removeEventListener('abort', onAbort);
@@ -895,14 +895,6 @@ class Job {
 }
 
 // The CLI renders Markdown headings in its final text as plain "Changes:" lines; restore the contract headings.
-/** The CLI's result text can drop heading-only lines the answer still has ("Deviations"/"Not done" before "None",
- *  2026-11-25): take the answer then, so the report keeps its four headings. */
-function finalText(result, answer) {
-  if (typeof result !== 'string') return answer;
-  const count = (text) => HEADINGS.filter((heading) => hasHeading(contractHeadings(text), heading)).length;
-  return answer && count(answer) > count(result) ? answer : result;
-}
-
 function contractHeadings(text) {
   return text.replace(/^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?(Changes|Verification|Deviations|Not done)(?:\*\*)?:?(?:\*\*)?[ \t]*$/gm,
     '## $1');
