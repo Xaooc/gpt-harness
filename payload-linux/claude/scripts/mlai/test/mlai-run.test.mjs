@@ -138,12 +138,15 @@ test('a sign-in or daily-limit failure before the agent starts is unavailable', 
   try {
     const host = path.join(fakes, 'host-gate.py');
     writeFileSync(host, 'import json, os, subprocess, sys\n' +
-      "open(os.path.join(os.environ['FAKE_MLAI_STATE_DIR'], 'host.txt'), 'w').write(' '.join(sys.argv[1:]))\n" +
+      "open(os.path.join(os.environ['FAKE_MLAI_STATE_DIR'], 'host.txt'), 'a').write(' '.join(sys.argv[1:]) + '\\n')\n" +
       "sys.exit(subprocess.call(json.loads(os.environ['PYTEST_GATE_LAUNCHER']) + ['-n', '0', '--basetemp=x']))\n");
     await fixture({ scenario: 'gate', env: { MLAI_PYTEST_GATE: host, FAKE_INNER_GATE: '1' } }, ({ rc, stderr, state }) => {
       assert.equal(rc, 0, stderr);
       assert.match(readFileSync(path.join(state, 'shim-exit.txt'), 'utf8'), /^0 /);
-      assert.equal(readFileSync(path.join(state, 'host.txt'), 'utf8'), '-n 0 -- tests/x.py::t');
+      assert.equal(readFileSync(path.join(state, 'host.txt'), 'utf8'), '-n 0 -- tests/x.py::t\n-n 0 --\n');
+      assert.match(readFileSync(path.join(state, 'plugin.txt'), 'utf8'), /^0 plugin ok True\n\[pytest\] waiting for the machine's test gate/);
+      assert.equal(JSON.parse(readFileSync(path.join(state, 'env-1.json'), 'utf8')).PYTEST_PLUGINS, 'mlai_gate',
+        'every pytest in the sandbox loads the plugin');
       assert.match(readFileSync(path.join(state, 'inner.txt'), 'utf8'),
         /^granted -n 0 -- --basetemp=\S+\/mlai-gate-bridge\/[\w-]+\/run-[\d-]+ tests\/x\.py::t$/);
     });

@@ -811,7 +811,14 @@ class Job {
       try { this.bridge = new GateBridge({ dir, gate, log: (line) => this.log(line) }).start(); }
       catch (error) { this.log(`gate bridge unavailable: ${error.message}`); }
     }
-    if (this.bridge) env.PYTEST_GATE_BRIDGE = this.bridge.dir;
+    if (this.bridge) {
+      env.PYTEST_GATE_BRIDGE = this.bridge.dir;
+      // Any pytest the sandbox starts (`python -m pytest`, `.venv/bin/pytest`, `uv run pytest`) loads pyplugin/mlai_gate
+      // and asks the same bridge; the agent did not keep to plain `pytest` (2026-11-25).
+      const plugins = path.join(SCRIPT_DIR, 'pyplugin');
+      env.PYTHONPATH = [plugins, env.PYTHONPATH].filter(Boolean).join(':');
+      env.PYTEST_PLUGINS = [env.PYTEST_PLUGINS, 'mlai_gate'].filter(Boolean).join(',');
+    }
     // The engine's step checkpoints write refs and objects into the repository's git directory. A worktree keeps it in
     // the main repo, outside the folder the CLI's sandbox lets the agent write, so every checkpoint failed
     // (checkpoint_error: Read-only file system; the engine goes on). Off there; on where .git sits in the job folder.

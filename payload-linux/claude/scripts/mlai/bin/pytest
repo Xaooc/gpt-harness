@@ -30,7 +30,8 @@ while [ ! -e "$bridge/grant-$id" ]; do
   fi
   sleep 1
 done
-python3 "$gate" -n "$workers" -- --basetemp="$bridge/run-$id" "$@"
+# Granted here: the pytest plugin (pyplugin/mlai_gate.py) must not ask again for this run.
+MLAI_GATE_GRANTED=1 python3 "$gate" -n "$workers" -- --basetemp="$bridge/run-$id" "$@"
 code=$?
 printf '%s\n' "$code" > "$bridge/done-$id"
 case "$code" in 0|5) rm -rf "$bridge/run-$id" ;; *) echo "[pytest] failing tests' dirs kept in $bridge/run-$id" >&2 ;; esac

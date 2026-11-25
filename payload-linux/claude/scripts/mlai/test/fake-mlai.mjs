@@ -15,7 +15,7 @@ writeFileSync(path.join(state, `prompt-${attempt}.md`), prompt);
 writeFileSync(path.join(state, `args-${attempt}.json`), JSON.stringify(process.argv.slice(2)));
 writeFileSync(path.join(state, `checkpoints-${attempt}.txt`), process.env.MINI_STEP_CHECKPOINTS ?? 'unset');
 writeFileSync(path.join(state, `env-${attempt}.json`), JSON.stringify(Object.fromEntries(['MINI_MLAI_FINAL_GATES',
-  'MINI_VERIFY_BASELINE', 'MINI_CHECKER', 'PYTEST_GATE_LAUNCHER', 'PATH'].map((key) => [key, process.env[key] ?? null]))));
+  'MINI_VERIFY_BASELINE', 'MINI_CHECKER', 'PYTEST_GATE_LAUNCHER', 'PATH', 'PYTEST_PLUGINS'].map((key) => [key, process.env[key] ?? null]))));
 
 const send = (event) => process.stdout.write(JSON.stringify(event) + '\n');
 send({ type: 'stage', content: 'Loading project context' });
@@ -75,6 +75,11 @@ switch (process.env.FAKE_MLAI_SCENARIO) {
     // The agent runs plain `pytest`: PATH leads to bin/pytest, which asks the host's gate through the bridge.
     const run = spawnSync('pytest', ['tests/x.py::t'], { stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
     writeFileSync(path.join(state, 'shim-exit.txt'), `${run.status} ${run.stderr ?? ''}`);
+    // `python -m pytest` bypasses the shim: the plugin PYTEST_PLUGINS loads asks the same bridge.
+    const plugin = spawnSync('python3', ['-c', 'import mlai_gate as g\nclass C: pass\nc = C()\n' +
+      'g.pytest_configure(c)\ng.pytest_unconfigure(c)\nprint("plugin ok", hasattr(c, "_mlai_gate"))'],
+    { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' });
+    writeFileSync(path.join(state, 'plugin.txt'), `${plugin.status} ${plugin.stdout}${plugin.stderr}`);
     const text = '## Changes\n- x\n\n## Verification\n- ran\n\n## Deviations\nNone\n\n## Not done\nNone';
     send({ type: 'answer', content: text });
     send({ type: 'result', exitCode: 0, text });
