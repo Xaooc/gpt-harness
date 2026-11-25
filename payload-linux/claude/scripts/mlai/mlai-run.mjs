@@ -540,14 +540,14 @@ class Job {
     // session is removed when the wrapper ends.
     args.push('--max-steps', String(this.maxSteps), '--session-id', this.sessionId, '--output-format', 'stream-json');
     this.readDirs ??= this.readAccess(brief);
-    for (const directory of this.readDirs) args.push('--add-dir', directory);
-    let prompt = rules + brief;
+    args.push(...this.readArgs());
+    let prompt = rules + this.readNote() + brief;
     if (Array.from(prompt).length > PROMPT_LIMIT && file) {
       // A copy in a folder of its own: the brief's real folder may be private (~/.claude, ~/.config) and must not open.
       this.briefDir ??= mkdtempSync(path.join(tmpdir(), 'mlai-brief-'));
       const copy = path.join(this.briefDir, path.basename(file));
       writeFileSync(copy, brief, { mode: 0o600 });
-      prompt = rules + `The full task brief is in the file ${copy}. Read it completely first and follow it exactly.`;
+      prompt = rules + this.readNote() + `The full task brief is in the file ${copy}. Read it completely first and follow it exactly.`;
       args.push('--add-dir', this.briefDir);
       this.addDir = this.briefDir;
     }
@@ -590,10 +590,21 @@ class Job {
     const dirs = [...found].filter((target) => target !== '/' && target !== dir && !target.startsWith(`${dir}/`) &&
       target !== home && this.readable(target)).sort();
     // Keep the outermost of nested folders.
-    const outer = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`)));
-    // The CLI mounts each --add-dir read-only over everything inside it, the job folder included (2026-11-24: with
-    // ~/dev readable every write in a ~/dev worktree failed with "Read-only file system"). A folder that holds the job
-    // folder is replaced by its other subfolders, level by level down to the job folder; shallow ones first, at most 64.
+    const kept = dirs.filter((target) => !dirs.some((other) => other !== target && target.startsWith(`${other}/`)));
+    if (kept.length) this.log(`read access: ${kept.join(' ')}`);
+    return kept;
+  }
+
+  /** Read access as CLI flags. Every root gets a Read rule: it lifts the approval for the file tools (read_file,
+   *  list_files, Glob, search_text) and mounts nothing; the sandbox already reads /. An absolute path in a rule starts
+   *  with // (verified 2026-11-25; one leading / never matches). Shell commands are let through only for --add-dir
+   *  folders, but the CLI mounts each --add-dir read-only over everything inside it, the job folder included
+   *  (2026-11-24: with ~/dev added every write in a ~/dev worktree failed with "Read-only file system"). So a root that
+   *  holds the job folder is added as its other subfolders, level by level down to the job folder, shallow ones first;
+   *  the engine honours the first 20 (J10 2026-11-25 stopped on `ls ~/dev/rpg-track-wt`, the folder itself). */
+  readArgs() {
+    const dir = this.options.dir;
+    const roots = (this.readDirs ?? []).filter((target) => !/[()]/.test(target));
     const split = (target) => {
       if (!dir.startsWith(`${target}/`)) return [target];
       const next = path.join(target, dir.slice(target.length + 1).split('/')[0]);
@@ -603,9 +614,22 @@ class Job {
         .flatMap((child) => child === dir ? [] : child === next ? split(child) : this.readable(child) ? [child] : []);
     };
     const depth = (target) => target.split('/').length;
-    const kept = outer.flatMap(split).sort((a, b) => depth(a) - depth(b) || a.localeCompare(b)).slice(0, 64);
-    if (kept.length) this.log(`read access: ${kept.join(' ')}`);
-    return kept;
+    const shell = roots.flatMap(split).sort((a, b) => depth(a) - depth(b) || a.localeCompare(b)).slice(0, 20);
+    return [
+      ...roots.flatMap((target) => ['--allowedTools', `Read(/${target})`, '--allowedTools', `Read(/${target}/**)`]),
+      ...shell.flatMap((target) => ['--add-dir', target])
+    ];
+  }
+
+  /** Folders that hold the job folder are readable only with the file tools: tell the agent, or it tries `ls ..`. */
+  readNote() {
+    const dir = this.options.dir;
+    const holders = (this.readDirs ?? []).filter((target) => dir.startsWith(`${target}/`));
+    if (!holders.length) return '';
+    const parent = path.dirname(dir);
+    return `Reading outside the working folder: ${parent} and the folders above it (inside ${holders.join(', ')}) open ` +
+      'only to your file tools (read_file, list_files, Glob, search_text); shell commands there (ls, cat, find) need an ' +
+      'approval nobody can give and stop the run. Use the file tools for them.\n\n';
   }
 
   gitOutside() {
@@ -624,7 +648,7 @@ class Job {
     if (model === 'pixis-opus') args.push('--effort', effort === 'xhigh' ? 'max' : effort);
     args.push('--max-steps', String(this.maxSteps), '--output-format', 'stream-json');
     if (this.addDir) args.push('--add-dir', this.addDir);
-    for (const directory of this.readDirs ?? []) args.push('--add-dir', directory);
+    args.push(...this.readArgs());
     const prompt = 'continue: you stopped at the step limit. Pick up exactly where you left off and finish the whole task.' +
       (write ? ' End with the four headings ## Changes, ## Verification, ## Deviations, ## Not done covering the whole ' +
         'task, not only this part.' : '');
