@@ -525,7 +525,7 @@
       "src": "claude/skills/luna/SKILL.md",
       "dest": "skills/luna/SKILL.md",
       "kind": "file",
-      "sha256": "e2b6a0e4e7de1c7a262369c2a2ed7b0861dfc8bbacd10e9833e6d0728afced84"
+      "sha256": "a4634e5b242ce2c9d5e982b19e2c882e4e902196d043dedbf9f48f3247a64918"
     },
     {
       "src": "claude/skills/luna-critics/SKILL.md",
@@ -3894,7 +3894,7 @@
       "src": "claude/scripts/conveyor/exec.mjs",
       "dest": "scripts/conveyor/exec.mjs",
       "kind": "file",
-      "sha256": "936194314e4b97a0f180f3e9f79332e87ca2e86cb9e7c5808228c3f9d9939153",
+      "sha256": "b8c14ed49e9cdcb9e9531bde79c1805f9af08644f7f2b31dc07cbb742c0e93ae",
       "executable": true
     },
     {
@@ -5380,7 +5380,7 @@
       "src": "claude/scripts/conveyor/test/mlai.test.mjs",
       "dest": "scripts/conveyor/test/mlai.test.mjs",
       "kind": "file",
-      "sha256": "433647ef7da5d27b09988b0cb65635c79bbfc4996a24a34083e61b2601dd76ba"
+      "sha256": "d0033b806ea723fb40080dfd7b3327a5fd26f2b95a959c391ff32f4ac5439d4c"
     },
     {
       "src": "claude/scripts/mlai-accounts.mjs",

@@ -10,7 +10,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const entry = path.resolve(here, '../../mlai.sh');
 const fake = path.join(here, 'fake-mlai.mjs');
 
-async function fixture({ scenario, worktree = false }, verify) {
+async function fixture({ scenario, worktree = false, write = true }, verify) {
   const root = mkdtempSync(path.join(tmpdir(), 'mlai-test-'));
   const dir = path.join(root, 'project with spaces');
   const out = path.join(root, 'result.md');
@@ -34,13 +34,15 @@ async function fixture({ scenario, worktree = false }, verify) {
     mkdirSync(path.join(root, 'shared'), { recursive: true });
     mkdirSync(path.join(root, 'projects'), { recursive: true });
     mkdirSync(path.join(home, '.codex'), { recursive: true });
+    mkdirSync(path.join(home, '.claude', 'scripts'), { recursive: true });
+    writeFileSync(path.join(home, '.claude', '.credentials.json'), '{}');
     writeFileSync(path.join(root, 'projects', 'ADMIN_ACCESS.txt'), 'x\n');
     writeFileSync(path.join(root, 'shared', 'notes.txt'), 'context\n');
     writeFileSync(brief, `Update greeting.txt and summarize the changes. Context: ${path.join(root, 'shared', 'notes.txt')}.\n`);
     writeFileSync(path.join(mlaiHome, 'auth.json'), JSON.stringify({
       expires: Date.now() + 86_400_000
     }));
-    const child = spawn('bash', [entry, '-w', '-C', dir, '-f', brief, '-o', out], {
+    const child = spawn('bash', [entry, write ? '-w' : '-r', '-C', dir, '-f', brief, '-o', out], {
       env: {
         ...process.env, HOME: home, MLAI_HOME: mlaiHome, MLAI_BIN: fake, MLAI_SLOT: slot,
         LUNA_RUN_DIR: run, LUNA_NO_REGISTRY: '1', MLAI_RETRIES: '2', MLAI_RETRY_DELAY_MS: '10',
@@ -99,6 +101,23 @@ test('a sign-in or daily-limit failure before the agent starts is unavailable', 
     assert.equal(status.unavailable_reason, 'auth');
     assert.notEqual(status.reached_running, '1');
   });
+  // The CLI's own failed final checks are not the owner's decision: a read-only report stands, marked unconfirmed, and
+  // its engine ran without final gates and baseline tests; unfinished write work is left for the next executor.
+  await fixture({ scenario: 'checks', write: false }, ({ rc, stderr, status, output, state }) => {
+    assert.equal(rc, 0, stderr);
+    assert.equal(status.state, 'done');
+    assert.equal(status.cli_subtype, 'error_checks_failed');
+    assert.match(output, /rpg_master\/x\.py:3[\s\S]*final checks did not confirm/);
+    const env = JSON.parse(readFileSync(path.join(state, 'env-1.json'), 'utf8'));
+    assert.deepEqual([env.MINI_MLAI_FINAL_GATES, env.MINI_VERIFY_BASELINE, env.MINI_CHECKER], ['0', '0', '0']);
+  });
+  await fixture({ scenario: 'checks' }, ({ rc, stderr, status, state }) => {
+    assert.equal(rc, 1, stderr);
+    assert.equal(status.state, 'incomplete');
+    assert.match(status.error, /final checks did not pass/);
+    const env = JSON.parse(readFileSync(path.join(state, 'env-1.json'), 'utf8'));
+    assert.deepEqual([env.MINI_MLAI_FINAL_GATES, env.MINI_VERIFY_BASELINE], [null, '0']);
+  });
   // The daily start limit is the account's quota, and the CLI's unreadable error keeps its code.
   await fixture({ scenario: 'daily' }, ({ rc, stderr, status }) => {
     assert.equal(rc, 3, stderr);
@@ -119,6 +138,9 @@ test('a run stopped by the step limit continues the same session and then remove
     assert.ok(args.includes('--yes'), 'approvals are answered');
     const denies = args.filter((arg, i) => args[i - 1] === '--disallowedTools');
     assert.ok(denies.includes(`Read(/${realpathSync(home)}/.codex/**)`), `provider sign-ins are denied: ${denies.join(' ')}`);
+    assert.ok(denies.includes(`Read(/${realpathSync(home)}/.claude/.credentials.json)`), 'Claude sign-in is denied');
+    assert.ok(!denies.some((rule) => rule.includes('/.claude)') || rule.includes('/.claude/scripts')),
+      'the harness scripts (pytest_gate.py) stay readable');
     assert.ok(!denies.some((rule) => realpathSync(dir).startsWith(rule.slice(6, -1).replace(/\/\*\*$/, '') + '/')),
       'no deny rule covers the job folder');
     assert.ok(!reads.some((target) => realpathSync(dir).startsWith(`${target}/`) || target === realpathSync(dir)),

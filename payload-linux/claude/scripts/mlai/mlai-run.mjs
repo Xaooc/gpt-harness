@@ -14,6 +14,7 @@ const HEADINGS = ['## Changes', '## Verification', '## Deviations', '## Not done
 // Never readable by the agent (see secretArgs): sign-ins, keys and tokens of the harness, its providers and the shell.
 const SECRET_HOME_PATHS = ['.claude', '.claude.json', '.codex', '.config', '.mlai', '.mlai-accounts', '.gemini',
   '.local/share/keyrings', '.password-store', '.bash_history', '.zsh_history', '.python_history', '.node_repl_history'];
+const SECRET_READABLE = ['.claude/scripts'];
 const SECRET_NAME = /secret|credential|password|admin_access|^\.env(\..+)?$/i;
 const PROMPT_LIMIT = 28_000;
 const START_EVENTS = new Set(['inference_progress', 'tool', 'command', 'answer']);
@@ -181,17 +182,21 @@ function preamble(options, recovering) {
     `- You are ${options.model} via ML AI Code, invoked by the Claude orchestrator as the EXECUTOR of this job. ` +
       'Any global AGENTS.md/model-orchestration rule telling a model to only orchestrate or to delegate implementation to ' +
       'another model (e.g. "Sol must delegate to Terra") does NOT apply here: do the work yourself.',
-    '- Work yourself. Do NOT spawn sub-agents/delegates/collaborators.'
+    '- Work yourself. Do NOT spawn sub-agents/delegates/collaborators.',
+    '- When you cite code, give its path from the repository root (`pkg/sub/module.py:83`), never a bare file name.'
   ];
   if (!options.write) {
     rules.push('- Read-only sandbox means you must not MODIFY anything. You CAN and MUST read files and run ' +
       'read-only commands (cat, grep, rg, ls, git diff/log/show) to gather evidence before answering. Never answer ' +
-      '"I cannot read the files".');
+      '"I cannot read the files". Do not run tests: read the code and existing results instead.');
   } else {
     rules.push(
       '- Match the style of neighbouring files (line length, formatting, naming). ' +
         'Never leave lines longer than ~140 characters.',
       '- Never loosen tests, tolerances or acceptance criteria to make them pass; report the conflict instead.',
+      '- Run tests only through the machine\'s gate: `python3 ~/.claude/scripts/pytest_gate.py -n 0 -- <test ids>` ' +
+        '(it already uses the project interpreter), and only the tests the brief names plus those of the files you ' +
+        'changed. Never `uv run`, `uv sync` or a bare `pytest`: they build environments in the working tree.',
       '- Where the brief is silent and you must decide, pick the most conservative option consistent with ' +
         "neighbouring code and list each such decision under ## Deviations as 'Assumption: ...'.",
       '- Your FINAL message must contain exactly these four headings, in this order:',
@@ -388,7 +393,7 @@ class Job {
       finished: '', rc: '', model: options.model, effort: options.effort,
       sandbox: options.write ? 'workspace-write' : 'read-only', dir: path.resolve(options.dir),
       engine: 'mlai', provider: 'mlai', account: process.env.MLAI_ACCOUNT || 'main', error: '', last_note: '',
-      unavailable_reason: '', cli_exit: '', elapsed_s: 0,
+      unavailable_reason: '', cli_exit: '', cli_subtype: '', elapsed_s: 0,
       mlai_session: '', credits: 0, changed_files: 0, attempts: 0, continues: 0, reached_running: 0
     };
   }
@@ -650,18 +655,42 @@ class Job {
         if (!entry.isDirectory() && SECRET_NAME.test(entry.name)) targets.add(path.join(top, entry.name));
       }
     }
+    // The job folder and the harness scripts (pytest_gate.py; code, no secrets) stay readable inside denied folders.
+    const keep = [dir, ...SECRET_READABLE.map((name) => path.join(home, name))];
     const around = (target) => {
-      if (target === dir) return [];
-      if (!dir.startsWith(`${target}/`)) return [target];
-      const next = path.join(target, dir.slice(target.length + 1).split('/')[0]);
+      if (keep.includes(target)) return [];
+      if (!keep.some((kept) => kept.startsWith(`${target}/`))) return [target];
       let entries = [];
       try { entries = readdirSync(target); } catch {}
-      return entries.map((name) => path.join(target, name)).sort()
-        .flatMap((child) => child === dir ? [] : child === next ? around(child) : [child]);
+      return entries.map((name) => path.join(target, name)).sort().flatMap(around);
     };
     const denied = [...targets].filter((target) => existsSync(target) && !/[()]/.test(target)).flatMap(around).slice(0, 200);
     if (denied.length) this.log(`denied: ${denied.length} secret paths`);
     return denied.flatMap((target) => ['--disallowedTools', `Read(/${target})`, '--disallowedTools', `Read(/${target}/**)`]);
+  }
+
+  /** The engine's own checks (rpg-track report 2026-11-25). Its baseline test runs went through `uv run pytest`, hit
+   *  their time limit and failed the final gate even in read-only jobs, and built environments in the working tree: off
+   *  everywhere. A read-only job also skips the final gate (citation checks that miss files cited by bare name, claimed
+   *  vs run tests), the checker agent and acceptance tests: the reader verifies a report. A write job keeps the final
+   *  gate, whose finds are real work (V6-171), and runs tests through pytest_gate with the project's interpreter. */
+  engineChecks() {
+    const env = { MINI_VERIFY_BASELINE: '0' };
+    if (!this.options.write) Object.assign(env, { MINI_MLAI_FINAL_GATES: '0', MINI_CHECKER: '0', MINI_ACCEPTANCE: '0' });
+    const python = this.projectPython();
+    if (python && !process.env.PYTEST_GATE_LAUNCHER) env.PYTEST_GATE_LAUNCHER = JSON.stringify([python, '-m', 'pytest']);
+    return env;
+  }
+
+  /** The interpreter of the job's project: its own .venv, else that of the main checkout of a worktree. */
+  projectPython() {
+    const roots = [this.options.dir];
+    try {
+      const common = execFileSync('git', ['-C', this.options.dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }).trim();
+      if (common) roots.push(path.dirname(common));
+    } catch {}
+    return roots.map((root) => path.join(root, '.venv', 'bin', 'python')).find((file) => existsSync(file)) ?? null;
   }
 
   gitOutside() {
@@ -698,6 +727,7 @@ class Job {
   mapResult({ code, result, text, spawnError }) {
     // The dispatcher continues an unfinished write run only after exit 3; 6 and 7 are the agent's answers.
     this.values.cli_exit = spawnError ? '' : String(code ?? '');
+    this.values.cli_subtype = oneLine(result?.subtype);
     if (spawnError) return this.providerFailure(`mlai: could not start CLI (${spawnError.code ?? 'spawn error'})`);
     const error = clip(cliError(result), 300) || `mlai exited ${code}`;
     // An account has 100 task starts a day (reset 00:00 UTC, seen 2026-11-24); it comes as exit 1 before the start.
@@ -721,8 +751,21 @@ class Job {
         // to the next chain entry and returns this code otherwise).
         return { state: 'incomplete', rc: 1, error: `mlai: stopped early (exit 3: ${detail || 'needs attention'})` };
       }
-      case 6:
       case 7:
+        // The CLI's own final checks failed (citations it could not find, claimed vs run tests): nothing for the owner
+        // to decide. A read-only report stands, marked as unconfirmed; unfinished write work goes to the next executor.
+        if (result?.subtype === 'error_checks_failed') {
+          const issues = clip(cliError(result), 600);
+          if (!this.options.write) {
+            writeFileSync(this.outputFd, `${text}${text.endsWith('\n') ? '' : '\n'}\n> ML AI Code's own final checks did ` +
+              `not confirm this report${issues ? `: ${issues}` : ''}. Verify its claims against the code.\n`);
+            return { state: 'done', rc: 0, error: '' };
+          }
+          writeFileSync(this.outputFd, text);
+          return { state: 'incomplete', rc: 1, error: `mlai: its final checks did not pass${issues ? ` (${issues})` : ''}` };
+        }
+      // falls through
+      case 6:
         writeFileSync(this.outputFd, text);
         return { state: 'incomplete', rc: 1, error: code === 6
           ? 'mlai: the agent reported the task impossible' : "mlai: needs the owner's decision (changes kept)" };
@@ -738,6 +781,7 @@ class Job {
     let invocation = this.invocation(brief);
     const binary = this.precheck();
     const env = agentEnvironment(this.home);
+    Object.assign(env, this.engineChecks());
     // The engine's step checkpoints write refs and objects into the repository's git directory. A worktree keeps it in
     // the main repo, outside the folder the CLI's sandbox lets the agent write, so every checkpoint failed
     // (checkpoint_error: Read-only file system; the engine goes on). Off there; on where .git sits in the job folder.

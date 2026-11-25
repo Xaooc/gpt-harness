@@ -1306,8 +1306,10 @@ async function runCommand(args) {
       // An mlai run that stopped short without changing anything leaves nothing to keep and nothing to apply twice: run
       // it on the next chain entry instead of reporting it as done (2026-11-24: J6d stopped on an approval it could not
       // get in headless mode, exit 0, and its work was silently lost).
-      // Exit 6 (the agent found the task impossible) and 7 (it needs the owner's decision) are answers, not stops.
-      const answered = ['6', '7'].includes(observed.values?.cli_exit);
+      // Exit 6 (the agent found the task impossible) and 7 (it needs the owner's decision) are answers, not stops; exit 7
+      // from the CLI's own failed final checks is unfinished work (rpg-track report 2026-11-25).
+      const checksFailed = observed.values?.cli_subtype === 'error_checks_failed';
+      const answered = ['6', '7'].includes(observed.values?.cli_exit) && !checksFailed;
       const noWork = !failure && !answered && entry.provider === 'mlai' && result.code !== 0 && !result.signal &&
         observed.values?.state !== 'done' && observed.values?.changed_files === '0' &&
         (mode === 'read' || await repositoryUnchanged(gate));
@@ -1322,7 +1324,8 @@ async function runCommand(args) {
       // step limit, `limited`) is continued by the next executor on the same working tree, under the same lock and gate
       // (owner's decision 2026-11-25: such jobs failed, the tracker re-queued them onto mlai and they stopped again).
       if (!panel && !continued && gate && entry.provider === 'mlai' && mode === 'write' && !result.signal && !noWork &&
-          observed.reachedRunning && observed.values?.state === 'incomplete' && observed.values?.cli_exit === '3') {
+          observed.reachedRunning && observed.values?.state === 'incomplete' &&
+          (observed.values?.cli_exit === '3' || checksFailed)) {
         continued = true;
         slot?.release();
         slot = null;

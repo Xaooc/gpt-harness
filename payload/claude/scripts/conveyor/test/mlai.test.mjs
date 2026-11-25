@@ -68,7 +68,8 @@ fi
 if [ -f "$flags/partial" ]; then
   printf 'half\n' > partial.txt
   printf 'Changes: half done\n' > "$out"
-  printf 'provider=mlai\nstate=incomplete\nreached_running=1\nchanged_files=1\ncli_exit=%s\nerror=mlai: stopped early (exit %s)\n' "$(cat "$flags/partial")" "$(cat "$flags/partial")" > "$out.status"
+  code="$(cut -d: -f1 "$flags/partial")" subtype="$(cut -s -d: -f2 "$flags/partial")"
+  printf 'provider=mlai\nstate=incomplete\nreached_running=1\nchanged_files=1\ncli_exit=%s\ncli_subtype=%s\nerror=mlai: stopped early (exit %s)\n' "$code" "$subtype" "$code" > "$out.status"
   exit 1
 fi
 if [ -f "$flags/routefail-${'$'}{MLAI_ACCOUNT:-main}" ]; then
@@ -145,7 +146,8 @@ test('mlai slot release; a network failure, or an unfinished write run with no c
     assert.equal(partial.status, 1, partial.stderr);
     assert.deepEqual((await readJson(`${out}.dispatch.json`)).attempts.map(({ provider }) => provider), ['mlai']);
     await fs.rm(path.join(dir, 'partial.txt'));
-    await fs.writeFile(path.join(path.dirname(out), 'partial'), '3');
+    // Exit 7 from the CLI's own failed final checks is unfinished work too, not the owner's decision.
+    await fs.writeFile(path.join(path.dirname(out), 'partial'), '7:error_checks_failed');
     const continued = await runJob('-w');
     assert.equal(continued.status, 0, continued.stderr);
     const handOff = await readJson(`${out}.dispatch.json`);

@@ -13,6 +13,8 @@ for await (const chunk of process.stdin) prompt += chunk;
 writeFileSync(path.join(state, `prompt-${attempt}.md`), prompt);
 writeFileSync(path.join(state, `args-${attempt}.json`), JSON.stringify(process.argv.slice(2)));
 writeFileSync(path.join(state, `checkpoints-${attempt}.txt`), process.env.MINI_STEP_CHECKPOINTS ?? 'unset');
+writeFileSync(path.join(state, `env-${attempt}.json`), JSON.stringify(Object.fromEntries(['MINI_MLAI_FINAL_GATES',
+  'MINI_VERIFY_BASELINE', 'MINI_CHECKER', 'PYTEST_GATE_LAUNCHER'].map((key) => [key, process.env[key] ?? null]))));
 
 const send = (event) => process.stdout.write(JSON.stringify(event) + '\n');
 send({ type: 'stage', content: 'Loading project context' });
@@ -54,6 +56,13 @@ switch (process.env.FAKE_MLAI_SCENARIO) {
     send({ type: 'result', state: 'error', error: 'Not signed in. Run `mlai login`.', exitCode: 4 });
     process.exitCode = 4;
     break;
+  case 'checks': {
+    const text = 'The flow is in rpg_master/x.py:3.';
+    send({ type: 'answer', content: text });
+    send({ type: 'result', exitCode: 7, subtype: 'error_checks_failed', text, error: 'Some final checks did not pass' });
+    process.exitCode = 7;
+    break;
+  }
   case 'daily':
     send({ type: 'result', state: 'error', code: 'daily_run_limit', error: '[object Object]', exitCode: 1 });
     process.exitCode = 1;
