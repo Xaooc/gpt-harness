@@ -67,7 +67,8 @@ if [ -f "$flags/nowork" ]; then
 fi
 if [ -f "$flags/partial" ]; then
   printf 'half\n' > partial.txt
-  printf 'provider=mlai\nstate=incomplete\nreached_running=1\nchanged_files=1\nerror=mlai: stopped early (exit 3: error_max_turns)\n' > "$out.status"
+  printf 'Changes: half done\n' > "$out"
+  printf 'provider=mlai\nstate=incomplete\nreached_running=1\nchanged_files=1\ncli_exit=%s\nerror=mlai: stopped early (exit %s)\n' "$(cat "$flags/partial")" "$(cat "$flags/partial")" > "$out.status"
   exit 1
 fi
 if [ -f "$flags/routefail-${'$'}{MLAI_ACCOUNT:-main}" ]; then
@@ -116,7 +117,7 @@ test('two live mlai slots skip to Codex without marking mlai unavailable', async
   });
 });
 
-test('mlai slot release; a network failure, or an unfinished write run with no changes, moves on unmarked; one with changes exits 1', async () => {
+test('mlai slot release; a network failure, or an unfinished write run with no changes, moves on unmarked; one with changes is continued by Codex unless the agent answered', async () => {
   await withEnvironment(async ({ home, dir, slots, out, runJob }) => {
     await fs.writeFile(path.join(path.dirname(out), 'netfail'), '');
     const failed = await runJob();
@@ -137,10 +138,22 @@ test('mlai slot release; a network failure, or an unfinished write run with no c
     assert.deepEqual((await readJson(`${out}.dispatch.json`)).attempts.map(({ provider }) => provider), ['mlai', 'codex']);
     assert.equal(Object.hasOwn(await readJson(path.join(home, 'providers.json')).catch(() => ({})), 'mlai'), false);
     await fs.rm(path.join(path.dirname(out), 'nowork'));
-    await fs.writeFile(path.join(path.dirname(out), 'partial'), '');
+    // The agent's answer "impossible" (exit 6) with changes stays final; a stop (exit 3) is continued by Codex on the same
+    // tree with a brief that carries mlai's changes and report.
+    await fs.writeFile(path.join(path.dirname(out), 'partial'), '6');
     const partial = await runJob('-w');
     assert.equal(partial.status, 1, partial.stderr);
     assert.deepEqual((await readJson(`${out}.dispatch.json`)).attempts.map(({ provider }) => provider), ['mlai']);
+    await fs.rm(path.join(dir, 'partial.txt'));
+    await fs.writeFile(path.join(path.dirname(out), 'partial'), '3');
+    const continued = await runJob('-w');
+    assert.equal(continued.status, 0, continued.stderr);
+    const handOff = await readJson(`${out}.dispatch.json`);
+    assert.deepEqual(handOff.attempts.map(({ provider }) => provider), ['mlai', 'codex']);
+    const codexArgs = (await fs.readFile(`${out}.log`, 'utf8')).split('\n');
+    const continuation = codexArgs[codexArgs.indexOf('-f') + 1];
+    assert.equal(continuation, handOff.continuation.brief);
+    assert.match(await fs.readFile(continuation, 'utf8'), /## Continuation[\s\S]*stopped early[\s\S]*- partial\.txt[\s\S]*half done/);
     await fs.rm(path.join(path.dirname(out), 'partial'));
     await fs.rm(path.join(dir, 'partial.txt'));
 

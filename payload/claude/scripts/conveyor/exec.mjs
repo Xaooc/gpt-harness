@@ -1041,6 +1041,23 @@ async function archiveAttempt(out, provider) {
   return prefix;
 }
 
+/** The brief for the executor that continues an unfinished mlai run: the task, why mlai stopped, what it changed and its
+ *  report, which may claim changes the code does not have. Named outside `<out>.*`, which archiveAttempt sweeps. */
+async function writeContinuation(gate, brief, out, why, report) {
+  const files = gate.base ? await gateChangedFiles(gate.repo, gate.base, gate.preExisting).catch(() => []) : [];
+  const clip = (text, size) => text.length > size ? `${text.slice(0, size)}\n[... cut ...]` : text;
+  const file = path.join(path.dirname(out), `continue-${path.basename(out)}.brief.md`);
+  await fs.writeFile(file, `${gate.brief.trimEnd()}\n\n## Continuation: another executor started this task\n\n` +
+    `ML AI Code worked on this task in this working tree and stopped before finishing (${why || 'unfinished'}). Its changes ` +
+    'are in the working tree. Its report is below; it may describe changes that are not in the code, so trust only the ' +
+    'code and `git diff`. Check what is really done, keep what is right, fix what is wrong, finish the rest of the task, ' +
+    'and report on the whole task, not only on your part.\n\n' +
+    `Files changed so far${gate.base ? ` (since ${gate.base.slice(0, 12)})` : ''}:\n` +
+    (files.length ? files.slice(0, 200).map((name) => `- ${name}`).join('\n') : '- (none detected; check git status)') +
+    `\n\nIts report:\n\n\`\`\`\n${clip(report.trim() || '(no report)', 8000)}\n\`\`\`\n`);
+  return file;
+}
+
 async function switchProvider(tier, from, to, reason, out) {
   // Keep every switch on one terminal line even when an error contains control characters.
   reason = reason.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
@@ -1186,7 +1203,7 @@ async function runCommand(args) {
     const gate = mode === 'write' ? await prepareGate(dir, brief, out, tier, panel, opts['--no-gate'], reviewSkip) : null;
     const refresh = () => providerState(config, { excludeCodexAccounts: excludedAccounts });
     let state = await refresh(), resolution = await resolve(state);
-    let cursor = -1, from = null, failedReason = null;
+    let cursor = -1, from = null, failedReason = null, runBrief = brief, continued = false;
     const busyEntries = new Map();
     while (true) {
       for (const [index, reason] of busyEntries) {
@@ -1195,7 +1212,7 @@ async function runCommand(args) {
       // The snapshot can say "sessions busy" while a slot has just opened: an mlai entry that is only busy is still
       // tried, and the live reservation decides.
       const index = resolution.chain.findIndex((entry, position) => position > cursor &&
-        (entry.available || (!busyEntries.has(position) && entry.provider === 'mlai' &&
+        !(continued && entry.provider === 'mlai') && (entry.available || (!busyEntries.has(position) && entry.provider === 'mlai' &&
           /^mlai sessions busy/.test(entry.reason ?? ''))));
       dispatch.chain = resolution.chain;
       if (index < 0) {
@@ -1271,7 +1288,7 @@ async function runCommand(args) {
       let result, observed;
       try {
         const launchAttempt = () => launch(entry, [mode === 'write' ? '-w' : '-r', '-m', entry.model, '-e', entry.effort,
-          '-C', dir, '-f', brief, '-o', out], dir, account, extraEnv);
+          '-C', dir, '-f', runBrief, '-o', out], dir, account, extraEnv);
         if (gate) {
           acceptance ??= {
             session: session || 'unknown', task: activeTaskId(session), runId: randomUUID(),
@@ -1289,7 +1306,9 @@ async function runCommand(args) {
       // An mlai run that stopped short without changing anything leaves nothing to keep and nothing to apply twice: run
       // it on the next chain entry instead of reporting it as done (2026-11-24: J6d stopped on an approval it could not
       // get in headless mode, exit 0, and its work was silently lost).
-      const noWork = !failure && entry.provider === 'mlai' && result.code !== 0 && !result.signal &&
+      // Exit 6 (the agent found the task impossible) and 7 (it needs the owner's decision) are answers, not stops.
+      const answered = ['6', '7'].includes(observed.values?.cli_exit);
+      const noWork = !failure && !answered && entry.provider === 'mlai' && result.code !== 0 && !result.signal &&
         observed.values?.state !== 'done' && observed.values?.changed_files === '0' &&
         (mode === 'read' || await repositoryUnchanged(gate));
       if (noWork) failure = { reason: 'start', note: observed.values?.error || 'mlai stopped without changes', mark: false };
@@ -1299,6 +1318,28 @@ async function runCommand(args) {
       });
       dispatch.code = result.code;
       if (failure && failure.mark !== false) await markUnavailable(entry.provider, failure.reason, failure.note, { config, account: failure.account });
+      // An mlai write run that stopped unfinished after changing files (CLI exit 3: an approval it could not get, the
+      // step limit, `limited`) is continued by the next executor on the same working tree, under the same lock and gate
+      // (owner's decision 2026-11-25: such jobs failed, the tracker re-queued them onto mlai and they stopped again).
+      if (!panel && !continued && gate && entry.provider === 'mlai' && mode === 'write' && !result.signal && !noWork &&
+          observed.reachedRunning && observed.values?.state === 'incomplete' && observed.values?.cli_exit === '3') {
+        continued = true;
+        slot?.release();
+        slot = null;
+        const report = await fs.readFile(out, 'utf8').catch(() => '');
+        attempt.retry = true;
+        attempt.reason = `continue: ${observed.values?.error || 'mlai stopped unfinished'}`;
+        attempt.archive = await archiveAttempt(out, entry.provider);
+        await fs.writeFile(`${out}.status`, 'state=starting\nnote=continuing after mlai stopped unfinished\n');
+        runBrief = await writeContinuation(gate, brief, out, observed.values?.error, report);
+        dispatch.brief = runBrief;
+        dispatch.continuation = { from: entry.provider, reason: observed.values?.error ?? null, brief: runBrief };
+        await saveDispatch();
+        cursor = index;
+        from = entry.provider;
+        failedReason = attempt.reason;
+        continue;
+      }
       const retryable = result.code === 3 || Boolean(failure && !result.launchError);
       const started = observed.reachedRunning && !noWork && (mode === 'write' || entry.provider === 'mlai');
       const canRetry = retryable && !started && !result.signal;
