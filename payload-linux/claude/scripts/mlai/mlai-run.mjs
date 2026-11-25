@@ -361,7 +361,7 @@ class Attempt {
       const code = await Promise.race([closed, stopped]);
       signal.throwIfAborted();
       return { code: this.result?.exitCode ?? code ?? 1, result: this.result, stderr: this.stderr,
-        text: typeof this.result?.text === 'string' ? this.result.text : this.answer, spawnError };
+        text: typeof this.result?.text === 'string' ? this.result.text : this.answer, answer: this.answer, spawnError };
     } finally {
       this.waitingForStream = false;
       signal.removeEventListener('abort', onAbort);
@@ -728,7 +728,7 @@ class Job {
     };
   }
 
-  mapResult({ code, result, text, spawnError }) {
+  mapResult({ code, result, text, answer, spawnError }) {
     // A read-only answer has no run of its own to verify, yet the engine starts it with a "> **Not verified.**" banner
     // whenever its checks found nothing to confirm; a reader that expects JSON (the delivery review) then fails to parse
     // it (2026-11-25). The banner goes to the log, the answer stays as the agent wrote it.
@@ -745,11 +745,21 @@ class Job {
     if (code !== 0 && /daily_run_limit|daily limit of \d+ task starts/i.test(error)) return this.providerFailure(error, 'quota');
     switch (code) {
       case 0: {
+        const raw = text;
         if (this.options.write) text = contractHeadings(text);
         writeFileSync(this.outputFd, text);
         const missing = this.options.write
           ? HEADINGS.filter((heading) => !hasHeading(text, heading)) : [];
-        if (missing.length) this.log(`result is missing contract headings: ${missing.join('|')}`);
+        if (missing.length) {
+          this.log(`result is missing contract headings: ${missing.join('|')}`);
+          // One run in three lost "Deviations"/"Not done" (2026-11-25) and the CLI's own texts were gone: keep them whole
+          // next to the output, so the next loss shows where the headings went.
+          const evidence = `${this.options.out}.headings.json`;
+          try {
+            writeFileSync(evidence, JSON.stringify({ missing, answer: answer ?? null, result: raw ?? null, saved: text }, null, 2));
+            this.log(`CLI texts kept for the missing headings: ${evidence}`);
+          } catch (error) { this.log(`could not keep the CLI texts: ${error.message}`); }
+        }
         return { state: missing.length ? 'incomplete' : 'done', rc: 0, error: '' };
       }
       case 3: {

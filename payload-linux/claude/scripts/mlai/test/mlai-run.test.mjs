@@ -120,6 +120,14 @@ test('a sign-in or daily-limit failure before the agent starts is unavailable', 
     // The agent's `pytest` is the gate shim, first on PATH.
     assert.match(env.PATH, /\/scripts\/mlai\/bin:/);
   });
+  // A write report that lost headings keeps the CLI's own texts next to the output for diagnosis.
+  await fixture({ scenario: 'headings' }, ({ rc, stderr, status, state }) => {
+    assert.equal(rc, 0, stderr);
+    assert.equal(status.state, 'incomplete');
+    const out = JSON.parse(readFileSync(path.join(state, '..', 'result.md.headings.json'), 'utf8'));
+    assert.deepEqual(out.missing, ['## Deviations', '## Not done']);
+    assert.match(out.answer, /## Deviations\nNone/);
+  });
   // The daily start limit is the account's quota, and the CLI's unreadable error keeps its code.
   await fixture({ scenario: 'daily' }, ({ rc, stderr, status }) => {
     assert.equal(rc, 3, stderr);

@@ -64,6 +64,12 @@ switch (process.env.FAKE_MLAI_SCENARIO) {
     process.exitCode = 7;
     break;
   }
+  case 'headings': {
+    const answer = '## Changes\n- x\n\n## Verification\n- y\n\n## Deviations\nNone\n\n## Not done\nNone';
+    send({ type: 'answer', content: answer });
+    send({ type: 'result', exitCode: 0, text: answer.replace(/^## (Deviations|Not done)\n/gm, '') });
+    break;
+  }
   case 'daily':
     send({ type: 'result', state: 'error', code: 'daily_run_limit', error: '[object Object]', exitCode: 1 });
     process.exitCode = 1;
